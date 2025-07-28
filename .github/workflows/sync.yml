@@ -3,7 +3,7 @@ name: "🚀 Sync Movidesk → Neon"
 
 on:
   schedule:
-    - cron: '0 * * * *'      # roda todo início de hora (UTC)
+    - cron: '30 10 * * *'      # roda todo início de hora (UTC)
   workflow_dispatch:        # possibilita botão “Run workflow”
 
 jobs:
