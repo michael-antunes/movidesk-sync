@@ -1,15 +1,15 @@
 name: 🚀 Sync Movidesk → Neon
 
 on:
-  # agenda automática: aqui a cada 5 minutos
   schedule:
-    - cron: '30 9 * * *'   # 👉 GitHub aceita intervalos de 5 em 5 min (mínimo recomendado)
-  # botão “Run workflow” manual
-  workflow_dispatch:
+    # roda a cada 5 minutos (mínimo suportado pelo GitHub Actions)
+    - cron:  '*/5 * * * *'
+  workflow_dispatch:   # permite "Run workflow" manual
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -20,10 +20,11 @@ jobs:
           python-version: '3.x'
 
       - name: Install dependencies
-        run: pip install requests psycopg2-binary
+        run: |
+          pip install requests psycopg2-binary
 
       - name: Run sync script
         env:
-          API_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:  ${{ secrets.NEON_DSN }}
+          API_TOKEN:   ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN:    ${{ secrets.NEON_DSN }}
         run: python sync_tickets.py
