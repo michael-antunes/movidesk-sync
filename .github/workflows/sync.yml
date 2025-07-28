@@ -1,29 +1,63 @@
-# .github/workflows/sync.yml
-name: "🚀 Sync Movidesk → Neon"
+import requests
+import psycopg2
+import os
 
-on:
-  schedule:
-    - cron: '30 10 * * *'      # roda todo início de hora (UTC)
-  workflow_dispatch:        # possibilita botão “Run workflow”
+API_TOKEN = os.getenv("API_TOKEN")
+NEON_DSN  = os.getenv("NEON_DSN")
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
+def fetch_tickets():
+    # ... seu código para chamar a API e devolver a lista de dicionários ...
+    return tickets
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+def clear_table(conn):
+    """Esvazia a tabela onde você carrega os dados antes de inserir o snapshot atual."""
+    with conn.cursor() as cur:
+        # use TRUNCATE para apagar tudo rapidinho, sem gerar WAL linha a linha
+        cur.execute("TRUNCATE TABLE visualizacao_atual.movidesk_tickets_abertos;")
+    conn.commit()
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'     # <─── ESTÁ NO MESMO NÍVEL DE "- uses:" + 2 espaços
+def upsert_tickets(conn, tickets):
+    sql = """
+    INSERT INTO visualizacao_atual.movidesk_tickets_abertos
+      (id, protocol, type, subject, status, basestatus, ownerTeam, serviceFirstLevel, createdDate, lastUpdate)
+    VALUES
+      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (id) DO UPDATE
+      SET protocol         = EXCLUDED.protocol,
+          type             = EXCLUDED.type,
+          subject          = EXCLUDED.subject,
+          status           = EXCLUDED.status,
+          basestatus       = EXCLUDED.basestatus,
+          ownerTeam        = EXCLUDED.ownerTeam,
+          serviceFirstLevel= EXCLUDED.serviceFirstLevel,
+          createdDate      = EXCLUDED.createdDate,
+          lastUpdate       = EXCLUDED.lastUpdate;
+    """
+    with conn.cursor() as cur:
+        for t in tickets:
+            cur.execute(sql, (
+                t["id"],
+                t.get("protocol"),
+                t.get("type"),
+                t.get("subject"),
+                t.get("status"),
+                t.get("baseStatus"),
+                t.get("ownerTeam"),
+                t.get("serviceFirstLevel"),
+                t.get("createdDate"),
+                t.get("lastUpdate"),
+            ))
+    conn.commit()
 
-      - name: Install dependencies
-        run: pip install requests psycopg2-binary
+def main():
+    tickets = fetch_tickets()
+    print(f"🔎 Tickets para sincronizar: {len(tickets)}")
+    conn = psycopg2.connect(NEON_DSN)
+    try:
+        clear_table(conn)         # <–– limpa tudo antes
+        upsert_tickets(conn, tickets)
+    finally:
+        conn.close()
 
-      - name: Run sync
-        env:
-          API_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:  ${{ secrets.NEON_DSN }}
-        run: python sync_tickets.py
+if __name__ == "__main__":
+    main()
