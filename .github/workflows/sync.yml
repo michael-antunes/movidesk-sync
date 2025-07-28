@@ -3,7 +3,7 @@ name: 🚀 Sync Movidesk → Neon
 on:
   # agenda automática: aqui a cada 5 minutos
   schedule:
-    - cron: '*/5 * * * *'   # 👉 GitHub aceita intervalos de 5 em 5 min (mínimo recomendado)
+    - cron: '30 9 * * *'   # 👉 GitHub aceita intervalos de 5 em 5 min (mínimo recomendado)
   # botão “Run workflow” manual
   workflow_dispatch:
 
