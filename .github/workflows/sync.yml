@@ -1,28 +1,33 @@
+# .github/workflows/sync.yml
 name: "🚀 Sync Movidesk → Neon"
 
 on:
   schedule:
     - cron: '0 * * * *'      # todo início de hora (UTC)
-  workflow_dispatch:        # botão “Run workflow”
+  workflow_dispatch:        # botão “Run workflow” no UI
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) Checkout do código
       - name: Checkout code
         uses: actions/checkout@v3
 
+      # 2) Configura Python
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'    # <- observe dois espaços antes de `python-version`
+          python-version: '3.x'    # <<-- ESTE É O with:, 2 espaços a mais que o uses
 
+      # 3) Instala dependências
       - name: Install dependencies
         run: pip install requests psycopg2-binary
 
-      - name: Run sync script
-        run: python sync_tickets.py
+      # 4) Executa o script de sync
+      - name: Run sync
         env:
           API_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN:  ${{ secrets.NEON_DSN }}
+        run: python sync_tickets.py
