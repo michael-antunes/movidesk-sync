@@ -2,9 +2,9 @@ name: 🚀 Sync Movidesk → Neon
 
 on:
   schedule:
-    # roda a cada 5 minutos (mínimo suportado pelo GitHub Actions)
-    - cron:  '*/5 * * * *'
-  workflow_dispatch:   # permite "Run workflow" manual
+    # roda a cada 5 minutos (mínimo aceito pelo GitHub Actions)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # botão “Run workflow” manual
 
 jobs:
   sync:
@@ -25,6 +25,6 @@ jobs:
 
       - name: Run sync script
         env:
-          API_TOKEN:   ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:    ${{ secrets.NEON_DSN }}
+          API_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN:  ${{ secrets.NEON_DSN }}
         run: python sync_tickets.py
