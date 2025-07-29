@@ -1,63 +1,58 @@
-import os, requests, psycopg2, json
+import os
+import requests
+import psycopg2
 from datetime import date
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN       = os.getenv("NEON_DSN")
 start_date = date.today().isoformat()
 
-def fetch_history():
+def fetch_resolved():
     params = {
         "token": API_TOKEN,
-        "$select": "id,protocol,resolvedIn",
-        "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {start_date}",
-        "$expand": (
-            "statusHistories("
-            "$select=status,justification,permanencyTimeWorkingTime,"
-            "permanencyTimeFullTime,changedBy,changedDate)"
-        )
+        "$select": "id,protocol,resolvedIn,lifetimeWorkingTime,stoppedTimeWorkingTime",
+        "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {start_date}"
     }
     r = requests.get("https://api.movidesk.com/public/v1/tickets", params=params)
     r.raise_for_status()
-    # Aqui r.json() já é uma lista de tickets
     return r.json()
 
-def save_history(records):
+def save_to_db(records):
     conn = psycopg2.connect(DSN)
     cur = conn.cursor()
     cur.execute("SET search_path TO visualizacao_resolucao;")
     for t in records:
-        ticket_id = t["id"]
-        protocol  = t.get("protocol")
-        for h in t.get("statusHistories", []):
-            cur.execute(
-                """
-                INSERT INTO resolucao_por_status
-                  (ticket_id, protocol, status, justificativa,
-                   seconds_utl, permanency_time_fulltime_seconds,
-                   changed_by, changed_date)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (ticket_id,status,justificativa) DO UPDATE
-                  SET seconds_utl                      = EXCLUDED.seconds_utl,
-                      permanency_time_fulltime_seconds = EXCLUDED.permanency_time_fulltime_seconds,
-                      changed_by                       = EXCLUDED.changed_by,
-                      changed_date                     = EXCLUDED.changed_date,
-                      imported_at                      = NOW()
-                """,
-                (
-                  ticket_id,
-                  protocol,
-                  h.get("status"),
-                  h.get("justification"),
-                  h.get("permanencyTimeWorkingTime"),
-                  h.get("permanencyTimeFullTime"),
-                  json.dumps(h.get("changedBy")),
-                  h.get("changedDate")
-                )
+        lt = t.get("lifetimeWorkingTime")
+        st = t.get("stoppedTimeWorkingTime")
+        net = lt - st if lt is not None and st is not None else None
+        hours = round(net/60, 2) if net is not None else None
+
+        cur.execute(
+            """
+            INSERT INTO movidesk_resolution
+              (ticket_id, protocol, resolved_in,
+               lifetime_working_time, stopped_time_working_time,
+               net_hours)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (ticket_id, resolved_in) DO UPDATE
+              SET lifetime_working_time       = EXCLUDED.lifetime_working_time,
+                  stopped_time_working_time   = EXCLUDED.stopped_time_working_time,
+                  net_hours                   = EXCLUDED.net_hours,
+                  imported_at                 = NOW()
+            """,
+            (
+              t["id"],
+              t.get("protocol"),
+              t["resolvedIn"],
+              lt,
+              st,
+              hours
             )
+        )
     conn.commit()
     cur.close()
     conn.close()
 
 if __name__ == "__main__":
-    tickets_h = fetch_history()
-    save_history(tickets_h)
+    tickets = fetch_resolved()
+    save_to_db(tickets)
