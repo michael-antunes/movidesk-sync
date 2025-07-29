@@ -4,97 +4,83 @@ import requests
 import psycopg2
 
 API_TOKEN = os.getenv("API_TOKEN")
-NEON_DSN = os.getenv("NEON_DSN")
+NEON_DSN  = os.getenv("NEON_DSN")
 
-def fetch_tickets(status_list=("Em atendimento","Aguardando"), max_retries=5):
+def fetch_tickets():
     """
-    Faz paginação e tenta até max_retries em cada página.
-    Se mesmo assim falhar, considera que não há tickets nessa página.
+    Puxa todos os tickets com status 'Em atendimento' ou 'Aguardando' da Movidesk
+    e retorna uma lista de dicionários.
     """
     headers = {"Authorization": f"Bearer {API_TOKEN}"}
     tickets = []
     page = 1
-
     while True:
-        params = {
-            "status": ",".join(status_list),
-            "page": page
-        }
-        for attempt in range(1, max_retries + 1):
-            resp = requests.get("https://api.movidesk.com/public/v1/tickets", headers=headers, params=params)
-            if resp.status_code == 200:
-                data = resp.json()
-                if not data:
-                    return tickets
-                tickets.extend(data)
-                page += 1
-                break
-            else:
-                wait = 2 ** attempt
-                print(f"⚠️  Server error {resp.status_code} on page {page}, attempt {attempt}/{max_retries}, sleeping {wait}s")
-                time.sleep(wait)
-        else:
-            # todas tentativas falharam, considera página vazia e encerra
-            print(f"⚠️  FAILED to fetch page {page} after {max_retries} retries, ending pagination.")
-            return tickets
+        url = "https://api.movidesk.com/public/v1/tickets"
+        params = {"status": "Em atendimento,Aguardando", "page": page}
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code >= 500:
+            raise RuntimeError(f"Server error {resp.status_code} on page {page}")
+        if resp.status_code != 200:
+            resp.raise_for_status()
 
+        data = resp.json()
+        if not data:
+            break
+        tickets.extend(data)
+        page += 1
     return tickets
 
 def clear_table(conn):
-    """Limpa toda a tabela antes de inserir o snapshot atual."""
+    """Trunca a tabela antes de inserir o snapshot atual."""
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE visualizacao_atual.movidesk_tickets_abertos;")
     conn.commit()
-    print("🗑  Table truncated.")
 
 def upsert_tickets(conn, tickets):
     """
-    Insere ou atualiza cada ticket via ON CONFLICT.
+    Insere ou atualiza cada ticket no Neon.
+    Assumindo que a tabela tem coluna 'id' como PK.
     """
     sql = """
     INSERT INTO visualizacao_atual.movidesk_tickets_abertos
       (id, protocol, type, subject, status, base_status, owner_team, service_first_level, created_date, last_update)
-    VALUES %s
-    ON CONFLICT (id) DO UPDATE SET
-      protocol          = EXCLUDED.protocol,
-      type              = EXCLUDED.type,
-      subject           = EXCLUDED.subject,
-      status            = EXCLUDED.status,
-      base_status       = EXCLUDED.base_status,
-      owner_team        = EXCLUDED.owner_team,
-      service_first_level = EXCLUDED.service_first_level,
-      created_date      = EXCLUDED.created_date,
-      last_update       = EXCLUDED.last_update;
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (id) DO UPDATE
+      SET protocol            = EXCLUDED.protocol,
+          type                = EXCLUDED.type,
+          subject             = EXCLUDED.subject,
+          status              = EXCLUDED.status,
+          base_status         = EXCLUDED.base_status,
+          owner_team          = EXCLUDED.owner_team,
+          service_first_level = EXCLUDED.service_first_level,
+          created_date        = EXCLUDED.created_date,
+          last_update         = EXCLUDED.last_update
     """
-    # psycopg2.extras.execute_values pode ajudar performance, mas aqui deixo manual
     with conn.cursor() as cur:
         for t in tickets:
-            cur.execute(sql, [
-                (
-                  t.get("id"),
-                  t.get("protocol"),
-                  t.get("type"),
-                  t.get("subject"),
-                  t.get("status"),
-                  t.get("baseStatus"),
-                  t.get("ownerTeam"),
-                  t.get("serviceFirstLevel"),
-                  t.get("createdDate"),
-                  t.get("lastUpdate"),
-                )
-            ])
+            cur.execute(sql, (
+                t.get("id"),
+                t.get("protocol"),
+                t.get("type"),
+                t.get("subject"),
+                t.get("status"),
+                t.get("baseStatus"),
+                t.get("ownerTeam"),
+                t.get("serviceFirstLevel"),
+                t.get("createdDate"),
+                t.get("lastUpdate")
+            ))
     conn.commit()
-    print(f"✅  Upserted {len(tickets)} tickets.")
 
 def main():
-    print("▶️  Starting sync...")
+    print("🔄 Starting sync…")
     tickets = fetch_tickets()
     print(f"✔️  Fetched {len(tickets)} tickets.")
-
     conn = psycopg2.connect(NEON_DSN)
     clear_table(conn)
     upsert_tickets(conn, tickets)
     conn.close()
+    print("✅ Sync complete.")
 
 if __name__ == "__main__":
     main()
