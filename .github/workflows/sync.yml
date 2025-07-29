@@ -3,7 +3,7 @@ name: 🚀 Sync Movidesk → Neon
 on:
   # roda todo início de hora (UTC)
   schedule:
-    - cron: '0 * * * *'
+    - cron: '30 9 * * *'
   # permite rodar manualmente pelo botão “Run workflow”
   workflow_dispatch:
 
@@ -42,7 +42,7 @@ jobs:
           EOF
 
       # 5) Executa seu script de fetch + insert
-      - name: Run sync script
+      - name: Run  script
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN:       ${{ secrets.NEON_DSN }}
