@@ -1,15 +1,15 @@
-name: Sync Movidesk -> Neon / Resolução
+name: Sync Movidesk → Neon / Resolução e Histórico
 
 on:
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '30 9 * * *'
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v3
 
       - name: Setup Python
@@ -20,24 +20,44 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run DB migrations
+      - name: Ensure schemas & tables exist
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" <<EOF
           CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
           CREATE TABLE IF NOT EXISTS visualizacao_resolucao.movidesk_resolution (
-            ticket_id   INTEGER   NOT NULL,
-            protocol    TEXT,
-            resolved_in TIMESTAMP NOT NULL,
-            net_hours   NUMERIC,
-            imported_at TIMESTAMP DEFAULT NOW(),
+            ticket_id                     INTEGER   NOT NULL,
+            protocol                      TEXT,
+            resolved_in                   TIMESTAMP NOT NULL,
+            lifetime_working_time         INTEGER,
+            stopped_time_working_time     INTEGER,
+            net_hours                     NUMERIC,
+            imported_at                   TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(ticket_id, resolved_in)
+          );
+          CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
+            ticket_id                         INTEGER   NOT NULL,
+            protocol                          TEXT,
+            status                            TEXT      NOT NULL,
+            justificativa                     TEXT,
+            seconds_utl                       INTEGER,
+            permanency_time_fulltime_seconds DOUBLE PRECISION,
+            changed_by                        JSONB,
+            changed_date                      TIMESTAMP,
+            imported_at                       TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY(ticket_id, status, justificativa)
           );
           EOF
 
-      - name: Run sync script
+      - name: Sync resolução líquida
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN:       ${{ secrets.NEON_DSN }}
         run: python sync_resolution_time.py
+
+      - name: Sync histórico de status
+        env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN:       ${{ secrets.NEON_DSN }}
+        run: python sync_status_history.py
