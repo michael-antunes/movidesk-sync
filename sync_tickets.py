@@ -14,7 +14,8 @@ def fetch_tickets():
     while True:
         params = {
             "token": API_TOKEN,
-            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel,responsibles",
+            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel",
+            "$expand": "responsibles($select=name)",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
