@@ -1,40 +1,50 @@
 # sync_tickets.py
 
 import os
+import time
 import requests
 import psycopg2
 
 API_TOKEN = os.getenv("API_TOKEN")
 NEON_DSN  = os.getenv("NEON_DSN")
 
-def fetch_tickets():
-    """
-    Puxa todos os tickets com status "Em atendimento" OU "Aguardando".
-    Reparou que a API Movidesk aceita múltiplos parâmetros ?status= via lista de tuplas.
-    """
+def fetch_tickets(max_retries=3):
+    """Puxa páginas de tickets, fazendo retry em 5xx."""
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
-        "Accept": "application/json"
+        "Accept": "application/json",
     }
     tickets = []
     page = 1
 
     while True:
-        # aqui passamos vários status de uma vez sem usar vírgula em string
         params = [
             ("status", "Em atendimento"),
             ("status", "Aguardando"),
             ("page", page)
         ]
-        resp = requests.get(
-            "https://api.movidesk.com/public/v1/tickets",
-            headers=headers,
-            params=params
-        )
-        resp.raise_for_status()
+
+        for attempt in range(1, max_retries + 1):
+            resp = requests.get(
+                "https://api.movidesk.com/public/v1/tickets",
+                headers=headers,
+                params=params,
+                timeout=30
+            )
+            if 500 <= resp.status_code < 600:
+                print(f"⚠️  Server error {resp.status_code} on page {page}, attempt {attempt}/{max_retries}")
+                time.sleep(5 * attempt)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            # se saiu do for sem break = falhou todas as tentativas
+            raise RuntimeError(f"Failed to fetch page {page} after {max_retries} retries")
+
         data = resp.json()
         if not data:
             break
+
         tickets.extend(data)
         page += 1
 
@@ -52,18 +62,17 @@ def upsert_tickets(conn, tickets):
     INSERT INTO visualizacao_atual.movidesk_tickets_abertos
       (id, protocol, type, subject, status, base_status,
        owner_team, service_first_level, created_date, last_update)
-    VALUES
-      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT (id) DO UPDATE
-    SET protocol           = EXCLUDED.protocol,
-        type               = EXCLUDED.type,
-        subject            = EXCLUDED.subject,
-        status             = EXCLUDED.status,
-        base_status        = EXCLUDED.base_status,
-        owner_team         = EXCLUDED.owner_team,
-        service_first_level= EXCLUDED.service_first_level,
-        created_date       = EXCLUDED.created_date,
-        last_update        = EXCLUDED.last_update;
+    SET protocol            = EXCLUDED.protocol,
+        type                = EXCLUDED.type,
+        subject             = EXCLUDED.subject,
+        status              = EXCLUDED.status,
+        base_status         = EXCLUDED.base_status,
+        owner_team          = EXCLUDED.owner_team,
+        service_first_level = EXCLUDED.service_first_level,
+        created_date        = EXCLUDED.created_date,
+        last_update         = EXCLUDED.last_update;
     """
     with conn.cursor() as cur:
         for t in tickets:
@@ -83,11 +92,12 @@ def upsert_tickets(conn, tickets):
 
 def main():
     tickets = fetch_tickets()
+    print(f"✓ Fetched {len(tickets)} tickets")
     conn = psycopg2.connect(NEON_DSN)
     clear_table(conn)
     upsert_tickets(conn, tickets)
     conn.close()
-    print(f"✓ Sincronizados {len(tickets)} tickets")
+    print(f"✓ Synced {len(tickets)} tickets to Neon")
 
 if __name__ == "__main__":
     main()
