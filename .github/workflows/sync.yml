@@ -1,4 +1,4 @@
-name: Sync Movidesk → Neon / Backlog
+name: Sync Movidesk -> Neon / Backlog
 
 on:
   # roda todo início de hora (UTC)
