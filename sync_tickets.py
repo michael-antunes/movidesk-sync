@@ -15,7 +15,6 @@ def fetch_tickets():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel",
-            "$expand": "responsibles",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -31,6 +30,19 @@ def fetch_tickets():
             break
 
     return all_tickets
+
+def fetch_ticket_responsavel(ticket_id):
+    url = f"https://api.movidesk.com/public/v1/tickets/{ticket_id}"
+    params = {
+        "token": API_TOKEN
+    }
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()
+    ticket = resp.json()
+    responsavel = ""
+    if ticket.get("responsibles") and len(ticket["responsibles"]) > 0:
+        responsavel = ticket["responsibles"][0].get("name", "")
+    return responsavel
 
 def upsert_tickets(conn, tickets):
     sql = """
@@ -56,9 +68,7 @@ def upsert_tickets(conn, tickets):
     """
     with conn.cursor() as cur:
         for t in tickets:
-            responsavel = ""
-            if t.get("responsibles") and len(t["responsibles"]) > 0:
-                responsavel = t["responsibles"][0].get("name", "")
+            responsavel = fetch_ticket_responsavel(t["id"])
             cur.execute(sql, (
                 t["id"],
                 t.get("protocol"),
