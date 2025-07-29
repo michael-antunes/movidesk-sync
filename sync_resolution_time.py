@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import psycopg2
 from datetime import date, datetime
@@ -31,6 +32,15 @@ def fetch_resolution_times():
     else:
         return []
 
+def parse_iso(s: str) -> datetime:
+    """
+    Garante que a string ISO tenha no máximo 6 dígitos na fração de segundo,
+    para não quebrar o datetime.fromisoformat().
+    """
+    # ex: '2025-07-29T18:00:12.2248568' -> '2025-07-29T18:00:12.224856'
+    s_fixed = re.sub(r'\.(\d{6})\d+', r'.\1', s)
+    return datetime.fromisoformat(s_fixed)
+
 def save_to_db(records):
     """
     Insere ou atualiza cada registro na tabela visualizacao_resolucao.movidesk_resolution
@@ -43,8 +53,11 @@ def save_to_db(records):
         ticket_id = t.get("id")
         protocol  = t.get("protocol")
         resolved_in_str = t.get("resolvedIn")
-        # converter ISO string para datetime
-        resolved_in = datetime.fromisoformat(resolved_in_str)
+        try:
+            resolved_in = parse_iso(resolved_in_str)
+        except Exception:
+            # se falhar, ignora este registro
+            continue
 
         lifetime = t.get("lifetimeWorkingTime") or 0
         stopped  = t.get("stoppedTimeWorkingTime") or 0
