@@ -20,26 +20,34 @@ def fetch_resolved():
 def save_to_db(records):
     conn = psycopg2.connect(DSN)
     cur = conn.cursor()
-    # Aponta o search_path para o schema onde a tabela já existe
     cur.execute("SET search_path TO visualizacao_resolucao;")
-
     for t in records:
         lt = t.get("lifetimeWorkingTime")
         st = t.get("stoppedTimeWorkingTime")
         net = lt - st if lt is not None and st is not None else None
-        hours = round(net / 60, 2) if net is not None else None
-
+        hours = round(net/60, 2) if net is not None else None
         cur.execute(
             """
-            INSERT INTO movidesk_resolution (ticket_id, protocol, resolved_in, net_hours)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO movidesk_resolution
+              (ticket_id, protocol, resolved_in,
+               lifetime_working_time, stopped_time_working_time,
+               net_hours)
+            VALUES (%s,%s,%s,%s,%s,%s)
             ON CONFLICT (ticket_id, resolved_in) DO UPDATE
-              SET net_hours   = EXCLUDED.net_hours,
-                  imported_at = NOW()
+              SET lifetime_working_time       = EXCLUDED.lifetime_working_time,
+                  stopped_time_working_time   = EXCLUDED.stopped_time_working_time,
+                  net_hours                   = EXCLUDED.net_hours,
+                  imported_at                 = NOW()
             """,
-            (t["id"], t["protocol"], t["resolvedIn"], hours)
+            (
+              t["id"],
+              t["protocol"],
+              t["resolvedIn"],
+              lt,
+              st,
+              hours
+            )
         )
-
     conn.commit()
     cur.close()
     conn.close()
