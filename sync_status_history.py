@@ -1,4 +1,7 @@
-import os, requests, psycopg2, json
+import os
+import requests
+import psycopg2
+import json
 from datetime import date
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -18,7 +21,7 @@ def fetch_history():
     }
     r = requests.get("https://api.movidesk.com/public/v1/tickets", params=params)
     r.raise_for_status()
-    return r.json()  # já é lista de tickets
+    return r.json()
 
 def save_history(records):
     conn = psycopg2.connect(DSN)
@@ -28,13 +31,13 @@ def save_history(records):
         ticket_id = t["id"]
         protocol  = t.get("protocol")
         for h in t.get("statusHistories", []):
-            status       = h.get("status")
-            # se não vier justificativa, usa string vazia em vez de None
+            status        = h.get("status")
+            # fallback para justificativa vazia
             justificativa = h.get("justification") or ""
-            secs_utl     = h.get("permanencyTimeWorkingTime")
-            secs_ft      = h.get("permanencyTimeFullTime")
-            changed_by   = json.dumps(h.get("changedBy"))
-            changed_date = h.get("changedDate")
+            secs_utl      = h.get("permanencyTimeWorkingTime")
+            secs_ft       = h.get("permanencyTimeFullTime")
+            changed_by    = json.dumps(h.get("changedBy"))
+            changed_date  = h.get("changedDate")
 
             cur.execute(
                 """
