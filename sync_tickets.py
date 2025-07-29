@@ -14,7 +14,7 @@ def fetch_tickets():
     while True:
         params = {
             "token": API_TOKEN,
-            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate",
+            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando'or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -60,6 +60,8 @@ def upsert_tickets(conn, tickets):
                 t.get("baseStatus"),
                 t.get("ownerTeam"),
                 t.get("serviceFirstLevel"),
+                t.get("serviceSecondLevel"),
+                t.get("serviceThirdLevel"),
                 t["createdDate"],
                 t["lastUpdate"]
             ))
