@@ -1,15 +1,16 @@
-name: "Sync Movidesk -> Neon / Resolução"
+name: Sync Movidesk -> Neon / Resolução
 
 on:
   schedule:
     - cron: '0 8 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
       - name: Setup Python
         uses: actions/setup-python@v4
@@ -35,7 +36,7 @@ jobs:
           );
           EOF
 
-      - name: Run sync
+      - name: Run sync script
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN:       ${{ secrets.NEON_DSN }}
