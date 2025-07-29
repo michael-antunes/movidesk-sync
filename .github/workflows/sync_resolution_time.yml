@@ -1,4 +1,5 @@
 name: Sync Movidesk → Neon / Resolução 
+
 on:
   schedule:
     - cron: '0 8 * * *'
@@ -7,6 +8,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
