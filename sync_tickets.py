@@ -1,17 +1,15 @@
-# sync_tickets.py
 import os
 import requests
 import psycopg2
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN       = os.getenv("NEON_DSN")
+DSN       = os.getenv("NEON_DSN", "").strip()
 
 def fetch_tickets():
-    """Puxa todos os tickets ‘Em atendimento’ ou ‘Aguardando’ da Movidesk."""
-    url         = "https://api.movidesk.com/public/v1/tickets"
+    url = "https://api.movidesk.com/public/v1/tickets"
     all_tickets = []
-    skip        = 0
-    top         = 100
+    skip = 0
+    top  = 100
 
     while True:
         params = {
@@ -22,13 +20,10 @@ def fetch_tickets():
             "$skip": skip
         }
         resp = requests.get(url, params=params)
-        print(f"🔄  DEBUG fetch: GET {resp.url} → {resp.status_code}")
         resp.raise_for_status()
-
         batch = resp.json()
         if not batch:
             break
-
         all_tickets.extend(batch)
         skip += len(batch)
         if len(batch) < top:
@@ -37,7 +32,6 @@ def fetch_tickets():
     return all_tickets
 
 def upsert_tickets(conn, tickets):
-    """Insere/atualiza cada ticket no Neon."""
     with conn.cursor() as cur:
         for t in tickets:
             cur.execute("""
@@ -62,18 +56,10 @@ def upsert_tickets(conn, tickets):
         conn.commit()
 
 def main():
-    print("🔄  Starting sync…")
     tickets = fetch_tickets()
-    print(f"⚠️  DEBUG: trouxe {len(tickets)} tickets")
-    if not tickets:
-        print("🚫  Sem tickets, saindo.")
-        return
-
-    print("🔒  Conectando ao Neon…")
     conn = psycopg2.connect(DSN)
     upsert_tickets(conn, tickets)
     conn.close()
-    print("✅  Sync concluído.")
 
 if __name__ == "__main__":
     main()
