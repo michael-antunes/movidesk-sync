@@ -27,35 +27,3 @@ jobs:
         MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
         NEON_DSN:       ${{ secrets.NEON_DSN }}
       run: python sync_tickets.py
-      jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Install dependencies
-        run: pip install requests psycopg2-binary
-
-      - name: Clear Neon table
-        env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          python - <<EOF
-          import psycopg2, os
-          conn = psycopg2.connect(os.getenv("NEON_DSN"))
-          with conn.cursor() as cur:
-              cur.execute("TRUNCATE TABLE visualizacao_atual.movidesk_tickets_abertos;")
-          conn.commit()
-          conn.close()
-          EOF
-
-      - name: Run sync script
-        env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:       ${{ secrets.NEON_DSN }}
-        run: python sync_tickets.py
