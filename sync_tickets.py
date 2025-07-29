@@ -14,9 +14,7 @@ def fetch_tickets():
     while True:
         params = {
             "token": API_TOKEN,
-            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,"
-                       "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
-                       "createdDate,lastUpdate",
+            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel,responsibles",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -37,9 +35,9 @@ def upsert_tickets(conn, tickets):
     sql = """
     INSERT INTO visualizacao_atual.movidesk_tickets_abertos
       (id, protocol, type, subject, status, base_status, owner_team,
-       service_first_level, service_second_level, service_third_level,
-       created_date, last_update, contagem)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+       service_first_level, created_date, last_update, contagem,
+       service_second_level, service_third_level, responsavel)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s)
     ON CONFLICT (id) DO UPDATE SET
       protocol             = EXCLUDED.protocol,
       type                 = EXCLUDED.type,
@@ -48,14 +46,18 @@ def upsert_tickets(conn, tickets):
       base_status          = EXCLUDED.base_status,
       owner_team           = EXCLUDED.owner_team,
       service_first_level  = EXCLUDED.service_first_level,
-      service_second_level = EXCLUDED.service_second_level,
-      service_third_level  = EXCLUDED.service_third_level,
       created_date         = EXCLUDED.created_date,
       last_update          = EXCLUDED.last_update,
-      contagem             = 1;
+      contagem             = 1,
+      service_second_level = EXCLUDED.service_second_level,
+      service_third_level  = EXCLUDED.service_third_level,
+      responsavel          = EXCLUDED.responsavel;
     """
     with conn.cursor() as cur:
         for t in tickets:
+            responsavel = ""
+            if t.get("responsibles") and len(t["responsibles"]) > 0:
+                responsavel = t["responsibles"][0].get("name", "")
             cur.execute(sql, (
                 t["id"],
                 t.get("protocol"),
@@ -65,10 +67,11 @@ def upsert_tickets(conn, tickets):
                 t.get("baseStatus"),
                 t.get("ownerTeam"),
                 t.get("serviceFirstLevel"),
+                t["createdDate"],
+                t["lastUpdate"],
                 t.get("serviceSecondLevel"),
                 t.get("serviceThirdLevel"),
-                t["createdDate"],
-                t["lastUpdate"]
+                responsavel
             ))
     conn.commit()
 
