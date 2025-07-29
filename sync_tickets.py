@@ -32,28 +32,38 @@ def fetch_tickets():
     return all_tickets
 
 def upsert_tickets(conn, tickets):
+    sql = """
+    INSERT INTO visualizacao_atual.movidesk_tickets_abertos
+      (id, protocol, type, subject, status, base_status, owner_team,
+       service_first_level, created_date, last_update, contagem)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 1)
+    ON CONFLICT (id) DO UPDATE SET
+      protocol            = EXCLUDED.protocol,
+      type                = EXCLUDED.type,
+      subject             = EXCLUDED.subject,
+      status              = EXCLUDED.status,
+      base_status         = EXCLUDED.base_status,
+      owner_team          = EXCLUDED.owner_team,
+      service_first_level = EXCLUDED.service_first_level,
+      created_date        = EXCLUDED.created_date,
+      last_update         = EXCLUDED.last_update,
+      contagem            = 1;
+    """
     with conn.cursor() as cur:
         for t in tickets:
-            cur.execute("""
-                INSERT INTO visualizacao_atual.movidesk_tickets_abertos
-                  (id, protocol, type, subject, status, base_status, owner_team, service_first_level, created_date, last_update)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (id) DO UPDATE SET
-                  protocol            = EXCLUDED.protocol,
-                  type                = EXCLUDED.type,
-                  subject             = EXCLUDED.subject,
-                  status              = EXCLUDED.status,
-                  base_status         = EXCLUDED.base_status,
-                  owner_team          = EXCLUDED.owner_team,
-                  service_first_level = EXCLUDED.service_first_level,
-                  created_date        = EXCLUDED.created_date,
-                  last_update         = EXCLUDED.last_update;
-            """, (
-                t["id"], t.get("protocol"), t["type"], t["subject"],
-                t["status"], t.get("baseStatus"), t.get("ownerTeam"),
-                t.get("serviceFirstLevel"), t["createdDate"], t["lastUpdate"]
+            cur.execute(sql, (
+                t["id"],
+                t.get("protocol"),
+                t["type"],
+                t["subject"],
+                t["status"],
+                t.get("baseStatus"),
+                t.get("ownerTeam"),
+                t.get("serviceFirstLevel"),
+                t["createdDate"],
+                t["lastUpdate"]
             ))
-        conn.commit()
+    conn.commit()
 
 def main():
     tickets = fetch_tickets()
