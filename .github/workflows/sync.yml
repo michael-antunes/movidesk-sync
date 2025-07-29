@@ -2,26 +2,28 @@ name: 🚀 Sync Movidesk → Neon
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # roda a cada 5 minutos
-  workflow_dispatch:       # permite rodar manualmente
+    # roda a cada hora (UTC)
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
 
-      - name: Install dependencies
-        run: pip install requests psycopg2-binary
+    - name: Install dependencies
+      run: pip install requests psycopg2-binary
 
-      - name: Run sync script
-        env:
-          API_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:  ${{ secrets.NEON_DSN }}
-        run: python sync_tickets.py
+    - name: Run sync script
+      env:
+        MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+        NEON_DSN:       ${{ secrets.NEON_DSN }}
+      run: python sync_tickets.py
