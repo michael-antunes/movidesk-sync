@@ -14,8 +14,10 @@ def fetch_tickets():
     while True:
         params = {
             "token": API_TOKEN,
-            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando'or status eq 'Novo')",
+            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,"
+                       "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
+                       "createdDate,lastUpdate",
+            "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
         }
@@ -35,19 +37,22 @@ def upsert_tickets(conn, tickets):
     sql = """
     INSERT INTO visualizacao_atual.movidesk_tickets_abertos
       (id, protocol, type, subject, status, base_status, owner_team,
-       service_first_level, created_date, last_update, contagem)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, 1)
+       service_first_level, service_second_level, service_third_level,
+       created_date, last_update, contagem)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
     ON CONFLICT (id) DO UPDATE SET
-      protocol            = EXCLUDED.protocol,
-      type                = EXCLUDED.type,
-      subject             = EXCLUDED.subject,
-      status              = EXCLUDED.status,
-      base_status         = EXCLUDED.base_status,
-      owner_team          = EXCLUDED.owner_team,
-      service_first_level = EXCLUDED.service_first_level,
-      created_date        = EXCLUDED.created_date,
-      last_update         = EXCLUDED.last_update,
-      contagem            = 1;
+      protocol             = EXCLUDED.protocol,
+      type                 = EXCLUDED.type,
+      subject              = EXCLUDED.subject,
+      status               = EXCLUDED.status,
+      base_status          = EXCLUDED.base_status,
+      owner_team           = EXCLUDED.owner_team,
+      service_first_level  = EXCLUDED.service_first_level,
+      service_second_level = EXCLUDED.service_second_level,
+      service_third_level  = EXCLUDED.service_third_level,
+      created_date         = EXCLUDED.created_date,
+      last_update          = EXCLUDED.last_update,
+      contagem             = 1;
     """
     with conn.cursor() as cur:
         for t in tickets:
@@ -68,10 +73,13 @@ def upsert_tickets(conn, tickets):
     conn.commit()
 
 def main():
+    print("🔄 Starting sync…")
     tickets = fetch_tickets()
+    print(f"🔎 {len(tickets)} tickets fetched.")
     conn = psycopg2.connect(DSN)
     upsert_tickets(conn, tickets)
     conn.close()
+    print("✅ Sync complete.")
 
 if __name__ == "__main__":
     main()
