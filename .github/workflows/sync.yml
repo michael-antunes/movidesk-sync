@@ -4,7 +4,7 @@ on:
   schedule:
     # roda a cada 5 minutos (mínimo aceito pelo GitHub Actions)
     - cron: '*/5 * * * *'
-  workflow_dispatch:  # botão “Run workflow” manual
+  workflow_dispatch:  # botão “Run workflow” manual no UI
 
 jobs:
   sync:
