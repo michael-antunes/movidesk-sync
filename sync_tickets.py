@@ -2,14 +2,15 @@ import requests
 import psycopg2
 import os
 
-MOVIEDESK_TOKEN = os.getenv('MOVIEDESK_TOKEN') or 'SEU_TOKEN_AQUI'
+MOVIEDESK_TOKEN = os.getenv('MOVIEDESK_TOKEN') or 'SEU_TOKEN_AQUI'  # Troque aqui
+
 DATABASE_URL = os.getenv('DATABASE_URL') or 'postgresql://tickets-movidesk_owner:SUA_SENHA@ep-fragrant-art-a45v8csv-pooler.us-east-1.aws.neon.tech/tickets-movidesk?sslmode=require'
 
 def fetch_tickets():
     url = "https://api.movidesk.com/public/v1/tickets"
     params = {
         "token": MOVIEDESK_TOKEN,
-        "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel,responsible",
+        "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,createdDate,lastUpdate,serviceSecondLevel,serviceThirdLevel,responsavel",
         "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
         "$top": 1000,
         "$skip": 0,
@@ -65,7 +66,7 @@ def upsert_tickets(conn, tickets):
                 t.get("lastUpdate"),
                 t.get("serviceSecondLevel"),
                 t.get("serviceThirdLevel"),
-                t.get("responsible")  # <-- CAMPO NOVO, IGUAL A EQUIPE
+                t.get("responsavel")    # <-- Aqui pega o campo responsavel
             ))
     conn.commit()
 
