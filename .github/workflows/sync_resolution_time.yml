@@ -1,15 +1,15 @@
-name: Sync Movidesk → Neon / Resolução e Histórico
+name: Sync Movidesk → Neon / Resolução 
 
 on:
   schedule:
-    - cron: '30 9 * * *'
+    - cron: '0 8 * * *'
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Setup Python
