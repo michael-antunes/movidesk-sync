@@ -1,5 +1,4 @@
 name: Sync Movidesk → Neon / Resolução 
-
 on:
   schedule:
     - cron: '0 8 * * *'
@@ -40,7 +39,7 @@ jobs:
             ticket_id                         INTEGER   NOT NULL,
             protocol                          TEXT,
             status                            TEXT      NOT NULL,
-            justificativa                     TEXT,
+            justificativa                     TEXT      NOT NULL,
             seconds_utl                       INTEGER,
             permanency_time_fulltime_seconds DOUBLE PRECISION,
             changed_by                        JSONB,
