@@ -9,29 +9,39 @@ NEON_DSN  = os.getenv("NEON_DSN")
 
 def fetch_tickets():
     """
-    Puxa todos os tickets “Em atendimento” e “Aguardando” separadamente
-    e retorna uma lista única.
+    Puxa todos os tickets com status "Em atendimento" OU "Aguardando".
+    Reparou que a API Movidesk aceita múltiplos parâmetros ?status= via lista de tuplas.
     """
-    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "Accept": "application/json"
+    }
     tickets = []
-    for status in ["Em atendimento", "Aguardando"]:
-        page = 1
-        while True:
-            resp = requests.get(
-                "https://api.movidesk.com/public/v1/tickets",
-                headers=headers,
-                params={"status": status, "page": page},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if not data:
-                break
-            tickets.extend(data)
-            page += 1
+    page = 1
+
+    while True:
+        # aqui passamos vários status de uma vez sem usar vírgula em string
+        params = [
+            ("status", "Em atendimento"),
+            ("status", "Aguardando"),
+            ("page", page)
+        ]
+        resp = requests.get(
+            "https://api.movidesk.com/public/v1/tickets",
+            headers=headers,
+            params=params
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            break
+        tickets.extend(data)
+        page += 1
+
     return tickets
 
 def clear_table(conn):
-    """Limpa toda a tabela antes de inserir o snapshot atual."""
+    """Limpa a tabela antes de inserir o snapshot atual."""
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE visualizacao_atual.movidesk_tickets_abertos;")
     conn.commit()
@@ -73,7 +83,6 @@ def upsert_tickets(conn, tickets):
 
 def main():
     tickets = fetch_tickets()
-    # conecta no Neon
     conn = psycopg2.connect(NEON_DSN)
     clear_table(conn)
     upsert_tickets(conn, tickets)
