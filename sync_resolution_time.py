@@ -4,27 +4,20 @@ import requests
 import psycopg2
 from datetime import date, datetime
 
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN       = os.getenv("NEON_DSN")
+API_TOKEN  = os.getenv("MOVIDESK_TOKEN")
+DSN        = os.getenv("NEON_DSN")
 start_date = date.today().isoformat()
 
 def fetch_resolution_times():
-    """
-    Busca tickets marcados como Resolved ou Closed,
-    trazendo id, protocolo, data de resolução e tempos.
-    Trata retorno que pode ser dict{"items": [...]} ou diretamente uma lista.
-    """
     params = {
         "token": API_TOKEN,
         "$select": "id,protocol,resolvedIn,lifetimeWorkingTime,stoppedTimeWorkingTime",
         "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {start_date}"
     }
-    url = "https://api.movidesk.com/public/v1/tickets"
-    r = requests.get(url, params=params)
+    r = requests.get("https://api.movidesk.com/public/v1/tickets", params=params)
     r.raise_for_status()
     payload = r.json()
-
-    # Se veio { "items": [...] }, retorna items, senão, assume que payload já é lista
+    # a API às vezes retorna { "items": [...] } ou retorna diretamente uma lista
     if isinstance(payload, dict):
         return payload.get("items", [])
     elif isinstance(payload, list):
@@ -33,18 +26,11 @@ def fetch_resolution_times():
         return []
 
 def parse_iso(s: str) -> datetime:
-    """
-    Garante que a string ISO tenha no máximo 6 dígitos na fração de segundo,
-    para não quebrar o datetime.fromisoformat().
-    """
-    # ex: '2025-07-29T18:00:12.2248568' -> '2025-07-29T18:00:12.224856'
+    # Trunca fração de segundo para até 6 dígitos (compatível com fromisoformat)
     s_fixed = re.sub(r'\.(\d{6})\d+', r'.\1', s)
     return datetime.fromisoformat(s_fixed)
 
 def save_to_db(records):
-    """
-    Insere ou atualiza cada registro na tabela visualizacao_resolucao.movidesk_resolution
-    """
     conn = psycopg2.connect(DSN)
     cur = conn.cursor()
     cur.execute("SET search_path TO visualizacao_resolucao;")
@@ -52,36 +38,37 @@ def save_to_db(records):
     for t in records:
         ticket_id = t.get("id")
         protocol  = t.get("protocol")
-        resolved_in_str = t.get("resolvedIn")
+        rs_str    = t.get("resolvedIn")
         try:
-            resolved_in = parse_iso(resolved_in_str)
+            resolved_in = parse_iso(rs_str)
         except Exception:
-            # se falhar, ignora este registro
             continue
 
+        # lifetimeWorkingTime e stoppedTimeWorkingTime vêm em MINUTOS
         lifetime = t.get("lifetimeWorkingTime") or 0
         stopped  = t.get("stoppedTimeWorkingTime") or 0
-        # horas úteis = (lifetime – stopped) / 3600
-        net_hours = (lifetime - stopped) / 3600 if lifetime is not None else None
+
+        # calcula horas úteis: (minutos ativos) / 60, mas nunca deixa ficar negativo
+        net_hours = max((lifetime - stopped) / 60, 0)
 
         cur.execute("""
-            INSERT INTO movidesk_resolution
-              (ticket_id, protocol, resolved_in,
-               lifetime_working_time, stopped_time_working_time, net_hours)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ticket_id, resolved_in) DO UPDATE
-              SET protocol       = EXCLUDED.protocol,
-                  lifetime_working_time     = EXCLUDED.lifetime_working_time,
-                  stopped_time_working_time = EXCLUDED.stopped_time_working_time,
-                  net_hours       = EXCLUDED.net_hours,
-                  imported_at     = NOW();
+          INSERT INTO movidesk_resolution
+            (ticket_id, protocol, resolved_in,
+             lifetime_working_time, stopped_time_working_time, net_hours)
+          VALUES (%s, %s, %s, %s, %s, %s)
+          ON CONFLICT (ticket_id, resolved_in) DO UPDATE
+            SET protocol                   = EXCLUDED.protocol,
+                lifetime_working_time      = EXCLUDED.lifetime_working_time,
+                stopped_time_working_time  = EXCLUDED.stopped_time_working_time,
+                net_hours                  = EXCLUDED.net_hours,
+                imported_at                = NOW();
         """, (
-            ticket_id,
-            protocol,
-            resolved_in,
-            lifetime,
-            stopped,
-            net_hours
+          ticket_id,
+          protocol,
+          resolved_in,
+          lifetime,
+          stopped,
+          net_hours
         ))
 
     conn.commit()
