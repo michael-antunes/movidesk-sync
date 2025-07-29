@@ -10,22 +10,32 @@ def fetch_history():
         "token": API_TOKEN,
         "$select": "id,protocol,resolvedIn",
         "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {start_date}",
-        "$expand": "statusHistories("
-                   " $select=status,justification,permanencyTimeWorkingTime,"
-                   "permanencyTimeFullTime,changedBy,changedDate)"
+        "$expand": (
+            "statusHistories("
+            "$select=status,justification,permanencyTimeWorkingTime,"
+            "permanencyTimeFullTime,changedBy,changedDate)"
+        )
     }
     r = requests.get("https://api.movidesk.com/public/v1/tickets", params=params)
     r.raise_for_status()
-    return r.json().get("items", [])
+    return r.json()  # já é lista de tickets
 
 def save_history(records):
     conn = psycopg2.connect(DSN)
     cur = conn.cursor()
     cur.execute("SET search_path TO visualizacao_resolucao;")
     for t in records:
-        tid   = t["id"]
-        proto = t.get("protocol")
+        ticket_id = t["id"]
+        protocol  = t.get("protocol")
         for h in t.get("statusHistories", []):
+            status       = h.get("status")
+            # se não vier justificativa, usa string vazia em vez de None
+            justificativa = h.get("justification") or ""
+            secs_utl     = h.get("permanencyTimeWorkingTime")
+            secs_ft      = h.get("permanencyTimeFullTime")
+            changed_by   = json.dumps(h.get("changedBy"))
+            changed_date = h.get("changedDate")
+
             cur.execute(
                 """
                 INSERT INTO resolucao_por_status
@@ -41,14 +51,14 @@ def save_history(records):
                       imported_at                      = NOW()
                 """,
                 (
-                  tid,
-                  proto,
-                  h.get("status"),
-                  h.get("justification"),
-                  h.get("permanencyTimeWorkingTime"),
-                  h.get("permanencyTimeFullTime"),
-                  json.dumps(h.get("changedBy")),
-                  h.get("changedDate")
+                  ticket_id,
+                  protocol,
+                  status,
+                  justificativa,
+                  secs_utl,
+                  secs_ft,
+                  changed_by,
+                  changed_date
                 )
             )
     conn.commit()
