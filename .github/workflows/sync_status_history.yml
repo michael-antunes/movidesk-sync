@@ -1,56 +1,112 @@
-name: Sync Movidesk -> Neon / Histórico de Status
+#!/usr/bin/env python3
+import os
+import json
+import time
+import requests
+import psycopg2
+from datetime import datetime
 
-on:
-  schedule:
-    - cron: '0 8 * * *'
-  workflow_dispatch:
+# -----------------------------------------------------------------------------
+# Parâmetros de ambiente obrigatórios
+# -----------------------------------------------------------------------------
+TOKEN = os.getenv("MOVIDESK_TOKEN")
+DSN   = os.getenv("NEON_DSN")
+if not TOKEN or not DSN:
+    raise RuntimeError("É preciso definir as variáveis MOVIDESK_TOKEN e NEON_DSN")
 
-jobs:
-  sync_status_history:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+# -----------------------------------------------------------------------------
+# Constantes
+# -----------------------------------------------------------------------------
+HEADERS = {"token": TOKEN}
+BASE_URL = "https://api.movidesk.com/public/v1"
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+# -----------------------------------------------------------------------------
+# Busca a lista de tickets que já foram importados (ou que você queira processar)
+# -----------------------------------------------------------------------------
+def get_ticket_ids():
+    with psycopg2.connect(DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT ticket_id FROM tickets_movidesk;")
+            return [row[0] for row in cur.fetchall()]
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+# -----------------------------------------------------------------------------
+# Chama a API de histórico de status de um ticket e retorna a lista de eventos
+# -----------------------------------------------------------------------------
+def fetch_status_history(ticket_id):
+    url = f"{BASE_URL}/tickets/statusHistory"
+    params = {"ticketId": ticket_id}
+    resp = requests.get(url, headers=HEADERS, params=params)
+    if resp.status_code != 200:
+        print(f"[ERROR] Ticket {ticket_id}: status {resp.status_code} → {resp.text}")
+        return []
+    data = resp.json()
+    # Alguns endpoints devolvem { "items": [...] }, outros devolvem lista direta
+    return data.get("items", data if isinstance(data, list) else [])
 
-      - name: Ensure schemas & tables exist
-        env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          psql "$NEON_DSN" <<EOF
-          CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
+# -----------------------------------------------------------------------------
+# Persiste no banco cada evento de status
+# -----------------------------------------------------------------------------
+def save_history(entries):
+    with psycopg2.connect(DSN) as conn:
+        with conn.cursor() as cur:
+            for e in entries:
+                ticket_id = e.get("ticketId")
+                status    = e.get("status")
+                justification = e.get("justification") or "-"
+                seconds_utl   = e.get("secondsWorkingTime")
+                full_seconds  = e.get("workingTimeFulltimeSeconds")
+                changed_by    = e.get("changedBy")
+                changed_date  = e.get("changedDate")
+                agent_name    = e.get("agentName")
+                team_name     = e.get("teamName")
 
-          -- cria a tabela (se não existir) já com os novos campos:
-          CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
-            ticket_id                         INTEGER   NOT NULL,
-            protocol                          TEXT,
-            status                            TEXT      NOT NULL,
-            justificativa                     TEXT      NOT NULL,
-            seconds_utl                       INTEGER,
-            permanency_time_fulltime_seconds DOUBLE PRECISION,
-            changed_by                        JSONB,
-            changed_date                      TIMESTAMP,
-            agent_name                        TEXT,
-            team_name                         TEXT,
-            imported_at                       TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY(ticket_id, status, justificativa)
-          );
+                # Converte changed_date de string ISO para timestamp Python
+                dt = None
+                if changed_date:
+                    try:
+                        dt = datetime.fromisoformat(changed_date)
+                    except ValueError:
+                        # Se vier com milissegundos extras, remove o excesso
+                        dt = datetime.fromisoformat(changed_date[:26])
 
-          -- se a tabela já existia, garanta que os campos agent_name e team_name existam:
-          ALTER TABLE visualizacao_resolucao.resolucao_por_status
-            ADD COLUMN IF NOT EXISTS agent_name TEXT,
-            ADD COLUMN IF NOT EXISTS team_name  TEXT;
-          EOF
+                cur.execute("""
+                    INSERT INTO visualizacao_resolucao.resolucao_por_status
+                      (ticket_id, protocol, status, justificativa,
+                       seconds_utl, permanency_time_fulltime_seconds,
+                       changed_by, changed_date,
+                       agent_name, team_name)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (ticket_id, status, justificativa) DO NOTHING
+                """, (
+                    ticket_id,
+                    None,                # protocol (não usamos aqui)
+                    status,
+                    justification,
+                    seconds_utl,
+                    full_seconds,
+                    json.dumps(changed_by) if changed_by is not None else None,
+                    dt,
+                    agent_name,
+                    team_name,
+                ))
+        conn.commit()
 
-      - name: Sync histórico de status
-        env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:       ${{ secrets.NEON_DSN }}
-        run: python sync_status_history.py
+# -----------------------------------------------------------------------------
+# Fluxo principal
+# -----------------------------------------------------------------------------
+def main():
+    print("Iniciando sync_status_history.py")
+    tickets = get_ticket_ids()
+    print(f"→ {len(tickets)} tickets encontrados para processar")
+    all_events = []
+    for tid in tickets:
+        evs = fetch_status_history(tid)
+        print(f"  Ticket {tid}: {len(evs)} eventos")
+        all_events.extend(evs)
+        time.sleep(0.3)  # throttle para não estourar rate-limit
+    print(f"Gravando no banco um total de {len(all_events)} eventos")
+    save_history(all_events)
+    print("Concluído com sucesso.")
+
+if __name__ == "__main__":
+    main()
