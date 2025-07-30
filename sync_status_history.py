@@ -1,115 +1,124 @@
 #!/usr/bin/env python3
 import os
-import json
+import re
 import time
+import json
 import requests
 import psycopg2
-from datetime import datetime
+from datetime import date, datetime
 
-# -----------------------------------------------------------------------------
-# Parâmetros de ambiente obrigatórios
-# -----------------------------------------------------------------------------
-TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN   = os.getenv("NEON_DSN")
-if not TOKEN or not DSN:
-    raise RuntimeError("É preciso definir as variáveis MOVIDESK_TOKEN e NEON_DSN")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+DSN       = os.getenv("NEON_DSN")
+START_DATE = date.today().isoformat()
 
-# -----------------------------------------------------------------------------
-# Constantes
-# -----------------------------------------------------------------------------
-HEADERS  = {"token": TOKEN}
+if not API_TOKEN or not DSN:
+    raise RuntimeError("MOVIDESK_TOKEN e NEON_DSN devem estar definidos")
+
 BASE_URL = "https://api.movidesk.com/public/v1"
+HEADERS  = {"token": API_TOKEN}
 
-# -----------------------------------------------------------------------------
-# Busca a lista de tickets que já foram resolvidos (estão na tabela movidesk_resolution)
-# -----------------------------------------------------------------------------
-def get_ticket_ids():
-    sql = """
-      SELECT DISTINCT ticket_id
-        FROM visualizacao_resolucao.movidesk_resolution
-      WHERE ticket_id IS NOT NULL
-    """
-    with psycopg2.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            return [row[0] for row in cur.fetchall()]
+_user_team_cache = {}
 
-# -----------------------------------------------------------------------------
-# Chama a API de histórico de status de um ticket
-# -----------------------------------------------------------------------------
-def fetch_status_history(ticket_id):
-    url = f"{BASE_URL}/tickets/statusHistory"
-    params = {"ticketId": ticket_id}
-    resp = requests.get(url, headers=HEADERS, params=params)
-    if resp.status_code != 200:
-        print(f"[ERROR] Ticket {ticket_id}: status {resp.status_code} → {resp.text}")
-        return []
+def parse_iso(s: str) -> datetime | None:
+    if not s:
+        return None
+    # trunca fração de segundos além de 6 dígitos
+    s_fixed = re.sub(r'\.(\d{6})\d+', r'.\1', s)
+    return datetime.fromisoformat(s_fixed)
+
+def fetch_resolved_ticket_ids() -> list[int]:
+    """Busca IDs de tickets Resolved ou Closed desde START_DATE."""
+    params = {
+        "token": API_TOKEN,
+        "$select": "id",
+        "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {START_DATE}",
+        "$top": 500
+    }
+    resp = requests.get(f"{BASE_URL}/tickets", params=params)
+    resp.raise_for_status()
     data = resp.json()
-    return data.get("items", data if isinstance(data, list) else [])
+    items = data.get("items") if isinstance(data, dict) else data
+    return [t["id"] for t in items]
 
-# -----------------------------------------------------------------------------
-# Persiste no banco cada evento de status
-# -----------------------------------------------------------------------------
-def save_history(entries):
-    with psycopg2.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            for e in entries:
-                ticket_id    = e.get("ticketId")
-                status       = e.get("status")
-                justification= e.get("justification") or "-"
-                seconds_utl  = e.get("secondsWorkingTime")
-                full_seconds = e.get("workingTimeFulltimeSeconds")
-                changed_by   = e.get("changedBy")
-                changed_date = e.get("changedDate")
-                agent_name   = e.get("agentName")
-                team_name    = e.get("teamName")
+def fetch_status_history(ticket_id: int) -> list[dict]:
+    """Puxa o histórico de status de um ticket."""
+    resp = requests.get(
+        f"{BASE_URL}/tickets/statusHistory",
+        headers=HEADERS,
+        params={"ticketId": ticket_id}
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("items") if isinstance(data, dict) else data
 
-                # Converte changed_date de string ISO para datetime
-                dt = None
-                if changed_date:
-                    try:
-                        dt = datetime.fromisoformat(changed_date)
-                    except ValueError:
-                        dt = datetime.fromisoformat(changed_date[:26])
+def get_user_team(user_id: int) -> str | None:
+    """Busca o nome da equipe de um usuário, com cache."""
+    if user_id in _user_team_cache:
+        return _user_team_cache[user_id]
+    resp = requests.get(f"{BASE_URL}/users/{user_id}", headers=HEADERS)
+    if resp.status_code != 200:
+        return None
+    team = resp.json().get("team", {}).get("name")
+    _user_team_cache[user_id] = team
+    return team
 
-                cur.execute("""
-                    INSERT INTO visualizacao_resolucao.resolucao_por_status
-                      (ticket_id, protocol, status, justificativa,
-                       seconds_utl, permanency_time_fulltime_seconds,
-                       changed_by, changed_date,
-                       agent_name, team_name)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (ticket_id, status, justificativa) DO NOTHING
-                """, (
-                    ticket_id,
-                    None,  # protocol não usamos aqui
-                    status,
-                    justification,
-                    seconds_utl,
-                    full_seconds,
-                    json.dumps(changed_by) if changed_by is not None else None,
-                    dt,
-                    agent_name,
-                    team_name,
-                ))
-        conn.commit()
+def save_history(records: list[dict]):
+    conn = psycopg2.connect(DSN)
+    cur = conn.cursor()
+    cur.execute("SET search_path TO visualizacao_resolucao;")
+    for e in records:
+        tid  = e.get("ticketId")
+        proto = e.get("protocol")
+        status = e.get("status")
+        justif = e.get("justification") or "-"
+        # permanencyTimeFullTime = segundos corridos
+        seconds_utl = e.get("permanencyTimeFullTime")
+        # permanencyTimeWorkingTime = segundos úteis
+        seconds_utl_work = e.get("permanencyTimeWorkingTime")
+        cb = e.get("changedBy") or {}
+        changed_by = json.dumps(cb)
+        changed_date = parse_iso(e.get("changedDate"))
+        agent_name = cb.get("name")
+        team_name  = get_user_team(cb.get("id")) if cb.get("id") else None
 
-# -----------------------------------------------------------------------------
-# Fluxo principal
-# -----------------------------------------------------------------------------
+        cur.execute("""
+        INSERT INTO resolucao_por_status (
+          ticket_id, protocol, status, justificativa,
+          seconds_utl, permanency_time_fulltime_seconds,
+          agent_name, team_name,
+          changed_by, changed_date, imported_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (ticket_id,status,justificativa) DO UPDATE
+          SET seconds_utl                      = EXCLUDED.seconds_utl,
+              permanency_time_fulltime_seconds = EXCLUDED.permanency_time_fulltime_seconds,
+              agent_name                       = EXCLUDED.agent_name,
+              team_name                        = EXCLUDED.team_name,
+              changed_by                       = EXCLUDED.changed_by,
+              changed_date                     = EXCLUDED.changed_date,
+              imported_at                      = NOW()
+        """, (
+          tid, proto, status, justif,
+          seconds_utl, seconds_utl_work,
+          agent_name, team_name,
+          changed_by, changed_date
+        ))
+    conn.commit()
+    cur.close()
+    conn.close()
+
 def main():
-    print("Iniciando sync_status_history.py")
-    tickets = get_ticket_ids()
-    print(f"→ {len(tickets)} tickets na fila de histórico")
+    print("=== Iniciando sync_status_history.py ===")
+    ticket_ids = fetch_resolved_ticket_ids()
+    print(f"→ {len(ticket_ids)} tickets a processar")
     all_events = []
-    for tid in tickets:
+    for tid in ticket_ids:
         evs = fetch_status_history(tid)
         print(f"  Ticket {tid}: {len(evs)} eventos")
         all_events.extend(evs)
         time.sleep(0.2)
-    print(f"Gravando {len(all_events)} eventos no banco")
+    print(f"→ Gravando {len(all_events)} eventos no banco")
     save_history(all_events)
-    print("Concluído com sucesso.")
+    print("=== Concluído com sucesso ===")
 
 if __name__ == "__main__":
     main()
