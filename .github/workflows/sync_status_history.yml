@@ -20,12 +20,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Ensure schema & table exist
+      - name: Ensure schemas & tables exist
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" <<EOF
           CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
+
+          -- cria a tabela (se não existir) já com os novos campos:
           CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
             ticket_id                         INTEGER   NOT NULL,
             protocol                          TEXT,
@@ -35,9 +37,16 @@ jobs:
             permanency_time_fulltime_seconds DOUBLE PRECISION,
             changed_by                        JSONB,
             changed_date                      TIMESTAMP,
+            agent_name                        TEXT,
+            team_name                         TEXT,
             imported_at                       TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(ticket_id, status, justificativa)
           );
+
+          -- se a tabela já existia, garanta que os campos agent_name e team_name existam:
+          ALTER TABLE visualizacao_resolucao.resolucao_por_status
+            ADD COLUMN IF NOT EXISTS agent_name TEXT,
+            ADD COLUMN IF NOT EXISTS team_name  TEXT;
           EOF
 
       - name: Sync histórico de status
