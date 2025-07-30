@@ -1,126 +1,83 @@
 import os
 import json
-import time
 import requests
 import psycopg2
-from datetime import date, datetime
+from datetime import datetime, timezone
 
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN = os.getenv("NEON_DSN")
-START_DATE = date.today().isoformat()
+API_URL           = "https://api.movidesk.com/public/v1"
+MOVI_TOKEN        = os.environ["MOVIDESK_TOKEN"]
+NEON_DSN          = os.environ["NEON_DSN"]
+SCHEMA            = "visualizacao_resolucao"
+TABLE             = f"{SCHEMA}.resolucao_por_status"
+HEADERS           = {"Content-Type": "application/json", "token": MOVI_TOKEN}
 
-BASE_URL = "https://api.movidesk.com/public/v1"
-HEADERS = {"token": API_TOKEN}
+def get_ticket_ids():
+    sql = f"""
+    SELECT DISTINCT ticket_id
+      FROM {SCHEMA}.resolucao_por_status
+    UNION
+    SELECT DISTINCT ticketId
+      FROM tickets_movidesk
+     WHERE statusBase = 'Resolvido'
+    """
+    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        return [r[0] for r in cur.fetchall()]
 
-_user_team_cache = {}
-
-def parse_iso(dt_str: str) -> datetime | None:
-    if not dt_str:
-        return None
-    parts = dt_str.split('.')
-    if len(parts) == 2 and len(parts[1]) > 6:
-        parts[1] = parts[1][:6]
-        dt_str = '.'.join(parts)
-    return datetime.fromisoformat(dt_str)
-
-def fetch_resolved_ticket_ids() -> list[int]:
-    today = date.today().isoformat()
-    params = {
-        "token": API_TOKEN,
-        "$select": "id",
-        "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {today}",
-        "$top": 500
-    }
-    resp = requests.get(f"{BASE_URL}/tickets", params=params)
+def fetch_status_history(ticket_id):
+    url = f"{API_URL}/tickets/statusHistory?ticketId={ticket_id}"
+    resp = requests.get(url, headers=HEADERS)
     resp.raise_for_status()
-    data = resp.json()
-    items = data.get("items") if isinstance(data, dict) else data
-    return [t["id"] for t in items]
+    return resp.json()  # retorna lista de eventos
 
-def fetch_status_history(ticket_id: int) -> list[dict]:
-    params = {
-        "token": API_TOKEN,
-        "id": ticket_id,
-        "$expand": (
-            "statusHistories("
-            "$select=status,justification,"
-            "permanencyTimeWorkingTime,permanencyTimeFullTime,"
-            "changedBy,changedDate)"
-        )
-    }
-    resp = requests.get(f"{BASE_URL}/tickets", params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    items = data.get("items") if isinstance(data, dict) else data
-    if items:
-        return items[0].get("statusHistories", [])
-    return []
+def save_to_db(ticket_id, protocol, history):
+    if not history:
+        return
+    rows = []
+    for ev in history:
+        status      = ev.get("status")
+        justification = ev.get("justification") or "-"
+        seconds_utl = ev.get("secondsUtl", 0)
+        permanency  = ev.get("permanencyTimeFulltimeSeconds")
+        changed_by  = json.dumps(ev.get("changedBy")) if ev.get("changedBy") else None
+        changed_date= ev.get("changedDate")
+        agent_name  = ev.get("agent",{}).get("name")
+        team_name   = ev.get("team",{}).get("name")
+        rows.append((
+            ticket_id,
+            protocol,
+            status,
+            justification,
+            seconds_utl,
+            permanency,
+            changed_by,
+            changed_date,
+            agent_name,
+            team_name
+        ))
 
-def save_history(events: list[dict]):
-    conn = psycopg2.connect(DSN)
-    cur = conn.cursor()
-    cur.execute("SET search_path TO visualizacao_resolucao;")
-    for e in events:
-        tid = e.get("ticketId")
-        status = e.get("status")
-        justification = e.get("justification") or "-"
-        sec_fulltime = e.get("permanencyTimeFullTime")
-        sec_working = e.get("permanencyTimeWorkingTime")
-        cb = e.get("changedBy") or {}
-        changed_by = json.dumps(cb, ensure_ascii=False)
-        changed_date = parse_iso(e.get("changedDate"))
-        agent_name = cb.get("name")
-        team_name = cb.get("team", {}).get("name")
+    insert_sql = f"""
+    INSERT INTO {TABLE}
+      (ticket_id, protocol, status, justificativa,
+       seconds_utl, permanency_time_fulltime_seconds,
+       changed_by, changed_date,
+       agent_name, team_name, imported_at)
+    VALUES
+      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+    ON CONFLICT (ticket_id, status, justificativa) DO NOTHING;
+    """
 
-        cur.execute(
-            """
-            INSERT INTO visualizacao_resolucao.resolucao_por_status
-              (ticket_id, protocol, status, justificativa,
-               seconds_utl, permanency_time_fulltime_seconds,
-               agent_name, team_name,
-               changed_by, changed_date, imported_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-            ON CONFLICT (ticket_id, status, justificativa) DO UPDATE
-              SET seconds_utl                      = EXCLUDED.seconds_utl,
-                  permanency_time_fulltime_seconds = EXCLUDED.permanency_time_fulltime_seconds,
-                  agent_name                       = EXCLUDED.agent_name,
-                  team_name                        = EXCLUDED.team_name,
-                  changed_by                       = EXCLUDED.changed_by,
-                  changed_date                     = EXCLUDED.changed_date,
-                  imported_at                      = NOW();
-            """,
-            (
-                tid,
-                None,
-                status,
-                justification,
-                sec_fulltime,
-                sec_working,
-                agent_name,
-                team_name,
-                changed_by,
-                changed_date
-            )
-        )
-    conn.commit()
-    cur.close()
-    conn.close()
+    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+        cur.executemany(insert_sql, rows)
+        conn.commit()
 
 def main():
-    print("=== Iniciando sync_status_history.py ===")
-    ticket_ids = fetch_resolved_ticket_ids()
-    print(f"→ {len(ticket_ids)} tickets para processar")
-    all_events = []
-    for tid in ticket_ids:
-        hist = fetch_status_history(tid)
-        print(f"  Ticket {tid}: importando {len(hist)} eventos")
-        for ev in hist:
-            ev["ticketId"] = tid
-        all_events.extend(hist)
-        time.sleep(0.2)
-    print(f"→ Gravando {len(all_events)} eventos no banco")
-    save_history(all_events)
-    print("=== Concluído com sucesso ===")
+    ids = get_ticket_ids()
+    for tid in ids:
+        history = fetch_status_history(tid)
+        protocol = None
+        # opcional: buscar protocol no ticket-seu-código se precisar
+        save_to_db(tid, protocol, history)
 
 if __name__ == "__main__":
     main()
