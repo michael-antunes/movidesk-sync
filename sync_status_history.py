@@ -1,73 +1,82 @@
+#!/usr/bin/env python3
 import os
-import json
 import requests
 import psycopg2
+from psycopg2.extras import execute_values
 
-API_URL    = "https://api.movidesk.com/public/v1"
-MOVI_TOKEN = os.environ["MOVIDESK_TOKEN"]
-NEON_DSN   = os.environ["NEON_DSN"]
-
-SCHEMA = "visualizacao_resolucao"
-TABLE  = f"{SCHEMA}.resolucao_por_status"
+MOVIDESK_TOKEN = os.environ["MOVIDESK_TOKEN"]
+NEON_DSN = os.environ["NEON_DSN"]
 
 HEADERS = {
     "Content-Type": "application/json",
-    "token": MOVI_TOKEN,
+    "Authorization": f"ApiKey {MOVIDESK_TOKEN}"
 }
+STATUS_HISTORY_URL = "https://api.movidesk.com/public/v1/tickets/statusHistory"
 
 def get_ticket_ids():
-    sql = f"""
-    SELECT DISTINCT ticket_id
-      FROM {TABLE}
-    """
-    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        return [r[0] for r in cur.fetchall()]
+    conn = psycopg2.connect(NEON_DSN)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT ticket_id FROM visualizacao_resolucao.movidesk_resolution;")
+    ids = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return ids
 
 def fetch_status_history(ticket_id):
-    url = f"{API_URL}/tickets/statusHistory?ticketId={ticket_id}"
-    resp = requests.get(url, headers=HEADERS)
-    resp.raise_for_status()
+    resp = requests.get(f"{STATUS_HISTORY_URL}?ticketId={ticket_id}", headers=HEADERS)
+    try:
+        resp.raise_for_status()
+    except requests.exceptions.HTTPError:
+        if resp.status_code == 404:
+            print(f"[WARN] ticket {ticket_id}: statusHistory 404, pulando")
+            return []
+        raise
     return resp.json()
 
-def save_to_db(ticket_id, protocol, history):
-    if not history:
-        return
+def save_to_db(ticket_id, history):
+    conn = psycopg2.connect(NEON_DSN)
+    cur = conn.cursor()
     rows = []
     for ev in history:
         rows.append((
             ticket_id,
-            protocol,
+            ev.get("protocol"),
             ev.get("status"),
-            ev.get("justification") or "-",
-            ev.get("secondsUtl", 0),
-            ev.get("permanencyTimeFulltimeSeconds"),
-            json.dumps(ev.get("changedBy")) if ev.get("changedBy") else None,
-            ev.get("changedDate"),
-            ev.get("agent",{}).get("name"),
-            ev.get("team",{}).get("name"),
+            ev.get("justification") or "",
+            ev.get("secondsUTL"),
+            ev.get("permanencyTimeFullTimeSeconds"),
+            ev.get("changedBy"),
+            ev.get("date"),
+            ev.get("agentName"),
+            ev.get("teamName"),
         ))
-
-    insert_sql = f"""
-    INSERT INTO {TABLE}
-      (ticket_id, protocol, status, justificativa,
-       seconds_utl, permanency_time_fulltime_seconds,
-       changed_by, changed_date,
-       agent_name, team_name, imported_at)
-    VALUES
-      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-    ON CONFLICT (ticket_id, status, justificativa) DO NOTHING
-    ;
-    """
-    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
-        cur.executemany(insert_sql, rows)
+    if rows:
+        sql = """
+        INSERT INTO visualizacao_resolucao.resolucao_por_status
+          (ticket_id, protocol, status, justificativa,
+           seconds_utl, permanency_time_fulltime_seconds,
+           changed_by, changed_date, agent_name, team_name)
+        VALUES %s
+        ON CONFLICT (ticket_id, status, justificativa) DO UPDATE
+        SET
+          seconds_utl = EXCLUDED.seconds_utl,
+          permanency_time_fulltime_seconds = EXCLUDED.permanency_time_fulltime_seconds,
+          changed_by = EXCLUDED.changed_by,
+          changed_date = EXCLUDED.changed_date,
+          agent_name = EXCLUDED.agent_name,
+          team_name = EXCLUDED.team_name,
+          imported_at = NOW();
+        """
+        execute_values(cur, sql, rows)
         conn.commit()
+    cur.close()
+    conn.close()
 
 def main():
-    tickets = get_ticket_ids()
-    for tid in tickets:
+    for tid in get_ticket_ids():
         history = fetch_status_history(tid)
-        save_to_db(tid, None, history)
+        if history:
+            save_to_db(tid, history)
 
 if __name__ == "__main__":
     main()
