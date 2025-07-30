@@ -1,4 +1,4 @@
-name: Sync Movidesk → Neon / Histórico de Status
+name: Sync Movidesk -> Neon / Histórico de Status
 
 on:
   schedule:
