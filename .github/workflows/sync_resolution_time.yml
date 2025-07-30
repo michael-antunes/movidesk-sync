@@ -51,12 +51,6 @@ jobs:
           );
           EOF
 
-      - name: Sync resolução líquida
-        env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:       ${{ secrets.NEON_DSN }}
-        run: python sync_resolution_time.py
-
       - name: Sync histórico de status
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
