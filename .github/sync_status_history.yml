@@ -1,4 +1,4 @@
-name: Sync Movidesk → Neon / Resolução 
+name: Sync Movidesk → Neon / Histórico de Status
 
 on:
   schedule:
@@ -6,9 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  sync:
+  sync_status_history:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -21,22 +20,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Ensure schemas & tables exist
+      - name: Ensure schema & table exist
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" <<EOF
           CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
-          CREATE TABLE IF NOT EXISTS visualizacao_resolucao.movidesk_resolution (
-            ticket_id                     INTEGER   NOT NULL,
-            protocol                      TEXT,
-            resolved_in                   TIMESTAMP NOT NULL,
-            lifetime_working_time         INTEGER,
-            stopped_time_working_time     INTEGER,
-            net_hours                     NUMERIC,
-            imported_at                   TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY(ticket_id, resolved_in)
-          );
           CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
             ticket_id                         INTEGER   NOT NULL,
             protocol                          TEXT,
