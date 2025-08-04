@@ -2,7 +2,6 @@ import os
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import date
 
 API_URL = "https://api.movidesk.com/public/v1"
 TOKEN   = os.environ["MOVIDESK_TOKEN"]
@@ -10,7 +9,7 @@ DSN     = os.environ["NEON_DSN"]
 HEADERS = {"token": TOKEN}
 
 def get_ticket_ids():
-    today = date.today().isoformat()
+    today = __import__("datetime").date.today().isoformat()
     ids = []
     skip = 0
     while True:
@@ -41,7 +40,11 @@ def fetch_team_name(team_id):
     return None
 
 def fetch_status_history(ticket_id):
-    r = requests.get(f"{API_URL}/tickets/statusHistory", params={"ticketId": ticket_id, "token": TOKEN})
+    r = requests.get(f"{API_URL}/tickets/statusHistory",
+                     params={"ticketId": ticket_id, "token": TOKEN},
+                     headers=HEADERS)
+    if r.status_code == 404:
+        return []
     r.raise_for_status()
     return r.json().get("statusHistory", [])
 
@@ -52,7 +55,7 @@ def save_to_db(ticket_id, history):
     cur = conn.cursor()
     rows = []
     for ev in history:
-        agent = ev.get("changedBy", {})
+        agent = ev.get("changedBy", {}) or {}
         team_name = fetch_team_name(agent.get("teamId"))
         rows.append((
             ticket_id,
