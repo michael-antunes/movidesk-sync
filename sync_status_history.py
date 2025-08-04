@@ -23,32 +23,30 @@ def get_ticket_ids():
         }
         r = requests.get(f"{API_URL}/tickets", params=params)
         r.raise_for_status()
-        data = r.json()
-        items = data.get("items") if isinstance(data, dict) else data
-        if not items:
+        batch = r.json().get("items", [])
+        if not batch:
             break
-        ids.extend(i["id"] for i in items)
-        if len(items) < 100:
+        ids += [t["id"] for t in batch]
+        if len(batch) < 100:
             break
         skip += 100
     return ids
 
+def fetch_team_name(team_id):
+    if not team_id:
+        return None
+    r = requests.get(f"{API_URL}/teams/{team_id}", headers=HEADERS)
+    if r.status_code == 200:
+        return r.json().get("name")
+    return None
+
 def fetch_status_history(ticket_id):
-    params = {
-        "token": TOKEN,
-        "id": ticket_id,
-        "$expand": (
-            "statusHistories("
-            "$select=status,justification,"
-            "permanencyTimeWorkingTime,permanencyTimeFullTime,"
-            "changedBy,changedDate)"
-        )
-    }
-    r = requests.get(f"{API_URL}/tickets", params=params)
+    r = requests.get(
+        f"{API_URL}/tickets/statusHistory",
+        params={"ticketId": ticket_id, "token": TOKEN}
+    )
     r.raise_for_status()
-    data = r.json()
-    items = data.get("items") if isinstance(data, dict) else data
-    return items[0].get("statusHistories", []) if items else []
+    return r.json().get("statusHistory", [])
 
 def save_to_db(ticket_id, history):
     if not history:
@@ -57,24 +55,24 @@ def save_to_db(ticket_id, history):
     cur = conn.cursor()
     rows = []
     for ev in history:
-        changed_by = ev.get("changedBy")
+        agent = ev.get("changedBy", {})
+        team_name = fetch_team_name(agent.get("teamId"))
         rows.append((
             ticket_id,
-            ev.get("protocol"),
             ev.get("status"),
             ev.get("justification") or "",
-            ev.get("permanencyTimeFullTime"),
             ev.get("permanencyTimeWorkingTime"),
-            changed_by,
+            ev.get("permanencyTimeFullTime"),
+            agent,
             ev.get("changedDate"),
-            changed_by.get("name") if changed_by else None,
-            changed_by.get("team", {}).get("name") if changed_by else None
+            agent.get("name"),
+            team_name
         ))
     sql = """
     INSERT INTO visualizacao_resolucao.resolucao_por_status
-      (ticket_id,protocol,status,justificativa,
-       seconds_utl,permanency_time_fulltime_seconds,
-       changed_by,changed_date,agent_name,team_name,imported_at)
+      (ticket_id, status, justificativa,
+       seconds_utl, permanency_time_fulltime_seconds,
+       changed_by, changed_date, agent_name, team_name, imported_at)
     VALUES %s
     ON CONFLICT (ticket_id,status,justificativa) DO UPDATE
       SET
