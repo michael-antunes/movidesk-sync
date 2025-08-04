@@ -23,7 +23,7 @@ def get_ticket_ids():
         }
         r = requests.get(f"{API_URL}/tickets", params=params)
         r.raise_for_status()
-        batch = r.json().get("items", [])
+        batch = r.json()
         if not batch:
             break
         ids += [t["id"] for t in batch]
@@ -41,10 +41,7 @@ def fetch_team_name(team_id):
     return None
 
 def fetch_status_history(ticket_id):
-    r = requests.get(
-        f"{API_URL}/tickets/statusHistory",
-        params={"ticketId": ticket_id, "token": TOKEN}
-    )
+    r = requests.get(f"{API_URL}/tickets/statusHistory", params={"ticketId": ticket_id, "token": TOKEN})
     r.raise_for_status()
     return r.json().get("statusHistory", [])
 
