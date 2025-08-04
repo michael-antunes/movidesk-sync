@@ -9,14 +9,12 @@ DSN     = os.environ["NEON_DSN"]
 HEADERS = {"token": TOKEN}
 
 def get_ticket_ids():
-    today = __import__("datetime").date.today().isoformat()
-    ids = []
     skip = 0
+    ids = []
     while True:
         params = {
             "token": TOKEN,
             "$select": "id",
-            "$filter": f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed') and resolvedIn ge {today}",
             "$top": 100,
             "$skip": skip
         }
@@ -25,9 +23,7 @@ def get_ticket_ids():
         batch = r.json()
         if not batch:
             break
-        ids += [t["id"] for t in batch]
-        if len(batch) < 100:
-            break
+        ids.extend(t["id"] for t in batch)
         skip += 100
     return ids
 
@@ -40,13 +36,15 @@ def fetch_team_name(team_id):
     return None
 
 def fetch_status_history(ticket_id):
-    r = requests.get(f"{API_URL}/tickets/statusHistory",
-                     params={"ticketId": ticket_id, "token": TOKEN},
-                     headers=HEADERS)
+    r = requests.get(
+        f"{API_URL}/tickets/statusHistory",
+        params={"ticketId": ticket_id, "token": TOKEN},
+        headers=HEADERS
+    )
     if r.status_code == 404:
         return []
     r.raise_for_status()
-    return r.json().get("statusHistory", [])
+    return r.json()  # já é um array de eventos
 
 def save_to_db(ticket_id, history):
     if not history:
@@ -55,18 +53,18 @@ def save_to_db(ticket_id, history):
     cur = conn.cursor()
     rows = []
     for ev in history:
-        agent = ev.get("changedBy", {}) or {}
-        team_name = fetch_team_name(agent.get("teamId"))
+        changed_by = ev.get("changedBy") or {}
+        team = fetch_team_name(changed_by.get("teamId"))
         rows.append((
             ticket_id,
             ev.get("status"),
             ev.get("justification") or "",
             ev.get("permanencyTimeWorkingTime"),
             ev.get("permanencyTimeFullTime"),
-            agent,
+            changed_by,
             ev.get("changedDate"),
-            agent.get("name"),
-            team_name
+            changed_by.get("name"),
+            team
         ))
     sql = """
     INSERT INTO visualizacao_resolucao.resolucao_por_status
@@ -74,7 +72,7 @@ def save_to_db(ticket_id, history):
        seconds_utl, permanency_time_fulltime_seconds,
        changed_by, changed_date, agent_name, team_name, imported_at)
     VALUES %s
-    ON CONFLICT (ticket_id,status,justificativa) DO UPDATE
+    ON CONFLICT (ticket_id, status, justificativa) DO UPDATE
       SET
         seconds_utl                       = EXCLUDED.seconds_utl,
         permanency_time_fulltime_seconds = EXCLUDED.permanency_time_fulltime_seconds,
