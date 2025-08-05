@@ -2,62 +2,52 @@ import os
 import json
 import requests
 import psycopg2
+from datetime import datetime
 
-def get_ticket_ids(conn):
-    single = os.getenv('TICKET_ID')
-    if single:
-        return [int(single)]
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT ticket_id FROM visualizacao_resolucao.resolucao_por_status")
-    ids = [row[0] for row in cur.fetchall()]
-    cur.close()
-    return ids
+TOKEN = os.getenv("MOVIDESK_TOKEN")
+DSN = os.getenv("NEON_DSN")
+TICKET_ID = os.getenv("TICKET_ID")
 
 def fetch_status_history(ticket_id):
-    token = os.environ["MOVIDESK_TOKEN"]
-    url = f"https://api.movidesk.com/public/v1/tickets/statusHistory?ticketId={ticket_id}&token={token}"
+    url = (
+        f"https://api.movidesk.com/public/v1/tickets/past"
+        f"?token={TOKEN}&id={ticket_id}"
+        f"&$expand=statusHistories("
+        f"$expand=changedBy($select=businessName),"
+        f"changedByTeam($select=businessName))"
+    )
     r = requests.get(url)
     r.raise_for_status()
-    return r.json()
+    return r.json().get("statusHistories", [])
 
-def save_history(conn, events):
+def main():
+    conn = psycopg2.connect(DSN)
     cur = conn.cursor()
-    for ev in events:
+    cur.execute("DELETE FROM visualizacao_resolucao.resolucao_por_status;")
+    for ev in fetch_status_history(TICKET_ID):
+        status = ev.get("status")
+        justificativa = ev.get("justification") or ""
+        seconds_utl = ev.get("permanencyTimeWorkingTime")
+        fulltime = ev.get("permanencyTimeFullTime")
+        changed_date = datetime.fromisoformat(ev.get("changedDate"))
+        agent = ev.get("changedBy", {}).get("businessName")
+        team = ev.get("changedByTeam", {}).get("businessName")
         cur.execute(
             """
             INSERT INTO visualizacao_resolucao.resolucao_por_status
-              (ticket_id, protocol, status, justificativa, seconds_utl,
-               permanency_time_fulltime_seconds, changed_by, changed_date,
-               agent_name, team_name)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (ticket_id,status,justificativa) DO NOTHING
+            (ticket_id, status, justificativa, seconds_utl,
+             permanency_time_fulltime_seconds, changed_by,
+             changed_date, agent_name, team_name)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-                ev.get("ticketId"),
-                ev.get("protocol"),
-                ev.get("status"),
-                ev.get("justificativa") or None,
-                ev.get("secondsUtil") or 0,
-                ev.get("permanencyTimeFulltimeSeconds") or 0,
-                json.dumps(ev.get("changedBy")) if ev.get("changedBy") else None,
-                ev.get("changedDate"),
-                ev.get("agentName"),
-                ev.get("teamName"),
+                TICKET_ID, status, justificativa,
+                seconds_utl, fulltime,
+                json.dumps(ev.get("changedBy")), changed_date,
+                agent, team
             )
         )
     conn.commit()
-    cur.close()
-
-def main():
-    dsn = os.environ["NEON_DSN"]
-    conn = psycopg2.connect(dsn)
-    cur = conn.cursor()
-    cur.execute("TRUNCATE visualizacao_resolucao.resolucao_por_status")
-    conn.commit()
-    cur.close()
-    for tid in get_ticket_ids(conn):
-        events = fetch_status_history(tid)
-        save_history(conn, events)
     conn.close()
 
 if __name__ == "__main__":
