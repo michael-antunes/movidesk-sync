@@ -15,27 +15,29 @@ jobs:
       NEON_DSN:       ${{ secrets.NEON_DSN }}
       TICKET_ID:      ${{ github.event.inputs.ticket_id }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checar código
+        uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v4
+      - name: Instalar Python
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - run: pip install -r requirements.txt
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
 
-      - name: Ensure tabela e colunas existam
+      - name: Garantir tabela existe
         run: |
           psql "$NEON_DSN" <<EOF
           CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
           CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
             ticket_id                         INTEGER   NOT NULL,
-            protocol                          TEXT,
             status                            TEXT      NOT NULL,
             justificativa                     TEXT      NOT NULL,
             seconds_utl                       INTEGER,
             permanency_time_fulltime_seconds DOUBLE PRECISION,
-            agent_name                        TEXT,
-            team_name                         TEXT,
+            agent_name                        TEXT      NOT NULL,
+            team_name                         TEXT      NOT NULL,
             changed_date                      TIMESTAMP,
             imported_at                       TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY(ticket_id, status, justificativa)
