@@ -1,7 +1,6 @@
-name: Sync Movidesk -> Neon / Histórico de Status
+name: Sync Movidesk → Neon / Histórico de Status
+
 on:
-  schedule:
-    - cron: '0 8 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,9 +13,13 @@ jobs:
         with:
           python-version: '3.10'
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - run: |
+      - name: Ensure tabela `resolucao_por_status` existe
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
           psql "$NEON_DSN" <<EOF
           CREATE SCHEMA IF NOT EXISTS visualizacao_resolucao;
           CREATE TABLE IF NOT EXISTS visualizacao_resolucao.resolucao_por_status (
@@ -34,10 +37,9 @@ jobs:
             PRIMARY KEY(ticket_id, status, justificativa)
           );
           EOF
-        env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
 
-      - run: python sync_status_history.py
+      - name: Sync histórico de status
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN:       ${{ secrets.NEON_DSN }}
+        run: python sync_status_history.py
