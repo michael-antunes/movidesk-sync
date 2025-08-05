@@ -4,52 +4,62 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 MOVIDESK_TOKEN = os.environ['MOVIDESK_TOKEN']
-NEON_DSN = os.environ['NEON_DSN']
-TICKET_ID = os.environ['TICKET_ID']
+NEON_DSN       = os.environ['NEON_DSN']
+TICKET_ID      = os.environ.get('TICKET_ID') or None
 
 def fetch_status_history(ticket_id):
     url = 'https://api.movidesk.com/public/v1/tickets/past'
     params = {
         'id': ticket_id,
         'token': MOVIDESK_TOKEN,
-        '$expand': 'statusHistories($expand=changedBy($select=businessName),changedByTeam($select=businessName))'
+        '$expand': 'statusHistories('
+                   '$expand=changedBy($select=businessName),'
+                   'changedByTeam($select=businessName)'
+                   ')'
     }
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get('statusHistories', [])
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    return r.json().get('statusHistories', [])
+
+def fetch_all_ticket_ids():
+    conn = psycopg2.connect(NEON_DSN)
+    cur = conn.cursor()
+    cur.execute('SELECT DISTINCT ticket_id FROM tickets_movidesk;')
+    ids = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return ids
 
 def save_to_db(events):
     conn = psycopg2.connect(NEON_DSN)
     cur = conn.cursor()
-    cur.execute('TRUNCATE visualizacao_resolucao.resolucao_por_status')
+    cur.execute('TRUNCATE visualizacao_resolucao.resolucao_por_status;')
     rows = []
     for ev in events:
         rows.append([
-            ev.get('ticketId'),
+            ev['ticketId'],
             ev.get('protocol'),
-            ev.get('status'),
-            ev.get('justification', ''),
-            ev.get('secondsUtc'),
+            ev['status'],
+            ev.get('justification'),
+            ev.get('secondsUtil'),
             ev.get('permanencyTimeFulltimeSeconds'),
-            ev.get('changedBy'),
-            ev.get('changedDate'),
             ev.get('changedBy', {}).get('businessName'),
             ev.get('changedByTeam', {}).get('businessName'),
+            ev.get('changedDate')
         ])
     sql = """
     INSERT INTO visualizacao_resolucao.resolucao_por_status
-      (ticket_id, protocol, status, justificativa, seconds_utl,
-       permanency_time_fulltime_seconds, changed_by, changed_date, agent_name, team_name)
+      (ticket_id, protocol, status, justificativa,
+       seconds_utl, permanency_time_fulltime_seconds,
+       agent_name, team_name, changed_date)
     VALUES %s
     ON CONFLICT(ticket_id, status, justificativa) DO UPDATE
-      SET seconds_utl                          = EXCLUDED.seconds_utl,
-          permanency_time_fulltime_seconds     = EXCLUDED.permanency_time_fulltime_seconds,
-          changed_by                           = EXCLUDED.changed_by,
-          changed_date                         = EXCLUDED.changed_date,
-          agent_name                           = EXCLUDED.agent_name,
-          team_name                            = EXCLUDED.team_name,
-          imported_at                          = NOW();
+      SET seconds_utl                        = EXCLUDED.seconds_utl,
+          permanency_time_fulltime_seconds   = EXCLUDED.permanency_time_fulltime_seconds,
+          agent_name                         = EXCLUDED.agent_name,
+          team_name                          = EXCLUDED.team_name,
+          changed_date                       = EXCLUDED.changed_date,
+          imported_at                        = NOW();
     """
     execute_values(cur, sql, rows)
     conn.commit()
@@ -57,8 +67,18 @@ def save_to_db(events):
     conn.close()
 
 def main():
-    events = fetch_status_history(TICKET_ID)
-    save_to_db(events)
+    if TICKET_ID:
+        ticket_ids = [int(TICKET_ID)]
+    else:
+        ticket_ids = fetch_all_ticket_ids()
+
+    all_events = []
+    for tid in ticket_ids:
+        evs = fetch_status_history(tid)
+        for e in evs:
+            all_events.append(e)
+
+    save_to_db(all_events)
 
 if __name__ == '__main__':
     main()
