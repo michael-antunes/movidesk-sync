@@ -1,7 +1,4 @@
-import os
-import time
-import requests
-import psycopg2
+import os, time, requests, psycopg2
 from psycopg2.extras import execute_values
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -12,54 +9,20 @@ DSN     = os.environ["NEON_DSN"]
 HEADERS = {"token": TOKEN}
 
 session = requests.Session()
-retry = Retry(
-    total=5,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET"]
-)
+retry = Retry(total=5, backoff_factor=1, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
 session.mount("https://", HTTPAdapter(max_retries=retry))
 
-def get_ticket_ids():
-    ids = []
-    skip = 0
-    while True:
-        r = session.get(
-            f"{API_URL}/tickets",
-            headers=HEADERS,
-            params={"$select": "id", "$top": 100, "$skip": skip}
-        )
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-        ids += [t["id"] for t in batch]
-        skip += 100
-        time.sleep(0.1)
-    return ids
-
 def fetch_team_name(team_id):
-    if not team_id:
-        return None
+    if not team_id: return None
     r = session.get(f"{API_URL}/teams/{team_id}", headers=HEADERS)
-    if r.status_code != 200:
-        return None
-    return r.json().get("name")
+    return r.json().get("name") if r.status_code == 200 else None
 
 def fetch_status_history(ticket_id):
-    r = session.get(
-        f"{API_URL}/tickets/statusHistory",
-        headers=HEADERS,
-        params={"ticketId": ticket_id}
-    )
-    if r.status_code == 404:
-        return []
-    r.raise_for_status()
-    return r.json()
+    r = session.get(f"{API_URL}/tickets/statusHistory", headers=HEADERS, params={"ticketId": ticket_id})
+    return [] if r.status_code == 404 else r.json()
 
 def save_to_db(ticket_id, history):
-    if not history:
-        return
+    if not history: return
     conn = psycopg2.connect(DSN)
     cur  = conn.cursor()
     rows = []
@@ -78,9 +41,8 @@ def save_to_db(ticket_id, history):
         ))
     sql = """
     INSERT INTO visualizacao_resolucao.resolucao_por_status
-      (ticket_id, status, justificativa,
-       seconds_utl, permanency_time_fulltime_seconds,
-       changed_by, changed_date, agent_name, team_name, imported_at)
+    (ticket_id, status, justificativa, seconds_utl, permanency_time_fulltime_seconds,
+     changed_by, changed_date, agent_name, team_name, imported_at)
     VALUES %s
     ON CONFLICT (ticket_id, status, justificativa) DO UPDATE
       SET seconds_utl                       = EXCLUDED.seconds_utl,
@@ -98,10 +60,9 @@ def save_to_db(ticket_id, history):
     conn.close()
 
 def main():
-    for tid in get_ticket_ids():
-        hist = fetch_status_history(tid)
-        save_to_db(tid, hist)
-        time.sleep(0.2)
+    tid = 274067
+    hist = fetch_status_history(tid)
+    save_to_db(tid, hist)
 
 if __name__ == "__main__":
     main()
