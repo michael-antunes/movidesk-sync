@@ -1,54 +1,65 @@
 import os
-import json
 import requests
 import psycopg2
-from datetime import datetime
+from psycopg2.extras import execute_values
 
-TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN = os.getenv("NEON_DSN")
-TICKET_ID = os.getenv("TICKET_ID")
+API_URL = "https://api.movidesk.com/public/v1/tickets/past"
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+TICKET_ID = os.environ.get("TICKET_ID")
+
+if not TICKET_ID:
+    raise SystemExit("❌ Variável TICKET_ID não definida")
 
 def fetch_status_history(ticket_id):
-    url = (
-        f"https://api.movidesk.com/public/v1/tickets/past"
-        f"?token={TOKEN}&id={ticket_id}"
-        f"&$expand=statusHistories("
-        f"$expand=changedBy($select=businessName),"
-        f"changedByTeam($select=businessName))"
-    )
-    r = requests.get(url)
+    params = {
+        "token": TOKEN,
+        "id": ticket_id,
+        "$expand": "statusHistories($expand=changedBy($select=businessName),changedByTeam($select=businessName))",
+    }
+    r = requests.get(API_URL, params=params)
     r.raise_for_status()
-    return r.json().get("statusHistories", [])
+    data = r.json()
+    return data.get("statusHistories", [])
+
+def save_to_db(records):
+    conn = psycopg2.connect(os.environ["NEON_DSN"])
+    with conn:
+        with conn.cursor() as cur:
+            # limpa só as linhas do ticket atual
+            cur.execute(
+                "DELETE FROM visualizacao_resolucao.resolucao_por_status WHERE ticket_id = %s;",
+                (TICKET_ID,),
+            )
+            if records:
+                rows = []
+                for ev in records:
+                    rows.append((
+                        int(TICKET_ID),
+                        ev.get("ticketId"),
+                        ev.get("status"),
+                        ev.get("justification") or "",
+                        ev.get("secondsUntilNextStatus"),
+                        ev.get("permanencyTimeFullTimeSeconds"),
+                        ev.get("changedBy", {}).get("businessName"),
+                        ev.get("changedByTeam", {}).get("businessName"),
+                        ev.get("creationDate")
+                    ))
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO visualizacao_resolucao.resolucao_por_status
+                      (ticket_id, protocol, status, justificativa, seconds_utl,
+                       permanency_time_fulltime_seconds, agent_name, team_name, changed_date)
+                    VALUES %s
+                    """,
+                    rows
+                )
+    conn.close()
 
 def main():
-    conn = psycopg2.connect(DSN)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM visualizacao_resolucao.resolucao_por_status;")
-    for ev in fetch_status_history(TICKET_ID):
-        status = ev.get("status")
-        justificativa = ev.get("justification") or ""
-        seconds_utl = ev.get("permanencyTimeWorkingTime")
-        fulltime = ev.get("permanencyTimeFullTime")
-        changed_date = datetime.fromisoformat(ev.get("changedDate"))
-        agent = ev.get("changedBy", {}).get("businessName")
-        team = ev.get("changedByTeam", {}).get("businessName")
-        cur.execute(
-            """
-            INSERT INTO visualizacao_resolucao.resolucao_por_status
-            (ticket_id, status, justificativa, seconds_utl,
-             permanency_time_fulltime_seconds, changed_by,
-             changed_date, agent_name, team_name)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """,
-            (
-                TICKET_ID, status, justificativa,
-                seconds_utl, fulltime,
-                json.dumps(ev.get("changedBy")), changed_date,
-                agent, team
-            )
-        )
-    conn.commit()
-    conn.close()
+    hist = fetch_status_history(TICKET_ID)
+    save_to_db(hist)
+    print(f"✅ Histórico de status do ticket {TICKET_ID} importado com {len(hist)} registros")
 
 if __name__ == "__main__":
     main()
