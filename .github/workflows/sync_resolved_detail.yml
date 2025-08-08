@@ -1,16 +1,15 @@
 name: Sync Movidesk -> Detalhe (resolucao_por_status)
 
 on:
-  schedule:
-    - cron: '*/30 * * * *'
-  workflow_dispatch: {}
   workflow_run:
-    workflows: ["Sync Movidesk -> Index (tickets_resolvidos)"]
+    workflows:
+      - Sync Movidesk -> Index (tickets_resolvidos)
     types: [completed]
+  workflow_dispatch: {}
 
 jobs:
   detail:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
       MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
