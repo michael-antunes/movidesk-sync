@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
