@@ -206,6 +206,20 @@ def extract_rows(ticket):
         rows.append((tid,protocol,status,justification,int(sec_work),float(sec_full),json.dumps(changed_by,ensure_ascii=False),changed_date,agent,team))
     return rows
 
+def dedupe_by_pk_keep_latest(rows):
+    best={}
+    for r in rows:
+        key=(r[0], r[2], r[3])
+        prev=best.get(key)
+        cur_cd=r[7] or ''
+        if prev is None:
+            best[key]=r
+        else:
+            prev_cd=prev[7] or ''
+            if cur_cd >= prev_cd:
+                best[key]=r
+    return list(best.values())
+
 def delete_ticket_rows(conn, ticket_id):
     cur=conn.cursor(); cur.execute("delete from visualizacao_resolucao.resolucao_por_status where ticket_id=%s",(ticket_id,)); cur.close()
 
@@ -244,17 +258,4 @@ def run():
         try:
             ticket=fetch_ticket_detail(tid)
         except requests.exceptions.HTTPError as e:
-            print(f"skip {tid}: {e}")
-            continue
-        delete_ticket_rows(conn, tid)
-        if is_resolved(ticket):
-            rows=extract_rows(ticket)
-            upsert_rows(conn, rows)
-            dt=latest_resolved_changed_date(ticket)
-            if dt and (max_resolved_seen is None or dt>max_resolved_seen): max_resolved_seen=dt
-    conn.close()
-    if max_u: set_cursor('status_history_lastupdate', max_u - timedelta(minutes=1))
-    if max_resolved_seen: set_cursor('status_history_lastresolved', max_resolved_seen - timedelta(minutes=1))
-
-if __name__ == '__main__':
-    run()
+            print(f"skip {tid}:
