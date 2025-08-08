@@ -3,21 +3,31 @@ import json
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime, timedelta, timezone
 from time import sleep
 
 MOVIDESK_TOKEN = os.environ['MOVIDESK_TOKEN']
 NEON_DSN = os.environ['NEON_DSN']
+TICKET_ID = os.environ.get('TICKET_ID', '').strip()
 
 def api_get(url, params):
-    for i in range(6):
+    for i in range(5):
         r = requests.get(url, params=params, timeout=60)
         if r.status_code in (429, 500, 502, 503, 504):
-            sleep(min(60, 2**i))
+            sleep(2**i)
             continue
         r.raise_for_status()
         return r.json()
     r.raise_for_status()
+
+def fetch_ticket_past(ticket_id):
+    url = 'https://api.movidesk.com/public/v1/tickets/past'
+    params = {
+        'token': MOVIDESK_TOKEN,
+        'id': ticket_id,
+        '$select': 'id,protocol,status,baseStatus,ownerTeam',
+        '$expand': 'statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
+    }
+    return api_get(url, params)
 
 def ensure_structure():
     conn = psycopg2.connect(NEON_DSN)
@@ -41,12 +51,6 @@ def ensure_structure():
         );
     """)
     cur.execute("""
-        create table if not exists visualizacao_resolucao.sync_control(
-            name text primary key,
-            last_update timestamp not null
-        );
-    """)
-    cur.execute("""
         select 1
         from information_schema.columns
         where table_schema='visualizacao_resolucao'
@@ -58,95 +62,26 @@ def ensure_structure():
     cur.close()
     conn.close()
 
-def get_cursor():
-    conn = psycopg2.connect(NEON_DSN)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("select last_update from visualizacao_resolucao.sync_control where name='status_history_batch'")
-    row = cur.fetchone()
-    if row:
-        cur.close(); conn.close()
-        return row[0].replace(tzinfo=timezone.utc)
-    dt = datetime.now(timezone.utc) - timedelta(days=7)
-    cur = conn.cursor()
-    cur.execute("insert into visualizacao_resolucao.sync_control(name,last_update) values('status_history_batch', %s) on conflict (name) do nothing", (dt,))
-    cur.close(); conn.close()
-    return dt
-
-def set_cursor(ts):
-    conn = psycopg2.connect(NEON_DSN)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("update visualizacao_resolucao.sync_control set last_update=%s where name='status_history_batch'", (ts,))
-    cur.close(); conn.close()
-
-def iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-def list_updated_ticket_ids(cursor_dt):
-    ids = set()
-    max_ts = cursor_dt
-    def fetch(url):
-        nonlocal ids, max_ts
-        top = 1000
-        skip = 0
-        while True:
-            params = {
-                'token': MOVIDESK_TOKEN,
-                '$select': 'id,lastUpdate,baseStatus',
-                '$filter': f"lastUpdate ge {iso(cursor_dt)}",
-                '$top': top,
-                '$skip': skip
-            }
-            batch = api_get(url, params)
-            if not batch:
-                break
-            for t in batch:
-                tid = t.get('id')
-                if tid is not None:
-                    ids.add(int(tid))
-                lu = t.get('lastUpdate')
-                if lu:
-                    try:
-                        ts = datetime.fromisoformat(lu.replace('Z','+00:00'))
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=timezone.utc)
-                        if ts > max_ts:
-                            max_ts = ts
-                    except Exception:
-                        pass
-            if len(batch) < top:
-                break
-            skip += len(batch)
-    fetch('https://api.movidesk.com/public/v1/tickets')
-    fetch('https://api.movidesk.com/public/v1/tickets/past')
-    return list(ids), max_ts
-
-def fetch_ticket_detail(ticket_id):
-    params = {
-        'token': MOVIDESK_TOKEN,
-        'id': ticket_id,
-        '$select': 'id,protocol,status,baseStatus,ownerTeam',
-        '$expand': 'statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
-    }
-    return api_get('https://api.movidesk.com/public/v1/tickets/past', params)
-
-def is_resolved(ticket):
-    bs = (ticket or {}).get('baseStatus') or ''
-    st = (ticket or {}).get('status') or ''
-    if bs in ('Resolved','Closed'):
-        return True
-    if (st or '').lower() in ('resolved','closed','resolvido','fechado'):
-        return True
-    return False
-
-def owner_team_name(ticket):
+def get_owner_team(ticket):
     ot = ticket.get('ownerTeam')
     if isinstance(ot, dict):
         return ot.get('businessName') or ''
     if isinstance(ot, str):
         return ot
     return ''
+
+def is_resolved(ticket):
+    bs = (ticket or {}).get('baseStatus') or ''
+    st = (ticket or {}).get('status') or ''
+    if bs in ('Resolved', 'Closed'):
+        return True
+    if (st or '').lower() in ('resolvido', 'fechado', 'resolved', 'closed'):
+        return True
+    for h in ticket.get('statusHistories', []) or []:
+        s = (h.get('status') or '').lower()
+        if s in ('resolvido', 'fechado', 'resolved', 'closed'):
+            return True
+    return False
 
 def teams_to_name(teams):
     names = []
@@ -161,7 +96,7 @@ def teams_to_name(teams):
 def extract_rows(ticket):
     tid = ticket.get('id')
     protocol = ticket.get('protocol')
-    owner_team = owner_team_name(ticket)
+    owner_team = get_owner_team(ticket)
     rows = []
     for h in ticket.get('statusHistories', []) or []:
         status = h.get('status') or ''
@@ -183,14 +118,11 @@ def extract_rows(ticket):
         rows.append((tid, protocol, status, justification, int(sec_work), float(sec_full), json.dumps(changed_by, ensure_ascii=False), changed_date, agent, team))
     return rows
 
-def delete_ticket_rows(conn, ticket_id):
-    cur = conn.cursor()
-    cur.execute("delete from visualizacao_resolucao.resolucao_por_status where ticket_id=%s", (ticket_id,))
-    cur.close()
-
-def upsert_rows(conn, rows):
+def upsert(rows):
     if not rows:
         return
+    conn = psycopg2.connect(NEON_DSN)
+    conn.autocommit = True
     cur = conn.cursor()
     sql = """
         insert into visualizacao_resolucao.resolucao_por_status
@@ -208,25 +140,18 @@ def upsert_rows(conn, rows):
     """
     execute_values(cur, sql, rows)
     cur.close()
-
-def run():
-    ensure_structure()
-    cursor_dt = get_cursor()
-    ids, max_ts = list_updated_ticket_ids(cursor_dt)
-    if not ids:
-        set_cursor(max_ts)
-        return
-    conn = psycopg2.connect(NEON_DSN)
-    conn.autocommit = True
-    for tid in ids:
-        ticket = fetch_ticket_detail(tid)
-        delete_ticket_rows(conn, tid)
-        if is_resolved(ticket):
-            rows = extract_rows(ticket)
-            upsert_rows(conn, rows)
     conn.close()
-    next_cursor = max_ts - timedelta(minutes=1)
-    set_cursor(next_cursor)
+
+def main():
+    if not TICKET_ID:
+        raise SystemExit('TICKET_ID ausente')
+    ensure_structure()
+    ticket = fetch_ticket_past(TICKET_ID)
+    if not is_resolved(ticket):
+        raise SystemExit('Ticket não está resolvido')
+    rows = extract_rows(ticket)
+    upsert(rows)
+    print(len(rows))
 
 if __name__ == '__main__':
-    run()
+    main()
