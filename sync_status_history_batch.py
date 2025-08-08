@@ -130,13 +130,27 @@ def list_ids_resolved_since(cursor_dt):
     return list(ids),max_res
 
 def fetch_ticket_detail(ticket_id):
-    params={
-        'token':MOVIDESK_TOKEN,
-        'id':ticket_id,
-        '$select':'id,protocol,status,baseStatus,ownerTeam',
-        '$expand':'statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
-    }
-    return api_get('https://api.movidesk.com/public/v1/tickets/past',params)
+    sel='id,protocol,status,baseStatus,ownerTeam'
+    exp='statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
+    p_id={'token':MOVIDESK_TOKEN,'id':ticket_id,'$select':sel,'$expand':exp}
+    p_f1={'token':MOVIDESK_TOKEN,'$select':sel,'$expand':exp,'$filter':f'id eq {int(ticket_id)}','$top':1}
+    try:
+        return api_get('https://api.movidesk.com/public/v1/tickets', p_id)
+    except requests.exceptions.HTTPError as e:
+        if e.response is None or e.response.status_code != 404:
+            raise
+    try:
+        return api_get('https://api.movidesk.com/public/v1/tickets/past', p_id)
+    except requests.exceptions.HTTPError as e:
+        if e.response is None or e.response.status_code != 404:
+            raise
+    batch = api_get('https://api.movidesk.com/public/v1/tickets', p_f1)
+    if isinstance(batch, list) and batch:
+        return batch[0]
+    batch = api_get('https://api.movidesk.com/public/v1/tickets/past', p_f1)
+    if isinstance(batch, list) and batch:
+        return batch[0]
+    return {}
 
 def is_resolved(ticket):
     bs=(ticket or {}).get('baseStatus') or ''
@@ -227,7 +241,11 @@ def run():
     conn=psycopg2.connect(NEON_DSN); conn.autocommit=True
     max_resolved_seen=cr
     for tid in ids:
-        ticket=fetch_ticket_detail(tid)
+        try:
+            ticket=fetch_ticket_detail(tid)
+        except requests.exceptions.HTTPError as e:
+            print(f"skip {tid}: {e}")
+            continue
         delete_ticket_rows(conn, tid)
         if is_resolved(ticket):
             rows=extract_rows(ticket)
