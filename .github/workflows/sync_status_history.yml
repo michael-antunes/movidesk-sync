@@ -1,9 +1,11 @@
-name: Sync Movidesk -> Neon / Histórico de Status (lote)
+name: Sync Movidesk -> Neon / Histórico de Status (1 ticket)
 
 on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      TICKET_ID:
+        description: 'ID do ticket resolvido'
+        required: true
 
 jobs:
   sync:
@@ -11,10 +13,11 @@ jobs:
     env:
       MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
       NEON_DSN: ${{ secrets.NEON_DSN }}
+      TICKET_ID: ${{ github.event.inputs.TICKET_ID }}
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: python sync_status_history_batch.py
+      - run: python sync_status_history.py
