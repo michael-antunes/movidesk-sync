@@ -25,7 +25,7 @@ def fetch_ticket_past(ticket_id):
         'token': MOVIDESK_TOKEN,
         'id': ticket_id,
         '$select': 'id,protocol,status,baseStatus',
-        '$expand': 'statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=businessName),changedByTeam($select=businessName))'
+        '$expand': 'ownerTeam($select=businessName),statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
     }
     return api_get(url, params)
 
@@ -77,6 +77,7 @@ def is_resolved(ticket):
 def extract_rows(ticket):
     tid = ticket.get('id')
     protocol = ticket.get('protocol')
+    owner_team = ((ticket.get('ownerTeam') or {}) or {}).get('businessName') or ''
     rows = []
     for h in ticket.get('statusHistories', []) or []:
         status = h.get('status') or ''
@@ -85,9 +86,14 @@ def extract_rows(ticket):
         sec_full = h.get('permanencyTimeFullTime') or 0
         changed_by = h.get('changedBy') or {}
         agent = (changed_by or {}).get('businessName') or ''
-        team = ''
-        if isinstance(h.get('changedByTeam'), dict):
-            team = h['changedByTeam'].get('businessName') or ''
+        teams = changed_by.get('teams') or []
+        if isinstance(teams, list):
+            team_names = [t.get('businessName') for t in teams if isinstance(t, dict) and t.get('businessName')]
+            team = ', '.join(team_names)
+        else:
+            team = ''
+        if not team:
+            team = owner_team
         changed_date = h.get('changedDate')
         rows.append((tid, protocol, status, justification, int(sec_work), float(sec_full), json.dumps(changed_by, ensure_ascii=False), changed_date, agent, team))
     return rows
