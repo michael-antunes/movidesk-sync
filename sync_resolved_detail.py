@@ -11,6 +11,8 @@ NEON_DSN = os.environ['NEON_DSN']
 IDX_SCHEMA = 'visualizacao_resolvidos'
 DET_SCHEMA = 'visualizacao_resolucao'
 RESOLVED_SET = {'resolved','closed','resolvido','fechado'}
+GENERIC_TEAMS = {'administradores','agente administrador','administrators','agent administrator','default','geral','todos','all','users','usuários','colaboradores'}
+TEAM_PRIORITY = ['telefone','chat','n1','n2','cs','suporte','service desk','desenvolvimento','squad','projeto']
 
 def api_get(url, params):
     for i in range(6):
@@ -37,10 +39,11 @@ def ensure_structure():
             changed_date timestamp,
             agent_name text default '',
             team_name text default '',
-            imported_at timestamp default now(),
-            primary key (ticket_id, status, justificativa)
+            imported_at timestamp default now()
         );
     """)
+    cur.execute(f"alter table {DET_SCHEMA}.resolucao_por_status drop constraint if exists resolucao_por_status_pkey;")
+    cur.execute(f"alter table {DET_SCHEMA}.resolucao_por_status add primary key (ticket_id, status, justificativa, changed_date);")
     cur.execute(f"""
         create table if not exists {IDX_SCHEMA}.detail_control(
             ticket_id integer primary key,
@@ -67,13 +70,38 @@ def owner_team_name(ticket):
     if isinstance(ot,str): return ot
     return ''
 
-def teams_to_name(teams):
+def pick_team(changed_by, owner_team, changed_by_team):
+    name=''
+    if isinstance(changed_by_team, dict):
+        name=(changed_by_team.get('businessName') or '').strip()
+    elif isinstance(changed_by_team, str):
+        name=changed_by_team.strip()
+    if name: return name
     names=[]
-    if isinstance(teams,list):
-        for t in teams:
-            if isinstance(t,dict) and t.get('businessName'): names.append(t['businessName'])
-            elif isinstance(t,str): names.append(t)
-    return ', '.join(sorted(set([n for n in names if n])))
+    if isinstance(changed_by, dict):
+        teams=changed_by.get('teams')
+        if isinstance(teams, list):
+            for t in teams:
+                n=(t.get('businessName') if isinstance(t,dict) else (t if isinstance(t,str) else '')) or ''
+                n=n.strip()
+                if n and n.lower() not in GENERIC_TEAMS and not n.lower().startswith('admin'):
+                    names.append(n)
+    names=list(dict.fromkeys(names))
+    if not names and isinstance(changed_by, dict):
+        teams=changed_by.get('teams')
+        if isinstance(teams, list):
+            for t in teams:
+                n=(t.get('businessName') if isinstance(t,dict) else (t if isinstance(t,str) else '')) or ''
+                n=n.strip()
+                if n: names.append(n)
+        names=list(dict.fromkeys(names))
+    if names:
+        lowered=[n.lower() for n in names]
+        for key in TEAM_PRIORITY:
+            for i,low in enumerate(lowered):
+                if key in low: return names[i]
+        return names[0]
+    return owner_team or ''
 
 def extract_rows(ticket):
     tid=ticket.get('id'); protocol=ticket.get('protocol'); owner_team=owner_team_name(ticket); rows=[]
@@ -84,29 +112,18 @@ def extract_rows(ticket):
         sec_full=h.get('permanencyTimeFullTime') or 0
         changed_by=h.get('changedBy') or {}
         agent=changed_by.get('businessName') if isinstance(changed_by,dict) else ''
-        team=teams_to_name(changed_by.get('teams')) if isinstance(changed_by,dict) else ''
-        if not team:
-            cbt=h.get('changedByTeam')
-            if isinstance(cbt,dict) and cbt.get('businessName'): team=cbt['businessName']
-            elif isinstance(cbt,str): team=cbt
-        if not team: team=owner_team
+        team=pick_team(changed_by, owner_team, h.get('changedByTeam'))
         changed_date=h.get('changedDate')
         rows.append((tid,protocol,status,justification,int(sec_work),float(sec_full),json.dumps(changed_by,ensure_ascii=False),changed_date,agent,team))
     return rows
 
-def dedupe_by_pk_keep_latest(rows):
-    best={}
+def dedupe_rows(rows):
+    seen=set(); out=[]
     for r in rows:
-        key=(r[0], r[2], r[3])
-        prev=best.get(key)
-        cur_cd=r[7] or ''
-        if prev is None:
-            best[key]=r
-        else:
-            prev_cd=prev[7] or ''
-            if cur_cd >= prev_cd:
-                best[key]=r
-    return list(best.values())
+        key=(r[0],r[2],r[3],r[7])
+        if key in seen: continue
+        seen.add(key); out.append(r)
+    return out
 
 def delete_ticket_rows(conn, tid):
     cur=conn.cursor(); cur.execute(f"delete from {DET_SCHEMA}.resolucao_por_status where ticket_id=%s",(tid,)); cur.close()
@@ -118,12 +135,11 @@ def upsert_detail(conn, rows):
         insert into {DET_SCHEMA}.resolucao_por_status
         (ticket_id, protocol, status, justificativa, seconds_uti, permanency_time_fulltime_seconds, changed_by, changed_date, agent_name, team_name)
         values %s
-        on conflict (ticket_id, status, justificativa) do update set
+        on conflict (ticket_id, status, justificativa, changed_date) do update set
             protocol=excluded.protocol,
             seconds_uti=excluded.seconds_uti,
             permanency_time_fulltime_seconds=excluded.permanency_time_fulltime_seconds,
             changed_by=excluded.changed_by,
-            changed_date=excluded.changed_date,
             agent_name=excluded.agent_name,
             team_name=excluded.team_name,
             imported_at=now();
@@ -168,7 +184,7 @@ def run():
         except Exception as e:
             print("skip", tid, str(e)); continue
         delete_ticket_rows(conn, tid)
-        rows=dedupe_by_pk_keep_latest(extract_rows(ticket))
+        rows=dedupe_rows(extract_rows(ticket))
         upsert_detail(conn, rows)
         upsert_control(conn, tid, lr, lu)
     if to_delete:
