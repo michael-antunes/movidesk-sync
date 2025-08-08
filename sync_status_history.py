@@ -24,8 +24,8 @@ def fetch_ticket_past(ticket_id):
     params = {
         'token': MOVIDESK_TOKEN,
         'id': ticket_id,
-        '$select': 'id,protocol,status,baseStatus',
-        '$expand': 'ownerTeam($select=businessName),statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
+        '$select': 'id,protocol,status,baseStatus,ownerTeam',
+        '$expand': 'statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;$expand=changedBy($select=id,businessName;$expand=teams($select=businessName)))'
     }
     return api_get(url, params)
 
@@ -61,6 +61,14 @@ def ensure_structure():
     cur.close()
     conn.close()
 
+def get_owner_team(ticket):
+    ot = ticket.get('ownerTeam')
+    if isinstance(ot, dict):
+        return ot.get('businessName') or ''
+    if isinstance(ot, str):
+        return ot
+    return ''
+
 def is_resolved(ticket):
     bs = (ticket or {}).get('baseStatus') or ''
     st = (ticket or {}).get('status') or ''
@@ -74,10 +82,22 @@ def is_resolved(ticket):
             return True
     return False
 
+def teams_to_name(teams):
+    names = []
+    if isinstance(teams, list):
+        for t in teams:
+            if isinstance(t, dict):
+                n = t.get('businessName')
+                if n:
+                    names.append(n)
+            elif isinstance(t, str):
+                names.append(t)
+    return ', '.join(sorted(set([n for n in names if n])))
+
 def extract_rows(ticket):
     tid = ticket.get('id')
     protocol = ticket.get('protocol')
-    owner_team = ((ticket.get('ownerTeam') or {}) or {}).get('businessName') or ''
+    owner_team = get_owner_team(ticket)
     rows = []
     for h in ticket.get('statusHistories', []) or []:
         status = h.get('status') or ''
@@ -85,13 +105,18 @@ def extract_rows(ticket):
         sec_work = h.get('permanencyTimeWorkingTime') or 0
         sec_full = h.get('permanencyTimeFullTime') or 0
         changed_by = h.get('changedBy') or {}
-        agent = (changed_by or {}).get('businessName') or ''
-        teams = changed_by.get('teams') or []
-        if isinstance(teams, list):
-            team_names = [t.get('businessName') for t in teams if isinstance(t, dict) and t.get('businessName')]
-            team = ', '.join(team_names)
+        agent = ''
+        if isinstance(changed_by, dict):
+            agent = changed_by.get('businessName') or ''
+            team = teams_to_name(changed_by.get('teams'))
         else:
             team = ''
+        if not team:
+            cbt = h.get('changedByTeam')
+            if isinstance(cbt, dict):
+                team = cbt.get('businessName') or ''
+            elif isinstance(cbt, str):
+                team = cbt
         if not team:
             team = owner_team
         changed_date = h.get('changedDate')
