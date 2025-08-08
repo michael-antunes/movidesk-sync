@@ -11,6 +11,10 @@ NEON_DSN = os.environ['NEON_DSN']
 
 RESOLVED_SET = {'resolved','closed','resolvido','fechado'}
 
+def start_of_today_utc():
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
 def api_get(url, params):
     for i in range(6):
         r = requests.get(url, params=params, timeout=60)
@@ -22,6 +26,7 @@ def api_get(url, params):
     r.raise_for_status()
 
 def ensure_structure():
+    st = start_of_today_utc()
     conn = psycopg2.connect(NEON_DSN); conn.autocommit = True; cur = conn.cursor()
     cur.execute("create schema if not exists visualizacao_resolucao;")
     cur.execute("""
@@ -47,7 +52,7 @@ def ensure_structure():
         );
     """)
     for n in ('status_history_lastupdate','status_history_lastresolved'):
-        cur.execute("insert into visualizacao_resolucao.sync_control(name,last_update) values(%s, now() - interval '14 days') on conflict (name) do nothing", (n,))
+        cur.execute("insert into visualizacao_resolucao.sync_control(name,last_update) values(%s,%s) on conflict (name) do nothing", (n, st))
     cur.execute("""
         select 1
         from information_schema.columns
@@ -63,12 +68,13 @@ def get_cursor(name):
     conn = psycopg2.connect(NEON_DSN); conn.autocommit = True; cur = conn.cursor()
     cur.execute("select last_update from visualizacao_resolucao.sync_control where name=%s", (name,))
     row = cur.fetchone(); cur.close(); conn.close()
-    dt = row[0] if row else datetime.now(timezone.utc)-timedelta(days=14)
+    dt = row[0] if row else start_of_today_utc()
     if isinstance(dt,str):
         try: dt = datetime.fromisoformat(dt.replace('Z','+00:00'))
-        except Exception: dt = datetime.now(timezone.utc)-timedelta(days=14)
+        except Exception: dt = start_of_today_utc()
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    st = start_of_today_utc()
+    return dt if dt > st else st
 
 def set_cursor(name, ts):
     if ts is None: return
@@ -80,6 +86,8 @@ def set_cursor(name, ts):
 def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def list_ids_updated_since(cursor_dt):
+    st = start_of_today_utc()
+    cursor_dt = cursor_dt if cursor_dt > st else st
     ids=set(); max_ts=cursor_dt
     def page(url):
         nonlocal ids,max_ts
@@ -105,6 +113,8 @@ def list_ids_updated_since(cursor_dt):
     return list(ids),max_ts
 
 def list_ids_resolved_since(cursor_dt):
+    st = start_of_today_utc()
+    cursor_dt = cursor_dt if cursor_dt > st else st
     ids=set(); max_res=cursor_dt
     top=500; skip=0
     filt = "statusHistories/any(s: s/changedDate ge "+iso(cursor_dt)+" and ("+ " or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED_SET]) +"))"
