@@ -1,5 +1,4 @@
 import os, time, json, requests, psycopg2
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import Json
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -29,68 +28,10 @@ def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
         skip += page_size
     return items
 
-def fetch_agents_list():
-    select_fields = ["id","businessName","userName","isActive","profileType","accessProfile"]
+def fetch_agents():
+    select_fields = ["id","businessName","userName","isActive","profileType","accessProfile","teams"]
     params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType)"}
     return fetch_paginated("persons", params, page_size=200)
-
-def fetch_person_detail_any(id_):
-    expands = [
-        "teams($select=businessName)",
-        "groups($select=businessName)",
-        "businessTeams($select=businessName)",
-        "teams",
-        "groups",
-        "businessTeams"
-    ]
-    for ex in expands:
-        params = {"id": id_, "$select": "id", "$expand": ex, "token": API_TOKEN}
-        try:
-            r = get_with_retry(f"{BASE}/persons", params)
-            j = r.json()
-            if isinstance(j, list) and j: j = j[0]
-            if isinstance(j, dict): return j
-        except requests.HTTPError:
-            time.sleep(0.1)
-    return {}
-
-def extract_team_names(obj):
-    names = []
-    for key in ("teams","groups","businessTeams"):
-        arr = obj.get(key) or []
-        for t in arr:
-            if isinstance(t, dict):
-                v = t.get("businessName") or t.get("name") or t.get("title")
-                if v: names.append(v)
-            elif isinstance(t, str):
-                names.append(t)
-    names = [n for n in names if n]
-    return list(dict.fromkeys(names)) or None
-
-def enrich_missing_teams(people):
-    need = []
-    byid = {}
-    for p in people:
-        try: pid = int(p.get("id"))
-        except: continue
-        byid[pid] = p
-        if not extract_team_names(p): need.append(pid)
-    if not need: return people
-    results = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fetch_person_detail_any, pid): pid for pid in need}
-        for f in as_completed(futs):
-            pid = futs[f]
-            try:
-                d = f.result()
-                t = extract_team_names(d)
-                if t: results[pid] = t
-            except Exception:
-                pass
-            time.sleep(0.05)
-    for pid, teams in results.items():
-        byid[pid]["teams"] = [{"businessName": n} for n in teams]
-    return list(byid.values())
 
 def pick_email(p):
     emails = p.get("emails") or []
@@ -103,11 +44,7 @@ def pick_email(p):
         first = emails[0]
         if isinstance(first, dict): return first.get("email") or ""
         if isinstance(first, str): return first
-    return p.get("userName") or p.get("email") or p.get("businessEmail") or ""
-
-def pick_teams(obj):
-    t = extract_team_names(obj)
-    return t or None
+    return p.get("userName") or ""
 
 def extract_access(p):
     return p.get("accessProfile") or p.get("businessProfile") or (p.get("profile") or {}).get("type","") or ""
@@ -117,6 +54,13 @@ def extract_active(p):
     if isinstance(v, bool): return v
     if isinstance(v, str): return v.strip().lower() in ("true","1","yes","y","sim")
     return bool(v)
+
+def pick_teams(p):
+    t = p.get("teams")
+    if isinstance(t, list): 
+        t = [x for x in t if x]
+        return t or None
+    return None
 
 DDL = """
 create schema if not exists visualizacao_agentes;
@@ -163,19 +107,17 @@ def upsert(conn, rows):
 def main():
     conn = psycopg2.connect(DSN)
     ensure_structure(conn)
-    people = fetch_agents_list()
+    people = fetch_agents()
     people = [p for p in people if p.get("profileType") in (1,3)]
-    people = enrich_missing_teams(people)
     rows = []
     for p in people:
         try: pid = int(p.get("id"))
         except: continue
         teams = pick_teams(p)
-        email = pick_email(p)
         rows.append({
             "agent_id": pid,
             "name": p.get("businessName") or p.get("name") or "",
-            "email": email,
+            "email": pick_email(p),
             "team_primary": (teams or [None])[0],
             "teams": teams,
             "access_type": extract_access(p),
