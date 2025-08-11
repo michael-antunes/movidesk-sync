@@ -2,7 +2,7 @@ name: Sync Movidesk -> Agentes
 
 on:
   schedule:
-    - cron: "15 * * * *"   # roda de hora em hora no minuto 15
+    - cron: "15 * * * *"
   workflow_dispatch: {}
 
 jobs:
