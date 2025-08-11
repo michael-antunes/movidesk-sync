@@ -1,4 +1,5 @@
 import os, time, json, requests, psycopg2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import Json
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -28,40 +29,24 @@ def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
         skip += page_size
     return items
 
-def fetch_agents():
+def fetch_agents_list():
     select_fields = ["id","businessName","userName","isActive","profileType","accessProfile"]
-    try:
-        params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType),teams($select=businessName)"}
-        data = fetch_paginated("persons", params, page_size=200)
-        print(f"[people] expand ok: {len(data)}")
-        return data
-    except requests.HTTPError as e:
-        print(f"[people] expand falhou: {e.response.status_code if e.response else '??'}; tentando sem expand")
-        params = {"$select": ",".join(select_fields)}
-        data = fetch_paginated("persons", params, page_size=200)
-        print(f"[people] sem expand: {len(data)}")
-        return data
+    params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType)"}
+    data = fetch_paginated("persons", params, page_size=200)
+    return data
 
-def fetch_teams_index():
-    try:
-        teams = fetch_paginated("teams", {}, page_size=200)
-    except requests.HTTPError as e:
-        print(f"[teams] erro {e.response.status_code if e.response else '??'}"); return {}
-    idx = {}
-    for t in teams:
-        name = t.get("businessName") or t.get("name") or t.get("title")
-        members = t.get("agents") or t.get("members") or []
-        for m in members:
-            if isinstance(m, dict):
-                aid = m.get("id") or m.get("agentId")
-            else:
-                aid = m
-            if aid is None: continue
-            try: aid = int(aid)
-            except: continue
-            idx.setdefault(aid, []).append(name)
-    print(f"[teams] index para {len(idx)} agentes")
-    return idx
+def fetch_person_detail(agent_id):
+    params = {
+        "id": agent_id,
+        "$select": "id",
+        "$expand": "teams($select=businessName)",
+        "token": API_TOKEN
+    }
+    r = get_with_retry(f"{BASE}/persons", params)
+    j = r.json()
+    if isinstance(j, list) and j: j = j[0]
+    if isinstance(j, dict): return j
+    return {}
 
 def pick_email(p):
     emails = p.get("emails") or []
@@ -76,14 +61,41 @@ def pick_email(p):
         if isinstance(first, str): return first
     return p.get("userName") or p.get("email") or p.get("businessEmail") or ""
 
-def pick_teams(p):
-    teams = p.get("teams") or []
+def pick_teams_from_obj(obj):
+    teams = obj.get("teams") or []
     out = []
     for t in teams:
         if isinstance(t, dict): out.append(t.get("businessName") or t.get("name") or t.get("title"))
         elif isinstance(t, str): out.append(t)
     out = [x for x in out if x]
     return out or None
+
+def enrich_missing_teams(people):
+    need = []
+    by_id = {}
+    for p in people:
+        try: pid = int(p.get("id"))
+        except: continue
+        by_id[pid] = p
+        t = pick_teams_from_obj(p)
+        if not t: need.append(pid)
+    if not need: return people
+    results = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_person_detail, aid): aid for aid in need}
+        for f in as_completed(futs):
+            aid = futs[f]
+            try:
+                d = f.result()
+                t = pick_teams_from_obj(d)
+                if t: results[aid] = t
+            except Exception:
+                pass
+            time.sleep(0.05)
+    for aid, teams in results.items():
+        if aid in by_id:
+            by_id[aid]["teams"] = [{"businessName": n} for n in teams]
+    return list(by_id.values())
 
 def extract_access(p):
     return p.get("accessProfile") or p.get("businessProfile") or (p.get("profile") or {}).get("type","") or ""
@@ -141,31 +153,25 @@ def upsert(conn, rows):
 def main():
     conn = psycopg2.connect(DSN)
     ensure_structure(conn)
-    people = fetch_agents()
-    team_idx = fetch_teams_index()
-    rows, total = [], 0
+    people = fetch_agents_list()
+    people = [p for p in people if p.get("profileType") in (1,3)]
+    people = enrich_missing_teams(people)
+    rows = []
     for p in people:
-        total += 1
-        pt = p.get("profileType")
-        if pt not in (1,3): continue
-        pid = p.get("id")
-        try: pid = int(pid)
+        try: pid = int(p.get("id"))
         except: continue
-        tnames = pick_teams(p)
-        if not tnames and team_idx.get(pid): tnames = team_idx.get(pid)
+        teams = pick_teams_from_obj(p)
         email = pick_email(p)
-        row = {
+        rows.append({
             "agent_id": pid,
             "name": p.get("businessName") or p.get("name") or "",
             "email": email,
-            "team_primary": (tnames or [None])[0],
-            "teams": tnames,
+            "team_primary": (teams or [None])[0],
+            "teams": teams,
             "access_type": extract_access(p),
             "is_active": extract_active(p),
             "raw": p
-        }
-        rows.append(row)
-    print(f"[normalize] recebidos: {total} | agentes: {len(rows)}")
+        })
     upsert(conn, rows)
     with conn.cursor() as cur:
         cur.execute("select count(*) from visualizacao_agentes.agentes"); print("linhas:", cur.fetchone()[0])
