@@ -2,7 +2,7 @@ name: Sync Movidesk -> Index (tickets_resolvidos)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -11,10 +11,18 @@ jobs:
     env:
       MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
       NEON_DSN: ${{ secrets.NEON_DSN }}
+      WINDOW_DAYS: "60"
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      - run: pip install requests psycopg2-binary
-      - run: python sync_resolved_index.py
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests psycopg2-binary
+
+      - name: Run sync_resolved_index.py
+        run: python sync_resolved_index.py
