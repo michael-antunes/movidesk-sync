@@ -34,50 +34,63 @@ def fetch_agents_list():
     params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType)"}
     return fetch_paginated("persons", params, page_size=200)
 
-def fetch_teams_brief():
-    params = {"$select": "id,businessName"}
-    return fetch_paginated("teams", params, page_size=200)
-
-def fetch_team_detail(team_id):
-    params = {"id": team_id, "$expand": "agents($select=id),members($select=id),persons($select=id)", "token": API_TOKEN}
-    r = get_with_retry(f"{BASE}/teams", params)
-    j = r.json()
-    if isinstance(j, list) and j: j = j[0]
-    if isinstance(j, dict): return j
+def fetch_person_detail_any(id_):
+    expands = [
+        "teams($select=businessName)",
+        "groups($select=businessName)",
+        "businessTeams($select=businessName)",
+        "teams",
+        "groups",
+        "businessTeams"
+    ]
+    for ex in expands:
+        params = {"id": id_, "$select": "id", "$expand": ex, "token": API_TOKEN}
+        try:
+            r = get_with_retry(f"{BASE}/persons", params)
+            j = r.json()
+            if isinstance(j, list) and j: j = j[0]
+            if isinstance(j, dict): return j
+        except requests.HTTPError:
+            time.sleep(0.1)
     return {}
 
-def ids_from_team(obj):
-    out = set()
-    for key in ("agents","members","persons","people","users"):
+def extract_team_names(obj):
+    names = []
+    for key in ("teams","groups","businessTeams"):
         arr = obj.get(key) or []
-        for m in arr:
-            if isinstance(m, dict):
-                for k in ("id","agentId","personId","userId"):
-                    if k in m:
-                        try: out.add(int(m[k]))
-                        except: pass
-            else:
-                try: out.add(int(m))
-                except: pass
-    return list(out) or None
+        for t in arr:
+            if isinstance(t, dict):
+                v = t.get("businessName") or t.get("name") or t.get("title")
+                if v: names.append(v)
+            elif isinstance(t, str):
+                names.append(t)
+    names = [n for n in names if n]
+    return list(dict.fromkeys(names)) or None
 
-def build_team_index():
-    brief = fetch_teams_brief()
-    idx = {}
-    if not brief: return idx
+def enrich_missing_teams(people):
+    need = []
+    byid = {}
+    for p in people:
+        try: pid = int(p.get("id"))
+        except: continue
+        byid[pid] = p
+        if not extract_team_names(p): need.append(pid)
+    if not need: return people
+    results = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fetch_team_detail, t.get("id")): (t.get("id"), t.get("businessName")) for t in brief if t.get("id") is not None}
+        futs = {ex.submit(fetch_person_detail_any, pid): pid for pid in need}
         for f in as_completed(futs):
-            _, name = futs[f]
+            pid = futs[f]
             try:
-                det = f.result()
-                members = ids_from_team(det) or []
-                for aid in members:
-                    idx.setdefault(aid, []).append(name)
+                d = f.result()
+                t = extract_team_names(d)
+                if t: results[pid] = t
             except Exception:
                 pass
             time.sleep(0.05)
-    return idx
+    for pid, teams in results.items():
+        byid[pid]["teams"] = [{"businessName": n} for n in teams]
+    return list(byid.values())
 
 def pick_email(p):
     emails = p.get("emails") or []
@@ -92,14 +105,9 @@ def pick_email(p):
         if isinstance(first, str): return first
     return p.get("userName") or p.get("email") or p.get("businessEmail") or ""
 
-def pick_teams_from_obj(obj):
-    teams = obj.get("teams") or []
-    out = []
-    for t in teams:
-        if isinstance(t, dict): out.append(t.get("businessName") or t.get("name") or t.get("title"))
-        elif isinstance(t, str): out.append(t)
-    out = [x for x in out if x]
-    return out or None
+def pick_teams(obj):
+    t = extract_team_names(obj)
+    return t or None
 
 def extract_access(p):
     return p.get("accessProfile") or p.get("businessProfile") or (p.get("profile") or {}).get("type","") or ""
@@ -157,20 +165,19 @@ def main():
     ensure_structure(conn)
     people = fetch_agents_list()
     people = [p for p in people if p.get("profileType") in (1,3)]
-    team_idx = build_team_index()
+    people = enrich_missing_teams(people)
     rows = []
     for p in people:
         try: pid = int(p.get("id"))
         except: continue
-        tnames = pick_teams_from_obj(p)
-        if not tnames and pid in team_idx: tnames = team_idx[pid]
+        teams = pick_teams(p)
         email = pick_email(p)
         rows.append({
             "agent_id": pid,
             "name": p.get("businessName") or p.get("name") or "",
             "email": email,
-            "team_primary": (tnames or [None])[0],
-            "teams": tnames,
+            "team_primary": (teams or [None])[0],
+            "teams": teams,
             "access_type": extract_access(p),
             "is_active": extract_active(p),
             "raw": p
