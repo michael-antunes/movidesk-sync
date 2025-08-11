@@ -2,7 +2,6 @@ import os
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime, timezone
 from time import sleep
 
 MOVIDESK_TOKEN = os.environ['MOVIDESK_TOKEN']
@@ -33,82 +32,36 @@ def ensure_structure():
           equipe_principal text,
           imported_at timestamp default now()
         );
-        create table if not exists visualizacao_agentes.sync_control(
-          name text primary key,
-          last_update timestamp not null
-        );
-    """)
-    cur.execute("""
-        insert into visualizacao_agentes.sync_control(name,last_update)
-        values('agents_lastupdate', now() at time zone 'utc' - interval '30 days')
-        on conflict (name) do nothing;
     """)
     cur.close(); conn.close()
 
-def get_cursor():
-    conn=psycopg2.connect(NEON_DSN); cur=conn.cursor()
-    cur.execute("select last_update from visualizacao_agentes.sync_control where name='agents_lastupdate'")
-    row=cur.fetchone(); cur.close(); conn.close()
-    if not row: return None
-    dt=row[0]
-    if isinstance(dt,str):
-        try: dt=datetime.fromisoformat(dt.replace('Z','+00:00'))
-        except Exception: dt=None
-    return dt
-
-def set_cursor(ts):
-    if ts is None: return
-    conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute("update visualizacao_agentes.sync_control set last_update=%s where name='agents_lastupdate'", (ts,))
-    cur.close(); conn.close()
-
-def ts_variants(dt):
-    z = dt.astimezone(timezone.utc)
-    a = z.strftime('%Y-%m-%dT%H:%M:%SZ')
-    b = z.strftime("datetime'%Y-%m-%dT%H:%M:%SZ'")
-    return [a, b]
-
-def try_persons_call(base_params, filters, expands):
+def try_persons(base, expands):
     last_exc=None
     for exp in expands:
-        for f in filters:
-            p=base_params.copy()
-            if exp: p['$expand']=exp
-            else: p.pop('$expand', None)
-            if f:  p['$filter']=f
-            else: p.pop('$filter', None)
-            try:
-                return api_get('https://api.movidesk.com/public/v1/persons', p)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code==400:
-                    last_exc=e
-                    continue
-                raise
+        p=base.copy()
+        if exp: p['$expand']=exp
+        else: p.pop('$expand', None)
+        try:
+            return api_get('https://api.movidesk.com/public/v1/persons', p)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code==400:
+                last_exc=e
+                continue
+            raise
     if last_exc: raise last_exc
     return []
 
-def list_agents(cursor_dt):
-    top=500; skip=0; max_lu=cursor_dt; out=[]
-    base={'token':MOVIDESK_TOKEN, '$select':'id,businessName,email,isAgent,isActive,lastUpdate', '$top':top}
+def list_all_agents():
+    top=1000; skip=0; out=[]
+    base={'token':MOVIDESK_TOKEN, '$select':'id,businessName,email,isAgent,isActive', '$top':top}
     expands=[
         'teams($select=businessName),profiles($select=businessName)',
         'teams($select=businessName)',
         None
     ]
-    if cursor_dt:
-        ts_opts=ts_variants(cursor_dt)
-        filters=[
-            f"isAgent eq true and lastUpdate ge {ts_opts[0]}",
-            f"lastUpdate ge {ts_opts[0]} and isAgent eq true",
-            f"isAgent eq true and lastUpdate ge {ts_opts[1]}",
-            f"lastUpdate ge {ts_opts[1]} and isAgent eq true"
-        ]
-    else:
-        filters=["isAgent eq true", None]
-
     while True:
-        params=base.copy(); params['$skip']=skip
-        batch=try_persons_call(params, filters, expands)
+        params=base.copy(); params['$skip']=skip; params['$filter']="isAgent eq true"
+        batch=try_persons(params, expands)
         if not batch: break
         for p in batch:
             aid=str(p.get('id') or '')
@@ -131,17 +84,9 @@ def list_agents(cursor_dt):
                     elif isinstance(pr, str): permissoes.append(pr)
             equipe_principal=equipes[0] if equipes else ''
             out.append((aid, nome, email, is_agent, habilitado, permissoes, equipes, equipe_principal))
-            lu=p.get('lastUpdate')
-            if lu:
-                try:
-                    dt=datetime.fromisoformat(lu.replace('Z','+00:00'))
-                    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
-                    if max_lu is None or dt>max_lu: max_lu=dt
-                except Exception:
-                    pass
-        if len(batch)<top: break
-        skip+=len(batch)
-    return out, max_lu
+        if len(batch) < top: break
+        skip += len(batch)
+    return out
 
 def upsert_agents(rows):
     if not rows: return
@@ -164,14 +109,8 @@ def upsert_agents(rows):
 
 def run():
     ensure_structure()
-    c=get_cursor()
-    rows,max_lu=list_agents(c)
-    if not rows and max_lu is None:
-        rows,max_lu=list_agents(None)
-    if rows:
-        upsert_agents(rows)
-    if max_lu:
-        set_cursor(max_lu)
+    rows=list_all_agents()
+    upsert_agents(rows)
 
 if __name__ == '__main__':
     run()
