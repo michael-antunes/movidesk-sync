@@ -1,116 +1,209 @@
 import os
+import time
+import json
 import requests
-import psycopg2
-from psycopg2.extras import execute_values
-from time import sleep
+import psycopg
+from typing import List, Dict, Any
 
-MOVIDESK_TOKEN = os.environ['MOVIDESK_TOKEN']
-NEON_DSN = os.environ['NEON_DSN']
+MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+PG_URL = os.environ["NEON_POSTGRES_URL"]
 
-def api_get(url, params):
-    for i in range(6):
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code in (429,500,502,503,504):
-            sleep(min(60, 2**i))
+# ---------- helpers de requisição (com paginação básica) ----------
+def fetch_paginated(endpoint: str, base_params: Dict[str, Any] = None, page_size: int = 100) -> List[Dict[str, Any]]:
+    params = dict(base_params or {})
+    params["token"] = TOKEN
+    params["$top"] = page_size
+
+    all_items: List[Dict[str, Any]] = []
+    skip = 0
+    while True:
+        params["$skip"] = skip
+        r = requests.get(f"{MOVIDESK_BASE}/{endpoint}", params=params, timeout=60)
+        if r.status_code == 429:
+            # respeita rate limit simples
+            time.sleep(5)
             continue
         r.raise_for_status()
-        return r.json()
-    r.raise_for_status()
+        batch = r.json()
+        if not isinstance(batch, list):
+            # quando a API devolve um objeto único
+            batch = [batch] if batch else []
+        all_items.extend(batch)
+        if len(batch) < page_size:
+            break
+        skip += page_size
+    return all_items
 
-def ensure_structure():
-    conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute("""
-        create schema if not exists visualizacao_agentes;
-        create table if not exists visualizacao_agentes.agentes(
-          agent_id text primary key,
-          nome text,
-          email text,
-          is_agent boolean,
-          habilitado boolean,
-          permissoes text[],
-          equipes text[],
-          equipe_principal text,
-          imported_at timestamp default now()
-        );
-    """)
-    cur.close(); conn.close()
+# Tenta obter o máximo possível direto dos agents; complementa por teams caso precise
+def fetch_agents() -> List[Dict[str, Any]]:
+    # Dica: muitos endpoints do Movidesk suportam OData ($select/$expand).
+    # Se seu tenant permitir, você pode destravar mais campos com $select/$expand.
+    try:
+        return fetch_paginated("agents", base_params={})
+    except requests.HTTPError:
+        # fallback defensivo (raro)
+        return []
 
-def try_persons(base, expands):
-    last_exc=None
-    for exp in expands:
-        p=base.copy()
-        if exp: p['$expand']=exp
-        else: p.pop('$expand', None)
-        try:
-            return api_get('https://api.movidesk.com/public/v1/persons', p)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code==400:
-                last_exc=e
-                continue
-            raise
-    if last_exc: raise last_exc
-    return []
+def fetch_teams() -> List[Dict[str, Any]]:
+    try:
+        return fetch_paginated("teams", base_params={})
+    except requests.HTTPError:
+        return []
 
-def list_all_agents():
-    top=1000; skip=0; out=[]
-    base={'token':MOVIDESK_TOKEN, '$select':'id,businessName,email,isAgent,isActive', '$top':top}
-    expands=[
-        'teams($select=businessName),profiles($select=businessName)',
-        'teams($select=businessName)',
-        None
-    ]
-    while True:
-        params=base.copy(); params['$skip']=skip; params['$filter']="isAgent eq true"
-        batch=try_persons(params, expands)
-        if not batch: break
-        for p in batch:
-            aid=str(p.get('id') or '')
-            if not aid: continue
-            nome=p.get('businessName') or ''
-            email=p.get('email') or ''
-            is_agent=bool(p.get('isAgent', False))
-            habilitado=bool(p.get('isActive', True))
-            equipes=[]
-            t=p.get('teams') or []
-            if isinstance(t, list):
-                for ti in t:
-                    if isinstance(ti, dict) and ti.get('businessName'): equipes.append(ti['businessName'])
-                    elif isinstance(ti, str): equipes.append(ti)
-            permissoes=[]
-            prof=p.get('profiles') or []
-            if isinstance(prof, list):
-                for pr in prof:
-                    if isinstance(pr, dict) and pr.get('businessName'): permissoes.append(pr['businessName'])
-                    elif isinstance(pr, str): permissoes.append(pr)
-            equipe_principal=equipes[0] if equipes else ''
-            out.append((aid, nome, email, is_agent, habilitado, permissoes, equipes, equipe_principal))
-        if len(batch) < top: break
-        skip += len(batch)
-    return out
-
-def upsert_agents(rows):
-    if not rows: return
-    conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
-    sql="""
-        insert into visualizacao_agentes.agentes(agent_id,nome,email,is_agent,habilitado,permissoes,equipes,equipe_principal,imported_at)
-        values %s
-        on conflict (agent_id) do update set
-          nome=excluded.nome,
-          email=excluded.email,
-          is_agent=excluded.is_agent,
-          habilitado=excluded.habilitado,
-          permissoes=excluded.permissoes,
-          equipes=excluded.equipes,
-          equipe_principal=excluded.equipe_principal,
-          imported_at=now();
+def build_team_index(teams_payload: List[Dict[str, Any]]) -> Dict[int, List[str]]:
     """
-    execute_values(cur, sql, rows)
-    cur.close(); conn.close()
+    Constrói um índice: agent_id -> [nomes_de_equipes]
+    Usa a lista de teams; cada team geralmente contém seus 'agents' ou 'members'.
+    """
+    index: Dict[int, List[str]] = {}
+    for t in teams_payload:
+        team_name = t.get("name") or t.get("title") or "Sem equipe"
+        members = t.get("agents") or t.get("members") or []
+        # membros podem ser lista de ids ou objetos
+        for m in members:
+            if isinstance(m, dict):
+                aid = m.get("id") or m.get("agentId")
+            else:
+                aid = m
+            if aid is None:
+                continue
+            index.setdefault(int(aid), []).append(team_name)
+    return index
 
-def run():
-    ensure_structure()
-    rows=list_all_agents()
-    upsert_agents(rows)
+def extract_email(agent: Dict[str, Any]) -> str:
+    # Alguns tenants retornam email direto; outros aninham em "person"
+    return (
+        agent.get("email")
+        or (agent.get("person") or {}).get("email")
+        or (agent.get("businessEmail"))
+        or ""
+    )
 
-if __name__ == '__main__':
-    run()
+def extract_access_type(agent: Dict[str, Any]) -> str:
+    # Campos possíveis/variantes
+    return (
+        agent.get("businessProfile")
+        or agent.get("profileType")
+        or agent.get("accessType")
+        or (agent.get("profile") or {}).get("type")
+        or ""
+    )
+
+def extract_is_active(agent: Dict[str, Any]) -> bool:
+    v = agent.get("isActive")
+    if v is None:
+        v = agent.get("active")
+    if isinstance(v, bool):
+        return v
+    # casos onde vem "true"/"false" como string
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "sim")
+    return bool(v)
+
+def normalize_agents(agents_payload: List[Dict[str, Any]],
+                     team_index: Dict[int, List[str]]) -> List[Dict[str, Any]]:
+    norm: List[Dict[str, Any]] = []
+    for a in agents_payload:
+        agent_id = a.get("id") or a.get("agentId")
+        if agent_id is None:
+            # ignora payload estranho
+            continue
+        agent_id = int(agent_id)
+
+        name = a.get("name") or (a.get("person") or {}).get("name") or ""
+        email = extract_email(a)
+        access_type = extract_access_type(a)
+        is_active = extract_is_active(a)
+
+        # tenta pegar equipes do próprio payload do agente (quando existe)
+        raw_teams = a.get("teams") or a.get("groups") or []
+        teams_names = []
+        if raw_teams:
+            # pode vir lista de strings, ids ou objetos
+            for t in raw_teams:
+                if isinstance(t, dict):
+                    teams_names.append(t.get("name") or t.get("title"))
+                elif isinstance(t, str):
+                    teams_names.append(t)
+        # complementa com índice vindo do /teams
+        if not teams_names and agent_id in team_index:
+            teams_names = team_index[agent_id]
+
+        teams_names = [t for t in teams_names if t] or None
+        team_primary = teams_names[0] if teams_names else None
+
+        norm.append({
+            "agent_id": agent_id,
+            "name": name,
+            "email": email,
+            "team_primary": team_primary,
+            "teams": teams_names,
+            "access_type": access_type,
+            "is_active": is_active,
+            "raw": a
+        })
+    return norm
+
+def ensure_table(conn: psycopg.Connection):
+    ddl = """
+    CREATE SCHEMA IF NOT EXISTS visualizacao_agentes;
+
+    CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes (
+      agent_id     BIGINT PRIMARY KEY,
+      name         TEXT NOT NULL,
+      email        TEXT NOT NULL,
+      team_primary TEXT,
+      teams        TEXT[],
+      access_type  TEXT,
+      is_active    BOOLEAN NOT NULL,
+      raw          JSONB,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_agentes_email ON visualizacao_agentes.agentes (lower(email));
+    CREATE INDEX IF NOT EXISTS idx_agentes_team ON visualizacao_agentes.agentes (team_primary);
+    """
+    with conn.cursor() as cur:
+        cur.execute(ddl)
+    conn.commit()
+
+def upsert_agents(conn: psycopg.Connection, rows: List[Dict[str, Any]]):
+    sql = """
+    INSERT INTO visualizacao_agentes.agentes
+      (agent_id, name, email, team_primary, teams, access_type, is_active, raw, updated_at)
+    VALUES
+      (%(agent_id)s, %(name)s, %(email)s, %(team_primary)s, %(teams)s, %(access_type)s, %(is_active)s, %(raw)s, now())
+    ON CONFLICT (agent_id) DO UPDATE SET
+      name = EXCLUDED.name,
+      email = EXCLUDED.email,
+      team_primary = EXCLUDED.team_primary,
+      teams = EXCLUDED.teams,
+      access_type = EXCLUDED.access_type,
+      is_active = EXCLUDED.is_active,
+      raw = EXCLUDED.raw,
+      updated_at = now();
+    """
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)
+    conn.commit()
+
+def main():
+    print("Baixando agents…")
+    agents_payload = fetch_agents()
+
+    print("Baixando teams (para mapear equipes)…")
+    teams_payload = fetch_teams()
+    team_index = build_team_index(teams_payload)
+
+    print("Normalizando…")
+    rows = normalize_agents(agents_payload, team_index)
+
+    print(f"{len(rows)} agentes prontos para upsert.")
+    with psycopg.connect(PG_URL, autocommit=False) as conn:
+        ensure_table(conn)
+        upsert_agents(conn, rows)
+    print("Concluído.")
+
+if __name__ == "__main__":
+    main()
