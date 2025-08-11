@@ -2,7 +2,7 @@ name: Sync Movidesk -> Agentes
 
 on:
   schedule:
-    - cron: "15 * * * *"
+    - cron: "15 6 * * *"
   workflow_dispatch: {}
 
 jobs:
