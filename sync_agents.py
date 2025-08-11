@@ -21,8 +21,8 @@ def api_get(url, params):
 def ensure_structure():
     conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
     cur.execute("""
-        create schema if not exists visualizacao_resolvidos;
-        create table if not exists visualizacao_resolvidos.agentes(
+        create schema if not exists visualizacao_agentes;
+        create table if not exists visualizacao_agentes.agentes(
           agent_id text primary key,
           nome text,
           email text,
@@ -33,19 +33,17 @@ def ensure_structure():
           equipe_principal text,
           imported_at timestamp default now()
         );
-    """)
-    cur.execute("""
-        create table if not exists visualizacao_resolvidos.sync_control(
+        create table if not exists visualizacao_agentes.sync_control(
           name text primary key,
           last_update timestamp not null
         );
     """)
-    cur.execute("insert into visualizacao_resolvidos.sync_control(name,last_update) values('agents_lastupdate', now() at time zone 'utc' - interval '30 days') on conflict (name) do nothing;")
+    cur.execute("insert into visualizacao_agentes.sync_control(name,last_update) values('agents_lastupdate', now() at time zone 'utc' - interval '30 days') on conflict (name) do nothing;")
     cur.close(); conn.close()
 
 def get_cursor():
-    conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute("select last_update from visualizacao_resolvidos.sync_control where name='agents_lastupdate'")
+    conn=psycopg2.connect(NEON_DSN); cur=conn.cursor()
+    cur.execute("select last_update from visualizacao_agentes.sync_control where name='agents_lastupdate'")
     row=cur.fetchone(); cur.close(); conn.close()
     if not row: return None
     dt=row[0]
@@ -57,7 +55,7 @@ def get_cursor():
 def set_cursor(ts):
     if ts is None: return
     conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute("update visualizacao_resolvidos.sync_control set last_update=%s where name='agents_lastupdate'", (ts,))
+    cur.execute("update visualizacao_agentes.sync_control set last_update=%s where name='agents_lastupdate'", (ts,))
     cur.close(); conn.close()
 
 def list_agents(cursor_dt):
@@ -83,18 +81,14 @@ def list_agents(cursor_dt):
             t=p.get('teams') or []
             if isinstance(t, list):
                 for ti in t:
-                    if isinstance(ti, dict) and ti.get('businessName'):
-                        equipes.append(ti['businessName'])
-                    elif isinstance(ti, str):
-                        equipes.append(ti)
+                    if isinstance(ti, dict) and ti.get('businessName'): equipes.append(ti['businessName'])
+                    elif isinstance(ti, str): equipes.append(ti)
             permissoes=[]
             prof=p.get('profiles') or []
             if isinstance(prof, list):
                 for pr in prof:
-                    if isinstance(pr, dict) and pr.get('businessName'):
-                        permissoes.append(pr['businessName'])
-                    elif isinstance(pr, str):
-                        permissoes.append(pr)
+                    if isinstance(pr, dict) and pr.get('businessName'): permissoes.append(pr['businessName'])
+                    elif isinstance(pr, str): permissoes.append(pr)
             equipe_principal=equipes[0] if equipes else ''
             out.append((aid, nome, email, is_agent, habilitado, permissoes, equipes, equipe_principal))
             lu=p.get('lastUpdate')
@@ -113,7 +107,7 @@ def upsert_agents(rows):
     if not rows: return
     conn=psycopg2.connect(NEON_DSN); conn.autocommit=True; cur=conn.cursor()
     sql="""
-        insert into visualizacao_resolvidos.agentes(agent_id,nome,email,is_agent,habilitado,permissoes,equipes,equipe_principal,imported_at)
+        insert into visualizacao_agentes.agentes(agent_id,nome,email,is_agent,habilitado,permissoes,equipes,equipe_principal,imported_at)
         values %s
         on conflict (agent_id) do update set
           nome=excluded.nome,
