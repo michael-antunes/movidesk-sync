@@ -31,16 +31,17 @@ def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
 
 def fetch_agents():
     select_fields = ["id","businessName","userName","isActive","profileType","accessProfile"]
-    params = {"$select": ",".join(select_fields), "$expand": "emails,teams", "$filter": "(profileType eq 1 or profileType eq 3)"}
-    data = fetch_paginated("persons", params, page_size=200)
-    if data:
-        print(f"[people] filtro agentes: {len(data)}")
+    try:
+        params = {"$select": ",".join(select_fields), "$expand": "emails,teams"}
+        data = fetch_paginated("persons", params, page_size=200)
+        print(f"[people] com expand: {len(data)}")
         return data
-    print("[people] sem retorno no filtro; tentando sem filtro")
-    params = {"$select": ",".join(select_fields), "$expand": "emails,teams"}
-    data = fetch_paginated("persons", params, page_size=200)
-    print(f"[people] sem filtro: {len(data)}")
-    return data
+    except requests.HTTPError as e:
+        print(f"[people] erro {e.response.status_code if e.response else '??'} com expand; tentando sem expand")
+        params = {"$select": ",".join(select_fields)}
+        data = fetch_paginated("persons", params, page_size=200)
+        print(f"[people] sem expand: {len(data)}")
+        return data
 
 def pick_email(person):
     emails = person.get("emails") or []
@@ -60,10 +61,8 @@ def pick_teams(person):
     teams = person.get("teams") or []
     out = []
     for t in teams:
-        if isinstance(t, dict):
-            out.append(t.get("businessName") or t.get("name") or t.get("title"))
-        elif isinstance(t, str):
-            out.append(t)
+        if isinstance(t, dict): out.append(t.get("businessName") or t.get("name") or t.get("title"))
+        elif isinstance(t, str): out.append(t)
     out = [x for x in out if x]
     return out or None
 
@@ -84,10 +83,8 @@ def normalize(people):
         if pt not in (1, 3):
             continue
         pid = p.get("id")
-        try:
-            pid = int(pid)
-        except Exception:
-            continue
+        try: pid = int(pid)
+        except Exception: continue
         teams = pick_teams(p)
         rows.append({
             "agent_id": pid,
@@ -139,8 +136,7 @@ on conflict (agent_id) do update set
 """
 
 def ensure_structure(conn):
-    with conn.cursor() as cur:
-        cur.execute(DDL)
+    with conn.cursor() as cur: cur.execute(DDL)
     conn.commit()
 
 def upsert(conn, rows):
