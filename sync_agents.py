@@ -38,7 +38,11 @@ def ensure_structure():
           last_update timestamp not null
         );
     """)
-    cur.execute("insert into visualizacao_agentes.sync_control(name,last_update) values('agents_lastupdate', now() at time zone 'utc' - interval '30 days') on conflict (name) do nothing;")
+    cur.execute("""
+        insert into visualizacao_agentes.sync_control(name,last_update)
+        values('agents_lastupdate', now() at time zone 'utc' - interval '30 days')
+        on conflict (name) do nothing;
+    """)
     cur.close(); conn.close()
 
 def get_cursor():
@@ -58,17 +62,53 @@ def set_cursor(ts):
     cur.execute("update visualizacao_agentes.sync_control set last_update=%s where name='agents_lastupdate'", (ts,))
     cur.close(); conn.close()
 
+def ts_variants(dt):
+    z = dt.astimezone(timezone.utc)
+    a = z.strftime('%Y-%m-%dT%H:%M:%SZ')
+    b = z.strftime("datetime'%Y-%m-%dT%H:%M:%SZ'")
+    return [a, b]
+
+def try_persons_call(base_params, filters, expands):
+    last_exc=None
+    for exp in expands:
+        for f in filters:
+            p=base_params.copy()
+            if exp: p['$expand']=exp
+            else: p.pop('$expand', None)
+            if f:  p['$filter']=f
+            else: p.pop('$filter', None)
+            try:
+                return api_get('https://api.movidesk.com/public/v1/persons', p)
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code==400:
+                    last_exc=e
+                    continue
+                raise
+    if last_exc: raise last_exc
+    return []
+
 def list_agents(cursor_dt):
-    top=1000; skip=0; max_lu=cursor_dt; out=[]
-    base={'token':MOVIDESK_TOKEN, '$select':'id,businessName,email,isAgent,isActive,lastUpdate', '$expand':'teams($select=businessName),profiles($select=businessName)', '$top':top}
+    top=500; skip=0; max_lu=cursor_dt; out=[]
+    base={'token':MOVIDESK_TOKEN, '$select':'id,businessName,email,isAgent,isActive,lastUpdate', '$top':top}
+    expands=[
+        'teams($select=businessName),profiles($select=businessName)',
+        'teams($select=businessName)',
+        None
+    ]
+    if cursor_dt:
+        ts_opts=ts_variants(cursor_dt)
+        filters=[
+            f"isAgent eq true and lastUpdate ge {ts_opts[0]}",
+            f"lastUpdate ge {ts_opts[0]} and isAgent eq true",
+            f"isAgent eq true and lastUpdate ge {ts_opts[1]}",
+            f"lastUpdate ge {ts_opts[1]} and isAgent eq true"
+        ]
+    else:
+        filters=["isAgent eq true", None]
+
     while True:
-        params=base.copy()
-        params['$skip']=skip
-        if cursor_dt:
-            params['$filter']=f"isAgent eq true and lastUpdate ge {cursor_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')}"
-        else:
-            params['$filter']="isAgent eq true"
-        batch=api_get('https://api.movidesk.com/public/v1/persons', params)
+        params=base.copy(); params['$skip']=skip
+        batch=try_persons_call(params, filters, expands)
         if not batch: break
         for p in batch:
             aid=str(p.get('id') or '')
