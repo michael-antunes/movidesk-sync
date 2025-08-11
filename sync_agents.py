@@ -32,21 +32,52 @@ def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
 def fetch_agents_list():
     select_fields = ["id","businessName","userName","isActive","profileType","accessProfile"]
     params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType)"}
-    data = fetch_paginated("persons", params, page_size=200)
-    return data
+    return fetch_paginated("persons", params, page_size=200)
 
-def fetch_person_detail(agent_id):
-    params = {
-        "id": agent_id,
-        "$select": "id",
-        "$expand": "teams($select=businessName)",
-        "token": API_TOKEN
-    }
-    r = get_with_retry(f"{BASE}/persons", params)
+def fetch_teams_brief():
+    params = {"$select": "id,businessName"}
+    return fetch_paginated("teams", params, page_size=200)
+
+def fetch_team_detail(team_id):
+    params = {"id": team_id, "$expand": "agents($select=id),members($select=id),persons($select=id)", "token": API_TOKEN}
+    r = get_with_retry(f"{BASE}/teams", params)
     j = r.json()
     if isinstance(j, list) and j: j = j[0]
     if isinstance(j, dict): return j
     return {}
+
+def ids_from_team(obj):
+    out = set()
+    for key in ("agents","members","persons","people","users"):
+        arr = obj.get(key) or []
+        for m in arr:
+            if isinstance(m, dict):
+                for k in ("id","agentId","personId","userId"):
+                    if k in m:
+                        try: out.add(int(m[k]))
+                        except: pass
+            else:
+                try: out.add(int(m))
+                except: pass
+    return list(out) or None
+
+def build_team_index():
+    brief = fetch_teams_brief()
+    idx = {}
+    if not brief: return idx
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(fetch_team_detail, t.get("id")): (t.get("id"), t.get("businessName")) for t in brief if t.get("id") is not None}
+        for f in as_completed(futs):
+            _, name = futs[f]
+            try:
+                det = f.result()
+                members = ids_from_team(det) or []
+                for aid in members:
+                    idx.setdefault(aid, []).append(name)
+            except Exception:
+                pass
+            time.sleep(0.05)
+    return idx
 
 def pick_email(p):
     emails = p.get("emails") or []
@@ -69,33 +100,6 @@ def pick_teams_from_obj(obj):
         elif isinstance(t, str): out.append(t)
     out = [x for x in out if x]
     return out or None
-
-def enrich_missing_teams(people):
-    need = []
-    by_id = {}
-    for p in people:
-        try: pid = int(p.get("id"))
-        except: continue
-        by_id[pid] = p
-        t = pick_teams_from_obj(p)
-        if not t: need.append(pid)
-    if not need: return people
-    results = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(fetch_person_detail, aid): aid for aid in need}
-        for f in as_completed(futs):
-            aid = futs[f]
-            try:
-                d = f.result()
-                t = pick_teams_from_obj(d)
-                if t: results[aid] = t
-            except Exception:
-                pass
-            time.sleep(0.05)
-    for aid, teams in results.items():
-        if aid in by_id:
-            by_id[aid]["teams"] = [{"businessName": n} for n in teams]
-    return list(by_id.values())
 
 def extract_access(p):
     return p.get("accessProfile") or p.get("businessProfile") or (p.get("profile") or {}).get("type","") or ""
@@ -143,38 +147,35 @@ def ensure_structure(conn):
     conn.commit()
 
 def upsert(conn, rows):
-    if not rows: 
-        print("[db] nenhum agente para gravar."); return
+    if not rows: return
     with conn.cursor() as cur:
         for r in rows: cur.execute(UPSERT, {**r, "raw": Json(r["raw"])})
     conn.commit()
-    print(f"[db] upsert: {len(rows)}")
 
 def main():
     conn = psycopg2.connect(DSN)
     ensure_structure(conn)
     people = fetch_agents_list()
     people = [p for p in people if p.get("profileType") in (1,3)]
-    people = enrich_missing_teams(people)
+    team_idx = build_team_index()
     rows = []
     for p in people:
         try: pid = int(p.get("id"))
         except: continue
-        teams = pick_teams_from_obj(p)
+        tnames = pick_teams_from_obj(p)
+        if not tnames and pid in team_idx: tnames = team_idx[pid]
         email = pick_email(p)
         rows.append({
             "agent_id": pid,
             "name": p.get("businessName") or p.get("name") or "",
             "email": email,
-            "team_primary": (teams or [None])[0],
-            "teams": teams,
+            "team_primary": (tnames or [None])[0],
+            "teams": tnames,
             "access_type": extract_access(p),
             "is_active": extract_active(p),
             "raw": p
         })
     upsert(conn, rows)
-    with conn.cursor() as cur:
-        cur.execute("select count(*) from visualizacao_agentes.agentes"); print("linhas:", cur.fetchone()[0])
     conn.close()
 
 if __name__ == "__main__":
