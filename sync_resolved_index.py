@@ -31,7 +31,6 @@ def ensure_structure():
     cur.execute(f"""
         create table if not exists {TABLE}(
             ticket_id integer primary key,
-            protocol text,
             status text not null,
             last_resolved_at timestamp,
             last_update timestamp,
@@ -44,7 +43,10 @@ def ensure_structure():
             last_update timestamp not null
         );
     """)
-    cur.execute(f"insert into {CTRL}(name,last_update) values(%s, now() - interval '60 days') on conflict (name) do nothing;", (CURSOR_NAME,))
+    cur.execute(
+        f"insert into {CTRL}(name,last_update) values(%s, now() - interval '60 days') on conflict (name) do nothing;",
+        (CURSOR_NAME,)
+    )
     cur.close(); conn.close()
 
 def get_cursor():
@@ -122,23 +124,22 @@ def list_ids_reopened_since(start_dt):
     return list(ids)
 
 def fetch_ticket_detail(ticket_id):
-    sel='id,protocol,status,baseStatus,lastUpdate'
+    sel='id,status,baseStatus,lastUpdate'
     exp='statusHistories($select=status,changedDate,baseStatus)'
     p={'token':TOKEN,'id':ticket_id,'$select':sel,'$expand':exp}
     try:
         return api_get('https://api.movidesk.com/public/v1/tickets', p)
     except requests.exceptions.HTTPError as e:
         if e.response is None or e.response.status_code != 404: raise
-    return api_get('https://api.movidesk.com/public/v1/tickets/past', p)
+        return api_get('https://api.movidesk.com/public/v1/tickets/past', p)
 
 def upsert_rows(rows):
     if not rows: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
     sql=f"""
-        insert into {TABLE}(ticket_id, protocol, status, last_resolved_at, last_update, imported_at)
+        insert into {TABLE}(ticket_id, status, last_resolved_at, last_update, imported_at)
         values %s
         on conflict (ticket_id) do update set
-          protocol=excluded.protocol,
           status=excluded.status,
           last_resolved_at=excluded.last_resolved_at,
           last_update=excluded.last_update,
@@ -159,18 +160,21 @@ def load_current_map():
     cur.close(); conn.close()
     return m
 
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-def fetch_changed_min_since(cursor_dt, ids):
-    if not ids: return []
-    cond_ids = " or ".join([f"id eq {i}" for i in ids])
-    filt = f"({cond_ids}) and lastUpdate ge {iso(cursor_dt)}"
-    p={'token':TOKEN,'$select':'id,status,baseStatus,lastUpdate,protocol','$filter':filt,'$top':PAGE_SIZE,'$skip':0}
-    r=api_get('https://api.movidesk.com/public/v1/tickets', p)
-    if not isinstance(r, list): r=[r] if r else []
-    return r
+def list_changed_since(cursor_dt):
+    out=[]; skip=0
+    while True:
+        p={'token':TOKEN,
+           '$select':'id,lastUpdate,status,baseStatus',
+           '$filter':f'lastUpdate ge {iso(cursor_dt)}',
+           '$top':PAGE_SIZE,'$skip':skip}
+        r=api_get('https://api.movidesk.com/public/v1/tickets', p)
+        if not r: break
+        if not isinstance(r, list): r=[r]
+        out.extend(r)
+        if len(r)<PAGE_SIZE: break
+        skip += PAGE_SIZE
+        if len(out) >= 10000: break
+    return out
 
 def run():
     ensure_structure()
@@ -193,34 +197,39 @@ def run():
             if isinstance(lu,str):
                 try: lu=datetime.fromisoformat(lu.replace('Z','+00:00'))
                 except Exception: lu=None
-            rows.append((t.get('id'), t.get('protocol'), t.get('status'), lr, lu, now_ts))
+            rows.append((t.get('id'), t.get('status'), lr, lu, now_ts))
     upsert_rows(rows)
 
     reopened = list_ids_reopened_since(cursor)
     if reopened: delete_ids(reopened)
 
     current_map = load_current_map()
+    changed = list_changed_since(cursor)
+    target=[]
+    for m in changed:
+        tid=m.get('id'); lu=m.get('lastUpdate')
+        if tid not in current_map: continue
+        if isinstance(lu,str):
+            try: lu=datetime.fromisoformat(lu.replace('Z','+00:00'))
+            except Exception: lu=None
+        if not lu: continue
+        if lu > current_map.get(tid):
+            target.append(tid)
+
     changed_rows=[]
-    id_list = list(current_map.keys())
-    for group in chunks(id_list, 40):
-        minis = fetch_changed_min_since(cursor, group)
-        if not minis: continue
-        for m in minis:
-            lu=m.get('lastUpdate')
-            if isinstance(lu,str):
-                try: lu=datetime.fromisoformat(lu.replace('Z','+00:00'))
-                except Exception: lu=None
-            if not lu: continue
-            if lu <= current_map.get(m.get('id')): continue
-            tid=m.get('id')
-            try:
-                t=fetch_ticket_detail(tid)
-            except Exception:
-                continue
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+        futs=[ex.submit(get_detail, tid) for tid in target]
+        for f in as_completed(futs):
+            tid,t=f.result()
+            if isinstance(t,dict) and t.get("error"): continue
             if not is_resolved(t):
                 reopened.append(tid); continue
             lr=latest_resolved_changed_date(t)
-            changed_rows.append((t.get('id'), t.get('protocol'), t.get('status'), lr, lu, now_ts))
+            lu=t.get('lastUpdate')
+            if isinstance(lu,str):
+                try: lu=datetime.fromisoformat(lu.replace('Z','+00:00'))
+                except Exception: lu=None
+            changed_rows.append((t.get('id'), t.get('status'), lr, lu, now_ts))
     upsert_rows(changed_rows)
     if reopened: delete_ids(list(set(reopened)))
 
