@@ -1,4 +1,4 @@
-import os, time, json, requests, psycopg2
+import os, json, requests, psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timezone
 from time import sleep
@@ -144,11 +144,11 @@ def control_map():
     cur.close(); conn.close()
     return d
 
-def delete_missing(conn, keep_ids):
+def delete_missing(conn, keep):
     cur=conn.cursor()
-    if keep_ids:
+    if keep:
         cur.execute(f"delete from {DET}.resolucao_por_status where ticket_id not in (select ticket_id from {IDX}.tickets_resolvidos)")
-        cur.execute(f"delete from {IDX}.detail_control where ticket_id not in (select ticket_id from {IDX}.tickets_resolvidos)")
+        cur.execute(f"delete from {IDX}.detail_control        where ticket_id not in (select ticket_id from {IDX}.tickets_resolvidos)")
     else:
         cur.execute(f"truncate table {DET}.resolucao_por_status")
         cur.execute(f"truncate table {IDX}.detail_control")
@@ -186,16 +186,15 @@ def upsert_control(conn, tid, lu):
 def run():
     ensure_structure()
     ids=ids_from_index()
-    if not ids: 
+    if not ids:
         conn=psycopg2.connect(DSN); conn.autocommit=True
         delete_missing(conn, False); conn.close()
         return
     ctrl=control_map()
     conn=psycopg2.connect(DSN); conn.autocommit=True
-    to_check=list(ids)
     changed=[]
-    for i in range(0,len(to_check),GROUP):
-        batch=to_check[i:i+GROUP]
+    for i in range(0,len(ids),GROUP):
+        batch=ids[i:i+GROUP]
         minis=fetch_min_batch(batch)
         for t in minis:
             tid=int(t["id"])
