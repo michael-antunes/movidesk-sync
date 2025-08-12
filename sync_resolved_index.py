@@ -1,12 +1,13 @@
 import os, time, requests, psycopg2
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN = os.environ["MOVIDESK_TOKEN"]
 DSN   = os.environ["NEON_DSN"]
 BASE  = "https://api.movidesk.com/public/v1"
 SCHEMA = "visualizacao_resolvidos"
 RESOLVED = {"resolved","closed","resolvido","fechado"}
-GROUP = 24
+CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
 
 def api_get(url, params, tries=6):
     for i in range(tries):
@@ -43,12 +44,12 @@ def get_cursor():
     conn=psycopg2.connect(DSN); cur=conn.cursor()
     cur.execute(f"select last_update from {SCHEMA}.sync_control where name='tr_lastresolved'")
     row=cur.fetchone(); cur.close(); conn.close()
-    dt=row[0] if row else datetime.now(timezone.utc)-timedelta(days=60)
-    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+    dt=row[0] if row else datetime.now(timezone.utc) - timedelta(days=60)
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
 def set_cursor(ts):
-    if ts.tzinfo is None: ts=ts.replace(tzinfo=timezone.utc)
+    if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
     cur.execute(f"update {SCHEMA}.sync_control set last_update=%s where name='tr_lastresolved'", (ts,))
     cur.close(); conn.close()
@@ -57,30 +58,52 @@ def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    conds=" or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED])
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({conds}))"
+    conds = " or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED])
+    filt  = f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({conds}))"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
-        batch=api_get(f"{BASE}/tickets/past", p) or []
+        batch = api_get(f"{BASE}/tickets/past", p) or []
         if not batch: break
         for t in batch:
-            if "id" in t:
-                try: ids.add(int(t["id"]))
+            tid = t.get("id")
+            if tid is not None:
+                try: ids.add(int(tid))
                 except: pass
         if len(batch) < top: break
         skip += top
     return list(ids)
 
-def fetch_min_batch(id_batch):
-    parts=[f"id eq {i}" for i in id_batch]
-    filt="(" + " or ".join(parts) + ")"
-    p={"token":TOKEN,"$select":"id,status,baseStatus,lastUpdate","$filter":filt,"$top":len(id_batch),"$skip":0}
+def list_ids_reopened_since(cursor_dt):
+    ids=set(); top=500; skip=0
+    conds = " and ".join([f"tolower(s/status) ne '{s}'" for s in RESOLVED])
+    filt  = f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {conds})"
+    while True:
+        p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
+        batch = api_get(f"{BASE}/tickets/past", p) or []
+        if not batch: break
+        for t in batch:
+            tid = t.get("id")
+            if tid is not None:
+                try: ids.add(int(tid))
+                except: pass
+        if len(batch) < top: break
+        skip += top
+    return list(ids)
+
+def fetch_ticket_min(ticket_id):
+    p={'token':TOKEN,'id':ticket_id,'$select':'id,status,baseStatus,lastUpdate'}
     try:
-        data = api_get(f"{BASE}/tickets", p)
+        r = api_get(f"{BASE}/tickets", p)
+        if isinstance(r, list): return r[0] if r else None
+        return r
     except requests.exceptions.HTTPError as e:
         if e.response is None or e.response.status_code != 404: raise
-        data = []
-    return data or []
+    try:
+        r = api_get(f"{BASE}/tickets/past", p)
+        if isinstance(r, list): return r[0] if r else None
+        return r
+    except:
+        return None
 
 def is_resolved(t):
     st=(t.get("status") or "").lower()
@@ -88,22 +111,22 @@ def is_resolved(t):
     if bs in ("Resolved","Closed"): return True
     return st in RESOLVED
 
-def upsert_resolved(conn, items):
+def upsert_rows(items):
     if not items: return
-    cur=conn.cursor()
-    for t in items:
+    conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
+    for tid, st in items:
         cur.execute(f"""
             insert into {SCHEMA}.tickets_resolvidos(ticket_id, status)
             values (%s,%s)
             on conflict (ticket_id) do update set status=excluded.status;
-        """,(int(t["id"]), t.get("status") or ""))
-    cur.close()
+        """,(tid, st))
+    cur.close(); conn.close()
 
-def delete_ids(conn, ids):
+def delete_ids(ids):
     if not ids: return
-    cur=conn.cursor()
+    conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
     cur.execute(f"delete from {SCHEMA}.tickets_resolvidos where ticket_id = any(%s)", (ids,))
-    cur.close()
+    cur.close(); conn.close()
 
 def current_index_ids():
     conn=psycopg2.connect(DSN); cur=conn.cursor()
@@ -115,30 +138,26 @@ def current_index_ids():
 def run():
     ensure_structure()
     cursor_dt=get_cursor()
-    ids_new=list_ids_resolved_since(cursor_dt)
+    new_ids=list_ids_resolved_since(cursor_dt)
     have=current_index_ids()
-    want=set(ids_new) | have
-    if not want:
-        set_cursor(datetime.now(timezone.utc)-timedelta(minutes=1))
-        return
-    conn=psycopg2.connect(DSN); conn.autocommit=True
-    to_del=[]
-    buf=list(want)
-    for i in range(0,len(buf),GROUP):
-        batch=buf[i:i+GROUP]
-        minis=fetch_min_batch(batch)
-        by_id={int(t["id"]):t for t in minis}
-        keep=[]
-        for tid in batch:
-            t=by_id.get(int(tid))
-            if t and is_resolved(t):
-                keep.append(t)
-            else:
-                if tid in have:
-                    to_del.append(tid)
-        upsert_resolved(conn, keep)
-    delete_ids(conn, to_del)
-    conn.close()
+    want=list(set(new_ids) | have)
+    to_upsert=[]; to_delete=[]
+    if want:
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+            futs={ex.submit(fetch_ticket_min, tid): tid for tid in want}
+            for f in as_completed(futs):
+                tid=futs[f]
+                t=f.result()
+                if t and is_resolved(t):
+                    st=t.get("status") or ""
+                    to_upsert.append((tid, st))
+                else:
+                    if tid in have:
+                        to_delete.append(tid)
+    upsert_rows(to_upsert)
+    delete_ids(to_delete)
+    reopened=list_ids_reopened_since(cursor_dt)
+    delete_ids(reopened)
     set_cursor(datetime.now(timezone.utc)-timedelta(minutes=1))
 
 if __name__ == "__main__":
