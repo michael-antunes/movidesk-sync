@@ -23,8 +23,7 @@ def ensure_structure():
     cur.execute(f"""
         create table if not exists {SCHEMA}.tickets_resolvidos(
           ticket_id integer primary key,
-          status    text not null,
-          imported_at timestamp default now()
+          status    text not null
         );
     """)
     cur.execute(f"""
@@ -58,13 +57,16 @@ def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    filt = "statusHistories/any(s: s/changedDate ge "+iso(cursor_dt)+" and ("+ " or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED]) +"))"
+    conds=" or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED])
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({conds}))"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
-        batch = api_get(f"{BASE}/tickets/past", p) or []
+        batch=api_get(f"{BASE}/tickets/past", p) or []
         if not batch: break
         for t in batch:
-            if "id" in t: ids.add(int(t["id"]))
+            if "id" in t:
+                try: ids.add(int(t["id"]))
+                except: pass
         if len(batch) < top: break
         skip += top
     return list(ids)
@@ -91,9 +93,9 @@ def upsert_resolved(conn, items):
     cur=conn.cursor()
     for t in items:
         cur.execute(f"""
-            insert into {SCHEMA}.tickets_resolvidos(ticket_id, status, imported_at)
-            values (%s,%s,now())
-            on conflict (ticket_id) do update set status=excluded.status, imported_at=now();
+            insert into {SCHEMA}.tickets_resolvidos(ticket_id, status)
+            values (%s,%s)
+            on conflict (ticket_id) do update set status=excluded.status;
         """,(int(t["id"]), t.get("status") or ""))
     cur.close()
 
@@ -137,7 +139,7 @@ def run():
         upsert_resolved(conn, keep)
     delete_ids(conn, to_del)
     conn.close()
-    set_cursor(datetime.now(timezone.utc)-timelta(minutes=1))
+    set_cursor(datetime.now(timezone.utc)-timedelta(minutes=1))
 
 if __name__ == "__main__":
     run()
