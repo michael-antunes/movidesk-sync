@@ -1,24 +1,19 @@
-name: Sync Movidesk -> Index (tickets_resolvidos)
+name: Sync Movidesk -> Detalhe (resolucao_por_status)
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+  workflow_run:
+    workflows:
+      - Sync Movidesk -> Index (tickets_resolvidos)
+    types: [completed]
 
 jobs:
-  index:
+  detail:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-      NEON_DSN: ${{ secrets.NEON_DSN }}
-      WINDOW_DAYS: "60"
-      CONCURRENCY: "8"
-      MAX_PAGES_PER_DAY: "200"
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
       - run: pip install requests psycopg2-binary
-      - run: python sync_resolved_index.py
+      - run: python sync_resolved_detail.py
