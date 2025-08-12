@@ -50,20 +50,10 @@ def fetch_agents():
     return people
 
 def fetch_person_extra(pid):
-    variants = [
-        "additionalFields",
-        "additionalFieldValues",
-        "customFieldValues",
-        "customFields"
-    ]
+    variants = ["additionalFields", "additionalFieldValues", "customFieldValues", "customFields"]
     for v in variants:
         try:
-            p = {
-                "token": API_TOKEN,
-                "id": pid,
-                "$select": "id",
-                "$expand": v
-            }
+            p = {"token": API_TOKEN, "id": pid, "$select": "id", "$expand": v}
             r = get_with_retry(f"{BASE}/persons", p)
             return r.json() or {}
         except requests.exceptions.HTTPError:
@@ -139,44 +129,6 @@ def search_time_squad(obj):
             stack.extend(cur)
     return None
 
-DDL = """
-create schema if not exists visualizacao_agentes;
-
-create table if not exists visualizacao_agentes.agentes (
-  agent_id     bigint primary key,
-  name         text not null,
-  email        text not null,
-  team_primary text,
-  teams        text[],
-  access_type  text,
-  time_squad   text,
-  is_active    boolean not null,
-  raw          jsonb,
-  updated_at   timestamptz not null default now()
-);
-
-create index if not exists idx_agentes_email on visualizacao_agentes.agentes (lower(email));
-create index if not exists idx_agentes_team  on visualizacao_agentes.agentes (team_primary);
-
-create table if not exists visualizacao_agentes.agentes_historico (
-  agent_id     bigint not null,
-  dia          date not null,
-  name         text not null,
-  email        text not null,
-  team_primary text,
-  teams        text[],
-  access_type  text,
-  time_squad   text,
-  is_active    boolean not null,
-  raw          jsonb,
-  imported_at  timestamptz not null default now(),
-  primary key (agent_id, dia)
-);
-
-create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_historico (lower(email));
-create index if not exists idx_ag_hist_day   on visualizacao_agentes.agentes_historico (dia);
-"""
-
 UPSERT_SNAPSHOT = """
 insert into visualizacao_agentes.agentes
   (agent_id,name,email,team_primary,teams,access_type,time_squad,is_active,raw,updated_at)
@@ -213,7 +165,46 @@ on conflict (agent_id,dia) do update set
 
 def ensure_structure(conn):
     with conn.cursor() as cur:
-        cur.execute(DDL)
+        cur.execute("create schema if not exists visualizacao_agentes;")
+        cur.execute("""
+            create table if not exists visualizacao_agentes.agentes (
+              agent_id     bigint primary key,
+              name         text not null,
+              email        text not null,
+              team_primary text,
+              teams        text[],
+              access_type  text,
+              time_squad   text,
+              is_active    boolean not null,
+              raw          jsonb,
+              updated_at   timestamptz not null default now()
+            );
+        """)
+        cur.execute("alter table visualizacao_agentes.agentes add column if not exists time_squad text;")
+        cur.execute("create index if not exists idx_agentes_email on visualizacao_agentes.agentes (lower(email));")
+        cur.execute("create index if not exists idx_agentes_team  on visualizacao_agentes.agentes (team_primary);")
+        cur.execute("""
+            create table if not exists visualizacao_agentes.agentes_historico (
+              agent_id     bigint not null,
+              dia          date not null,
+              name         text not null,
+              email        text not null,
+              team_primary text,
+              teams        text[],
+              access_type  text,
+              time_squad   text,
+              is_active    boolean not null,
+              raw          jsonb,
+              imported_at  timestamptz not null default now(),
+              primary key (agent_id, dia)
+            );
+        """)
+        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists dia date;")
+        cur.execute("update visualizacao_agentes.agentes_historico set dia = current_date where dia is null;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico drop constraint if exists agentes_historico_pkey;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico add constraint agentes_historico_pkey primary key (agent_id, dia);")
+        cur.execute("create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_historico (lower(email));")
+        cur.execute("create index if not exists idx_ag_hist_day   on visualizacao_agentes.agentes_historico (dia);")
     conn.commit()
 
 def latest_fingerprints(conn, agent_ids):
