@@ -100,6 +100,7 @@ create table if not exists visualizacao_agentes.agentes (
   team_primary text,
   teams        text[],
   access_type  text,
+  time_squad   text,
   is_active    boolean not null,
   raw          jsonb,
   updated_at   timestamptz not null default now()
@@ -126,15 +127,16 @@ create index if not exists idx_ag_hist_dia   on visualizacao_agentes.agentes_his
 
 UPSERT_NOW = """
 insert into visualizacao_agentes.agentes
-  (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at)
+  (agent_id,name,email,team_primary,teams,access_type,time_squad,is_active,raw,updated_at)
 values
-  (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now())
+  (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(time_squad)s,%(is_active)s,%(raw)s,now())
 on conflict (agent_id) do update set
   name=excluded.name,
   email=excluded.email,
   team_primary=excluded.team_primary,
   teams=excluded.teams,
   access_type=excluded.access_type,
+  time_squad=excluded.time_squad,
   is_active=excluded.is_active,
   raw=excluded.raw,
   updated_at=now();
@@ -166,7 +168,14 @@ limit 1;
 """
 
 def ensure_structure(conn):
-    with conn.cursor() as cur: cur.execute(DDL)
+    with conn.cursor() as cur:
+        cur.execute(DDL)
+        cur.execute("alter table visualizacao_agentes.agentes add column if not exists time_squad text;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists dia date;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists time_squad text;")
+        cur.execute("update visualizacao_agentes.agentes_historico set dia = current_date where dia is null;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico drop constraint if exists agentes_historico_pkey;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico add constraint agentes_historico_pkey primary key (agent_id, dia);")
     conn.commit()
 
 def upsert_now(conn, rows):
@@ -195,6 +204,7 @@ def main():
         try: pid = int(p.get("id"))
         except: continue
         teams = pick_teams(p)
+        time_squad = extract_squad(p)
         row_now = {
             "agent_id": pid,
             "name": (p.get("businessName") or p.get("name") or "").strip(),
@@ -202,6 +212,7 @@ def main():
             "team_primary": (teams or [None])[0],
             "teams": teams,
             "access_type": extract_access(p),
+            "time_squad": time_squad,
             "is_active": extract_active(p),
             "raw": p
         }
@@ -209,7 +220,6 @@ def main():
     upsert_now(conn, rows_now)
     for r in rows_now:
         last = fetch_last_hist(conn, r["agent_id"])
-        time_squad = extract_squad(r["raw"])
         hist = {
             "agent_id": r["agent_id"],
             "dia": today,
@@ -219,7 +229,7 @@ def main():
             "teams": r["teams"],
             "access_type": r["access_type"],
             "is_active": r["is_active"],
-            "time_squad": time_squad,
+            "time_squad": r["time_squad"],
             "raw": r["raw"]
         }
         must = False
