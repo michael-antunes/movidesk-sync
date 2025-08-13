@@ -1,4 +1,4 @@
-import os, time, random, json, requests, psycopg2
+import os, time, random, requests, psycopg2
 from psycopg2.extras import Json
 from zoneinfo import ZoneInfo
 from datetime import datetime
@@ -59,11 +59,15 @@ def pick_email(p):
     if isinstance(emails, list) and emails:
         for e in emails:
             if isinstance(e, dict) and e.get("isDefault"):
-                return (e.get("email") or "").strip()
+                v = (e.get("email") or "").strip()
+                if v:
+                    return v
         pref = ("professional","profissional","commercial","comercial")
         for e in emails:
             if isinstance(e, dict) and str(e.get("emailType","")).lower() in pref:
-                return (e.get("email") or "").strip()
+                v = (e.get("email") or "").strip()
+                if v:
+                    return v
         f = emails[0]
         if isinstance(f, dict):
             return (f.get("email") or "").strip()
@@ -121,8 +125,9 @@ def extract_squad(p):
                 return str(val or "").strip()
     return None
 
-DDL = """
+DDL = '''
 create schema if not exists visualizacao_agentes;
+
 create table if not exists visualizacao_agentes.agentes (
   agent_id     bigint primary key,
   name         text not null,
@@ -135,11 +140,17 @@ create table if not exists visualizacao_agentes.agentes (
   raw          jsonb,
   updated_at   timestamptz not null default now()
 );
+
+alter table visualizacao_agentes.agentes
+  add column if not exists time_squad text,
+  add column if not exists updated_at timestamptz not null default now();
+
 create index if not exists idx_agentes_email on visualizacao_agentes.agentes (lower(email));
 create index if not exists idx_agentes_team  on visualizacao_agentes.agentes (team_primary);
+
 create table if not exists visualizacao_agentes.agentes_historico (
   agent_id     bigint not null,
-  dia          date not null,
+  dia          date,
   name         text not null,
   email        text not null,
   team_primary text,
@@ -148,7 +159,150 @@ create table if not exists visualizacao_agentes.agentes_historico (
   time_squad   text,
   is_active    boolean not null,
   raw          jsonb,
-  updated_at   timestamptz not null default now(),
-  constraint agentes_historico_pkey primary key (agent_id, dia)
+  updated_at   timestamptz not null default now()
 );
-create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_histor_
+
+alter table visualizacao_agentes.agentes_historico
+  add column if not exists dia date,
+  add column if not exists time_squad text,
+  add column if not exists updated_at timestamptz not null default now();
+
+update visualizacao_agentes.agentes_historico set dia = current_date where dia is null;
+
+alter table visualizacao_agentes.agentes_historico drop constraint if exists agentes_historico_pkey;
+alter table visualizacao_agentes.agentes_historico alter column dia set not null;
+alter table visualizacao_agentes.agentes_historico add constraint agentes_historico_pkey primary key (agent_id, dia);
+
+create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_historico (lower(email));
+create index if not exists idx_ag_hist_dia   on visualizacao_agentes.agentes_historico (dia);
+'''
+
+UPSERT_NOW = '''
+insert into visualizacao_agentes.agentes
+  (agent_id,name,email,team_primary,teams,access_type,time_squad,is_active,raw,updated_at)
+values
+  (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(time_squad)s,%(is_active)s,%(raw)s,now())
+on conflict (agent_id) do update set
+  name=excluded.name,
+  email=excluded.email,
+  team_primary=excluded.team_primary,
+  teams=excluded.teams,
+  access_type=excluded.access_type,
+  time_squad=excluded.time_squad,
+  is_active=excluded.is_active,
+  raw=excluded.raw,
+  updated_at=now();
+'''
+
+INSERT_HIST = '''
+insert into visualizacao_agentes.agentes_historico
+  (agent_id,dia,name,email,team_primary,teams,access_type,time_squad,is_active,raw,updated_at)
+values
+  (%(agent_id)s,%(dia)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(time_squad)s,%(is_active)s,%(raw)s,now())
+on conflict (agent_id,dia) do update set
+  name=excluded.name,
+  email=excluded.email,
+  team_primary=excluded.team_primary,
+  teams=excluded.teams,
+  access_type=excluded.access_type,
+  time_squad=excluded.time_squad,
+  is_active=excluded.is_active,
+  raw=excluded.raw,
+  updated_at=now();
+'''
+
+SELECT_LAST_HIST = '''
+select name,email,team_primary,teams,access_type,time_squad,is_active,dia
+from visualizacao_agentes.agentes_historico
+where agent_id=%s
+order by dia desc
+limit 1;
+'''
+
+def ensure_structure(conn):
+    with conn.cursor() as cur:
+        cur.execute(DDL)
+    conn.commit()
+
+def upsert_now(conn, rows):
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(UPSERT_NOW, {**r, "raw": Json(r["raw"])})
+    conn.commit()
+
+def upsert_hist(conn, row):
+    with conn.cursor() as cur:
+        cur.execute(INSERT_HIST, {**row, "raw": Json(row["raw"])})
+
+def fetch_last_hist(conn, agent_id):
+    with conn.cursor() as cur:
+        cur.execute(SELECT_LAST_HIST, (agent_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {"name": r[0], "email": r[1], "team_primary": r[2], "teams": r[3], "access_type": r[4], "time_squad": r[5], "is_active": r[6], "dia": r[7]}
+
+def main():
+    tz = ZoneInfo("America/Sao_Paulo")
+    today = datetime.now(tz).date()
+    conn = psycopg2.connect(DSN)
+    ensure_structure(conn)
+    people = [p for p in fetch_agents() if p.get("profileType") in (1,3)]
+    rows_now = []
+    for p in people:
+        try:
+            pid = int(p.get("id"))
+        except:
+            continue
+        teams = pick_teams(p)
+        row = {
+            "agent_id": pid,
+            "name": (p.get("businessName") or p.get("name") or "").strip(),
+            "email": pick_email(p),
+            "team_primary": (teams or [None])[0],
+            "teams": teams,
+            "access_type": extract_access(p),
+            "time_squad": extract_squad(p),
+            "is_active": extract_active(p),
+            "raw": p
+        }
+        rows_now.append(row)
+    upsert_now(conn, rows_now)
+    for r in rows_now:
+        last = fetch_last_hist(conn, r["agent_id"])
+        hist = {
+            "agent_id": r["agent_id"],
+            "dia": today,
+            "name": r["name"],
+            "email": r["email"],
+            "team_primary": r["team_primary"],
+            "teams": r["teams"],
+            "access_type": r["access_type"],
+            "time_squad": r["time_squad"],
+            "is_active": r["is_active"],
+            "raw": r["raw"]
+        }
+        must = False
+        if last is None:
+            must = True
+        else:
+            changed = (
+                (last.get("name") or "") != (hist["name"] or "") or
+                (last.get("email") or "") != (hist["email"] or "") or
+                (last.get("team_primary") or "") != (hist["team_primary"] or "") or
+                (last.get("access_type") or "") != (hist["access_type"] or "") or
+                (last.get("time_squad") or "") != (hist["time_squad"] or "") or
+                bool(last.get("is_active")) != bool(hist["is_active"]) or
+                (last.get("teams") or []) != (hist["teams"] or [])
+            )
+            if changed or last.get("dia") != today:
+                must = True
+        if must:
+            upsert_hist(conn, hist)
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    main()
