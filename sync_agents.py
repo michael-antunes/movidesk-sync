@@ -4,7 +4,7 @@ from psycopg2.extras import Json
 TOKEN = os.environ["MOVIDESK_TOKEN"]
 DSN = os.environ["NEON_DSN"]
 BASE = "https://api.movidesk.com/public/v1"
-CUSTOM_FIELD_ID = 222343
+CUSTOM_FIELD_ID = "222343"
 
 def get_with_retry(url, params=None, tries=4):
     last = None
@@ -69,9 +69,7 @@ def ensure_structure(conn):
     conn.commit()
 
 def list_people():
-    out = []
-    skip = 0
-    top = 500
+    out, skip, top = [], 0, 500
     while True:
         p = {
             "token": TOKEN,
@@ -80,52 +78,46 @@ def list_people():
             "$skip": skip,
         }
         data = get_with_retry(f"{BASE}/persons", p)
-        if not data:
-            break
+        if not data: break
         out.extend(data)
-        if len(data) < top:
-            break
+        if len(data) < top: break
         skip += top
     return out
 
 def person_detail(pid):
-    p = {
-        "token": TOKEN,
-        "$expand": "teams,customFieldValues,emails"
-    }
+    p = {"token": TOKEN, "$expand": "teams,customFieldValues,emails"}
     try:
         return get_with_retry(f"{BASE}/persons/{pid}", p)
-    except requests.HTTPError as e:
+    except requests.HTTPError:
         return None
 
 def pick_email(detail, fallback):
-    emails = detail.get("emails") or []
-    chosen = None
+    emails = (detail or {}).get("emails") or []
     for e in emails:
-        if e.get("isDefault"):
-            chosen = e.get("email")
-            break
-    if not chosen and emails:
-        chosen = emails[0].get("email")
-    if not chosen:
-        chosen = fallback or ""
-    return chosen
+        if e.get("isDefault"): return (e.get("email") or "").strip()
+    if emails: return (emails[0].get("email") or "").strip()
+    return (fallback or "").strip()
+
+def norm(v):
+    if v is None: return None
+    s = str(v).strip()
+    return s or None
 
 def extract_time_squad(detail):
-    cf = detail.get("customFieldValues") or []
+    cf = (detail or {}).get("customFieldValues") or []
     for item in cf:
-        if str(item.get("customFieldId")) == str(CUSTOM_FIELD_ID):
-            v = item.get("value")
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            name = item.get("name") or item.get("valueName")
-            if name:
-                return str(name)
-            items = item.get("items")
-            if isinstance(items, list) and items:
-                nm = items[0].get("name") or items[0].get("value")
-                if nm:
-                    return str(nm)
+        if str(item.get("customFieldId")) != CUSTOM_FIELD_ID: continue
+        v = item.get("value")
+        if isinstance(v, str) and norm(v): return norm(v)
+        if isinstance(v, dict):
+            n = v.get("name") or v.get("valueName") or v.get("value")
+            if norm(n): return norm(n)
+        n1 = item.get("name") or item.get("valueName")
+        if norm(n1): return norm(n1)
+        items = item.get("items")
+        if isinstance(items, list) and items:
+            n2 = items[0].get("name") or items[0].get("valueName") or items[0].get("value")
+            if norm(n2): return norm(n2)
     return None
 
 def upsert(conn, row):
@@ -160,18 +152,20 @@ def main():
             team_names = [t.get("name") for t in teams_detail if isinstance(t, dict) and t.get("name")]
             team_primary = team_names[0] if team_names else None
             email = pick_email(detail, p.get("userName"))
+            ts = extract_time_squad(detail)
             row = {
                 "agent_id": int(pid),
-                "name": str(p.get("businessName") or "").strip(),
-                "email": str(email or "").strip(),
+                "name": norm(p.get("businessName")) or "",
+                "email": email or "",
                 "team_primary": team_primary,
                 "teams": team_names if team_names else None,
                 "access_type": p.get("accessProfile"),
                 "is_active": bool(p.get("isActive")),
                 "raw": detail if detail else p,
-                "time_squad": extract_time_squad(detail)
+                "time_squad": ts
             }
             upsert(conn, row)
+            print(f"upsert agent_id={pid} teams={len(team_names)} primary={team_primary or '-'} time_squad={ts or '-'}")
         conn.commit()
     finally:
         conn.close()
