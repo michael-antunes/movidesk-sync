@@ -18,14 +18,13 @@ def get_with_retry(url, params, tries=3, timeout=60):
             return r
         except requests.exceptions.RequestException as e:
             last = e
-            if i < tries-1:
-                time.sleep(2*(i+1))
+            if i < tries - 1:
+                time.sleep(2 * (i + 1))
     raise last
 
 def ensure_struct(conn):
     ddl = """
     CREATE SCHEMA IF NOT EXISTS visualizacao_agentes;
-
     CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes (
         agent_id BIGINT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -38,12 +37,10 @@ def ensure_struct(conn):
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         time_squad TEXT
     );
-
     CREATE TABLE IF NOT EXISTS visualizacao_agentes.sync_control (
         name TEXT PRIMARY KEY,
         last_update TIMESTAMPTZ NOT NULL
     );
-
     CREATE INDEX IF NOT EXISTS idx_agentes_email ON visualizacao_agentes.agentes (lower(email));
     CREATE INDEX IF NOT EXISTS idx_agentes_team ON visualizacao_agentes.agentes (team_primary);
     CREATE INDEX IF NOT EXISTS idx_agentes_teams_gin ON visualizacao_agentes.agentes USING GIN (teams);
@@ -62,11 +59,10 @@ def get_last_sync(conn):
 
 def set_last_sync(conn, when):
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO visualizacao_agentes.sync_control (name,last_update)
-            VALUES (%s,%s)
-            ON CONFLICT (name) DO UPDATE SET last_update = EXCLUDED.last_update
-        """,(SYNC_KEY, when))
+        cur.execute(
+            "INSERT INTO visualizacao_agentes.sync_control (name,last_update) VALUES (%s,%s) ON CONFLICT (name) DO UPDATE SET last_update=EXCLUDED.last_update",
+            (SYNC_KEY, when),
+        )
     conn.commit()
 
 def fetch_all_agents():
@@ -77,9 +73,9 @@ def fetch_all_agents():
         p = {
             "token": TOKEN,
             "$select": "id,businessName,userName,isActive,profileType,accessProfile",
-            "$expand": "teams($select=name),customFieldValues($select=customFieldId,value)",
+            "$expand": "teams,customFieldValues",
             "$top": size,
-            "$skip": page*size
+            "$skip": page * size,
         }
         r = get_with_retry(f"{BASE}/persons", p)
         batch = r.json()
@@ -122,7 +118,7 @@ def shape(row):
         "access_type": row.get("accessProfile"),
         "is_active": bool(row.get("isActive")),
         "time_squad": extract_time_squad(row),
-        "raw": row
+        "raw": row,
     }
 
 def upsert_agents(conn, rows):
@@ -132,15 +128,15 @@ def upsert_agents(conn, rows):
     VALUES
       (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
     ON CONFLICT (agent_id) DO UPDATE SET
-      name = EXCLUDED.name,
-      email = EXCLUDED.email,
-      team_primary = EXCLUDED.team_primary,
-      teams = EXCLUDED.teams,
-      access_type = EXCLUDED.access_type,
-      is_active = EXCLUDED.is_active,
-      raw = EXCLUDED.raw,
-      updated_at = now(),
-      time_squad = EXCLUDED.time_squad
+      name=EXCLUDED.name,
+      email=EXCLUDED.email,
+      team_primary=EXCLUDED.team_primary,
+      teams=EXCLUDED.teams,
+      access_type=EXCLUDED.access_type,
+      is_active=EXCLUDED.is_active,
+      raw=EXCLUDED.raw,
+      updated_at=now(),
+      time_squad=EXCLUDED.time_squad
     WHERE
       visualizacao_agentes.agentes.name IS DISTINCT FROM EXCLUDED.name OR
       visualizacao_agentes.agentes.email IS DISTINCT FROM EXCLUDED.email OR
@@ -160,7 +156,7 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_struct(conn)
-        people = [p for p in fetch_all_agents() if p.get("profileType") in (1,3)]
+        people = [p for p in fetch_all_agents() if p.get("profileType") in (1, 3)]
         shaped = [shape(x) for x in people]
         if shaped:
             upsert_agents(conn, shaped)
