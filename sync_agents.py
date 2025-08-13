@@ -6,12 +6,8 @@ from psycopg2.extras import Json
 TOKEN = os.environ["MOVIDESK_TOKEN"]
 DSN = os.environ["NEON_DSN"]
 BASE = "https://api.movidesk.com/public/v1"
-SYNC_KEY = "agentes_lastsync"
 CF_ID = 222343
-
-def ts_utc(dt):
-    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+SYNC_KEY = "agentes_lastsync"
 
 def get_with_retry(url, params, tries=3, timeout=60):
     last = None
@@ -22,7 +18,8 @@ def get_with_retry(url, params, tries=3, timeout=60):
             return r
         except requests.exceptions.RequestException as e:
             last = e
-            if i < tries-1: time.sleep(2*(i+1))
+            if i < tries-1:
+                time.sleep(2*(i+1))
     raise last
 
 def ensure_struct(conn):
@@ -59,7 +56,8 @@ def get_last_sync(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT last_update FROM visualizacao_agentes.sync_control WHERE name=%s", (SYNC_KEY,))
         r = cur.fetchone()
-    if r: return r[0]
+    if r:
+        return r[0]
     return datetime.now(timezone.utc) - timedelta(days=60)
 
 def set_last_sync(conn, when):
@@ -68,65 +66,62 @@ def set_last_sync(conn, when):
             INSERT INTO visualizacao_agentes.sync_control (name,last_update)
             VALUES (%s,%s)
             ON CONFLICT (name) DO UPDATE SET last_update = EXCLUDED.last_update
-        """,(SYNC_KEY, ts_utc(when)))
+        """,(SYNC_KEY, when))
     conn.commit()
 
+def fetch_all_agents():
+    out = []
+    page = 0
+    size = 500
+    while True:
+        p = {
+            "token": TOKEN,
+            "$select": "id,businessName,userName,isActive,profileType,accessProfile",
+            "$expand": "teams($select=name),customFieldValues($select=customFieldId,value)",
+            "$top": size,
+            "$skip": page*size
+        }
+        r = get_with_retry(f"{BASE}/persons", p)
+        batch = r.json()
+        out.extend(batch)
+        if len(batch) < size:
+            break
+        page += 1
+    return out
+
+def normalize_teams(teams):
+    if not teams:
+        return None, []
+    names = []
+    for t in teams:
+        if isinstance(t, dict):
+            n = t.get("name") or t.get("title") or t.get("description")
+            if n:
+                names.append(str(n))
+        else:
+            names.append(str(t))
+    names = [n for n in names if n]
+    return (names[0] if names else None, names)
+
 def extract_time_squad(p):
-    for key in ("customFieldValues","additionalFields","customFields"):
-        arr = p.get(key)
-        if not arr: continue
-        for it in arr:
-            cid = it.get("customFieldId") or it.get("id") or (it.get("customField") or {}).get("id")
-            nm  = it.get("customFieldName") or it.get("name") or (it.get("customField") or {}).get("name")
-            if cid == CF_ID or (nm and nm.lower().startswith("time (guerra de squad")):
-                val = it.get("value") or it.get("formattedValue") or it.get("text") or it.get("title")
-                if isinstance(val, list): return ",".join([str(x) for x in val])
-                return str(val) if val is not None else None
+    arr = p.get("customFieldValues") or []
+    for it in arr:
+        if it.get("customFieldId") == CF_ID:
+            v = it.get("value")
+            return str(v) if v is not None else None
     return None
 
-def fetch_all_agents():
-    expansions = ["teams,customFieldValues","teams,additionalFields","teams"]
-    for exp in expansions:
-        try:
-            out = []
-            page = 0
-            size = 500
-            while True:
-                p = {
-                    "token": TOKEN,
-                    "$select": "id,businessName,userName,isActive,profileType,accessProfile",
-                    "$expand": exp,
-                    "$top": size,
-                    "$skip": page*size
-                }
-                r = get_with_retry(f"{BASE}/persons", p)
-                batch = r.json()
-                out.extend(batch)
-                if len(batch) < size: break
-                page += 1
-            return out
-        except requests.exceptions.HTTPError:
-            if exp == expansions[-1]: raise
-            time.sleep(1)
-    return []
-
 def shape(row):
-    teams = row.get("teams") or []
-    team_primary = teams[0] if teams else None
-    email = (row.get("userName") or "").strip()
-    name = (row.get("businessName") or "").strip()
-    access = row.get("accessProfile")
-    is_active = bool(row.get("isActive"))
-    time_squad = extract_time_squad(row)
+    team_primary, team_list = normalize_teams(row.get("teams"))
     return {
         "agent_id": int(row["id"]),
-        "name": name,
-        "email": email,
+        "name": (row.get("businessName") or "").strip(),
+        "email": (row.get("userName") or "").strip(),
         "team_primary": team_primary,
-        "teams": teams if isinstance(teams, list) else [],
-        "access_type": access,
-        "is_active": is_active,
-        "time_squad": time_squad,
+        "teams": team_list,
+        "access_type": row.get("accessProfile"),
+        "is_active": bool(row.get("isActive")),
+        "time_squad": extract_time_squad(row),
         "raw": row
     }
 
@@ -165,7 +160,6 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_struct(conn)
-        fetch_all_agents()  # warm-up DNS if needed
         people = [p for p in fetch_all_agents() if p.get("profileType") in (1,3)]
         shaped = [shape(x) for x in people]
         if shaped:
