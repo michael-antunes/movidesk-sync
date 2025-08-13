@@ -7,6 +7,7 @@ import psycopg2.extras as pgx
 BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN")
+CUSTOM_FIELD_ID = 222343
 
 def get_with_retry(url, params, tries=3, timeout=60):
     err = None
@@ -57,11 +58,9 @@ def extract_team_names(person):
             if isinstance(item, str) and item:
                 out.append(item)
             elif isinstance(item, dict):
-                # caso a API retorne objetos
                 n = item.get("name") or item.get("teamName") or item.get("value") or item.get("text")
                 if isinstance(n, str) and n:
                     out.append(n)
-    # dedup simples mantendo ordem
     seen = set()
     uniq = []
     for n in out:
@@ -70,11 +69,40 @@ def extract_team_names(person):
             uniq.append(n)
     return uniq
 
+def extract_custom_field_value(person, field_id):
+    vals = person.get("customFieldValues") or []
+    if not isinstance(vals, list):
+        return None
+    for cf in vals:
+        try:
+            if int(cf.get("customFieldId")) != int(field_id):
+                continue
+        except Exception:
+            continue
+        v = cf.get("value")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        items = cf.get("items")
+        if isinstance(items, list) and items:
+            names = []
+            for it in items:
+                name = None
+                if isinstance(it, dict):
+                    name = it.get("customFieldItem") or it.get("name") or it.get("text") or it.get("value")
+                elif isinstance(it, str):
+                    name = it
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+            if names:
+                return ", ".join(dict.fromkeys(names))
+        return None
+    return None
+
 def fetch_all_persons():
     params = {
         "token": TOKEN,
-        # AQUI está o ponto: pedir teams direto no $select
         "$select": "id,businessName,userName,isActive,profileType,accessProfile,teams",
+        "$expand": "customFieldValues",
         "$top": 500,
         "$skip": 0
     }
@@ -90,18 +118,19 @@ def fetch_all_persons():
 
 def upsert_agents(conn, people):
     sql = """
-    INSERT INTO visualizacao_agentes.agentes
-    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
-    VALUES (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
-    ON CONFLICT (agent_id) DO UPDATE SET
-        name        = EXCLUDED.name,
-        email       = EXCLUDED.email,
-        team_primary= EXCLUDED.team_primary,
-        teams       = EXCLUDED.teams,
-        access_type = EXCLUDED.access_type,
-        is_active   = EXCLUDED.is_active,
-        raw         = EXCLUDED.raw,
-        updated_at  = now(),
+    INSERT INTO visualizacao_agentes.agentes 
+    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad) 
+    VALUES 
+    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s) 
+    ON CONFLICT (agent_id) DO UPDATE SET 
+        name        = EXCLUDED.name, 
+        email       = EXCLUDED.email, 
+        team_primary= EXCLUDED.team_primary, 
+        teams       = EXCLUDED.teams, 
+        access_type = EXCLUDED.access_type, 
+        is_active   = EXCLUDED.is_active, 
+        raw         = EXCLUDED.raw, 
+        updated_at  = now(), 
         time_squad  = EXCLUDED.time_squad
     """
     rows = []
@@ -114,6 +143,7 @@ def upsert_agents(conn, people):
         except Exception:
             continue
         teams = extract_team_names(p)
+        time_squad = extract_custom_field_value(p, CUSTOM_FIELD_ID)
         rows.append({
             "agent_id": pid,
             "name": p.get("businessName") or "",
@@ -123,7 +153,7 @@ def upsert_agents(conn, people):
             "access_type": p.get("accessProfile"),
             "is_active": bool(p.get("isActive")),
             "raw": pgx.Json(p),
-            "time_squad": None  # deixamos pronto para popular depois
+            "time_squad": time_squad
         })
     if not rows:
         return
