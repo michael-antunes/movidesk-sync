@@ -171,8 +171,10 @@ def ensure_structure(conn):
     with conn.cursor() as cur:
         cur.execute(DDL)
         cur.execute("alter table visualizacao_agentes.agentes add column if not exists time_squad text;")
+        cur.execute("alter table visualizacao_agentes.agentes add column if not exists updated_at timestamptz not null default now();")
         cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists dia date;")
         cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists time_squad text;")
+        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists updated_at timestamptz not null default now();")
         cur.execute("update visualizacao_agentes.agentes_historico set dia = current_date where dia is null;")
         cur.execute("alter table visualizacao_agentes.agentes_historico drop constraint if exists agentes_historico_pkey;")
         cur.execute("alter table visualizacao_agentes.agentes_historico add constraint agentes_historico_pkey primary key (agent_id, dia);")
