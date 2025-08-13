@@ -70,13 +70,7 @@ def fetch_all_agents():
     page = 0
     size = 500
     while True:
-        p = {
-            "token": TOKEN,
-            "$select": "id,businessName,userName,isActive,profileType,accessProfile",
-            "$expand": "teams,customFieldValues",
-            "$top": size,
-            "$skip": page * size,
-        }
+        p = {"token": TOKEN, "$top": size, "$skip": page * size}
         r = get_with_retry(f"{BASE}/persons", p)
         batch = r.json()
         out.extend(batch)
