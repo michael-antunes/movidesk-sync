@@ -1,37 +1,36 @@
-import os, time, json, random, requests, psycopg2
-from datetime import datetime
+import os, time, random, json, requests, psycopg2
 from psycopg2.extras import Json
 from zoneinfo import ZoneInfo
+from datetime import datetime
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN", "")
 DSN = os.getenv("NEON_DSN", "")
 BASE = "https://api.movidesk.com/public/v1"
-CF_SQUAD_ID = os.getenv("MOVIDESK_SQUAD_FIELD_ID", "222343")
+CF_SQUAD_ID = os.getenv("MOVIDESK_SQUAD_FIELD_ID", "")
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))
-PAGE_DELAY_MS = int(os.getenv("MOVIDESK_PAGE_DELAY_MS", "250"))
 READ_TIMEOUT = int(os.getenv("MOVIDESK_READ_TIMEOUT", "120"))
 CONNECT_TIMEOUT = int(os.getenv("MOVIDESK_CONNECT_TIMEOUT", "10"))
 MAX_TRIES = int(os.getenv("MOVIDESK_MAX_TRIES", "8"))
+PAGE_DELAY_MS = int(os.getenv("MOVIDESK_PAGE_DELAY_MS", "250"))
 
 _session = requests.Session()
 
-def get_with_retry(url, params, tries=MAX_TRIES, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
-    for i in range(tries):
+def get_with_retry(url, params):
+    for i in range(MAX_TRIES):
         try:
-            r = _session.get(url, params=params, timeout=(connect_timeout, read_timeout))
+            r = _session.get(url, params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             r.raise_for_status()
             return r
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
             if isinstance(e, requests.exceptions.HTTPError):
-                code = getattr(e.response, "status_code", 0) or 0
-                if code not in (429, 500, 502, 503, 504):
+                c = getattr(e.response, "status_code", 0) or 0
+                if c not in (429,500,502,503,504):
                     raise
-            if i == tries - 1:
+            if i == MAX_TRIES - 1:
                 raise
-            sleep_s = min(60, (1.6 ** i)) + random.uniform(0, 0.6)
-            time.sleep(sleep_s)
+            time.sleep(min(60, 1.7**i) + random.uniform(0,0.6))
 
-def fetch_paginated(endpoint, params=None, page_size=PAGE_SIZE, hard_limit=20000, delay_ms=PAGE_DELAY_MS):
+def fetch_paginated(endpoint, params=None, page_size=PAGE_SIZE):
     p = dict(params or {})
     p["token"] = API_TOKEN
     p["$top"] = page_size
@@ -43,11 +42,11 @@ def fetch_paginated(endpoint, params=None, page_size=PAGE_SIZE, hard_limit=20000
         if not isinstance(batch, list):
             batch = [batch]
         items.extend(batch)
-        if len(batch) < page_size or len(items) >= hard_limit:
+        if len(batch) < page_size:
             break
         skip += page_size
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
+        if PAGE_DELAY_MS > 0:
+            time.sleep(PAGE_DELAY_MS/1000.0)
     return items
 
 def fetch_agents():
@@ -65,11 +64,11 @@ def pick_email(p):
         for e in emails:
             if isinstance(e, dict) and str(e.get("emailType","")).lower() in pref:
                 return (e.get("email") or "").strip()
-        first = emails[0]
-        if isinstance(first, dict):
-            return (first.get("email") or "").strip()
-        if isinstance(first, str):
-            return first.strip()
+        f = emails[0]
+        if isinstance(f, dict):
+            return (f.get("email") or "").strip()
+        if isinstance(f, str):
+            return f.strip()
     return (p.get("userName") or "").strip()
 
 def extract_access(p):
@@ -109,7 +108,7 @@ def extract_squad(p):
             if not isinstance(it, dict):
                 continue
             fid = str(it.get("id") or it.get("fieldId") or it.get("customFieldId") or "")
-            if fid == str(CF_SQUAD_ID):
+            if CF_SQUAD_ID and fid == CF_SQUAD_ID:
                 val = it.get("value")
                 if isinstance(val, dict):
                     return str(val.get("name") or val.get("value") or "").strip()
@@ -146,150 +145,10 @@ create table if not exists visualizacao_agentes.agentes_historico (
   team_primary text,
   teams        text[],
   access_type  text,
-  is_active    boolean not null,
   time_squad   text,
+  is_active    boolean not null,
   raw          jsonb,
   updated_at   timestamptz not null default now(),
   constraint agentes_historico_pkey primary key (agent_id, dia)
 );
-create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_historico (lower(email));
-create index if not exists idx_ag_hist_dia   on visualizacao_agentes.agentes_historico (dia);
-"""
-
-UPSERT_NOW = """
-insert into visualizacao_agentes.agentes
-  (agent_id,name,email,team_primary,teams,access_type,time_squad,is_active,raw,updated_at)
-values
-  (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(time_squad)s,%(is_active)s,%(raw)s,now())
-on conflict (agent_id) do update set
-  name=excluded.name,
-  email=excluded.email,
-  team_primary=excluded.team_primary,
-  teams=excluded.teams,
-  access_type=excluded.access_type,
-  time_squad=excluded.time_squad,
-  is_active=excluded.is_active,
-  raw=excluded.raw,
-  updated_at=now();
-"""
-
-INSERT_HIST = """
-insert into visualizacao_agentes.agentes_historico
-  (agent_id,dia,name,email,team_primary,teams,access_type,is_active,time_squad,raw,updated_at)
-values
-  (%(agent_id)s,%(dia)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(time_squad)s,%(raw)s,now())
-on conflict (agent_id,dia) do update set
-  name=excluded.name,
-  email=excluded.email,
-  team_primary=excluded.team_primary,
-  teams=excluded.teams,
-  access_type=excluded.access_type,
-  is_active=excluded.is_active,
-  time_squad=excluded.time_squad,
-  raw=excluded.raw,
-  updated_at=now();
-"""
-
-SELECT_LAST_HIST = """
-select name,email,team_primary,teams,access_type,is_active,time_squad,dia
-from visualizacao_agentes.agentes_historico
-where agent_id=%s
-order by dia desc
-limit 1;
-"""
-
-def ensure_structure(conn):
-    with conn.cursor() as cur:
-        cur.execute(DDL)
-        cur.execute("alter table visualizacao_agentes.agentes add column if not exists time_squad text;")
-        cur.execute("alter table visualizacao_agentes.agentes add column if not exists updated_at timestamptz not null default now();")
-        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists dia date;")
-        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists time_squad text;")
-        cur.execute("alter table visualizacao_agentes.agentes_historico add column if not exists updated_at timestamptz not null default now();")
-        cur.execute("update visualizacao_agentes.agentes_historico set dia = current_date where dia is null;")
-        cur.execute("alter table visualizacao_agentes.agentes_historico drop constraint if exists agentes_historico_pkey;")
-        cur.execute("alter table visualizacao_agentes.agentes_historico add constraint agentes_historico_pkey primary key (agent_id, dia);")
-    conn.commit()
-
-def upsert_now(conn, rows):
-    if not rows:
-        return
-    with conn.cursor() as cur:
-        for r in rows:
-            cur.execute(UPSERT_NOW, {**r, "raw": Json(r["raw"])})
-    conn.commit()
-
-def upsert_history(conn, row):
-    with conn.cursor() as cur:
-        cur.execute(INSERT_HIST, {**row, "raw": Json(row["raw"])})
-
-def fetch_last_hist(conn, agent_id):
-    with conn.cursor() as cur:
-        cur.execute(SELECT_LAST_HIST, (agent_id,))
-        r = cur.fetchone()
-        if not r:
-            return None
-        return {"name": r[0], "email": r[1], "team_primary": r[2], "teams": r[3], "access_type": r[4], "is_active": r[5], "time_squad": r[6], "dia": r[7]}
-
-def main():
-    conn = psycopg2.connect(DSN)
-    ensure_structure(conn)
-    people = [p for p in fetch_agents() if p.get("profileType") in (1,3)]
-    rows_now = []
-    today = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
-    for p in people:
-        try:
-            pid = int(p.get("id"))
-        except:
-            continue
-        teams = pick_teams(p)
-        time_squad = extract_squad(p)
-        row_now = {
-            "agent_id": pid,
-            "name": (p.get("businessName") or p.get("name") or "").strip(),
-            "email": pick_email(p),
-            "team_primary": (teams or [None])[0],
-            "teams": teams,
-            "access_type": extract_access(p),
-            "time_squad": time_squad,
-            "is_active": extract_active(p),
-            "raw": p
-        }
-        rows_now.append(row_now)
-    upsert_now(conn, rows_now)
-    for r in rows_now:
-        last = fetch_last_hist(conn, r["agent_id"])
-        hist = {
-            "agent_id": r["agent_id"],
-            "dia": today,
-            "name": r["name"],
-            "email": r["email"],
-            "team_primary": r["team_primary"],
-            "teams": r["teams"],
-            "access_type": r["access_type"],
-            "is_active": r["is_active"],
-            "time_squad": r["time_squad"],
-            "raw": r["raw"]
-        }
-        must = False
-        if last is None:
-            must = True
-        else:
-            changed = (
-                (last.get("name") or "") != (hist["name"] or "") or
-                (last.get("email") or "") != (hist["email"] or "") or
-                (last.get("team_primary") or "") != (hist["team_primary"] or "") or
-                (last.get("access_type") or "") != (hist["access_type"] or "") or
-                bool(last.get("is_active")) != bool(hist["is_active"]) or
-                (last.get("time_squad") or "") != (hist["time_squad"] or "") or
-                (last.get("teams") or []) != (hist["teams"] or [])
-            )
-            if changed or last.get("dia") != today:
-                must = True
-        if must:
-            upsert_history(conn, hist)
-    conn.commit()
-    conn.close()
-
-if __name__ == "__main__":
-    main()
+create index if not exists idx_ag_hist_email on visualizacao_agentes.agentes_histor_
