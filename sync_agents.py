@@ -9,22 +9,19 @@ TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN")
 CUSTOM_FIELD_ID = 222343
 
-def get_with_retry(url, params, tries=3, timeout=60):
+def get_with_retry(url, params, tries=5, timeout=60):
     err = None
-    for _ in range(tries):
+    for i in range(tries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(60, 2**i))
+                continue
             r.raise_for_status()
             return r
-        except requests.HTTPError as e:
-            err = e
-            if e.response is not None and e.response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2)
-                continue
-            raise
         except requests.RequestException as e:
             err = e
-            time.sleep(2)
+            time.sleep(min(60, 2**i))
     raise err
 
 def ensure_structure(conn):
@@ -98,6 +95,11 @@ def extract_custom_field_value(person, field_id):
         return None
     return None
 
+def fetch_person_detail(pid):
+    params = {"token": TOKEN, "$expand": "customFieldValues"}
+    r = get_with_retry(f"{BASE}/persons/{pid}", params)
+    return r.json()
+
 def fetch_all_persons():
     params = {
         "token": TOKEN,
@@ -113,7 +115,22 @@ def fetch_all_persons():
         if not isinstance(page, list) or not page:
             break
         people.extend(page)
+        if len(page) < params["$top"]:
+            break
         params["$skip"] += params["$top"]
+    missing = []
+    for p in people:
+        if extract_custom_field_value(p, CUSTOM_FIELD_ID) is None:
+            missing.append(p.get("id"))
+    for pid in missing:
+        try:
+            dp = fetch_person_detail(pid)
+            for i in range(len(people)):
+                if people[i].get("id") == pid:
+                    people[i] = dp
+                    break
+        except Exception:
+            continue
     return people
 
 def upsert_agents(conn, people):
