@@ -17,7 +17,7 @@ def get_with_retry(url, params=None, tries=4):
             return r.json()
         except requests.RequestException as e:
             last = e
-            if getattr(e, "response", None) is not None and e.response.status_code in (400,404):
+            if getattr(e, "response", None) is not None and e.response.status_code in (400, 404):
                 raise
             time.sleep(1.2 * (i + 1))
     raise last
@@ -75,7 +75,6 @@ def fetch_all_agents():
         params = {
             "token": TOKEN,
             "$select": "id,businessName,userName,isActive,profileType,accessProfile",
-            "$expand": "teams",
             "$top": page_size,
             "$skip": skip
         }
@@ -108,7 +107,7 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_structure(conn)
-        people = [p for p in fetch_all_agents() if p.get("profileType") in (1,3)]
+        people = [p for p in fetch_all_agents() if p.get("profileType") in (1, 3)]
         with conn.cursor() as cur:
             for p in people:
                 pid = p.get("id")
