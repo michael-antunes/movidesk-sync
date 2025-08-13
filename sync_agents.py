@@ -1,145 +1,186 @@
-import os, time, requests, psycopg2
+import os, time, requests, json
+from datetime import datetime, timedelta, timezone
+import psycopg2
 from psycopg2.extras import Json
 
-API_TOKEN = os.getenv("MOVIDESK_TOKEN", "")
-DSN = os.getenv("NEON_DSN", "")
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+DSN = os.environ["NEON_DSN"]
 BASE = "https://api.movidesk.com/public/v1"
+SYNC_KEY = "agentes_lastsync"
+CF_ID = 222343
 
-def get_with_retry(url, params, tries=6):
+def ts_utc(dt): 
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def iso_z(dt): 
+    return ts_utc(dt).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def get_with_retry(url, params, tries=3, timeout=60):
+    last = None
     for i in range(tries):
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code in (429,500,502,503,504):
-            time.sleep(min(60, 2**i)); continue
-        r.raise_for_status(); return r
-    r.raise_for_status()
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            last = e
+            if i < tries-1: time.sleep(2*(i+1))
+    raise last
 
-def fetch_paginated(endpoint, params=None, page_size=200):
-    p = dict(params or {})
-    p["token"] = API_TOKEN
-    p["$top"] = page_size
-    items, skip = [], 0
-    while True:
-        p["$skip"] = skip
-        r = get_with_retry(f"{BASE}/{endpoint}", p)
-        batch = r.json() or []
-        if not isinstance(batch, list): batch = [batch]
-        items.extend(batch)
-        if len(batch) < page_size: break
-        skip += page_size
-    return items
+def ensure_struct(conn):
+    ddl = """
+    CREATE SCHEMA IF NOT EXISTS visualizacao_agentes;
 
-def fetch_agents():
-    select_fields = ["id","businessName","userName","isActive","profileType","accessProfile","teams"]
-    params = {"$select": ",".join(select_fields), "$expand": "emails($select=email,isDefault,emailType)"}
-    return fetch_paginated("persons", params, page_size=200)
+    CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes (
+        agent_id BIGINT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        team_primary TEXT,
+        teams TEXT[],
+        access_type TEXT,
+        is_active BOOLEAN NOT NULL,
+        raw JSONB,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        time_squad TEXT
+    );
 
-def pick_email(p):
-    emails = p.get("emails") or []
-    if isinstance(emails, list) and emails:
-        for e in emails:
-            if isinstance(e, dict) and e.get("isDefault"):
-                v = (e.get("email") or "").strip()
-                if v: return v
-        pref = ("professional","profissional","commercial","comercial")
-        for e in emails:
-            if isinstance(e, dict) and str(e.get("emailType","")).lower() in pref:
-                v = (e.get("email") or "").strip()
-                if v: return v
-        f = emails[0]
-        if isinstance(f, dict): return (f.get("email") or "").strip()
-        if isinstance(f, str): return f.strip()
-    return (p.get("userName") or "").strip()
+    CREATE TABLE IF NOT EXISTS visualizacao_agentes.sync_control (
+        name TEXT PRIMARY KEY,
+        last_update TIMESTAMPTZ NOT NULL
+    );
 
-def extract_access(p):
-    return str(p.get("accessProfile") or p.get("businessProfile") or (p.get("profile") or {}).get("type","") or "")
-
-def extract_active(p):
-    v = p.get("isActive", p.get("active"))
-    if isinstance(v, bool): return v
-    if isinstance(v, str): return v.strip().lower() in ("true","1","yes","y","sim")
-    return bool(v)
-
-def pick_teams(p):
-    t = p.get("teams")
-    if isinstance(t, list):
-        out = []
-        for x in t:
-            if isinstance(x, dict):
-                n = (x.get("businessName") or x.get("name") or "").strip()
-                if n: out.append(n)
-            elif isinstance(x, str):
-                s = x.strip()
-                if s: out.append(s)
-        return out or None
-    return None
-
-DDL = """
-create schema if not exists visualizacao_agentes;
-create table if not exists visualizacao_agentes.agentes (
-  agent_id     bigint primary key,
-  name         text not null,
-  email        text not null,
-  team_primary text,
-  teams        text[],
-  access_type  text,
-  is_active    boolean not null,
-  raw          jsonb,
-  updated_at   timestamptz not null default now()
-);
-create index if not exists idx_agentes_email on visualizacao_agentes.agentes (lower(email));
-create index if not exists idx_agentes_team  on visualizacao_agentes.agentes (team_primary);
-create or replace view visualizacao_agentes.vw_agentes_resumida as
-select agent_id,name,email,coalesce(team_primary, teams[1]) as equipe,access_type,is_active
-from visualizacao_agentes.agentes;
-"""
-
-UPSERT = """
-insert into visualizacao_agentes.agentes
-  (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at)
-values
-  (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now())
-on conflict (agent_id) do update set
-  name=excluded.name,
-  email=excluded.email,
-  team_primary=excluded.team_primary,
-  teams=excluded.teams,
-  access_type=excluded.access_type,
-  is_active=excluded.is_active,
-  raw=excluded.raw,
-  updated_at=now();
-"""
-
-def ensure_structure(conn):
-    with conn.cursor() as cur: cur.execute(DDL)
+    CREATE INDEX IF NOT EXISTS idx_agentes_email ON visualizacao_agentes.agentes (lower(email));
+    CREATE INDEX IF NOT EXISTS idx_agentes_team ON visualizacao_agentes.agentes (team_primary);
+    CREATE INDEX IF NOT EXISTS idx_agentes_teams_gin ON visualizacao_agentes.agentes USING GIN (teams);
+    """
+    with conn.cursor() as cur:
+        cur.execute(ddl)
     conn.commit()
 
-def upsert(conn, rows):
-    if not rows: return
+def get_last_sync(conn):
     with conn.cursor() as cur:
-        for r in rows: cur.execute(UPSERT, {**r, "raw": Json(r["raw"])})
+        cur.execute("SELECT last_update FROM visualizacao_agentes.sync_control WHERE name=%s", (SYNC_KEY,))
+        r = cur.fetchone()
+    if r: 
+        return r[0]
+    return datetime.now(timezone.utc) - timedelta(days=60)
+
+def set_last_sync(conn, when):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO visualizacao_agentes.sync_control (name,last_update)
+            VALUES (%s,%s)
+            ON CONFLICT (name) DO UPDATE SET last_update = EXCLUDED.last_update
+        """,(SYNC_KEY, ts_utc(when)))
+    conn.commit()
+
+def extract_time_squad(p):
+    for key in ("customFieldValues","additionalFields","customFields"):
+        arr = p.get(key)
+        if not arr: 
+            continue
+        for it in arr:
+            cid = it.get("customFieldId") or it.get("id") or (it.get("customField") or {}).get("id")
+            nm  = it.get("customFieldName") or it.get("name") or (it.get("customField") or {}).get("name")
+            if cid == CF_ID or (nm and nm.lower().startswith("time (guerra de squad")):
+                val = it.get("value") or it.get("formattedValue") or it.get("text") or it.get("title")
+                if isinstance(val, list): 
+                    return ",".join([str(x) for x in val])
+                return str(val) if val is not None else None
+    return None
+
+def fetch_agents_since(since_dt):
+    since = iso_z(ts_utc(since_dt))
+    expansions = ["teams,customFieldValues","teams,additionalFields","teams"]
+    for exp in expansions:
+        try:
+            page = 0
+            page_size = 500
+            out = []
+            while True:
+                p = {
+                    "token": TOKEN,
+                    "$select": "id,businessName,userName,isActive,profileType,accessProfile,lastUpdate",
+                    "$expand": exp,
+                    "$filter": f"lastUpdate ge {since}",
+                    "$top": page_size,
+                    "$skip": page*page_size
+                }
+                r = get_with_retry(f"{BASE}/persons", p)
+                batch = r.json()
+                out.extend(batch)
+                if len(batch) < page_size: break
+                page += 1
+            return out
+        except requests.exceptions.HTTPError:
+            if exp == expansions[-1]: raise
+            else: time.sleep(1)
+    return []
+
+def shape(row):
+    teams = row.get("teams") or []
+    team_primary = teams[0] if teams else None
+    email = (row.get("userName") or "").strip()
+    name = (row.get("businessName") or "").strip()
+    access = row.get("accessProfile")
+    is_active = bool(row.get("isActive"))
+    time_squad = extract_time_squad(row)
+    return {
+        "agent_id": int(row["id"]),
+        "name": name,
+        "email": email,
+        "team_primary": team_primary,
+        "teams": teams if isinstance(teams, list) else [],
+        "access_type": access,
+        "is_active": is_active,
+        "time_squad": time_squad,
+        "raw": row
+    }
+
+def upsert_agents(conn, rows):
+    sql = """
+    INSERT INTO visualizacao_agentes.agentes
+      (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
+    VALUES
+      (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
+    ON CONFLICT (agent_id) DO UPDATE SET
+      name = EXCLUDED.name,
+      email = EXCLUDED.email,
+      team_primary = EXCLUDED.team_primary,
+      teams = EXCLUDED.teams,
+      access_type = EXCLUDED.access_type,
+      is_active = EXCLUDED.is_active,
+      raw = EXCLUDED.raw,
+      updated_at = now(),
+      time_squad = EXCLUDED.time_squad
+    WHERE
+      visualizacao_agentes.agentes.name IS DISTINCT FROM EXCLUDED.name OR
+      visualizacao_agentes.agentes.email IS DISTINCT FROM EXCLUDED.email OR
+      visualizacao_agentes.agentes.team_primary IS DISTINCT FROM EXCLUDED.team_primary OR
+      visualizacao_agentes.agentes.teams IS DISTINCT FROM EXCLUDED.teams OR
+      visualizacao_agentes.agentes.access_type IS DISTINCT FROM EXCLUDED.access_type OR
+      visualizacao_agentes.agentes.is_active IS DISTINCT FROM EXCLUDED.is_active OR
+      visualizacao_agentes.agentes.time_squad IS DISTINCT FROM EXCLUDED.time_squad OR
+      visualizacao_agentes.agentes.raw IS DISTINCT FROM EXCLUDED.raw
+    """
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(sql, {**r, "raw": Json(r["raw"])})
     conn.commit()
 
 def main():
     conn = psycopg2.connect(DSN)
-    ensure_structure(conn)
-    people = [p for p in fetch_agents() if p.get("profileType") in (1,3)]
-    rows = []
-    for p in people:
-        try: pid = int(p.get("id"))
-        except: continue
-        teams = pick_teams(p)
-        rows.append({
-            "agent_id": pid,
-            "name": (p.get("businessName") or p.get("name") or "").strip(),
-            "email": pick_email(p),
-            "team_primary": (teams or [None])[0],
-            "teams": teams,
-            "access_type": extract_access(p),
-            "is_active": extract_active(p),
-            "raw": p
-        })
-    upsert(conn, rows)
-    conn.close()
+    try:
+        ensure_struct(conn)
+        last = get_last_sync(conn)
+        data = fetch_agents_since(last)
+        shaped = [shape(x) for x in data if x.get("profileType") in (1,3)]
+        if shaped:
+            upsert_agents(conn, shaped)
+        set_last_sync(conn, datetime.now(timezone.utc))
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
