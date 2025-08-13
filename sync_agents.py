@@ -1,4 +1,4 @@
-import os, time, json, requests, psycopg2
+import os, time, json, random, requests, psycopg2
 from datetime import datetime
 from psycopg2.extras import Json
 from zoneinfo import ZoneInfo
@@ -7,16 +7,31 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN", "")
 DSN = os.getenv("NEON_DSN", "")
 BASE = "https://api.movidesk.com/public/v1"
 CF_SQUAD_ID = os.getenv("MOVIDESK_SQUAD_FIELD_ID", "222343")
+PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))
+PAGE_DELAY_MS = int(os.getenv("MOVIDESK_PAGE_DELAY_MS", "250"))
+READ_TIMEOUT = int(os.getenv("MOVIDESK_READ_TIMEOUT", "120"))
+CONNECT_TIMEOUT = int(os.getenv("MOVIDESK_CONNECT_TIMEOUT", "10"))
+MAX_TRIES = int(os.getenv("MOVIDESK_MAX_TRIES", "8"))
 
-def get_with_retry(url, params, tries=6):
+_session = requests.Session()
+
+def get_with_retry(url, params, tries=MAX_TRIES, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
     for i in range(tries):
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(min(60, 2**i)); continue
-        r.raise_for_status(); return r
-    r.raise_for_status()
+        try:
+            r = _session.get(url, params=params, timeout=(connect_timeout, read_timeout))
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            if isinstance(e, requests.exceptions.HTTPError):
+                code = getattr(e.response, "status_code", 0) or 0
+                if code not in (429, 500, 502, 503, 504):
+                    raise
+            if i == tries - 1:
+                raise
+            sleep_s = min(60, (1.6 ** i)) + random.uniform(0, 0.6)
+            time.sleep(sleep_s)
 
-def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
+def fetch_paginated(endpoint, params=None, page_size=PAGE_SIZE, hard_limit=20000, delay_ms=PAGE_DELAY_MS):
     p = dict(params or {})
     p["token"] = API_TOKEN
     p["$top"] = page_size
@@ -25,28 +40,36 @@ def fetch_paginated(endpoint, params=None, page_size=200, hard_limit=20000):
         p["$skip"] = skip
         r = get_with_retry(f"{BASE}/{endpoint}", p)
         batch = r.json() or []
-        if not isinstance(batch, list): batch = [batch]
+        if not isinstance(batch, list):
+            batch = [batch]
         items.extend(batch)
-        if len(batch) < page_size or len(items) >= hard_limit: break
+        if len(batch) < page_size or len(items) >= hard_limit:
+            break
         skip += page_size
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
     return items
 
 def fetch_agents():
     select_fields = ["id","businessName","userName","isActive","profileType","accessProfile","emails","teams","customFieldValues"]
     params = {"$select": ",".join(select_fields)}
-    return fetch_paginated("persons", params, page_size=200)
+    return fetch_paginated("persons", params, page_size=PAGE_SIZE)
 
 def pick_email(p):
     emails = p.get("emails") or []
     if isinstance(emails, list) and emails:
         for e in emails:
-            if isinstance(e, dict) and e.get("isDefault"): return (e.get("email") or "").strip()
+            if isinstance(e, dict) and e.get("isDefault"):
+                return (e.get("email") or "").strip()
         pref = ("professional","profissional","commercial","comercial")
         for e in emails:
-            if isinstance(e, dict) and str(e.get("emailType","")).lower() in pref: return (e.get("email") or "").strip()
+            if isinstance(e, dict) and str(e.get("emailType","")).lower() in pref:
+                return (e.get("email") or "").strip()
         first = emails[0]
-        if isinstance(first, dict): return (first.get("email") or "").strip()
-        if isinstance(first, str): return first.strip()
+        if isinstance(first, dict):
+            return (first.get("email") or "").strip()
+        if isinstance(first, str):
+            return first.strip()
     return (p.get("userName") or "").strip()
 
 def extract_access(p):
@@ -54,8 +77,10 @@ def extract_access(p):
 
 def extract_active(p):
     v = p.get("isActive", p.get("active"))
-    if isinstance(v, bool): return v
-    if isinstance(v, str): return v.strip().lower() in ("true","1","yes","y","sim")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("true","1","yes","y","sim")
     return bool(v)
 
 def pick_teams(p):
@@ -65,10 +90,12 @@ def pick_teams(p):
         for x in t:
             if isinstance(x, dict):
                 n = (x.get("businessName") or x.get("name") or "").strip()
-                if n: out.append(n)
+                if n:
+                    out.append(n)
             elif isinstance(x, str):
                 s = x.strip()
-                if s: out.append(s)
+                if s:
+                    out.append(s)
         return out or None
     return None
 
@@ -76,18 +103,22 @@ def extract_squad(p):
     keys = ("customFieldValues","additionalFields","additionalFieldValues","customFields","personFields")
     for key in keys:
         arr = p.get(key)
-        if not isinstance(arr, list): continue
+        if not isinstance(arr, list):
+            continue
         for it in arr:
-            if not isinstance(it, dict): continue
+            if not isinstance(it, dict):
+                continue
             fid = str(it.get("id") or it.get("fieldId") or it.get("customFieldId") or "")
             if fid == str(CF_SQUAD_ID):
                 val = it.get("value")
-                if isinstance(val, dict): return str(val.get("name") or val.get("value") or "").strip()
+                if isinstance(val, dict):
+                    return str(val.get("name") or val.get("value") or "").strip()
                 return str(val or "").strip()
             name = str(it.get("label") or it.get("name") or "").lower()
             if "guerra" in name and "squad" in name:
                 val = it.get("value")
-                if isinstance(val, dict): return str(val.get("name") or val.get("value") or "").strip()
+                if isinstance(val, dict):
+                    return str(val.get("name") or val.get("value") or "").strip()
                 return str(val or "").strip()
     return None
 
@@ -181,19 +212,23 @@ def ensure_structure(conn):
     conn.commit()
 
 def upsert_now(conn, rows):
-    if not rows: return
+    if not rows:
+        return
     with conn.cursor() as cur:
-        for r in rows: cur.execute(UPSERT_NOW, {**r, "raw": Json(r["raw"])})
+        for r in rows:
+            cur.execute(UPSERT_NOW, {**r, "raw": Json(r["raw"])})
     conn.commit()
 
 def upsert_history(conn, row):
-    with conn.cursor() as cur: cur.execute(INSERT_HIST, {**row, "raw": Json(row["raw"])})
+    with conn.cursor() as cur:
+        cur.execute(INSERT_HIST, {**row, "raw": Json(row["raw"])})
 
 def fetch_last_hist(conn, agent_id):
     with conn.cursor() as cur:
         cur.execute(SELECT_LAST_HIST, (agent_id,))
         r = cur.fetchone()
-        if not r: return None
+        if not r:
+            return None
         return {"name": r[0], "email": r[1], "team_primary": r[2], "teams": r[3], "access_type": r[4], "is_active": r[5], "time_squad": r[6], "dia": r[7]}
 
 def main():
@@ -203,8 +238,10 @@ def main():
     rows_now = []
     today = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
     for p in people:
-        try: pid = int(p.get("id"))
-        except: continue
+        try:
+            pid = int(p.get("id"))
+        except:
+            continue
         teams = pick_teams(p)
         time_squad = extract_squad(p)
         row_now = {
@@ -235,7 +272,8 @@ def main():
             "raw": r["raw"]
         }
         must = False
-        if last is None: must = True
+        if last is None:
+            must = True
         else:
             changed = (
                 (last.get("name") or "") != (hist["name"] or "") or
@@ -246,8 +284,10 @@ def main():
                 (last.get("time_squad") or "") != (hist["time_squad"] or "") or
                 (last.get("teams") or []) != (hist["teams"] or [])
             )
-            if changed or last.get("dia") != today: must = True
-        if must: upsert_history(conn, hist)
+            if changed or last.get("dia") != today:
+                must = True
+        if must:
+            upsert_history(conn, hist)
     conn.commit()
     conn.close()
 
