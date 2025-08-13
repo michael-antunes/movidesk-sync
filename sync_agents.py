@@ -1,168 +1,139 @@
-import os
-import time
-import requests
-import psycopg2
+import os, time, json, requests, psycopg2
 from psycopg2.extras import Json
 
-TOKEN = os.environ.get("MOVIDESK_TOKEN", "")
-DSN = os.environ.get("NEON_DSN", "")
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+DSN = os.environ["NEON_DSN"]
 BASE = "https://api.movidesk.com/public/v1"
+CUSTOM_FIELD_ID = 222343
 
-# Campo adicional de Pessoa: "Time (guerra de squads):"
-CUSTOM_FIELD_SQUAD_ID = 222343
-
-
-# ------------------------- HTTP helpers ------------------------- #
-def get_with_retry(url, params, tries=4, timeout=60):
-    """GET com retry para chamadas 'lista' (erros != 404 devem falhar)."""
-    err = None
-    for i in range(tries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            err = e
-            time.sleep(2 ** i)
-    raise err
-
-
-def get_detail_allow_404(url, params, tries=3, timeout=60):
-    """GET com retry para chamadas 'detalhe' que podem retornar 404.
-    Retorna: dict JSON se ok, None se 404, ou relança se outro erro."""
+def get_with_retry(url, params=None, tries=4):
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 404:
-                return None
+            r = requests.get(url, params=params, timeout=60)
+            if r.status_code == 429:
+                time.sleep(2 + i)
+                continue
             r.raise_for_status()
             return r.json()
-        except requests.HTTPError as e:
-            # Se não for 404, tenta novamente e no fim relança
-            last = e
         except requests.RequestException as e:
             last = e
-        time.sleep(2 ** i)
-    # Se chegamos aqui e não foi 404, relança
-    if last:
-        raise last
-    return None
+            if hasattr(e, "response") and e.response is not None and e.response.status_code in (400,404):
+                raise
+            time.sleep(1.5 * (i + 1))
+    raise last
 
-
-# ------------------------- DB structure ------------------------- #
 def ensure_structure(conn):
     ddl = """
     create schema if not exists visualizacao_agentes;
 
     create table if not exists visualizacao_agentes.agentes (
-        agent_id     bigint primary key,
-        name         text not null,
-        email        text not null,
+        agent_id bigint primary key,
+        name text not null,
+        email text not null,
         team_primary text,
-        teams        text[],
-        access_type  text,
-        is_active    boolean not null,
-        raw          jsonb,
-        updated_at   timestamptz not null default now(),
-        time_squad   text
+        teams text[],
+        access_type text,
+        is_active boolean not null,
+        raw jsonb,
+        updated_at timestamp with time zone not null default now(),
+        time_squad text
     );
 
-    create index if not exists idx_agentes_email on visualizacao_agentes.agentes (lower(email));
-    create index if not exists idx_agentes_team  on visualizacao_agentes.agentes (team_primary);
-    create index if not exists idx_agentes_teams_gin on visualizacao_agentes.agentes using gin (teams);
+    do $$
+    begin
+      if not exists (
+        select 1 from pg_indexes
+        where schemaname='visualizacao_agentes' and indexname='idx_agentes_email'
+      ) then
+        create index idx_agentes_email on visualizacao_agentes.agentes (lower(email));
+      end if;
+
+      if not exists (
+        select 1 from pg_indexes
+        where schemaname='visualizacao_agentes' and indexname='idx_agentes_team'
+      ) then
+        create index idx_agentes_team on visualizacao_agentes.agentes (team_primary);
+      end if;
+
+      if not exists (
+        select 1 from pg_indexes
+        where schemaname='visualizacao_agentes' and indexname='idx_agentes_teams_gin'
+      ) then
+        create index idx_agentes_teams_gin on visualizacao_agentes.agentes using gin (teams);
+      end if;
+    end$$;
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
     conn.commit()
 
-
-# ------------------------- API fetchers ------------------------- #
-def fetch_all_agents():
-    """Lista de pessoas (sem expand para evitar 400)."""
-    results = []
+def list_people():
+    out = []
     skip = 0
     top = 500
     while True:
-        params = {
+        p = {
             "token": TOKEN,
             "$select": "id,businessName,userName,isActive,profileType,accessProfile",
             "$top": top,
             "$skip": skip,
         }
-        r = get_with_retry(f"{BASE}/persons", params)
-        page = r.json()
-        if not isinstance(page, list):
-            page = []
-        results.extend(page)
-        if len(page) < top:
+        data = get_with_retry(f"{BASE}/persons", p)
+        if not data:
+            break
+        out.extend(data)
+        if len(data) < top:
             break
         skip += top
-    return results
+    return out
 
+def person_detail(pid):
+    p = {
+        "token": TOKEN,
+        "$expand": "teams,customFieldValues,emails"
+    }
+    try:
+        return get_with_retry(f"{BASE}/persons/{pid}", p)
+    except requests.HTTPError as e:
+        return None
 
-def fetch_person_detail(person_id):
-    """Detalhe da pessoa com expand. Tolerante a 404 (retorna None)."""
-    params = {"token": TOKEN, "$expand": "teams,customFieldValues,emails"}
-    return get_detail_allow_404(f"{BASE}/persons/{person_id}", params)
-
-
-# ------------------------- extract helpers ------------------------- #
-def extract_email(detail, fallback_username):
-    emails = (detail or {}).get("emails") or []
+def pick_email(detail, fallback):
+    emails = detail.get("emails") or []
+    chosen = None
     for e in emails:
         if e.get("isDefault"):
-            return e.get("email") or fallback_username or ""
-    if emails:
-        return emails[0].get("email") or fallback_username or ""
-    return fallback_username or ""
-
-
-def extract_teams(detail):
-    teams = (detail or {}).get("teams") or []
-    names = []
-    for t in teams:
-        n = t.get("name")
-        if n:
-            names.append(n)
-    return names
-
+            chosen = e.get("email")
+            break
+    if not chosen and emails:
+        chosen = emails[0].get("email")
+    if not chosen:
+        chosen = fallback or ""
+    return chosen
 
 def extract_time_squad(detail):
-    """Lê o valor do campo adicional (lista de valores ou string simples)."""
-    if not detail:
-        return None
-    vals = detail.get("customFieldValues") or []
-    for v in vals:
-        # Alguns retornam ID como string
-        try:
-            cfid = int(v.get("customFieldId"))
-        except Exception:
-            continue
-        if cfid != CUSTOM_FIELD_SQUAD_ID:
-            continue
-        val = v.get("value")
-        # Pode vir string, dict {name/value}, ou lista
-        if isinstance(val, dict):
-            if "name" in val:
-                return str(val["name"])
-            if "value" in val:
-                return str(val["value"])
-            return None
-        if isinstance(val, list):
-            # No Movidesk este campo é seleção única, mas mantemos seguro
-            return ",".join([str(x) for x in val if x is not None]) or None
-        return (None if val is None else str(val))
+    cf = detail.get("customFieldValues") or []
+    for item in cf:
+        if str(item.get("customFieldId")) == str(CUSTOM_FIELD_ID):
+            v = item.get("value")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            name = item.get("name") or item.get("valueName")
+            if name:
+                return str(name)
+            items = item.get("items")
+            if isinstance(items, list) and items:
+                nm = items[0].get("name") or items[0].get("value")
+                if nm:
+                    return str(nm)
     return None
 
-
-# ------------------------- upsert ------------------------- #
-def upsert_agent(conn, row):
+def upsert(conn, row):
     sql = """
     insert into visualizacao_agentes.agentes
-    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,time_squad,updated_at)
+      (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
     values
-    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,%(time_squad)s,now())
+      (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
     on conflict (agent_id) do update set
       name=excluded.name,
       email=excluded.email,
@@ -171,55 +142,39 @@ def upsert_agent(conn, row):
       access_type=excluded.access_type,
       is_active=excluded.is_active,
       raw=excluded.raw,
-      time_squad=excluded.time_squad,
-      updated_at=now();
+      updated_at=now(),
+      time_squad=excluded.time_squad;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, row)
+        cur.execute(sql, {**row, "raw": Json(row["raw"])})
 
-
-# ------------------------- main ------------------------- #
 def main():
-    if not TOKEN or not DSN:
-        raise RuntimeError("MOVIDESK_TOKEN e NEON_DSN são obrigatórios no ambiente")
-
     conn = psycopg2.connect(DSN)
     try:
         ensure_structure(conn)
-
-        # Apenas perfis de agentes (1 e 3 são os usados no projeto)
-        base_people = [p for p in fetch_all_agents() if p.get("profileType") in (1, 3)]
-
-        for p in base_people:
+        people = [p for p in list_people() if p.get("profileType") in (1,3)]
+        for p in people:
             pid = p.get("id")
-            if not pid:
-                continue
-
-            detail = fetch_person_detail(pid)
-            # Se 404, apenas seguimos sem detalhe para esse ID
-            teams = extract_teams(detail)
-            team_primary = teams[0] if teams else None
-
-            email = extract_email(detail, p.get("userName"))
-            time_squad = extract_time_squad(detail)
-
+            detail = person_detail(pid) or {}
+            teams_detail = detail.get("teams") or []
+            team_names = [t.get("name") for t in teams_detail if isinstance(t, dict) and t.get("name")]
+            team_primary = team_names[0] if team_names else None
+            email = pick_email(detail, p.get("userName"))
             row = {
                 "agent_id": int(pid),
-                "name": p.get("businessName") or "",
-                "email": email or "",
+                "name": str(p.get("businessName") or "").strip(),
+                "email": str(email or "").strip(),
                 "team_primary": team_primary,
-                "teams": teams if teams else None,
+                "teams": team_names if team_names else None,
                 "access_type": p.get("accessProfile"),
                 "is_active": bool(p.get("isActive")),
-                "raw": Json(detail if detail is not None else p),  # guarda algo útil
-                "time_squad": time_squad,
+                "raw": detail if detail else p,
+                "time_squad": extract_time_squad(detail)
             }
-            upsert_agent(conn, row)
-
+            upsert(conn, row)
         conn.commit()
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     main()
