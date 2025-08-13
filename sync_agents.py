@@ -56,35 +56,19 @@ def ensure_structure(conn):
         cur.execute(ddl)
     conn.commit()
 
-def fetch_persons_page(skip, expand_variant):
+def fetch_persons_page(skip):
     params = {
         "token": TOKEN,
         "$select": "id,businessName,userName,isActive,profileType,accessProfile",
         "$top": 500,
         "$skip": skip
     }
-    if expand_variant == "teams":
-        params["$expand"] = "teams"
-    elif expand_variant == "teams_name":
-        params["$expand"] = "teams($select=name)"
-    data = get_with_retry(f"{BASE}/persons", params)
-    return data
+    return get_with_retry(f"{BASE}/persons", params)
 
-def fetch_all_agents():
-    variants = ["teams", "teams_name", "none"]
-    chosen = None
-    for v in variants:
-        try:
-            _ = fetch_persons_page(0, v)
-            chosen = v
-            break
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 400:
-                continue
-            raise
+def fetch_all_persons():
     out, skip = [], 0
     while True:
-        data = fetch_persons_page(skip, chosen)
+        data = fetch_persons_page(skip)
         if not data:
             break
         out.extend(data)
@@ -93,21 +77,43 @@ def fetch_all_agents():
         skip += 500
     return out
 
-def parse_teams(p):
+def fetch_person_detail(pid):
+    variants = [
+        "teams,customFieldValues",
+        "customFieldValues,teams",
+        "teams($select=name),customFieldValues",
+        "customFieldValues",
+        ""
+    ]
+    for v in variants:
+        try:
+            params = {"token": TOKEN}
+            if v:
+                params["$expand"] = v
+            return get_with_retry(f"{BASE}/persons/{pid}", params)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                continue
+            raise
+    return get_with_retry(f"{BASE}/persons/{pid}", {"token": TOKEN})
+
+def parse_teams_from_detail(detail):
     names = []
-    t = p.get("teams") or []
+    t = detail.get("teams") or []
     if isinstance(t, list):
         for it in t:
-            n = it.get("name") if isinstance(it, dict) else None
-            if not n and isinstance(it, str):
+            if isinstance(it, dict):
+                n = it.get("name") or it.get("valueName") or it.get("value")
+            elif isinstance(it, str):
                 n = it
+            else:
+                n = None
             if n:
                 names.append(str(n))
     return names
 
-def person_time_squad(pid):
-    d = get_with_retry(f"{BASE}/persons/{pid}", {"token": TOKEN, "$expand": "customFieldValues"})
-    cf = d.get("customFieldValues") or []
+def parse_time_squad_from_detail(detail):
+    cf = detail.get("customFieldValues") or []
     for item in cf:
         if str(item.get("customFieldId")) != CUSTOM_FIELD_ID:
             continue
@@ -149,31 +155,31 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_structure(conn)
-        people = [p for p in fetch_all_agents() if p.get("profileType") in (1,3)]
+        base_people = [p for p in fetch_all_persons() if p.get("profileType") in (1,3)]
         with conn.cursor() as cur:
-            for p in people:
+            for p in base_people:
                 pid = p.get("id")
                 try:
                     pid_int = int(pid)
                 except Exception:
                     continue
-                teams = parse_teams(p)
-                team_primary = teams[0] if teams else None
-                email = (p.get("userName") or "").strip()
                 try:
-                    time_squad = person_time_squad(pid)
+                    detail = fetch_person_detail(pid)
                 except requests.HTTPError:
-                    time_squad = None
+                    detail = {}
+                teams = parse_teams_from_detail(detail)
+                team_primary = teams[0] if teams else None
+                time_squad = parse_time_squad_from_detail(detail)
                 row = {
                     "agent_id": pid_int,
                     "name": (p.get("businessName") or "").strip(),
-                    "email": email,
+                    "email": (p.get("userName") or "").strip(),
                     "team_primary": team_primary,
                     "teams": teams if teams else None,
                     "access_type": p.get("accessProfile"),
                     "is_active": bool(p.get("isActive")),
-                    "raw": p,
-                    "time_squad": time_squad,
+                    "raw": {"base": p, "detail": detail},
+                    "time_squad": time_squad
                 }
                 cur.execute(UPSERT, {**row, "raw": Json(row["raw"])})
         conn.commit()
