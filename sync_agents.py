@@ -1,5 +1,5 @@
-import os, time, requests, json
-from datetime import datetime, timedelta, timezone
+import os, time, requests
+from datetime import datetime, timezone, timedelta
 import psycopg2
 from psycopg2.extras import Json
 
@@ -9,12 +9,9 @@ BASE = "https://api.movidesk.com/public/v1"
 SYNC_KEY = "agentes_lastsync"
 CF_ID = 222343
 
-def ts_utc(dt): 
+def ts_utc(dt):
     if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
-def iso_z(dt): 
-    return ts_utc(dt).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def get_with_retry(url, params, tries=3, timeout=60):
     last = None
@@ -62,8 +59,7 @@ def get_last_sync(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT last_update FROM visualizacao_agentes.sync_control WHERE name=%s", (SYNC_KEY,))
         r = cur.fetchone()
-    if r: 
-        return r[0]
+    if r: return r[0]
     return datetime.now(timezone.utc) - timedelta(days=60)
 
 def set_last_sync(conn, when):
@@ -78,44 +74,40 @@ def set_last_sync(conn, when):
 def extract_time_squad(p):
     for key in ("customFieldValues","additionalFields","customFields"):
         arr = p.get(key)
-        if not arr: 
-            continue
+        if not arr: continue
         for it in arr:
             cid = it.get("customFieldId") or it.get("id") or (it.get("customField") or {}).get("id")
             nm  = it.get("customFieldName") or it.get("name") or (it.get("customField") or {}).get("name")
             if cid == CF_ID or (nm and nm.lower().startswith("time (guerra de squad")):
                 val = it.get("value") or it.get("formattedValue") or it.get("text") or it.get("title")
-                if isinstance(val, list): 
-                    return ",".join([str(x) for x in val])
+                if isinstance(val, list): return ",".join([str(x) for x in val])
                 return str(val) if val is not None else None
     return None
 
-def fetch_agents_since(since_dt):
-    since = iso_z(ts_utc(since_dt))
+def fetch_all_agents():
     expansions = ["teams,customFieldValues","teams,additionalFields","teams"]
     for exp in expansions:
         try:
-            page = 0
-            page_size = 500
             out = []
+            page = 0
+            size = 500
             while True:
                 p = {
                     "token": TOKEN,
-                    "$select": "id,businessName,userName,isActive,profileType,accessProfile,lastUpdate",
+                    "$select": "id,businessName,userName,isActive,profileType,accessProfile",
                     "$expand": exp,
-                    "$filter": f"lastUpdate ge {since}",
-                    "$top": page_size,
-                    "$skip": page*page_size
+                    "$top": size,
+                    "$skip": page*size
                 }
                 r = get_with_retry(f"{BASE}/persons", p)
                 batch = r.json()
                 out.extend(batch)
-                if len(batch) < page_size: break
+                if len(batch) < size: break
                 page += 1
             return out
         except requests.exceptions.HTTPError:
             if exp == expansions[-1]: raise
-            else: time.sleep(1)
+            time.sleep(1)
     return []
 
 def shape(row):
@@ -173,9 +165,9 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_struct(conn)
-        last = get_last_sync(conn)
-        data = fetch_agents_since(last)
-        shaped = [shape(x) for x in data if x.get("profileType") in (1,3)]
+        fetch_all_agents()  # warm-up DNS if needed
+        people = [p for p in fetch_all_agents() if p.get("profileType") in (1,3)]
+        shaped = [shape(x) for x in people]
         if shaped:
             upsert_agents(conn, shaped)
         set_last_sync(conn, datetime.now(timezone.utc))
