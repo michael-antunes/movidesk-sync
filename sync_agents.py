@@ -18,7 +18,7 @@ def get_with_retry(url, params=None, tries=4):
             return r.json()
         except requests.RequestException as e:
             last = e
-            if getattr(e, "response", None) and e.response is not None and e.response.status_code in (400,404):
+            if getattr(e, "response", None) is not None and e.response.status_code in (400,404):
                 raise
             time.sleep(1.2 * (i + 1))
     raise last
@@ -28,9 +28,9 @@ def ensure_structure(conn):
     create schema if not exists visualizacao_agentes;
 
     create table if not exists visualizacao_agentes.agentes (
-        agent_id    bigint primary key,
-        name        text not null,
-        email       text not null,
+        agent_id     bigint primary key,
+        name         text not null,
+        email        text not null,
         team_primary text,
         teams        text[],
         access_type  text,
@@ -56,32 +56,53 @@ def ensure_structure(conn):
         cur.execute(ddl)
     conn.commit()
 
+def fetch_persons_page(skip, expand_variant):
+    params = {
+        "token": TOKEN,
+        "$select": "id,businessName,userName,isActive,profileType,accessProfile",
+        "$top": 500,
+        "$skip": skip
+    }
+    if expand_variant == "teams":
+        params["$expand"] = "teams"
+    elif expand_variant == "teams_name":
+        params["$expand"] = "teams($select=name)"
+    data = get_with_retry(f"{BASE}/persons", params)
+    return data
+
 def fetch_all_agents():
-    out, skip, top = [], 0, 500
+    variants = ["teams", "teams_name", "none"]
+    chosen = None
+    for v in variants:
+        try:
+            _ = fetch_persons_page(0, v)
+            chosen = v
+            break
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
+                continue
+            raise
+    out, skip = [], 0
     while True:
-        params = {
-            "token": TOKEN,
-            "$select": "id,businessName,userName,isActive,profileType,accessProfile",
-            "$expand": "teams",
-            "$top": top,
-            "$skip": skip,
-        }
-        data = get_with_retry(f"{BASE}/persons", params)
+        data = fetch_persons_page(skip, chosen)
         if not data:
             break
         out.extend(data)
-        if len(data) < top:
+        if len(data) < 500:
             break
-        skip += top
+        skip += 500
     return out
 
 def parse_teams(p):
     names = []
     t = p.get("teams") or []
-    for it in t:
-        n = it.get("name")
-        if n:
-            names.append(str(n))
+    if isinstance(t, list):
+        for it in t:
+            n = it.get("name") if isinstance(it, dict) else None
+            if not n and isinstance(it, str):
+                n = it
+            if n:
+                names.append(str(n))
     return names
 
 def person_time_squad(pid):
@@ -139,7 +160,10 @@ def main():
                 teams = parse_teams(p)
                 team_primary = teams[0] if teams else None
                 email = (p.get("userName") or "").strip()
-                time_squad = person_time_squad(pid)
+                try:
+                    time_squad = person_time_squad(pid)
+                except requests.HTTPError:
+                    time_squad = None
                 row = {
                     "agent_id": pid_int,
                     "name": (p.get("businessName") or "").strip(),
