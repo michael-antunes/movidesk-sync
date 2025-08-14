@@ -1,32 +1,33 @@
-import os, time, requests, psycopg2, psycopg2.extras as pgx
+import os
+import time
+import requests
+import psycopg2
+import psycopg2.extras as pgx
 
 BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN")
+CUSTOM_FIELD_ID = int(os.getenv("MOVIDESK_CF_SQUAD", "222343"))
+PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
 
-def get_with_retry(url, params, tries=3, timeout=60):
+def api_get(url, params):
     err = None
-    for _ in range(tries):
+    for i in range(6):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, timeout=60)
+            if r.status_code in (429,500,502,503,504):
+                time.sleep(min(60,2**i)); continue
             r.raise_for_status()
-            return r
-        except requests.HTTPError as e:
-            err = e
-            if e.response is not None and e.response.status_code in (429,500,502,503,504):
-                time.sleep(2)
-                continue
-            raise
+            return r.json()
         except requests.RequestException as e:
-            err = e
-            time.sleep(2)
+            err = e; time.sleep(min(60,2**i))
     raise err
 
 def ensure_structure(conn):
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS visualizacao_agentes")
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes(
+        CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes (
             agent_id     BIGINT PRIMARY KEY,
             name         TEXT NOT NULL,
             email        TEXT NOT NULL,
@@ -56,76 +57,79 @@ def extract_team_names(person):
                 n = item.get("name") or item.get("teamName") or item.get("value") or item.get("text")
                 if isinstance(n, str) and n:
                     out.append(n)
-    seen, uniq = set(), []
+    seen = set()
+    uniq = []
     for n in out:
         if n not in seen:
             seen.add(n)
             uniq.append(n)
     return uniq
 
-def extract_time_squad(person, field_id="222343"):
-    cfs = person.get("customFieldValues")
-    if not isinstance(cfs, list):
-        return None
-    for cf in cfs:
-        if not isinstance(cf, dict):
+def extract_time_squad(person, field_id):
+    vals = person.get("customFieldValues") or []
+    for cf in vals:
+        try:
+            if int(cf.get("customFieldId")) != int(field_id):
+                continue
+        except Exception:
             continue
-        if str(cf.get("customFieldId")) != str(field_id):
-            continue
-        vals = []
-        items = cf.get("items")
-        if isinstance(items, list):
-            for it in items:
-                v = it.get("customFieldItem") if isinstance(it, dict) else it
-                if isinstance(v, str) and v.strip():
-                    vals.append(v.strip())
+        names = []
+        items = cf.get("items") or []
+        for it in items:
+            if isinstance(it, dict):
+                v = it.get("customFieldItem") or it.get("name") or it.get("text") or it.get("value")
+            else:
+                v = str(it)
+            if isinstance(v, str) and v.strip():
+                names.append(v.strip())
         v = cf.get("value")
         if isinstance(v, str) and v.strip():
-            vals.append(v.strip())
-        vals = list(dict.fromkeys(vals))
-        return " | ".join(vals) if vals else None
+            names.append(v.strip())
+        if names:
+            return ", ".join(dict.fromkeys(names))
+        return None
     return None
 
-def fetch_all_agents():
+def fetch_agents():
     params = {
         "token": TOKEN,
         "$select": "id,businessName,userName,isActive,profileType,accessProfile,teams",
-        "$expand": "customFieldValues",
-        "$filter": "profileType eq 1 or profileType eq 3",
-        "$top": 500,
+        "$filter": "(profileType eq 1 or profileType eq 3)",
+        "$expand": "customFieldValues($expand=items)",
+        "$top": PAGE_SIZE,
         "$skip": 0
     }
     people = []
     while True:
-        r = get_with_retry(f"{BASE}/persons", params)
-        page = r.json()
+        page = api_get(f"{BASE}/persons", params)
         if not isinstance(page, list) or not page:
             break
         people.extend(page)
+        if len(page) < params["$top"]:
+            break
         params["$skip"] += params["$top"]
     return people
 
 def upsert_agents(conn, people):
     sql = """
     INSERT INTO visualizacao_agentes.agentes
-      (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
+    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
     VALUES
-      (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
+    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
     ON CONFLICT (agent_id) DO UPDATE SET
-      name=EXCLUDED.name,
-      email=EXCLUDED.email,
-      team_primary=EXCLUDED.team_primary,
-      teams=EXCLUDED.teams,
-      access_type=EXCLUDED.access_type,
-      is_active=EXCLUDED.is_active,
-      raw=EXCLUDED.raw,
-      updated_at=now(),
-      time_squad=EXCLUDED.time_squad
+        name=EXCLUDED.name,
+        email=EXCLUDED.email,
+        team_primary=EXCLUDED.team_primary,
+        teams=EXCLUDED.teams,
+        access_type=EXCLUDED.access_type,
+        is_active=EXCLUDED.is_active,
+        raw=EXCLUDED.raw,
+        updated_at=now(),
+        time_squad=EXCLUDED.time_squad
     """
     rows = []
     for p in people:
-        pt = p.get("profileType")
-        if pt not in (1, 3, "1", "3"):
+        if p.get("profileType") not in (1,3,"1","3"):
             continue
         pid = p.get("id")
         try:
@@ -142,7 +146,7 @@ def upsert_agents(conn, people):
             "access_type": p.get("accessProfile"),
             "is_active": bool(p.get("isActive")),
             "raw": pgx.Json(p),
-            "time_squad": extract_time_squad(p)
+            "time_squad": extract_time_squad(p, CUSTOM_FIELD_ID)
         })
     if not rows:
         return
@@ -152,11 +156,11 @@ def upsert_agents(conn, people):
 
 def main():
     if not TOKEN or not DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN.")
+        raise RuntimeError("Defina as variáveis de ambiente MOVIDESK_TOKEN e NEON_DSN.")
     conn = psycopg2.connect(DSN)
     try:
         ensure_structure(conn)
-        people = fetch_all_agents()
+        people = fetch_agents()
         upsert_agents(conn, people)
     finally:
         conn.close()
