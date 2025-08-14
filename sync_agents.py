@@ -7,21 +7,20 @@ import psycopg2.extras as pgx
 BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN")
-CUSTOM_FIELD_ID = 222343
+CUSTOM_FIELD_ID = int(os.getenv("MOVIDESK_CF_SQUAD", "222343"))
+PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
 
-def get_with_retry(url, params, tries=5, timeout=60):
+def api_get(url, params):
     err = None
-    for i in range(tries):
+    for i in range(6):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(60, 2**i))
-                continue
+            r = requests.get(url, params=params, timeout=60)
+            if r.status_code in (429,500,502,503,504):
+                time.sleep(min(60,2**i)); continue
             r.raise_for_status()
-            return r
+            return r.json()
         except requests.RequestException as e:
-            err = e
-            time.sleep(min(60, 2**i))
+            err = e; time.sleep(min(60,2**i))
     raise err
 
 def ensure_structure(conn):
@@ -95,64 +94,46 @@ def extract_custom_field_value(person, field_id):
         return None
     return None
 
-def fetch_person_detail(pid):
-    params = {"token": TOKEN, "$expand": "customFieldValues"}
-    r = get_with_retry(f"{BASE}/persons/{pid}", params)
-    return r.json()
-
-def fetch_all_persons():
+def fetch_agents():
     params = {
         "token": TOKEN,
         "$select": "id,businessName,userName,isActive,profileType,accessProfile,teams",
         "$expand": "customFieldValues",
-        "$top": 500,
+        "$filter": "(profileType eq 1 or profileType eq 3)",
+        "$top": PAGE_SIZE,
         "$skip": 0
     }
     people = []
     while True:
-        r = get_with_retry(f"{BASE}/persons", params)
-        page = r.json()
+        page = api_get(f"{BASE}/persons", params)
         if not isinstance(page, list) or not page:
             break
         people.extend(page)
         if len(page) < params["$top"]:
             break
         params["$skip"] += params["$top"]
-    missing = []
-    for p in people:
-        if extract_custom_field_value(p, CUSTOM_FIELD_ID) is None:
-            missing.append(p.get("id"))
-    for pid in missing:
-        try:
-            dp = fetch_person_detail(pid)
-            for i in range(len(people)):
-                if people[i].get("id") == pid:
-                    people[i] = dp
-                    break
-        except Exception:
-            continue
     return people
 
 def upsert_agents(conn, people):
     sql = """
-    INSERT INTO visualizacao_agentes.agentes 
-    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad) 
-    VALUES 
-    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s) 
-    ON CONFLICT (agent_id) DO UPDATE SET 
-        name        = EXCLUDED.name, 
-        email       = EXCLUDED.email, 
-        team_primary= EXCLUDED.team_primary, 
-        teams       = EXCLUDED.teams, 
-        access_type = EXCLUDED.access_type, 
-        is_active   = EXCLUDED.is_active, 
-        raw         = EXCLUDED.raw, 
-        updated_at  = now(), 
+    INSERT INTO visualizacao_agentes.agentes
+    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
+    VALUES
+    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
+    ON CONFLICT (agent_id) DO UPDATE SET
+        name        = EXCLUDED.name,
+        email       = EXCLUDED.email,
+        team_primary= EXCLUDED.team_primary,
+        teams       = EXCLUDED.teams,
+        access_type = EXCLUDED.access_type,
+        is_active   = EXCLUDED.is_active,
+        raw         = EXCLUDED.raw,
+        updated_at  = now(),
         time_squad  = EXCLUDED.time_squad
     """
     rows = []
     for p in people:
-        if p.get("profileType") not in (1, 3):
+        if p.get("profileType") not in (1,3):
             continue
         pid = p.get("id")
         try:
@@ -184,7 +165,7 @@ def main():
     conn = psycopg2.connect(DSN)
     try:
         ensure_structure(conn)
-        people = fetch_all_persons()
+        people = fetch_agents()
         upsert_agents(conn, people)
     finally:
         conn.close()
