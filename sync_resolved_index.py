@@ -24,13 +24,15 @@ def ensure_structure():
     cur.execute(f"""
         create table if not exists {SCHEMA}.tickets_resolvidos(
           ticket_id integer primary key,
-          status    text not null
+          status text not null,
+          last_resolved_at timestamptz not null
         );
     """)
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_resolved_at timestamptz not null default now();")
     cur.execute(f"""
         create table if not exists {SCHEMA}.sync_control(
           name text primary key,
-          last_update timestamp not null
+          last_update timestamptz not null
         );
     """)
     cur.execute(f"""
@@ -90,8 +92,17 @@ def list_ids_reopened_since(cursor_dt):
         skip += top
     return list(ids)
 
+def parse_dt(s):
+    if not s: return None
+    try:
+        if isinstance(s, str) and s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z","+00:00"))
+        return datetime.fromisoformat(s) if isinstance(s,str) else s
+    except:
+        return None
+
 def fetch_ticket_min(ticket_id):
-    p={'token':TOKEN,'id':ticket_id,'$select':'id,status,baseStatus,lastUpdate'}
+    p={'token':TOKEN,'id':ticket_id,'$select':'id,status,baseStatus,lastUpdate,statusHistories'}
     try:
         r = api_get(f"{BASE}/tickets", p)
         if isinstance(r, list): return r[0] if r else None
@@ -111,15 +122,30 @@ def is_resolved(t):
     if bs in ("Resolved","Closed"): return True
     return st in RESOLVED
 
+def resolved_at(t):
+    best=None
+    hist=t.get("statusHistories") or []
+    for s in hist:
+        st=(s.get("status") or "").lower()
+        bs=(s.get("baseStatus") or "")
+        if bs in ("Resolved","Closed") or st in RESOLVED:
+            cd=s.get("changedDate") or s.get("date") or s.get("changedDateTime")
+            dt=parse_dt(cd)
+            if dt and (best is None or dt>best): best=dt
+    if best: return best
+    return parse_dt(t.get("lastUpdate"))
+
 def upsert_rows(items):
     if not items: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    for tid, st in items:
+    for tid, st, rat in items:
         cur.execute(f"""
-            insert into {SCHEMA}.tickets_resolvidos(ticket_id, status)
-            values (%s,%s)
-            on conflict (ticket_id) do update set status=excluded.status;
-        """,(tid, st))
+            insert into {SCHEMA}.tickets_resolvidos(ticket_id, status, last_resolved_at)
+            values (%s,%s,%s)
+            on conflict (ticket_id) do update
+            set status=excluded.status,
+                last_resolved_at=excluded.last_resolved_at;
+        """,(tid, st, rat))
     cur.close(); conn.close()
 
 def delete_ids(ids):
@@ -150,7 +176,9 @@ def run():
                 t=f.result()
                 if t and is_resolved(t):
                     st=t.get("status") or ""
-                    to_upsert.append((tid, st))
+                    rat=resolved_at(t) or datetime.now(timezone.utc)
+                    if rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
+                    to_upsert.append((tid, st, rat))
                 else:
                     if tid in have:
                         to_delete.append(tid)
