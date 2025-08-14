@@ -25,10 +25,16 @@ def ensure_structure():
         create table if not exists {SCHEMA}.tickets_resolvidos(
           ticket_id integer primary key,
           status text not null,
-          last_resolved_at timestamptz not null
+          last_resolved_at timestamptz not null,
+          last_update timestamptz,
+          responsible_id bigint,
+          responsible_name text
         );
     """)
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_resolved_at timestamptz not null default now();")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_update timestamptz;")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_id bigint;")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_name text;")
     cur.execute(f"""
         create table if not exists {SCHEMA}.sync_control(
           name text primary key,
@@ -102,7 +108,7 @@ def parse_dt(s):
         return None
 
 def fetch_ticket_min(ticket_id):
-    p={'token':TOKEN,'id':ticket_id,'$select':'id,status,baseStatus,lastUpdate,statusHistories'}
+    p={'token':TOKEN,'id':ticket_id,'$select':'id,status,baseStatus,lastUpdate,statusHistories,owner'}
     try:
         r = api_get(f"{BASE}/tickets", p)
         if isinstance(r, list): return r[0] if r else None
@@ -135,17 +141,31 @@ def resolved_at(t):
     if best: return best
     return parse_dt(t.get("lastUpdate"))
 
+def extract_responsible(t):
+    o=t.get("owner") or {}
+    rid=o.get("id")
+    rname=o.get("businessName") or o.get("name") or o.get("fullName")
+    try:
+        rid=int(rid) if rid is not None else None
+    except:
+        rid=None
+    return rid, rname
+
 def upsert_rows(items):
     if not items: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    for tid, st, rat in items:
+    for tid, st, rat, lupd, rid, rname in items:
         cur.execute(f"""
-            insert into {SCHEMA}.tickets_resolvidos(ticket_id, status, last_resolved_at)
-            values (%s,%s,%s)
-            on conflict (ticket_id) do update
-            set status=excluded.status,
-                last_resolved_at=excluded.last_resolved_at;
-        """,(tid, st, rat))
+            insert into {SCHEMA}.tickets_resolvidos
+            (ticket_id, status, last_resolved_at, last_update, responsible_id, responsible_name)
+            values (%s,%s,%s,%s,%s,%s)
+            on conflict (ticket_id) do update set
+                status = excluded.status,
+                last_resolved_at = excluded.last_resolved_at,
+                last_update = excluded.last_update,
+                responsible_id = coalesce(excluded.responsible_id, {SCHEMA}.tickets_resolvidos.responsible_id),
+                responsible_name = coalesce(excluded.responsible_name, {SCHEMA}.tickets_resolvidos.responsible_name);
+        """,(tid, st, rat, lupd, rid, rname))
     cur.close(); conn.close()
 
 def delete_ids(ids):
@@ -178,7 +198,9 @@ def run():
                     st=t.get("status") or ""
                     rat=resolved_at(t) or datetime.now(timezone.utc)
                     if rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
-                    to_upsert.append((tid, st, rat))
+                    lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
+                    rid,rname=extract_responsible(t)
+                    to_upsert.append((tid, st, rat, lupd, rid, rname))
                 else:
                     if tid in have:
                         to_delete.append(tid)
