@@ -42,8 +42,26 @@ def ensure_structure(conn):
         """)
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS agentes_pkey ON visualizacao_agentes.agentes(agent_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_email ON visualizacao_agentes.agentes (lower(email))")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_team  ON visualizacao_agentes.agentes (team_primary)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_team ON visualizacao_agentes.agentes (team_primary)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_teams_gin ON visualizacao_agentes.agentes USING GIN (teams)")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes_historico (
+            history_id    BIGSERIAL PRIMARY KEY,
+            agent_id      BIGINT NOT NULL,
+            change_date   DATE NOT NULL,
+            changed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            name          TEXT NOT NULL,
+            email         TEXT NOT NULL,
+            team_primary  TEXT,
+            teams         TEXT[],
+            access_type   TEXT,
+            is_active     BOOLEAN NOT NULL,
+            time_squad    TEXT,
+            snapshot_hash TEXT NOT NULL
+        )
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_agentes_hist_agent_date ON visualizacao_agentes.agentes_historico(agent_id, change_date)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_hist_agent ON visualizacao_agentes.agentes_historico(agent_id)")
     conn.commit()
 
 def extract_team_names(person):
@@ -154,6 +172,62 @@ def upsert_agents(conn, people):
         pgx.execute_batch(cur, sql, rows, page_size=500)
     conn.commit()
 
+def record_history(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+        WITH nowsp AS (
+          SELECT (now() AT TIME ZONE 'America/Sao_Paulo')::date AS d
+        ),
+        snap AS (
+          SELECT
+            a.agent_id,
+            a.name,
+            a.email,
+            a.team_primary,
+            a.teams,
+            a.access_type,
+            a.is_active,
+            a.time_squad,
+            md5(
+              coalesce(lower(a.email),'')||'|'||
+              coalesce(a.team_primary,'')||'|'||
+              coalesce(array_to_string(a.teams, ','),'')||'|'||
+              coalesce(a.time_squad,'')||'|'||
+              CASE WHEN a.is_active THEN '1' ELSE '0' END
+            ) AS h
+          FROM visualizacao_agentes.agentes a
+        ),
+        last AS (
+          SELECT DISTINCT ON (agent_id)
+            agent_id, snapshot_hash
+          FROM visualizacao_agentes.agentes_historico
+          ORDER BY agent_id, changed_at DESC
+        ),
+        to_ins AS (
+          SELECT s.*, n.d AS change_date
+          FROM snap s
+          CROSS JOIN nowsp n
+          LEFT JOIN last l ON l.agent_id = s.agent_id
+          WHERE coalesce(l.snapshot_hash, '') <> s.h
+        )
+        INSERT INTO visualizacao_agentes.agentes_historico
+          (agent_id, change_date, name, email, team_primary, teams, access_type, is_active, time_squad, snapshot_hash)
+        SELECT
+          agent_id, change_date, name, email, team_primary, teams, access_type, is_active, time_squad, h
+        FROM to_ins
+        ON CONFLICT (agent_id, change_date) DO UPDATE SET
+          name=excluded.name,
+          email=excluded.email,
+          team_primary=excluded.team_primary,
+          teams=excluded.teams,
+          access_type=excluded.access_type,
+          is_active=excluded.is_active,
+          time_squad=excluded.time_squad,
+          snapshot_hash=excluded.snapshot_hash,
+          changed_at=now()
+        """)
+    conn.commit()
+
 def main():
     if not TOKEN or not DSN:
         raise RuntimeError("Defina as variáveis de ambiente MOVIDESK_TOKEN e NEON_DSN.")
@@ -162,6 +236,7 @@ def main():
         ensure_structure(conn)
         people = fetch_agents()
         upsert_agents(conn, people)
+        record_history(conn)
     finally:
         conn.close()
 
