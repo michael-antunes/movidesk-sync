@@ -14,7 +14,8 @@ CONNECT_TIMEOUT=int(os.getenv("CONNECT_TIMEOUT","15"))
 READ_TIMEOUT=int(os.getenv("READ_TIMEOUT","120"))
 MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
 
-TRIGGER_STATUSES=set(s.strip().lower() for s in os.getenv("TRIGGER_STATUSES","resolved,resolvido").split(",") if s.strip())
+TRIGGER_TITLES=[s.strip() for s in os.getenv("TRIGGER_TITLES","Resolved,Resolvido").split(",") if s.strip()]
+CLOSE_TITLES=[s.strip() for s in os.getenv("CLOSE_TITLES","Closed,Fechado").split(",") if s.strip()]
 CURSOR_REWIND_MIN=int(os.getenv("CURSOR_REWIND_MIN","5"))
 
 session=requests.Session()
@@ -87,29 +88,16 @@ def set_cursor(ts):
 
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-def _trigger_predicate():
-    wants_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
-    wants_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
-    parts=[]
-    if wants_res: parts.append("s/baseStatus eq 'Resolved'")
-    if wants_closed: parts.append("s/baseStatus eq 'Closed'")
-    if not parts: parts.append("s/baseStatus eq 'Resolved'")
+def _any_status_eq(field_alias, titles):
+    if not titles: return None
+    parts=[f"{field_alias}/status eq '{t}'" for t in titles]
     return "("+" or ".join(parts)+")"
-
-def _not_trigger_predicate():
-    wants_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
-    wants_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
-    parts=[]
-    bs=[]
-    if wants_res: bs.append("s/baseStatus ne 'Resolved'")
-    if wants_closed: bs.append("s/baseStatus ne 'Closed'")
-    if not bs: bs.append("s/baseStatus ne 'Resolved'")
-    parts.append("("+" and ".join(bs)+")")
-    return "("+" and ".join(parts)+")"
 
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {_trigger_predicate()})"
+    trig=_any_status_eq("s", TRIGGER_TITLES)
+    if not trig: trig="s/status eq 'Resolved'"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
         batch=api_get(f"{BASE}/tickets/past",p) or []
@@ -125,7 +113,10 @@ def list_ids_resolved_since(cursor_dt):
 
 def list_ids_reopened_since(cursor_dt):
     ids=set(); top=500; skip=0
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {_not_trigger_predicate()})"
+    trig=_any_status_eq("s", TRIGGER_TITLES)
+    if not trig: trig="s/status eq 'Resolved'"
+    not_trig=" and ".join([f"s/status ne '{t}'" for t in TRIGGER_TITLES]) if TRIGGER_TITLES else "s/status ne 'Resolved'"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({not_trig}))"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
         batch=api_get(f"{BASE}/tickets/past",p) or []
@@ -168,9 +159,8 @@ def is_resolved(t):
 def resolved_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
-        st=(s.get("status") or "").lower()
-        bs=(s.get("baseStatus") or "")
-        if bs=="Resolved" or st in {"resolved","resolvido"}:
+        st=(s.get("status") or "")
+        if st in TRIGGER_TITLES:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best or parse_dt(t.get("lastUpdate"))
@@ -178,9 +168,8 @@ def resolved_at(t):
 def closed_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
-        st=(s.get("status") or "").lower()
-        bs=(s.get("baseStatus") or "")
-        if bs=="Closed" or st in {"closed","fechado"}:
+        st=(s.get("status") or "")
+        if st in CLOSE_TITLES:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best
@@ -250,8 +239,8 @@ def run():
                     lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
                     rid,rname=extract_responsible(t)
                     to_upsert.append((tid,st,rat,cat,lupd,rid,rname))
-                    if ("resolved" in TRIGGER_STATUSES or "resolvido" in TRIGGER_STATUSES) and rat and rat>max_seen: max_seen=rat
-                    if ("closed" in TRIGGER_STATUSES or "fechado" in TRIGGER_STATUSES) and cat and cat>max_seen: max_seen=cat
+                    if rat and rat>max_seen: max_seen=rat
+                    if cat and cat>max_seen: max_seen=cat
                 else:
                     if tid in have: to_delete.append(tid)
     upsert_rows(to_upsert)
