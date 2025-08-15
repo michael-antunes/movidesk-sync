@@ -8,17 +8,16 @@ TOKEN=os.environ["MOVIDESK_TOKEN"]
 DSN=os.environ["NEON_DSN"]
 BASE="https://api.movidesk.com/public/v1"
 SCHEMA="visualizacao_resolvidos"
-RESOLVED={"resolved","closed","resolvido","fechado"}
 CONCURRENCY=int(os.getenv("CONCURRENCY","8"))
 CONNECT_TIMEOUT=int(os.getenv("CONNECT_TIMEOUT","15"))
 READ_TIMEOUT=int(os.getenv("READ_TIMEOUT","120"))
 MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
+TRIGGER_STATUSES=set(s.strip().lower() for s in os.getenv("TRIGGER_STATUSES","resolved,resolvido").split(",") if s.strip())
 
 session=requests.Session()
 retry_cfg=Retry(total=5,connect=5,read=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=["GET"])
 adapter=HTTPAdapter(max_retries=retry_cfg,pool_connections=CONCURRENCY*2,pool_maxsize=CONCURRENCY*2)
-session.mount("https://",adapter)
-session.mount("http://",adapter)
+session.mount("https://",adapter); session.mount("http://",adapter)
 
 def api_get(url,params,tries=MAX_TRIES):
     last=None
@@ -83,11 +82,11 @@ def set_cursor(ts):
     cur.execute(f"update {SCHEMA}.sync_control set last_update=%s where name='tr_lastresolved'",(ts,))
     cur.close(); conn.close()
 
-def iso(dt): return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    conds=" or ".join([f"tolower(s/status) eq '{s}'" for s in RESOLVED])
+    conds=" or ".join([f"tolower(s/status) eq '{s}'" for s in TRIGGER_STATUSES])
     filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({conds}))"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
@@ -104,7 +103,7 @@ def list_ids_resolved_since(cursor_dt):
 
 def list_ids_reopened_since(cursor_dt):
     ids=set(); top=500; skip=0
-    conds=" and ".join([f"tolower(s/status) ne '{s}'" for s in RESOLVED])
+    conds=" and ".join([f"tolower(s/status) ne '{s}'" for s in TRIGGER_STATUSES])
     filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {conds})"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
@@ -143,8 +142,7 @@ def fetch_ticket_min(ticket_id):
 def is_resolved(t):
     st=(t.get("status") or "").lower()
     bs=(t.get("baseStatus") or "")
-    if bs in ("Resolved","Closed"): return True
-    return st in RESOLVED
+    return bs in ("Resolved","Closed") or st in {"resolved","resolvido","closed","fechado"}
 
 def resolved_at(t):
     best=None
@@ -220,7 +218,7 @@ def run():
                 try:
                     t=f.result()
                 except Exception as e:
-                    print(f"warn: fetch failed for ticket {tid}: {e}"); continue
+                    print(f"warn: fetch failed for ticket",tid,":",e); continue
                 if t and is_resolved(t):
                     st=t.get("status") or ""
                     rat=resolved_at(t) or datetime.now(timezone.utc)
