@@ -13,6 +13,7 @@ CONNECT_TIMEOUT=int(os.getenv("CONNECT_TIMEOUT","15"))
 READ_TIMEOUT=int(os.getenv("READ_TIMEOUT","120"))
 MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
 TRIGGER_STATUSES=set(s.strip().lower() for s in os.getenv("TRIGGER_STATUSES","resolved,resolvido").split(",") if s.strip())
+CURSOR_REWIND_MIN=int(os.getenv("CURSOR_REWIND_MIN","5"))
 
 session=requests.Session()
 retry_cfg=Retry(total=5,connect=5,read=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=["GET"])
@@ -72,9 +73,9 @@ def get_cursor():
     conn=psycopg2.connect(DSN); cur=conn.cursor()
     cur.execute(f"select last_update from {SCHEMA}.sync_control where name='tr_lastresolved'")
     row=cur.fetchone(); cur.close(); conn.close()
-    dt=row[0] if row else datetime.now(timezone.utc)-timedelta(days=60)
-    if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
-    return dt
+    base=row[0] if row else datetime.now(timezone.utc)-timedelta(days=60)
+    if base.tzinfo is None: base=base.replace(tzinfo=timezone.utc)
+    return base - timedelta(minutes=CURSOR_REWIND_MIN)
 
 def set_cursor(ts):
     if ts.tzinfo is None: ts=ts.replace(tzinfo=timezone.utc)
@@ -84,10 +85,47 @@ def set_cursor(ts):
 
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
+def _trigger_predicate():
+    bs=[],[]
+    base_checks=[]
+    word_eq=[]
+    word_has=[]
+    want_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
+    want_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
+    if want_res: base_checks.append("s/baseStatus eq 'Resolved'")
+    if want_closed: base_checks.append("s/baseStatus eq 'Closed'")
+    words=set()
+    if want_res: words.update(["resolved","resolvido"])
+    if want_closed: words.update(["closed","fechado"])
+    for w in sorted(words):
+        word_eq.append(f"tolower(s/status) eq '{w}'")
+        word_has.append(f"contains(tolower(s/status), '{w}')")
+    parts=[]
+    if base_checks: parts.append("("+" or ".join(base_checks)+")")
+    if word_eq: parts.append("("+" or ".join(word_eq)+")")
+    if word_has: parts.append("("+" or ".join(word_has)+")")
+    return "("+" or ".join(parts)+")"
+
+def _not_trigger_predicate():
+    want_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
+    want_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
+    base_checks=[]
+    if want_res: base_checks.append("s/baseStatus ne 'Resolved'")
+    if want_closed: base_checks.append("s/baseStatus ne 'Closed'")
+    words=set()
+    if want_res: words.update(["resolved","resolvido"])
+    if want_closed: words.update(["closed","fechado"])
+    word_ne=[f"tolower(s/status) ne '{w}'" for w in sorted(words)]
+    word_not_has=[f"not contains(tolower(s/status), '{w}')" for w in sorted(words)]
+    parts=[]
+    if base_checks: parts.append("("+" and ".join(base_checks)+")")
+    if word_ne: parts.append("("+" and ".join(word_ne)+")")
+    if word_not_has: parts.append("("+" and ".join(word_not_has)+")")
+    return "("+" and ".join(parts)+")"
+
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    conds=" or ".join([f"tolower(s/status) eq '{s}'" for s in TRIGGER_STATUSES])
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({conds}))"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {_trigger_predicate()})"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
         batch=api_get(f"{BASE}/tickets/past",p) or []
@@ -103,8 +141,7 @@ def list_ids_resolved_since(cursor_dt):
 
 def list_ids_reopened_since(cursor_dt):
     ids=set(); top=500; skip=0
-    conds=" and ".join([f"tolower(s/status) ne '{s}'" for s in TRIGGER_STATUSES])
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {conds})"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {_not_trigger_predicate()})"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
         batch=api_get(f"{BASE}/tickets/past",p) or []
@@ -210,6 +247,7 @@ def run():
     have=current_index_ids()
     want=list(set(new_ids)|have)
     to_upsert=[]; to_delete=[]
+    max_seen=cursor_dt
     if want:
         with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
             futs={ex.submit(fetch_ticket_min,tid):tid for tid in want}
@@ -228,13 +266,15 @@ def run():
                     lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
                     rid,rname=extract_responsible(t)
                     to_upsert.append((tid,st,rat,cat,lupd,rid,rname))
+                    if ("resolved" in TRIGGER_STATUSES or "resolvido" in TRIGGER_STATUSES) and rat and rat>max_seen: max_seen=rat
+                    if ("closed" in TRIGGER_STATUSES or "fechado" in TRIGGER_STATUSES) and cat and cat>max_seen: max_seen=cat
                 else:
                     if tid in have: to_delete.append(tid)
     upsert_rows(to_upsert)
     delete_ids(to_delete)
     reopened=list_ids_reopened_since(cursor_dt)
     delete_ids(reopened)
-    set_cursor(datetime.now(timezone.utc)-timedelta(minutes=1))
+    set_cursor(max_seen)
 
 if __name__=="__main__":
     run()
