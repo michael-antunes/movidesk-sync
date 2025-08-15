@@ -45,7 +45,6 @@ def ensure_structure():
           status text not null,
           last_resolved_at timestamptz not null,
           last_closed_at timestamptz,
-          status_changed_at timestamptz,
           last_update timestamptz,
           responsible_id bigint,
           responsible_name text
@@ -53,7 +52,6 @@ def ensure_structure():
     """)
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_resolved_at timestamptz not null default now();")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_closed_at timestamptz;")
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists status_changed_at timestamptz;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_update timestamptz;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_id bigint;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_name text;")
@@ -167,21 +165,6 @@ def closed_at(t):
             if dt and (best is None or dt>best): best=dt
     return best
 
-def status_changed_at(t):
-    cur=(t.get("status") or "").lower()
-    bs=(t.get("baseStatus") or "")
-    target_closed=bs=="Closed" or cur in {"closed","fechado"}
-    target_resolved=bs=="Resolved" or cur in {"resolved","resolvido"}
-    best=None
-    for s in (t.get("statusHistories") or []):
-        st=(s.get("status") or "").lower()
-        bsh=(s.get("baseStatus") or "")
-        ok=(target_closed and (bsh=="Closed" or st in {"closed","fechado"})) or (target_resolved and (bsh=="Resolved" or st in {"resolved","resolvido"})) or (not target_closed and not target_resolved and st==cur)
-        if ok:
-            dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
-            if dt and (best is None or dt>best): best=dt
-    return best or parse_dt(t.get("lastUpdate"))
-
 def extract_responsible(t):
     o=t.get("owner") or {}
     rid=o.get("id")
@@ -193,20 +176,19 @@ def extract_responsible(t):
 def upsert_rows(items):
     if not items: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    for tid,st,rat,cat,sat,lupd,rid,rname in items:
+    for tid,st,rat,cat,lupd,rid,rname in items:
         cur.execute(f"""
             insert into {SCHEMA}.tickets_resolvidos
-            (ticket_id,status,last_resolved_at,last_closed_at,status_changed_at,last_update,responsible_id,responsible_name)
-            values (%s,%s,%s,%s,%s,%s,%s,%s)
+            (ticket_id,status,last_resolved_at,last_closed_at,last_update,responsible_id,responsible_name)
+            values (%s,%s,%s,%s,%s,%s,%s)
             on conflict (ticket_id) do update set
                 status=excluded.status,
                 last_resolved_at=excluded.last_resolved_at,
                 last_closed_at=excluded.last_closed_at,
-                status_changed_at=excluded.status_changed_at,
                 last_update=excluded.last_update,
                 responsible_id=coalesce(excluded.responsible_id,{SCHEMA}.tickets_resolvidos.responsible_id),
                 responsible_name=coalesce(excluded.responsible_name,{SCHEMA}.tickets_resolvidos.responsible_name);
-        """,(tid,st,rat,cat,sat,lupd,rid,rname))
+        """,(tid,st,rat,cat,lupd,rid,rname))
     cur.close(); conn.close()
 
 def delete_ids(ids):
@@ -244,11 +226,9 @@ def run():
                     if rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
                     cat=closed_at(t)
                     if cat and cat.tzinfo is None: cat=cat.replace(tzinfo=timezone.utc)
-                    sat=status_changed_at(t) or rat
-                    if sat.tzinfo is None: sat=sat.replace(tzinfo=timezone.utc)
                     lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
                     rid,rname=extract_responsible(t)
-                    to_upsert.append((tid,st,rat,cat,sat,lupd,rid,rname))
+                    to_upsert.append((tid,st,rat,cat,lupd,rid,rname))
                 else:
                     if tid in have: to_delete.append(tid)
     upsert_rows(to_upsert)
