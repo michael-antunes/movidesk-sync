@@ -1,7 +1,8 @@
-import os, time, requests, psycopg2
+import os, requests, psycopg2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN=os.environ["MOVIDESK_TOKEN"]
@@ -17,6 +18,7 @@ MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
 TRIGGER_TITLES=[s.strip() for s in os.getenv("TRIGGER_TITLES","Resolved,Resolvido").split(",") if s.strip()]
 CLOSE_TITLES=[s.strip() for s in os.getenv("CLOSE_TITLES","Closed,Fechado").split(",") if s.strip()]
 CURSOR_REWIND_MIN=int(os.getenv("CURSOR_REWIND_MIN","5"))
+TZ=ZoneInfo("America/Sao_Paulo")
 
 session=requests.Session()
 retry_cfg=Retry(total=5,connect=5,read=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=["GET"])
@@ -29,15 +31,15 @@ def api_get(url,params,tries=MAX_TRIES):
         try:
             r=session.get(url,params=params,timeout=(CONNECT_TIMEOUT,READ_TIMEOUT))
             if r.status_code in (429,500,502,503,504):
-                time.sleep(min(90,2**i)); continue
+                _sleep=min(90,2**i); import time; time.sleep(_sleep); continue
             r.raise_for_status(); return r.json()
         except (requests.exceptions.Timeout,requests.exceptions.ConnectionError) as e:
-            last=e; time.sleep(min(90,2**i)); continue
+            last=e; import time; time.sleep(min(90,2**i)); continue
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code==404: return None
-            last=e; time.sleep(min(60,2**i)); continue
+            last=e; import time; time.sleep(min(60,2**i)); continue
         except ValueError as e:
-            last=e; time.sleep(min(30,2**i)); continue
+            last=e; import time; time.sleep(min(30,2**i)); continue
     if last: raise last
 
 def ensure_structure():
@@ -45,6 +47,17 @@ def ensure_structure():
     cur.execute(f"create schema if not exists {SCHEMA};")
     cur.execute(f"""
         create table if not exists {SCHEMA}.tickets_resolvidos(
+          ticket_id integer primary key,
+          status text not null,
+          last_resolved_at timestamptz not null,
+          last_closed_at timestamptz,
+          last_update timestamptz,
+          responsible_id bigint,
+          responsible_name text
+        );
+    """)
+    cur.execute(f"""
+        create table if not exists {SCHEMA}.tickets_resolvidos_diario(
           ticket_id integer primary key,
           status text not null,
           last_resolved_at timestamptz not null,
@@ -95,8 +108,7 @@ def _any_status_eq(field_alias, titles):
 
 def list_ids_resolved_since(cursor_dt):
     ids=set(); top=500; skip=0
-    trig=_any_status_eq("s", TRIGGER_TITLES)
-    if not trig: trig="s/status eq 'Resolved'"
+    trig=_any_status_eq("s", TRIGGER_TITLES) or "s/status eq 'Resolved'"
     filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
     while True:
         p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
@@ -113,8 +125,6 @@ def list_ids_resolved_since(cursor_dt):
 
 def list_ids_reopened_since(cursor_dt):
     ids=set(); top=500; skip=0
-    trig=_any_status_eq("s", TRIGGER_TITLES)
-    if not trig: trig="s/status eq 'Resolved'"
     not_trig=" and ".join([f"s/status ne '{t}'" for t in TRIGGER_TITLES]) if TRIGGER_TITLES else "s/status ne 'Resolved'"
     filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({not_trig}))"
     while True:
@@ -182,12 +192,12 @@ def extract_responsible(t):
     except: rid=None
     return rid,rname
 
-def upsert_rows(items):
+def upsert_rows(table, items):
     if not items: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
     for tid,st,rat,cat,lupd,rid,rname in items:
         cur.execute(f"""
-            insert into {SCHEMA}.tickets_resolvidos
+            insert into {SCHEMA}.{table}
             (ticket_id,status,last_resolved_at,last_closed_at,last_update,responsible_id,responsible_name)
             values (%s,%s,%s,%s,%s,%s,%s)
             on conflict (ticket_id) do update set
@@ -195,15 +205,15 @@ def upsert_rows(items):
                 last_resolved_at=excluded.last_resolved_at,
                 last_closed_at=excluded.last_closed_at,
                 last_update=excluded.last_update,
-                responsible_id=coalesce(excluded.responsible_id,{SCHEMA}.tickets_resolvidos.responsible_id),
-                responsible_name=coalesce(excluded.responsible_name,{SCHEMA}.tickets_resolvidos.responsible_name);
+                responsible_id=coalesce(excluded.responsible_id,{SCHEMA}.{table}.responsible_id),
+                responsible_name=coalesce(excluded.responsible_name,{SCHEMA}.{table}.responsible_name);
         """,(tid,st,rat,cat,lupd,rid,rname))
     cur.close(); conn.close()
 
-def delete_ids(ids):
+def delete_ids(table, ids):
     if not ids: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute(f"delete from {SCHEMA}.tickets_resolvidos where ticket_id = any(%s)",(ids,))
+    cur.execute(f"delete from {SCHEMA}.{table} where ticket_id = any(%s)",(ids,))
     cur.close(); conn.close()
 
 def current_index_ids():
@@ -212,6 +222,20 @@ def current_index_ids():
     data=[r[0] for r in cur.fetchall()]
     cur.close(); conn.close()
     return set(data)
+
+def in_last_two_days_sp(dt):
+    if not dt: return False
+    sp=dt.astimezone(TZ)
+    start= datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0) - timedelta(days=1)
+    return sp >= start
+
+def prune_diario():
+    conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
+    cur.execute(f"""
+        delete from {SCHEMA}.tickets_resolvidos_diario
+        where (last_resolved_at at time zone 'America/Sao_Paulo')::date < ((now() at time zone 'America/Sao_Paulo')::date - 1)
+    """)
+    cur.close(); conn.close()
 
 def run():
     ensure_structure()
@@ -243,10 +267,17 @@ def run():
                     if cat and cat>max_seen: max_seen=cat
                 else:
                     if tid in have: to_delete.append(tid)
-    upsert_rows(to_upsert)
-    delete_ids(to_delete)
+    upsert_rows("tickets_resolvidos", to_upsert)
+    delete_ids("tickets_resolvidos", to_delete)
     reopened=list_ids_reopened_since(cursor_dt)
-    delete_ids(reopened)
+    delete_ids("tickets_resolvidos", reopened)
+
+    recent=[row for row in to_upsert if in_last_two_days_sp(row[2])]
+    upsert_rows("tickets_resolvidos_diario", recent)
+    delete_ids("tickets_resolvidos_diario", to_delete)
+    delete_ids("tickets_resolvidos_diario", reopened)
+    prune_diario()
+
     set_cursor(max_seen)
 
 if __name__=="__main__":
