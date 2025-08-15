@@ -8,10 +8,12 @@ TOKEN=os.environ["MOVIDESK_TOKEN"]
 DSN=os.environ["NEON_DSN"]
 BASE="https://api.movidesk.com/public/v1"
 SCHEMA="visualizacao_resolvidos"
+
 CONCURRENCY=int(os.getenv("CONCURRENCY","8"))
 CONNECT_TIMEOUT=int(os.getenv("CONNECT_TIMEOUT","15"))
 READ_TIMEOUT=int(os.getenv("READ_TIMEOUT","120"))
 MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
+
 TRIGGER_STATUSES=set(s.strip().lower() for s in os.getenv("TRIGGER_STATUSES","resolved,resolvido").split(",") if s.strip())
 CURSOR_REWIND_MIN=int(os.getenv("CURSOR_REWIND_MIN","5"))
 
@@ -91,10 +93,7 @@ def _trigger_predicate():
     parts=[]
     if wants_res: parts.append("s/baseStatus eq 'Resolved'")
     if wants_closed: parts.append("s/baseStatus eq 'Closed'")
-    words=[]
-    if wants_res: words+=["resolved","resolvido"]
-    if wants_closed: words+=["closed","fechado"]
-    if words: parts.append("("+" or ".join([f"tolower(s/status) eq '{w}'" for w in words])+")")
+    if not parts: parts.append("s/baseStatus eq 'Resolved'")
     return "("+" or ".join(parts)+")"
 
 def _not_trigger_predicate():
@@ -104,11 +103,8 @@ def _not_trigger_predicate():
     bs=[]
     if wants_res: bs.append("s/baseStatus ne 'Resolved'")
     if wants_closed: bs.append("s/baseStatus ne 'Closed'")
-    if bs: parts.append("("+" and ".join(bs)+")")
-    words=[]
-    if wants_res: words+=["resolved","resolvido"]
-    if wants_closed: words+=["closed","fechado"]
-    if words: parts.append("("+" and ".join([f"tolower(s/status) ne '{w}'" for w in words])+")")
+    if not bs: bs.append("s/baseStatus ne 'Resolved'")
+    parts.append("("+" and ".join(bs)+")")
     return "("+" and ".join(parts)+")"
 
 def list_ids_resolved_since(cursor_dt):
