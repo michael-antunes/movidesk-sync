@@ -17,7 +17,8 @@ MAX_TRIES=int(os.getenv("MAX_TRIES","6"))
 session=requests.Session()
 retry_cfg=Retry(total=5,connect=5,read=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=["GET"])
 adapter=HTTPAdapter(max_retries=retry_cfg,pool_connections=CONCURRENCY*2,pool_maxsize=CONCURRENCY*2)
-session.mount("https://",adapter); session.mount("http://",adapter)
+session.mount("https://",adapter)
+session.mount("http://",adapter)
 
 def api_get(url,params,tries=MAX_TRIES):
     last=None
@@ -152,7 +153,7 @@ def resolved_at(t):
         bs=(s.get("baseStatus") or "")
         if bs=="Resolved" or st in {"resolved","resolvido"}:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
-            if dt and (best is None or dt<best): best=dt
+            if dt and (best is None or dt>best): best=dt
     return best or parse_dt(t.get("lastUpdate"))
 
 def closed_at(t):
