@@ -86,41 +86,29 @@ def set_cursor(ts):
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 def _trigger_predicate():
-    bs=[],[]
-    base_checks=[]
-    word_eq=[]
-    word_has=[]
-    want_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
-    want_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
-    if want_res: base_checks.append("s/baseStatus eq 'Resolved'")
-    if want_closed: base_checks.append("s/baseStatus eq 'Closed'")
-    words=set()
-    if want_res: words.update(["resolved","resolvido"])
-    if want_closed: words.update(["closed","fechado"])
-    for w in sorted(words):
-        word_eq.append(f"tolower(s/status) eq '{w}'")
-        word_has.append(f"contains(tolower(s/status), '{w}')")
+    wants_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
+    wants_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
     parts=[]
-    if base_checks: parts.append("("+" or ".join(base_checks)+")")
-    if word_eq: parts.append("("+" or ".join(word_eq)+")")
-    if word_has: parts.append("("+" or ".join(word_has)+")")
+    if wants_res: parts.append("s/baseStatus eq 'Resolved'")
+    if wants_closed: parts.append("s/baseStatus eq 'Closed'")
+    words=[]
+    if wants_res: words+=["resolved","resolvido"]
+    if wants_closed: words+=["closed","fechado"]
+    if words: parts.append("("+" or ".join([f"tolower(s/status) eq '{w}'" for w in words])+")")
     return "("+" or ".join(parts)+")"
 
 def _not_trigger_predicate():
-    want_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
-    want_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
-    base_checks=[]
-    if want_res: base_checks.append("s/baseStatus ne 'Resolved'")
-    if want_closed: base_checks.append("s/baseStatus ne 'Closed'")
-    words=set()
-    if want_res: words.update(["resolved","resolvido"])
-    if want_closed: words.update(["closed","fechado"])
-    word_ne=[f"tolower(s/status) ne '{w}'" for w in sorted(words)]
-    word_not_has=[f"not contains(tolower(s/status), '{w}')" for w in sorted(words)]
+    wants_res=("resolved" in TRIGGER_STATUSES) or ("resolvido" in TRIGGER_STATUSES)
+    wants_closed=("closed" in TRIGGER_STATUSES) or ("fechado" in TRIGGER_STATUSES)
     parts=[]
-    if base_checks: parts.append("("+" and ".join(base_checks)+")")
-    if word_ne: parts.append("("+" and ".join(word_ne)+")")
-    if word_not_has: parts.append("("+" and ".join(word_not_has)+")")
+    bs=[]
+    if wants_res: bs.append("s/baseStatus ne 'Resolved'")
+    if wants_closed: bs.append("s/baseStatus ne 'Closed'")
+    if bs: parts.append("("+" and ".join(bs)+")")
+    words=[]
+    if wants_res: words+=["resolved","resolvido"]
+    if wants_closed: words+=["closed","fechado"]
+    if words: parts.append("("+" and ".join([f"tolower(s/status) ne '{w}'" for w in words])+")")
     return "("+" and ".join(parts)+")"
 
 def list_ids_resolved_since(cursor_dt):
@@ -256,11 +244,11 @@ def run():
                 try:
                     t=f.result()
                 except Exception as e:
-                    print(f"warn: fetch failed for ticket",tid,":",e); continue
+                    print("warn: fetch failed for ticket",tid,":",e); continue
                 if t and is_resolved(t):
                     st=t.get("status") or ""
                     rat=resolved_at(t) or datetime.now(timezone.utc)
-                    if rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
+                    if rat and rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
                     cat=closed_at(t)
                     if cat and cat.tzinfo is None: cat=cat.replace(tzinfo=timezone.utc)
                     lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
