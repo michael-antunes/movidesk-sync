@@ -1,4 +1,6 @@
 import os, time, requests, psycopg2
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -8,15 +10,44 @@ BASE  = "https://api.movidesk.com/public/v1"
 SCHEMA = "visualizacao_resolvidos"
 RESOLVED = {"resolved","closed","resolvido","fechado"}
 CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
+CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "15"))
+READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "120"))
+MAX_TRIES = int(os.getenv("MAX_TRIES", "6"))
 
-def api_get(url, params, tries=6):
+session = requests.Session()
+retry_cfg = Retry(
+    total=5,
+    connect=5,
+    read=5,
+    backoff_factor=1,
+    status_forcelist=[429,500,502,503,504],
+    allowed_methods=["GET"]
+)
+adapter = HTTPAdapter(max_retries=retry_cfg, pool_connections=CONCURRENCY*2, pool_maxsize=CONCURRENCY*2)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+def api_get(url, params, tries=MAX_TRIES):
+    last_err=None
     for i in range(tries):
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code in (429,500,502,503,504):
+        try:
+            r = session.get(url, params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if r.status_code in (429,500,502,503,504):
+                time.sleep(min(90, 2**i)); continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err=e
+            time.sleep(min(90, 2**i)); continue
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return None
+            last_err=e
             time.sleep(min(60, 2**i)); continue
-        r.raise_for_status()
-        return r.json()
-    r.raise_for_status()
+        except ValueError as e:
+            last_err=e
+            time.sleep(min(30, 2**i)); continue
+    if last_err: raise last_err
 
 def ensure_structure():
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
@@ -26,12 +57,16 @@ def ensure_structure():
           ticket_id integer primary key,
           status text not null,
           last_resolved_at timestamptz not null,
+          last_closed_at timestamptz,
+          status_changed_at timestamptz,
           last_update timestamptz,
           responsible_id bigint,
           responsible_name text
         );
     """)
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_resolved_at timestamptz not null default now();")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_closed_at timestamptz;")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists status_changed_at timestamptz;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_update timestamptz;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_id bigint;")
     cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_name text;")
@@ -130,16 +165,38 @@ def is_resolved(t):
 
 def resolved_at(t):
     best=None
-    hist=t.get("statusHistories") or []
-    for s in hist:
+    for s in (t.get("statusHistories") or []):
         st=(s.get("status") or "").lower()
         bs=(s.get("baseStatus") or "")
-        if bs in ("Resolved","Closed") or st in RESOLVED:
-            cd=s.get("changedDate") or s.get("date") or s.get("changedDateTime")
-            dt=parse_dt(cd)
+        if bs=="Resolved" or st in {"resolved","resolvido"}:
+            dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
+            if dt and (best is None or dt<best): best=dt
+    return best or parse_dt(t.get("lastUpdate"))
+
+def closed_at(t):
+    best=None
+    for s in (t.get("statusHistories") or []):
+        st=(s.get("status") or "").lower()
+        bs=(s.get("baseStatus") or "")
+        if bs=="Closed" or st in {"closed","fechado"}:
+            dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
-    if best: return best
-    return parse_dt(t.get("lastUpdate"))
+    return best
+
+def status_changed_at(t):
+    cur=(t.get("status") or "").lower()
+    bs=(t.get("baseStatus") or "")
+    target_closed = bs=="Closed" or cur in {"closed","fechado"}
+    target_resolved = bs=="Resolved" or cur in {"resolved","resolvido"}
+    best=None
+    for s in (t.get("statusHistories") or []):
+        st=(s.get("status") or "").lower()
+        bsh=(s.get("baseStatus") or "")
+        ok = (target_closed and (bsh=="Closed" or st in {"closed","fechado"})) or (target_resolved and (bsh=="Resolved" or st in {"resolved","resolvido"})) or (not target_closed and not target_resolved and st==cur)
+        if ok:
+            dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
+            if dt and (best is None or dt>best): best=dt
+    return best or parse_dt(t.get("lastUpdate"))
 
 def extract_responsible(t):
     o=t.get("owner") or {}
@@ -154,18 +211,20 @@ def extract_responsible(t):
 def upsert_rows(items):
     if not items: return
     conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    for tid, st, rat, lupd, rid, rname in items:
+    for tid, st, rat, cat, sat, lupd, rid, rname in items:
         cur.execute(f"""
             insert into {SCHEMA}.tickets_resolvidos
-            (ticket_id, status, last_resolved_at, last_update, responsible_id, responsible_name)
-            values (%s,%s,%s,%s,%s,%s)
+            (ticket_id, status, last_resolved_at, last_closed_at, status_changed_at, last_update, responsible_id, responsible_name)
+            values (%s,%s,%s,%s,%s,%s,%s,%s)
             on conflict (ticket_id) do update set
                 status = excluded.status,
                 last_resolved_at = excluded.last_resolved_at,
+                last_closed_at = excluded.last_closed_at,
+                status_changed_at = excluded.status_changed_at,
                 last_update = excluded.last_update,
                 responsible_id = coalesce(excluded.responsible_id, {SCHEMA}.tickets_resolvidos.responsible_id),
                 responsible_name = coalesce(excluded.responsible_name, {SCHEMA}.tickets_resolvidos.responsible_name);
-        """,(tid, st, rat, lupd, rid, rname))
+        """,(tid, st, rat, cat, sat, lupd, rid, rname))
     cur.close(); conn.close()
 
 def delete_ids(ids):
@@ -193,14 +252,22 @@ def run():
             futs={ex.submit(fetch_ticket_min, tid): tid for tid in want}
             for f in as_completed(futs):
                 tid=futs[f]
-                t=f.result()
+                try:
+                    t=f.result()
+                except Exception as e:
+                    print(f"warn: fetch failed for ticket {tid}: {e}")
+                    continue
                 if t and is_resolved(t):
                     st=t.get("status") or ""
                     rat=resolved_at(t) or datetime.now(timezone.utc)
                     if rat.tzinfo is None: rat=rat.replace(tzinfo=timezone.utc)
+                    cat=closed_at(t)
+                    if cat and cat.tzinfo is None: cat=cat.replace(tzinfo=timezone.utc)
+                    sat=status_changed_at(t) or rat
+                    if sat.tzinfo is None: sat=sat.replace(tzinfo=timezone.utc)
                     lupd=parse_dt(t.get("lastUpdate")) or datetime.now(timezone.utc)
                     rid,rname=extract_responsible(t)
-                    to_upsert.append((tid, st, rat, lupd, rid, rname))
+                    to_upsert.append((tid, st, rat, cat, sat, lupd, rid, rname))
                 else:
                     if tid in have:
                         to_delete.append(tid)
