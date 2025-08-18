@@ -57,22 +57,6 @@ def ensure_structure():
         );
     """)
     cur.execute(f"""
-        create table if not exists {SCHEMA}.tickets_resolvidos_diario(
-          ticket_id integer primary key,
-          status text not null,
-          last_resolved_at timestamptz not null,
-          last_closed_at timestamptz,
-          last_update timestamptz,
-          responsible_id bigint,
-          responsible_name text
-        );
-    """)
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_resolved_at timestamptz not null default now();")
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_closed_at timestamptz;")
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_update timestamptz;")
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_id bigint;")
-    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists responsible_name text;")
-    cur.execute(f"""
         create table if not exists {SCHEMA}.sync_control(
           name text primary key,
           last_update timestamptz not null
@@ -82,6 +66,12 @@ def ensure_structure():
         insert into {SCHEMA}.sync_control(name,last_update)
         values ('tr_lastresolved', now() - interval '60 days')
         on conflict (name) do nothing;
+    """)
+    cur.execute(f"create index if not exists ix_tr_lastupd on {SCHEMA}.tickets_resolvidos(last_update);")
+    cur.execute(f"""
+        create or replace view {SCHEMA}.vw_tickets_resolvidos as
+        select ticket_id,status,last_resolved_at,last_closed_at,last_update,responsible_id,responsible_name
+        from {SCHEMA}.tickets_resolvidos;
     """)
     cur.close(); conn.close()
 
@@ -101,44 +91,45 @@ def set_cursor(ts):
 
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-def _any_status_eq(field_alias, titles):
+def _build_eq_any_status(field_alias, titles):
+    titles=[(t or "").lower() for t in titles if (t or "").strip()]
     if not titles: return None
-    parts=[f"{field_alias}/status eq '{t}'" for t in titles]
+    parts=[f"tolower({field_alias}) eq '{t}'" for t in titles]
     return "("+" or ".join(parts)+")"
 
-def list_ids_resolved_since(cursor_dt):
-    ids=set(); top=500; skip=0
-    trig=_any_status_eq("s", TRIGGER_TITLES) or "s/status eq 'Resolved'"
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
-    while True:
-        p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
-        batch=api_get(f"{BASE}/tickets/past",p) or []
-        if not batch: break
-        for t in batch:
-            tid=t.get("id")
-            if tid is not None:
-                try: ids.add(int(tid))
-                except: pass
-        if len(batch)<top: break
-        skip+=top
+def _build_ne_all_status(field_alias, titles):
+    titles=[(t or "").lower() for t in titles if (t or "").strip()]
+    if not titles: return None
+    parts=[f"tolower({field_alias}) ne '{t}'" for t in titles]
+    return "("+" and ".join(parts)+")"
+
+def _fetch_ids_from_endpoints(filt):
+    ids=set()
+    for path in ("/tickets","/tickets/past"):
+        top=100; skip=0
+        while True:
+            p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
+            batch=api_get(f"{BASE}{path}",p) or []
+            if not batch: break
+            for t in batch:
+                tid=t.get("id")
+                if tid is not None:
+                    try: ids.add(int(tid))
+                    except: pass
+            if len(batch)<top: break
+            skip+=top
     return list(ids)
 
+def list_ids_resolved_since(cursor_dt):
+    trig=_build_eq_any_status("s/status", TRIGGER_TITLES) or "tolower(s/status) eq 'resolved'"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
+    return _fetch_ids_from_endpoints(filt)
+
 def list_ids_reopened_since(cursor_dt):
-    ids=set(); top=500; skip=0
-    not_trig=" and ".join([f"s/status ne '{t}'" for t in TRIGGER_TITLES]) if TRIGGER_TITLES else "s/status ne 'Resolved'"
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and ({not_trig}))"
-    while True:
-        p={"token":TOKEN,"$select":"id","$filter":filt,"$top":top,"$skip":skip}
-        batch=api_get(f"{BASE}/tickets/past",p) or []
-        if not batch: break
-        for t in batch:
-            tid=t.get("id")
-            if tid is not None:
-                try: ids.add(int(tid))
-                except: pass
-        if len(batch)<top: break
-        skip+=top
-    return list(ids)
+    excl=set([t.lower() for t in TRIGGER_TITLES]+[t.lower() for t in CLOSE_TITLES])
+    ne=_build_ne_all_status("s/status", excl) or "(tolower(s/status) ne 'resolved' and tolower(s/status) ne 'closed')"
+    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {ne})"
+    return _fetch_ids_from_endpoints(filt)
 
 def parse_dt(s):
     if not s: return None
@@ -164,13 +155,13 @@ def fetch_ticket_min(ticket_id):
 def is_resolved(t):
     st=(t.get("status") or "").lower()
     bs=(t.get("baseStatus") or "")
-    return bs in ("Resolved","Closed") or st in {"resolved","resolvido","closed","fechado"}
+    return (bs in ("Resolved","Closed")) or (st in {"resolved","resolvido","closed","fechado"})
 
 def resolved_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
         st=(s.get("status") or "")
-        if st in TRIGGER_TITLES:
+        if st in TRIGGER_TITLES or (st or "").lower() in {x.lower() for x in TRIGGER_TITLES}:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best or parse_dt(t.get("lastUpdate"))
@@ -179,7 +170,7 @@ def closed_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
         st=(s.get("status") or "")
-        if st in CLOSE_TITLES:
+        if st in CLOSE_TITLES or (st or "").lower() in {x.lower() for x in CLOSE_TITLES}:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best
@@ -223,20 +214,6 @@ def current_index_ids():
     cur.close(); conn.close()
     return set(data)
 
-def in_last_two_days_sp(dt):
-    if not dt: return False
-    sp=dt.astimezone(TZ)
-    start= datetime.now(TZ).replace(hour=0,minute=0,second=0,microsecond=0) - timedelta(days=1)
-    return sp >= start
-
-def prune_diario():
-    conn=psycopg2.connect(DSN); conn.autocommit=True; cur=conn.cursor()
-    cur.execute(f"""
-        delete from {SCHEMA}.tickets_resolvidos_diario
-        where (last_resolved_at at time zone 'America/Sao_Paulo')::date < ((now() at time zone 'America/Sao_Paulo')::date - 1)
-    """)
-    cur.close(); conn.close()
-
 def run():
     ensure_structure()
     cursor_dt=get_cursor()
@@ -271,13 +248,6 @@ def run():
     delete_ids("tickets_resolvidos", to_delete)
     reopened=list_ids_reopened_since(cursor_dt)
     delete_ids("tickets_resolvidos", reopened)
-
-    recent=[row for row in to_upsert if in_last_two_days_sp(row[2])]
-    upsert_rows("tickets_resolvidos_diario", recent)
-    delete_ids("tickets_resolvidos_diario", to_delete)
-    delete_ids("tickets_resolvidos_diario", reopened)
-    prune_diario()
-
     set_cursor(max_seen)
 
 if __name__=="__main__":
