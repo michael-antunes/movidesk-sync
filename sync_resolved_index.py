@@ -120,10 +120,14 @@ def _fetch_ids_from_endpoints(filt):
             skip+=top
     return list(ids)
 
-def list_ids_resolved_since(cursor_dt):
-    trig=_build_eq_any_status("s/status", TRIGGER_TITLES) or "tolower(s/status) eq 'resolved'"
-    filt=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
-    return _fetch_ids_from_endpoints(filt)
+def list_ids_candidates_since(cursor_dt):
+    trig=_build_eq_any_status("s/status", TRIGGER_TITLES+CLOSE_TITLES)
+    if not trig: trig="(tolower(s/status) eq 'resolved' or tolower(s/status) eq 'resolvido' or tolower(s/status) eq 'closed' or tolower(s/status) eq 'fechado')"
+    filt_hist=f"statusHistories/any(s: s/changedDate ge {iso(cursor_dt)} and {trig})"
+    ids1=set(_fetch_ids_from_endpoints(filt_hist))
+    filt_last=f"lastUpdate ge {iso(cursor_dt)}"
+    ids2=set(_fetch_ids_from_endpoints(filt_last))
+    return list(ids1|ids2)
 
 def list_ids_reopened_since(cursor_dt):
     excl=set([t.lower() for t in TRIGGER_TITLES]+[t.lower() for t in CLOSE_TITLES])
@@ -161,7 +165,7 @@ def resolved_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
         st=(s.get("status") or "")
-        if st in TRIGGER_TITLES or (st or "").lower() in {x.lower() for x in TRIGGER_TITLES}:
+        if (st or "").lower() in {x.lower() for x in TRIGGER_TITLES+CLOSE_TITLES}:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best or parse_dt(t.get("lastUpdate"))
@@ -170,7 +174,7 @@ def closed_at(t):
     best=None
     for s in (t.get("statusHistories") or []):
         st=(s.get("status") or "")
-        if st in CLOSE_TITLES or (st or "").lower() in {x.lower() for x in CLOSE_TITLES}:
+        if (st or "").lower() in {x.lower() for x in CLOSE_TITLES}:
             dt=parse_dt(s.get("changedDate") or s.get("date") or s.get("changedDateTime"))
             if dt and (best is None or dt>best): best=dt
     return best
@@ -217,7 +221,7 @@ def current_index_ids():
 def run():
     ensure_structure()
     cursor_dt=get_cursor()
-    new_ids=list_ids_resolved_since(cursor_dt)
+    new_ids=list_ids_candidates_since(cursor_dt)
     have=current_index_ids()
     want=list(set(new_ids)|have)
     to_upsert=[]; to_delete=[]
