@@ -60,23 +60,38 @@ def _extract_teams(p):
         team_primary = names[0]
     return (team_primary or None), (names or None)
 
+def _pick_first_items_label(e):
+    items = e.get("items")
+    if isinstance(items, list) and items:
+        for it in items:
+            if isinstance(it, dict):
+                v = it.get("customFieldItem") or it.get("text") or it.get("value")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return None
+
 def _extract_time_squad_from_custom_fields(p):
     cf = p.get("customFieldValues") or p.get("customFields") or []
     if not isinstance(cf, list):
         return None
     if FIELD_ID:
         for e in cf:
-            try:
-                if str(e.get("customFieldId","")).strip() == FIELD_ID:
-                    return e.get("value") or e.get("text") or e.get("optionValue")
-            except Exception:
-                pass
+            if str(e.get("customFieldId","")).strip() == FIELD_ID:
+                v = e.get("value") or e.get("text") or e.get("optionValue") or _pick_first_items_label(e)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
     if FIELD_LBL:
         lbl = FIELD_LBL.lower()
         for e in cf:
             name = (e.get("field") or e.get("name") or e.get("label") or "")
             if isinstance(name, str) and name.lower() == lbl:
-                return e.get("value") or e.get("text") or e.get("optionValue")
+                v = e.get("value") or e.get("text") or e.get("optionValue") or _pick_first_items_label(e)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    for e in cf:
+        v = _pick_first_items_label(e)
+        if isinstance(v, str) and v.lower().startswith("time "):
+            return v
     return None
 
 def _val(x):
