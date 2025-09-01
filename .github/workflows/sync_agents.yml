@@ -1,4 +1,4 @@
-name: sync-agentes
+name: Sync Movidesk -> Agentes
 on:
   schedule:
     - cron: "15 8 * * *"
@@ -13,17 +13,19 @@ jobs:
           python-version: "3.11"
       - run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests psycopg2-binary; fi
-      - env:
+      - name: Locate script
+        id: locate
+        run: |
+          set -e
+          FILE="$(git ls-files | grep -E '(^|/)sync_agentes\.py$' | head -n1 || true)"
+          if [ -z "$FILE" ]; then
+            echo "Arquivo sync_agentes.py não encontrado"; ls -la; echo "--- árvore ---"; ls -R; exit 2
+          fi
+          echo "script=$FILE" >> "$GITHUB_OUTPUT"
+      - name: Run python
+        env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           SQUAD_EMAIL_MAP: ${{ secrets.SQUAD_EMAIL_MAP }}
           SQUAD_TEAM_MAP: ${{ secrets.SQUAD_TEAM_MAP }}
-        run: |
-          set -e
-          for CAND in sync_agentes.py scripts/sync_agentes.py src/sync_agentes.py sync_agents.py scripts/sync_agents.py src/sync_agents.py; do
-            if [ -f "$CAND" ]; then TARGET="$CAND"; break; fi
-          done
-          if [ -z "${TARGET:-}" ]; then
-            echo "sync_agentes.py não encontrado"; ls -R; exit 2
-          fi
-          python "$TARGET"
+        run: python "${{ steps.locate.outputs.script }}"
