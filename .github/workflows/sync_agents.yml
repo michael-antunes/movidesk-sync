@@ -1,20 +1,18 @@
-name: Sync Movidesk -> Agentes
-
+name: sync-agentes
 on:
   schedule:
-    - cron: "15 6 * * *"
+    - cron: "15 8 * * *"
   workflow_dispatch: {}
-
 jobs:
-  sync:
+  run:
     runs-on: ubuntu-latest
-    env:
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-      NEON_DSN:       ${{ secrets.NEON_DSN }}
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - run: python sync_agents.py
+      - env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+        run: python sync_agentes.py
