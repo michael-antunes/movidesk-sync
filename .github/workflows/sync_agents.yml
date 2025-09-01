@@ -13,19 +13,9 @@ jobs:
           python-version: "3.11"
       - run: |
           if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests psycopg2-binary; fi
-      - name: Locate script
-        id: locate
-        run: |
-          set -e
-          FILE="$(git ls-files | grep -E '(^|/)sync_agentes\.py$' | head -n1 || true)"
-          if [ -z "$FILE" ]; then
-            echo "Arquivo sync_agentes.py não encontrado"; ls -la; echo "--- árvore ---"; ls -R; exit 2
-          fi
-          echo "script=$FILE" >> "$GITHUB_OUTPUT"
-      - name: Run python
-        env:
+      - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           SQUAD_EMAIL_MAP: ${{ secrets.SQUAD_EMAIL_MAP }}
           SQUAD_TEAM_MAP: ${{ secrets.SQUAD_TEAM_MAP }}
-        run: python "${{ steps.locate.outputs.script }}"
+        run: python sync_agents.py
