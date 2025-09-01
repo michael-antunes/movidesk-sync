@@ -8,8 +8,18 @@ from psycopg2.extras import execute_values, Json
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
-SQUAD_EMAIL_MAP = json.loads(os.getenv("SQUAD_EMAIL_MAP", "{}"))
-SQUAD_TEAM_MAP = json.loads(os.getenv("SQUAD_TEAM_MAP", "{}"))
+
+def _load_json_env(name, default):
+    v = os.getenv(name)
+    if not v or not v.strip():
+        return default
+    try:
+        return json.loads(v)
+    except Exception:
+        return default
+
+SQUAD_EMAIL_MAP = _load_json_env("SQUAD_EMAIL_MAP", {})
+SQUAD_TEAM_MAP = _load_json_env("SQUAD_TEAM_MAP", {})
 
 def _compute_time_squad(email, team_primary, teams):
     if email and email in SQUAD_EMAIL_MAP:
