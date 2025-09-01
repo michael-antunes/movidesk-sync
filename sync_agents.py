@@ -8,31 +8,8 @@ from psycopg2.extras import execute_values, Json
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
-
-def _load_json_env(name, default):
-    v = os.getenv(name)
-    if not v or not v.strip():
-        return default
-    try:
-        return json.loads(v)
-    except Exception:
-        return default
-
-SQUAD_EMAIL_MAP = _load_json_env("SQUAD_EMAIL_MAP", {})
-SQUAD_TEAM_MAP = _load_json_env("SQUAD_TEAM_MAP", {})
-
-def _compute_time_squad(email, team_primary, teams):
-    if email and email in SQUAD_EMAIL_MAP:
-        return SQUAD_EMAIL_MAP[email]
-    if team_primary and team_primary in SQUAD_TEAM_MAP:
-        return SQUAD_TEAM_MAP[team_primary]
-    for t in teams or []:
-        if t in SQUAD_TEAM_MAP:
-            return SQUAD_TEAM_MAP[t]
-    return None
-
-def _val(x):
-    return x if x not in ("", [], {}) else None
+FIELD_ID  = os.getenv("PERSON_TIME_SQUAD_FIELD_ID", "").strip()
+FIELD_LBL = os.getenv("PERSON_TIME_SQUAD_FIELD_LABEL", "").strip()
 
 def fetch_agents():
     assert API_TOKEN, "MOVIDESK_TOKEN ausente"
@@ -42,12 +19,7 @@ def fetch_agents():
     filtro = os.getenv("MOVIDESK_PERSON_FILTER", "profileType ne 2")
     items = []
     while True:
-        params = {
-            "token": API_TOKEN,
-            "$top": top,
-            "$skip": skip,
-            "$filter": filtro
-        }
+        params = {"token": API_TOKEN, "$top": top, "$skip": skip, "$filter": filtro}
         r = requests.get(url, params=params, timeout=60)
         r.raise_for_status()
         page = r.json() if r.text else []
@@ -60,29 +32,68 @@ def fetch_agents():
         time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.2")))
     return items
 
-def _extract_email(item):
-    email = (item.get("email") or item.get("emailAddress") or "")
+def _extract_email(p):
+    email = (p.get("email") or p.get("emailAddress") or p.get("userName") or "")
     if email:
         return email.lower()
-    emails = item.get("emails")
+    emails = p.get("emails")
     if isinstance(emails, list) and emails:
-        preferred = next((e for e in emails if e.get("isDefault")), emails[0])
-        return (preferred.get("email") or "").lower() or None
+        pref = next((e for e in emails if e.get("isDefault")), emails[0])
+        return (pref.get("email") or "").lower() or None
     return None
 
-def normalize(item):
-    pid = item.get("id")
+def _extract_teams(p):
+    team_primary = None
+    names = []
+    src = p.get("teams") or p.get("memberships") or []
+    if isinstance(src, list):
+        for t in src:
+            if isinstance(t, str) and t:
+                names.append(t)
+            elif isinstance(t, dict):
+                name = t.get("name") or (t.get("team") or {}).get("name") or t.get("teamName") or t.get("value")
+                if name:
+                    names.append(name)
+                if (t.get("isDefault") or t.get("isPrimary") or t.get("default")) and name:
+                    team_primary = name
+    if not team_primary and names:
+        team_primary = names[0]
+    return (team_primary or None), (names or None)
+
+def _extract_time_squad_from_custom_fields(p):
+    cf = p.get("customFieldValues") or p.get("customFields") or []
+    if not isinstance(cf, list):
+        return None
+    if FIELD_ID:
+        for e in cf:
+            try:
+                if str(e.get("customFieldId","")).strip() == FIELD_ID:
+                    return e.get("value") or e.get("text") or e.get("optionValue")
+            except Exception:
+                pass
+    if FIELD_LBL:
+        lbl = FIELD_LBL.lower()
+        for e in cf:
+            name = (e.get("field") or e.get("name") or e.get("label") or "")
+            if isinstance(name, str) and name.lower() == lbl:
+                return e.get("value") or e.get("text") or e.get("optionValue")
+    return None
+
+def _val(x):
+    return x if x not in ("", [], {}) else None
+
+def normalize(p):
+    pid = p.get("id")
     try:
-        agent_id = int(pid)
+        agent_id = int(str(pid))
     except Exception:
         agent_id = pid
-    name = item.get("businessName") or item.get("name")
-    email = _extract_email(item)
-    is_active = item.get("isActive")
-    access_type = item.get("accessProfile") or item.get("profileType")
-    teams = item.get("teams") if isinstance(item.get("teams"), list) else None
-    team_primary = teams[0] if teams else None
-    time_squad = _compute_time_squad(email, team_primary, teams or [])
+    name = p.get("businessName") or p.get("name")
+    email = _extract_email(p)
+    is_active = p.get("isActive")
+    access_type = p.get("accessProfile") or p.get("profileType")
+    team_primary, teams = _extract_teams(p)
+    time_squad = _extract_time_squad_from_custom_fields(p)
     return {
         "agent_id": agent_id,
         "name": _val(name),
@@ -91,7 +102,7 @@ def normalize(item):
         "teams": teams,
         "access_type": _val(access_type),
         "is_active": bool(is_active) if is_active is not None else None,
-        "raw": item,
+        "raw": p,
         "time_squad": _val(time_squad),
     }
 
@@ -118,13 +129,13 @@ def upsert_agentes(rows):
           is_active = EXCLUDED.is_active,
           raw = EXCLUDED.raw,
           updated_at = NOW(),
-          time_squad = EXCLUDED.time_squad
+          time_squad = COALESCE(EXCLUDED.time_squad, visualizacao_agentes.agentes.time_squad)
         """
         execute_values(cur, sql, values, template=template)
 
 def main():
-    data = fetch_agents()
-    rows = [normalize(it) for it in data if isinstance(it, dict)]
+    people = fetch_agents()
+    rows = [normalize(p) for p in people if isinstance(p, dict)]
     rows = [r for r in rows if r.get("agent_id")]
     if not rows:
         return
