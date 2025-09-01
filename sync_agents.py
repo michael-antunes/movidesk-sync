@@ -1,244 +1,139 @@
 import os
+import json
 import time
 import requests
 import psycopg2
-import psycopg2.extras as pgx
+from psycopg2.extras import execute_values, Json
 
-BASE = "https://api.movidesk.com/public/v1"
-TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN = os.getenv("NEON_DSN")
-CUSTOM_FIELD_ID = int(os.getenv("MOVIDESK_CF_SQUAD", "222343"))
-PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+NEON_DSN = os.getenv("NEON_DSN")
+SQUAD_EMAIL_MAP = json.loads(os.getenv("SQUAD_EMAIL_MAP", "{}"))
+SQUAD_TEAM_MAP = json.loads(os.getenv("SQUAD_TEAM_MAP", "{}"))
 
-def api_get(url, params):
-    err = None
-    for i in range(6):
-        try:
-            r = requests.get(url, params=params, timeout=60)
-            if r.status_code in (429,500,502,503,504):
-                time.sleep(min(60,2**i)); continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            err = e; time.sleep(min(60,2**i))
-    raise err
-
-def ensure_structure(conn):
-    with conn.cursor() as cur:
-        cur.execute("CREATE SCHEMA IF NOT EXISTS visualizacao_agentes")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes (
-            agent_id     BIGINT PRIMARY KEY,
-            name         TEXT NOT NULL,
-            email        TEXT NOT NULL,
-            team_primary TEXT,
-            teams        TEXT[],
-            access_type  TEXT,
-            is_active    BOOLEAN NOT NULL,
-            raw          JSONB,
-            updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-            time_squad   TEXT
-        )
-        """)
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS agentes_pkey ON visualizacao_agentes.agentes(agent_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_email ON visualizacao_agentes.agentes (lower(email))")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_team ON visualizacao_agentes.agentes (team_primary)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_teams_gin ON visualizacao_agentes.agentes USING GIN (teams)")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS visualizacao_agentes.agentes_historico (
-            history_id    BIGSERIAL PRIMARY KEY,
-            agent_id      BIGINT NOT NULL,
-            change_date   DATE NOT NULL,
-            changed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-            name          TEXT NOT NULL,
-            email         TEXT NOT NULL,
-            team_primary  TEXT,
-            teams         TEXT[],
-            access_type   TEXT,
-            is_active     BOOLEAN NOT NULL,
-            time_squad    TEXT,
-            snapshot_hash TEXT NOT NULL
-        )
-        """)
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_agentes_hist_agent_date ON visualizacao_agentes.agentes_historico(agent_id, change_date)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_agentes_hist_agent ON visualizacao_agentes.agentes_historico(agent_id)")
-    conn.commit()
-
-def extract_team_names(person):
-    t = person.get("teams")
-    out = []
-    if isinstance(t, list):
-        for item in t:
-            if isinstance(item, str) and item:
-                out.append(item)
-            elif isinstance(item, dict):
-                n = item.get("name") or item.get("teamName") or item.get("value") or item.get("text")
-                if isinstance(n, str) and n:
-                    out.append(n)
-    seen = set()
-    uniq = []
-    for n in out:
-        if n not in seen:
-            seen.add(n)
-            uniq.append(n)
-    return uniq
-
-def extract_time_squad(person, field_id):
-    vals = person.get("customFieldValues") or []
-    for cf in vals:
-        try:
-            if int(cf.get("customFieldId")) != int(field_id):
-                continue
-        except Exception:
-            continue
-        names = []
-        items = cf.get("items") or []
-        for it in items:
-            if isinstance(it, dict):
-                v = it.get("customFieldItem") or it.get("name") or it.get("text") or it.get("value")
-            else:
-                v = str(it)
-            if isinstance(v, str) and v.strip():
-                names.append(v.strip())
-        v = cf.get("value")
-        if isinstance(v, str) and v.strip():
-            names.append(v.strip())
-        if names:
-            return ", ".join(dict.fromkeys(names))
-        return None
+def _compute_time_squad(email, team_primary, teams):
+    if email and email in SQUAD_EMAIL_MAP:
+        return SQUAD_EMAIL_MAP[email]
+    if team_primary and team_primary in SQUAD_TEAM_MAP:
+        return SQUAD_TEAM_MAP[team_primary]
+    for t in teams or []:
+        if t in SQUAD_TEAM_MAP:
+            return SQUAD_TEAM_MAP[t]
     return None
 
+def _val(x):
+    return x if x not in ("", [], {}) else None
+
 def fetch_agents():
-    params = {
-        "token": TOKEN,
-        "$select": "id,businessName,userName,isActive,profileType,accessProfile,teams",
-        "$filter": "(profileType eq 1 or profileType eq 3)",
-        "$expand": "customFieldValues($expand=items)",
-        "$top": PAGE_SIZE,
-        "$skip": 0
-    }
-    people = []
+    assert API_TOKEN, "MOVIDESK_TOKEN ausente"
+    url = f"{API_BASE}/agents"
+    top = int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))
+    skip = 0
+    items = []
     while True:
-        page = api_get(f"{BASE}/persons", params)
-        if not isinstance(page, list) or not page:
+        params = {
+            "token": API_TOKEN,
+            "$top": top,
+            "$skip": skip
+        }
+        r = requests.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        page = r.json() if r.text else []
+        if not isinstance(page, list):
+            page = []
+        items.extend(page)
+        if len(page) < top:
             break
-        people.extend(page)
-        if len(page) < params["$top"]:
-            break
-        params["$skip"] += params["$top"]
-    return people
+        skip += top
+        time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.2")))
+    return items
 
-def upsert_agents(conn, people):
-    sql = """
-    INSERT INTO visualizacao_agentes.agentes
-    (agent_id,name,email,team_primary,teams,access_type,is_active,raw,updated_at,time_squad)
-    VALUES
-    (%(agent_id)s,%(name)s,%(email)s,%(team_primary)s,%(teams)s,%(access_type)s,%(is_active)s,%(raw)s,now(),%(time_squad)s)
-    ON CONFLICT (agent_id) DO UPDATE SET
-        name=EXCLUDED.name,
-        email=EXCLUDED.email,
-        team_primary=EXCLUDED.team_primary,
-        teams=EXCLUDED.teams,
-        access_type=EXCLUDED.access_type,
-        is_active=EXCLUDED.is_active,
-        raw=EXCLUDED.raw,
-        updated_at=now(),
-        time_squad=EXCLUDED.time_squad
-    """
-    rows = []
-    for p in people:
-        if p.get("profileType") not in (1,3,"1","3"):
-            continue
-        pid = p.get("id")
-        try:
-            pid = int(str(pid))
-        except Exception:
-            continue
-        teams = extract_team_names(p)
-        rows.append({
-            "agent_id": pid,
-            "name": p.get("businessName") or "",
-            "email": p.get("userName") or "",
-            "team_primary": teams[0] if teams else None,
-            "teams": teams if teams else None,
-            "access_type": p.get("accessProfile"),
-            "is_active": bool(p.get("isActive")),
-            "raw": pgx.Json(p),
-            "time_squad": extract_time_squad(p, CUSTOM_FIELD_ID)
-        })
-    if not rows:
-        return
-    with conn.cursor() as cur:
-        pgx.execute_batch(cur, sql, rows, page_size=500)
-    conn.commit()
+def normalize(item):
+    agent_id = item.get("id") or item.get("agentId") or item.get("personId")
+    name = item.get("businessName") or item.get("name")
+    email = (item.get("email") or item.get("emailAddress") or "").lower() or None
+    is_active = item.get("isActive")
+    access_type = None
+    if isinstance(item.get("businessProfile"), dict):
+        access_type = item["businessProfile"].get("name")
+    access_type = access_type or item.get("profileType") or item.get("accessType")
+    team_primary = None
+    tp = item.get("teamPrimary") or item.get("team_primary") or item.get("primaryTeam")
+    if isinstance(tp, dict):
+        team_primary = tp.get("name")
+    elif isinstance(tp, str):
+        team_primary = tp
+    teams = []
+    raw_teams = item.get("teams") or item.get("memberships") or []
+    if isinstance(raw_teams, list):
+        for t in raw_teams:
+            if isinstance(t, dict):
+                if "name" in t:
+                    teams.append(t["name"])
+                elif "team" in t and isinstance(t["team"], dict) and "name" in t["team"]:
+                    teams.append(t["team"]["name"])
+            elif isinstance(t, str):
+                teams.append(t)
+    team_primary = _val(team_primary)
+    teams = teams or None
+    time_squad = _compute_time_squad(email, team_primary, teams or [])
+    row = {
+        "agent_id": agent_id,
+        "name": _val(name),
+        "email": _val(email),
+        "team_primary": team_primary,
+        "teams": teams,
+        "access_type": _val(access_type),
+        "is_active": bool(is_active) if is_active is not None else None,
+        "raw": item,
+        "time_squad": _val(time_squad),
+    }
+    return row
 
-def record_history(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        WITH nowsp AS (
-          SELECT (now() AT TIME ZONE 'America/Sao_Paulo')::date AS d
-        ),
-        snap AS (
-          SELECT
-            a.agent_id,
-            a.name,
-            a.email,
-            a.team_primary,
-            a.teams,
-            a.access_type,
-            a.is_active,
-            a.time_squad,
-            md5(
-              coalesce(lower(a.email),'')||'|'||
-              coalesce(a.team_primary,'')||'|'||
-              coalesce(array_to_string(a.teams, ','),'')||'|'||
-              coalesce(a.time_squad,'')||'|'||
-              CASE WHEN a.is_active THEN '1' ELSE '0' END
-            ) AS h
-          FROM visualizacao_agentes.agentes a
-        ),
-        last AS (
-          SELECT DISTINCT ON (agent_id)
-            agent_id, snapshot_hash
-          FROM visualizacao_agentes.agentes_historico
-          ORDER BY agent_id, changed_at DESC
-        ),
-        to_ins AS (
-          SELECT s.*, n.d AS change_date
-          FROM snap s
-          CROSS JOIN nowsp n
-          LEFT JOIN last l ON l.agent_id = s.agent_id
-          WHERE coalesce(l.snapshot_hash, '') <> s.h
-        )
-        INSERT INTO visualizacao_agentes.agentes_historico
-          (agent_id, change_date, name, email, team_primary, teams, access_type, is_active, time_squad, snapshot_hash)
-        SELECT
-          agent_id, change_date, name, email, team_primary, teams, access_type, is_active, time_squad, h
-        FROM to_ins
-        ON CONFLICT (agent_id, change_date) DO UPDATE SET
-          name=excluded.name,
-          email=excluded.email,
-          team_primary=excluded.team_primary,
-          teams=excluded.teams,
-          access_type=excluded.access_type,
-          is_active=excluded.is_active,
-          time_squad=excluded.time_squad,
-          snapshot_hash=excluded.snapshot_hash,
-          changed_at=now()
-        """)
-    conn.commit()
+def upsert_agentes(rows):
+    assert NEON_DSN, "NEON_DSN ausente"
+    cols = ["agent_id","name","email","team_primary","teams","access_type","is_active","raw","updated_at","time_squad"]
+    template = "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)"
+    values = []
+    for r in rows:
+        values.append((
+            r["agent_id"],
+            r["name"],
+            r["email"],
+            r["team_primary"],
+            r["teams"],
+            r["access_type"],
+            r["is_active"],
+            Json(r["raw"]),
+            r["time_squad"],
+        ))
+    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+        sql = """
+        INSERT INTO visualizacao_agentes.agentes
+          (agent_id, name, email, team_primary, teams, access_type, is_active, raw, updated_at, time_squad)
+        VALUES %s
+        ON CONFLICT (agent_id) DO UPDATE SET
+          name = EXCLUDED.name,
+          email = EXCLUDED.email,
+          team_primary = EXCLUDED.team_primary,
+          teams = EXCLUDED.teams,
+          access_type = EXCLUDED.access_type,
+          is_active = EXCLUDED.is_active,
+          raw = EXCLUDED.raw,
+          updated_at = NOW(),
+          time_squad = EXCLUDED.time_squad
+        """
+        execute_values(cur, sql, values, template=template)
 
 def main():
-    if not TOKEN or not DSN:
-        raise RuntimeError("Defina as variáveis de ambiente MOVIDESK_TOKEN e NEON_DSN.")
-    conn = psycopg2.connect(DSN)
-    try:
-        ensure_structure(conn)
-        people = fetch_agents()
-        upsert_agents(conn, people)
-        record_history(conn)
-    finally:
-        conn.close()
+    data = fetch_agents()
+    rows = [normalize(it) for it in data if isinstance(it, dict)]
+    rows = [r for r in rows if r.get("agent_id")]
+    if not rows:
+        return
+    batch = int(os.getenv("UPSERT_BATCH", "1000"))
+    for i in range(0, len(rows), batch):
+        upsert_agentes(rows[i:i+batch])
 
 if __name__ == "__main__":
     main()
