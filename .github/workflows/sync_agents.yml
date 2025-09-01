@@ -1,4 +1,4 @@
-name: Sync Movidesk -> Agentes
+name: sync-agentes
 on:
   schedule:
     - cron: "15 8 * * *"
@@ -11,8 +11,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
+      - run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests psycopg2-binary; fi
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-        run: python sync_agentes.py
+          SQUAD_EMAIL_MAP: ${{ secrets.SQUAD_EMAIL_MAP }}
+          SQUAD_TEAM_MAP: ${{ secrets.SQUAD_TEAM_MAP }}
+        run: |
+          set -e
+          for CAND in sync_agentes.py scripts/sync_agentes.py src/sync_agentes.py sync_agents.py scripts/sync_agents.py src/sync_agents.py; do
+            if [ -f "$CAND" ]; then TARGET="$CAND"; break; fi
+          done
+          if [ -z "${TARGET:-}" ]; then
+            echo "sync_agentes.py não encontrado"; ls -R; exit 2
+          fi
+          python "$TARGET"
