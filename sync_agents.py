@@ -87,7 +87,6 @@ def normalize(item):
 
 def upsert_agentes(rows):
     assert NEON_DSN, "NEON_DSN ausente"
-    cols = ["agent_id","name","email","team_primary","teams","access_type","is_active","raw","updated_at","time_squad"]
     template = "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)"
     values = []
     for r in rows:
