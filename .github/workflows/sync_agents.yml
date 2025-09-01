@@ -1,4 +1,4 @@
-name: sync-agentes
+name: Sync Movidesk -> Agentes
 on:
   schedule:
     - cron: "15 8 * * *"
