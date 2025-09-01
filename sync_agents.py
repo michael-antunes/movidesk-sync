@@ -31,11 +31,7 @@ def fetch_agents():
     skip = 0
     items = []
     while True:
-        params = {
-            "token": API_TOKEN,
-            "$top": top,
-            "$skip": skip
-        }
+        params = {"token": API_TOKEN, "$top": top, "$skip": skip}
         r = requests.get(url, params=params, timeout=60)
         r.raise_for_status()
         page = r.json() if r.text else []
@@ -77,7 +73,7 @@ def normalize(item):
     team_primary = _val(team_primary)
     teams = teams or None
     time_squad = _compute_time_squad(email, team_primary, teams or [])
-    row = {
+    return {
         "agent_id": agent_id,
         "name": _val(name),
         "email": _val(email),
@@ -88,7 +84,6 @@ def normalize(item):
         "raw": item,
         "time_squad": _val(time_squad),
     }
-    return row
 
 def upsert_agentes(rows):
     assert NEON_DSN, "NEON_DSN ausente"
@@ -97,15 +92,8 @@ def upsert_agentes(rows):
     values = []
     for r in rows:
         values.append((
-            r["agent_id"],
-            r["name"],
-            r["email"],
-            r["team_primary"],
-            r["teams"],
-            r["access_type"],
-            r["is_active"],
-            Json(r["raw"]),
-            r["time_squad"],
+            r["agent_id"], r["name"], r["email"], r["team_primary"], r["teams"],
+            r["access_type"], r["is_active"], Json(r["raw"]), r["time_squad"]
         ))
     with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
         sql = """
