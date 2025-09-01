@@ -36,12 +36,18 @@ def _val(x):
 
 def fetch_agents():
     assert API_TOKEN, "MOVIDESK_TOKEN ausente"
-    url = f"{API_BASE}/agents"
+    url = f"{API_BASE}/persons"
     top = int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))
     skip = 0
+    filtro = os.getenv("MOVIDESK_PERSON_FILTER", "profileType ne 2")
     items = []
     while True:
-        params = {"token": API_TOKEN, "$top": top, "$skip": skip}
+        params = {
+            "token": API_TOKEN,
+            "$top": top,
+            "$skip": skip,
+            "$filter": filtro
+        }
         r = requests.get(url, params=params, timeout=60)
         r.raise_for_status()
         page = r.json() if r.text else []
@@ -54,40 +60,34 @@ def fetch_agents():
         time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.2")))
     return items
 
+def _extract_email(item):
+    email = (item.get("email") or item.get("emailAddress") or "")
+    if email:
+        return email.lower()
+    emails = item.get("emails")
+    if isinstance(emails, list) and emails:
+        preferred = next((e for e in emails if e.get("isDefault")), emails[0])
+        return (preferred.get("email") or "").lower() or None
+    return None
+
 def normalize(item):
-    agent_id = item.get("id") or item.get("agentId") or item.get("personId")
+    pid = item.get("id")
+    try:
+        agent_id = int(pid)
+    except Exception:
+        agent_id = pid
     name = item.get("businessName") or item.get("name")
-    email = (item.get("email") or item.get("emailAddress") or "").lower() or None
+    email = _extract_email(item)
     is_active = item.get("isActive")
-    access_type = None
-    if isinstance(item.get("businessProfile"), dict):
-        access_type = item["businessProfile"].get("name")
-    access_type = access_type or item.get("profileType") or item.get("accessType")
-    team_primary = None
-    tp = item.get("teamPrimary") or item.get("team_primary") or item.get("primaryTeam")
-    if isinstance(tp, dict):
-        team_primary = tp.get("name")
-    elif isinstance(tp, str):
-        team_primary = tp
-    teams = []
-    raw_teams = item.get("teams") or item.get("memberships") or []
-    if isinstance(raw_teams, list):
-        for t in raw_teams:
-            if isinstance(t, dict):
-                if "name" in t:
-                    teams.append(t["name"])
-                elif "team" in t and isinstance(t["team"], dict) and "name" in t["team"]:
-                    teams.append(t["team"]["name"])
-            elif isinstance(t, str):
-                teams.append(t)
-    team_primary = _val(team_primary)
-    teams = teams or None
+    access_type = item.get("accessProfile") or item.get("profileType")
+    teams = item.get("teams") if isinstance(item.get("teams"), list) else None
+    team_primary = teams[0] if teams else None
     time_squad = _compute_time_squad(email, team_primary, teams or [])
     return {
         "agent_id": agent_id,
         "name": _val(name),
         "email": _val(email),
-        "team_primary": team_primary,
+        "team_primary": _val(team_primary),
         "teams": teams,
         "access_type": _val(access_type),
         "is_active": bool(is_active) if is_active is not None else None,
