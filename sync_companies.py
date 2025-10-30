@@ -10,7 +10,6 @@ CSV_ENV = os.getenv("FIELDS_CSV_PATH","").strip()
 
 def log(x): print(f"[sync_companies] {x}", flush=True)
 
-# ---------------- HTTP ----------------
 def get_with_retry(session, url, params):
     a = 0
     while True:
@@ -44,11 +43,9 @@ def fetch_companies():
     all_items = fetch_companies_filtered(None)
     return [x for x in all_items if str(x.get("personType")) == "2"]
 
-# ---------------- helpers ----------------
 def try_load_person_fields(csv_path):
     try:
-        if not csv_path or not os.path.isfile(csv_path):
-            return {}
+        if not csv_path or not os.path.isfile(csv_path): return {}
         df = pd.read_csv(csv_path, sep=";", encoding="utf-8")
         df = df.rename(columns={c: c.strip() for c in df.columns})
         df = df[df["Campo para"].str.strip().str.lower().eq("pessoa")]
@@ -76,8 +73,7 @@ def discover_standard_columns(items):
     for it in items:
         for k, v in it.items():
             if k == "customFieldValues": continue
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                base.add(k)
+            if isinstance(v, (str, int, float, bool)) or v is None: base.add(k)
     return sorted(base)
 
 def discover_cf_ids(items):
@@ -111,10 +107,9 @@ def build_cf_columns(cf_ids, field_map):
         by_id[fid] = {"name": name, "col": col}
     return cols, by_id
 
-# ---------------- NEON: estrutura mínima (fallback) ----------------
 def ensure_min_structure(conn):
     with conn.cursor() as cur:
-        cur.execute("""create schema if not exists visualizacao_atual;""")
+        cur.execute("create schema if not exists visualizacao_atual;")
         cur.execute("""
         create table if not exists visualizacao_atual.movidesk_companies_raw (
           id varchar(64) primary key,
@@ -129,9 +124,13 @@ def ensure_min_structure(conn):
           rule_id int,
           line int,
           value_text text not null default '',
-          value_raw jsonb,
-          primary key (company_id, custom_field_id, coalesce(rule_id,0), coalesce(line,0), value_text)
+          value_raw jsonb
         );
+        """)
+        cur.execute("""
+        create unique index if not exists movidesk_company_custom_fields_uniq
+          on visualizacao_atual.movidesk_company_custom_fields
+          (company_id, custom_field_id, coalesce(rule_id,0), coalesce(line,0), value_text);
         """)
         cur.execute("""
         create table if not exists visualizacao_atual.movidesk_companies_wide (
@@ -166,18 +165,19 @@ def apply_catalog(conn, std_cols, by_id):
             cur.execute("""
             insert into visualizacao_atual.movidesk_companies_columns (col_name, display_name, is_standard, source)
             values (%s,%s,true,'std')
-            on conflict (col_name) do update set display_name=excluded.display_name, is_standard=excluded.is_standard, source=excluded.source;
+            on conflict (col_name) do update
+              set display_name=excluded.display_name, is_standard=excluded.is_standard, source=excluded.source;
             """, (col, c))
         for fid, meta in by_id.items():
             cur.execute("""
             insert into visualizacao_atual.movidesk_companies_columns (col_name, display_name, is_standard, source)
             values (%s,%s,false,'cf')
-            on conflict (col_name) do update set display_name=excluded.display_name, is_standard=excluded.is_standard, source=excluded.source;
+            on conflict (col_name) do update
+              set display_name=excluded.display_name, is_standard=excluded.is_standard, source=excluded.source;
             """, (meta["col"], meta["name"]))
         cur.execute("select visualizacao_atual.ensure_company_columns();")
     conn.commit()
 
-# ---------------- NEON: dados ----------------
 def upsert_raw(conn, items):
     with conn.cursor() as cur:
         for it in items:
@@ -205,7 +205,7 @@ def load_eav(conn, items, by_id):
                 insert into visualizacao_atual.movidesk_company_custom_fields
                   (company_id,custom_field_id,custom_field_name,rule_id,line,value_text,value_raw)
                 values (%s,%s,%s,%s,%s,%s,%s)
-                on conflict do nothing;
+                on conflict on constraint movidesk_company_custom_fields_uniq do nothing;
                 """, (str(it.get("id")), int(fid), meta["name"], cv.get("customFieldRuleId"),
                       cv.get("line"), val_txt, json.dumps(cv, ensure_ascii=False)))
     conn.commit()
@@ -234,35 +234,26 @@ def upsert_wide(conn, items, std_cols, by_id, cf_cols):
             cur.execute(upsert, vals)
     conn.commit()
 
-# ---------------- main ----------------
 def main():
     if not API_TOKEN or not DSN:
         log("ERRO: defina MOVIDESK_TOKEN e NEON_DSN."); sys.exit(2)
-
     field_map = try_load_person_fields(CSV_ENV)
     items = fetch_companies()
     std_cols = discover_standard_columns(items)
     cf_ids = discover_cf_ids(items)
     cf_cols, by_id = build_cf_columns(cf_ids, field_map)
-
     conn = psycopg2.connect(DSN)
-
-    # fallback robusto: garante estrutura mínima SEMPRE
     ensure_min_structure(conn)
-
-    # se catálogo existir, usa função do Neon; senão, acrescenta colunas direto
     if catalog_exists(conn):
         log("Catálogo encontrado -> ensure_company_columns()")
         apply_catalog(conn, std_cols, by_id)
     else:
-        log("Catálogo NÃO encontrado -> acrescentando colunas direto na WIDE")
+        log("Catálogo não encontrado -> acrescentando colunas direto na WIDE")
         ensure_wide_columns(conn, std_cols, cf_cols)
-
     upsert_raw(conn, items)
     load_eav(conn, items, by_id)
     upsert_wide(conn, items, std_cols, by_id, cf_cols)
     conn.close()
-
     log(f"empresas coletadas: {len(items)}, colunas padrão: {len(std_cols)}, adicionais: {len(cf_cols)}")
 
 if __name__ == "__main__":
