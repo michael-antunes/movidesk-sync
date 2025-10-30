@@ -1,0 +1,20 @@
+name: Sync Movidesk -> Empresas (padrões + adicionais)
+on:
+  schedule:
+    - cron: "20 8 * * *"
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests psycopg2-binary pandas unidecode
+      - name: Sync companies
+        env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: python sync_companies.py
