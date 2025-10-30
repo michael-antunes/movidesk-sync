@@ -117,4 +117,37 @@ def ensure_table(conn, std_cols, cf_cols):
             cur.execute(f'alter table visualizacao_empresa.empresas add column if not exists "{c}" text;')
     conn.commit()
 
-def replace_rows(conn, items, std_c
+def replace_rows(conn, items, std_cols, by_id, cf_cols):
+    std_cols_s = [sanitize(c) for c in std_cols]
+    cols = ["id"] + [c for c in std_cols_s if c != "id"] + cf_cols
+    placeholders = ",".join(["%s"]*len(cols))
+    ins = f'insert into visualizacao_empresa.empresas ({",".join([f"""\"{c}\"""" for c in cols])}) values ({placeholders})'
+    with conn.cursor() as cur:
+        cur.execute("truncate table visualizacao_empresa.empresas;")
+        for it in items:
+            row = {}
+            for c in std_cols: row[sanitize(c)] = scalar(it.get(c))
+            for cv in (it.get("customFieldValues") or []):
+                fid = cv.get("customFieldId")
+                if fid is None: continue
+                meta = by_id.get(int(fid))
+                if not meta: continue
+                row[meta["col"]] = flatten_cf_value(cv)
+            vals = [str(it.get("id"))] + [None if row.get(c) is None else str(row.get(c)) for c in cols if c!="id"]
+            cur.execute(ins, vals)
+    conn.commit()
+
+def main():
+    if not API_TOKEN or not DSN: sys.exit(2)
+    field_map = try_load_person_fields(CSV_ENV)
+    items = fetch_companies()
+    std_cols = discover_std_cols(items)
+    cf_ids = discover_cf_ids(items)
+    cf_cols, by_id = build_cf_cols(cf_ids, field_map)
+    conn = psycopg2.connect(DSN)
+    ensure_table(conn, std_cols, cf_cols)
+    replace_rows(conn, items, std_cols, by_id, cf_cols)
+    conn.close()
+
+if __name__ == "__main__":
+    main()
