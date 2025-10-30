@@ -1,5 +1,4 @@
-import os, time, random, json, re, sys
-from unidecode import unidecode
+import os, time, random, json, re, sys, unicodedata
 import pandas as pd
 import requests
 import psycopg2
@@ -46,7 +45,7 @@ def try_load_person_fields(csv_path):
         if not csv_path or not os.path.isfile(csv_path): return {}
         df = pd.read_csv(csv_path, sep=";", encoding="utf-8")
         df = df.rename(columns={c: c.strip() for c in df.columns})
-        df = df[df["Campo para"].str.strip().str.lower().eq("pessoa")]
+        df = df[df["Campo para"].astype(str).str.strip().str.lower().eq("pessoa")]
         df = df[df.get("Ativo","Sim").astype(str).str.strip().str.lower().isin(["sim","true","1","ativo"])]
         df = df[["Id","Nome"]].dropna()
         df["Id"] = df["Id"].astype(int)
@@ -55,9 +54,10 @@ def try_load_person_fields(csv_path):
         return {}
 
 def sanitize(name):
-    b = unidecode(str(name)).lower()
-    b = re.sub(r"[^a-z0-9_]+","_", b).strip("_")
-    return (b if b else "campo")[:60]
+    n = unicodedata.normalize("NFKD", str(name)).encode("ascii","ignore").decode("ascii")
+    n = n.lower()
+    n = re.sub(r"[^a-z0-9_]+","_", n).strip("_")
+    return (n if n else "campo")[:60]
 
 def scalar(v):
     if isinstance(v, (str, int, float, bool)) or v is None: return v
@@ -117,6 +117,21 @@ def ensure_table(conn, std_cols, cf_cols):
             cur.execute(f'alter table visualizacao_empresa.empresas add column if not exists "{c}" text;')
     conn.commit()
 
+def rename_legacy_cf_columns(conn, by_id):
+    with conn.cursor() as cur:
+        cur.execute("""
+            select lower(column_name)
+            from information_schema.columns
+            where table_schema='visualizacao_empresa' and table_name='empresas'
+        """)
+        existing = {r[0] for r in cur.fetchall()}
+        for fid, meta in by_id.items():
+            legacy = f"cf_{fid}".lower()
+            target = meta["col"].lower()
+            if legacy in existing and target not in existing and legacy != target:
+                cur.execute(f'alter table visualizacao_empresa.empresas rename column "{legacy}" to "{target}";')
+    conn.commit()
+
 def replace_rows(conn, items, std_cols, by_id, cf_cols):
     std_cols_s = [sanitize(c) for c in std_cols]
     cols = ["id"] + [c for c in std_cols_s if c != "id"] + cf_cols
@@ -146,6 +161,7 @@ def main():
     cf_ids = discover_cf_ids(items)
     cf_cols, by_id = build_cf_cols(cf_ids, field_map)
     conn = psycopg2.connect(DSN)
+    rename_legacy_cf_columns(conn, by_id)
     ensure_table(conn, std_cols, cf_cols)
     replace_rows(conn, items, std_cols, by_id, cf_cols)
     conn.close()
