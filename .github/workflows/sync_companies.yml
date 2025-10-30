@@ -1,8 +1,10 @@
-name: Sync Movidesk -> Empresas (padrões + adicionais)
+name: Sync Movidesk -> Empresas
+
 on:
   schedule:
     - cron: "20 8 * * *"
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
