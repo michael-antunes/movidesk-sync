@@ -111,7 +111,43 @@ def build_cf_columns(cf_ids, field_map):
         by_id[fid] = {"name": name, "col": col}
     return cols, by_id
 
-# ---------------- NEON (estrutura) ----------------
+# ---------------- NEON: estrutura mínima (fallback) ----------------
+def ensure_min_structure(conn):
+    with conn.cursor() as cur:
+        cur.execute("""create schema if not exists visualizacao_atual;""")
+        cur.execute("""
+        create table if not exists visualizacao_atual.movidesk_companies_raw (
+          id varchar(64) primary key,
+          raw jsonb not null
+        );
+        """)
+        cur.execute("""
+        create table if not exists visualizacao_atual.movidesk_company_custom_fields (
+          company_id varchar(64) not null,
+          custom_field_id int not null,
+          custom_field_name varchar(256) not null,
+          rule_id int,
+          line int,
+          value_text text not null default '',
+          value_raw jsonb,
+          primary key (company_id, custom_field_id, coalesce(rule_id,0), coalesce(line,0), value_text)
+        );
+        """)
+        cur.execute("""
+        create table if not exists visualizacao_atual.movidesk_companies_wide (
+          id varchar(64) primary key
+        );
+        """)
+    conn.commit()
+
+def ensure_wide_columns(conn, std_cols, cf_cols):
+    with conn.cursor() as cur:
+        for c in std_cols:
+            cur.execute(f'alter table visualizacao_atual.movidesk_companies_wide add column if not exists "{sanitize_column(c)}" text;')
+        for c in cf_cols:
+            cur.execute(f'alter table visualizacao_atual.movidesk_companies_wide add column if not exists "{c}" text;')
+    conn.commit()
+
 def catalog_exists(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -123,9 +159,8 @@ def catalog_exists(conn):
         """)
         return cur.fetchone() is not None
 
-def apply_catalog_and_function(conn, std_cols, by_id):
+def apply_catalog(conn, std_cols, by_id):
     with conn.cursor() as cur:
-        # insere/atualiza catálogo
         for c in std_cols:
             col = sanitize_column(c)
             cur.execute("""
@@ -139,24 +174,10 @@ def apply_catalog_and_function(conn, std_cols, by_id):
             values (%s,%s,false,'cf')
             on conflict (col_name) do update set display_name=excluded.display_name, is_standard=excluded.is_standard, source=excluded.source;
             """, (meta["col"], meta["name"]))
-        # chama função que garante colunas na wide
         cur.execute("select visualizacao_atual.ensure_company_columns();")
     conn.commit()
 
-def ensure_wide_direct(conn, std_cols, cf_cols):
-    with conn.cursor() as cur:
-        cur.execute("""
-        create table if not exists visualizacao_atual.movidesk_companies_wide (
-          id varchar(64) primary key
-        );
-        """)
-        for c in std_cols:
-            cur.execute(f'alter table visualizacao_atual.movidesk_companies_wide add column if not exists "{sanitize_column(c)}" text;')
-        for c in cf_cols:
-            cur.execute(f'alter table visualizacao_atual.movidesk_companies_wide add column if not exists "{c}" text;')
-    conn.commit()
-
-# ---------------- NEON (dados) ----------------
+# ---------------- NEON: dados ----------------
 def upsert_raw(conn, items):
     with conn.cursor() as cur:
         for it in items:
@@ -226,12 +247,16 @@ def main():
 
     conn = psycopg2.connect(DSN)
 
+    # fallback robusto: garante estrutura mínima SEMPRE
+    ensure_min_structure(conn)
+
+    # se catálogo existir, usa função do Neon; senão, acrescenta colunas direto
     if catalog_exists(conn):
-        log("Catálogo encontrado: usando ensure_company_columns()")
-        apply_catalog_and_function(conn, std_cols, by_id)
+        log("Catálogo encontrado -> ensure_company_columns()")
+        apply_catalog(conn, std_cols, by_id)
     else:
-        log("Catálogo NÃO encontrado: adicionando colunas direto na WIDE")
-        ensure_wide_direct(conn, std_cols, cf_cols)
+        log("Catálogo NÃO encontrado -> acrescentando colunas direto na WIDE")
+        ensure_wide_columns(conn, std_cols, cf_cols)
 
     upsert_raw(conn, items)
     load_eav(conn, items, by_id)
