@@ -121,7 +121,8 @@ def replace_rows(conn, items, std_cols, by_id, cf_cols):
     std_cols_s = [sanitize(c) for c in std_cols]
     cols = ["id"] + [c for c in std_cols_s if c != "id"] + cf_cols
     placeholders = ",".join(["%s"]*len(cols))
-    ins = f'insert into visualizacao_empresa.empresas ({",".join([f"""\"{c}\"""" for c in cols])}) values ({placeholders})'
+    cols_sql = ",".join([f'"{c}"' for c in cols])
+    ins = f'insert into visualizacao_empresa.empresas ({cols_sql}) values ({placeholders})'
     with conn.cursor() as cur:
         cur.execute("truncate table visualizacao_empresa.empresas;")
         for it in items:
