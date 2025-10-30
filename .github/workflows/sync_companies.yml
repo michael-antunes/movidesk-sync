@@ -1,20 +1,59 @@
 name: Sync Movidesk -> Empresas (padrões + adicionais)
+
 on:
   schedule:
     - cron: "20 8 * * *"
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: pip install requests psycopg2-binary pandas unidecode
-      - name: Sync companies
+
+      - name: Find script + validate files
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT_PATH="$(git ls-files | grep -E '(^|/)sync_companies\.py$' | head -n1 || true)"
+          if [ -z "${SCRIPT_PATH}" ]; then
+            echo "ERRO: sync_companies.py não encontrado no repo." >&2
+            echo "Dica: coloque o arquivo no raiz ou em scripts/ e faça commit." >&2
+            exit 1
+          fi
+          echo "SCRIPT_PATH=${SCRIPT_PATH}" >> $GITHUB_OUTPUT
+
+          # CSV: usa env FIELDS_CSV_PATH se existir, senão tenta caminhos comuns
+          CSV_PATH="${FIELDS_CSV_PATH:-}"
+          if [ -z "${CSV_PATH}" ]; then
+            for c in \
+              "data/Campos adicionais do Movidesk.csv" \
+              "data/Campos_adicionais_do_Movidesk.csv" \
+              "Campos adicionais do Movidesk.csv" \
+              "Campos_adicionais_do_Movidesk.csv"
+            do
+              if [ -f "$c" ]; then CSV_PATH="$c"; break; fi
+            done
+          fi
+          if [ -z "${CSV_PATH}" ] || [ ! -f "${CSV_PATH}" ]; then
+            echo "ERRO: CSV de campos adicionais não encontrado." >&2
+            echo "Crie/commite o arquivo em data/Campos adicionais do Movidesk.csv (ou defina FIELDS_CSV_PATH)." >&2
+            exit 1
+          fi
+          echo "CSV_PATH=${CSV_PATH}"
+
+      - name: Run sync
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: python sync_companies.py
+          FIELDS_CSV_PATH: ${{ env.FIELDS_CSV_PATH }}
+        run: |
+          python "${{ steps.paths.outputs.SCRIPT_PATH }}"
