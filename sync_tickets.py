@@ -16,11 +16,7 @@ def fetch_tickets():
     while True:
         params = {
             "token": API_TOKEN,
-            "$select": ",".join([
-                "id","protocol","type","subject","status","baseStatus",
-                "ownerTeam","serviceFirstLevel","serviceSecondLevel",
-                "serviceThirdLevel","createdDate","lastUpdate"
-            ]),
+            "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
             "$expand": "owner,clients,createdBy",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
@@ -112,6 +108,15 @@ def upsert_tickets(conn, rows):
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=300)
     conn.commit()
 
+def cleanup_resolvidos(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            DELETE FROM visualizacao_atual.movidesk_tickets_abertos t
+            USING visualizacao_resolvidos.tickets_resolvidos r
+            WHERE r.ticket_id = t.id
+        """)
+    conn.commit()
+
 def backfill_cod_ref(conn):
     sql = """
     UPDATE visualizacao_atual.movidesk_tickets_abertos t
@@ -131,6 +136,7 @@ def main():
     rows = fetch_tickets()
     conn = psycopg2.connect(DSN)
     upsert_tickets(conn, rows)
+    cleanup_resolvidos(conn)
     backfill_cod_ref(conn)
     conn.close()
 
