@@ -16,9 +16,9 @@ def fetch_tickets_open():
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
             "$expand": (
                 "owner($select=id,businessName),"
-                "clients($expand=organization($select=id,businessName);"
-                "$select=id,businessName,personType,profileType,organization),"
-                "createdBy($select=id,businessName)"
+                "createdBy($select=id,businessName),"
+                "clients($select=id,businessName,personType,profileType),"
+                "clients/organization($select=id,businessName)"
             ),
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
@@ -72,7 +72,6 @@ def enrich_people(ids):
     return out
 
 def build_json_records(tickets):
-    # Sempre enriquecemos createdBy e todos os clients
     person_ids = set()
     for t in tickets:
         cb = (t.get("createdBy") or {}).get("id")
@@ -108,25 +107,22 @@ def build_json_records(tickets):
 
         participants = []
         for pid, info in participants_map.items():
-            # dados do ticket (podem já ter organization sem codeReferenceAdditional)
             from_ticket = None
             for c in t.get("clients") or []:
                 if isinstance(c, dict) and str(c.get("id")) == pid:
                     from_ticket = c
                     break
 
-            # enriquecimento via /persons
             p_enriched = people.get(pid)
             org_ticket = (from_ticket.get("organization") if from_ticket else None) or {}
             org_person = (p_enriched.get("organization") if isinstance(p_enriched, dict) else None) or {}
 
-            # compor organization final: id/nome do ticket (se houver), e codeReference do persons
             org_obj = None
             if org_ticket or org_person:
                 org_obj = {
                     "id": org_ticket.get("id") or org_person.get("id"),
                     "businessName": org_ticket.get("businessName") or org_person.get("businessName"),
-                    "codeReferenceAdditional": org_person.get("codeReferenceAdditional")  # só o persons possui
+                    "codeReferenceAdditional": org_person.get("codeReferenceAdditional")
                 }
 
             p_name = (p_enriched.get("businessName") if isinstance(p_enriched, dict) else None) or info.get("fallback_name")
