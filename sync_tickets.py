@@ -14,7 +14,7 @@ def _company_from_person(p):
         name = org.get("businessName") or org.get("name")
         if name:
             return name
-    for k in ("organizationBusinessName","companyBusinessName","companyName","businessNameCompany"):
+    for k in ("organizationBusinessName", "companyBusinessName", "companyName", "businessNameCompany"):
         v = p.get(k)
         if v:
             return v
@@ -31,7 +31,7 @@ def fetch_tickets():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": "owner,clients,createdBy,clients.organization,createdBy.organization",
+            "$expand": "owner,clients($expand=organization),createdBy($expand=organization)",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -50,15 +50,17 @@ def fetch_tickets():
                 owner_id = int(owner_id) if owner_id is not None else None
             except Exception:
                 owner_id = None
+
             sel = None
-            cls = t.get("clients") or []
-            for c in cls:
+            for c in t.get("clients") or []:
                 if isinstance(c, dict):
                     sel = c
                     break
             if not sel:
                 sel = t.get("createdBy") or {}
+
             empresa = _company_from_person(sel)
+
             out.append({
                 "id": t["id"],
                 "protocol": t.get("protocol"),
@@ -128,20 +130,4 @@ def backfill_cod_ref(conn):
     SET empresa_cod_ref_adicional = e.codereferenceadditional
     FROM visualizacao_empresa.empresas e
     WHERE e.businessname IS NOT NULL
-      AND lower(trim(e.businessname)) = lower(trim(t.solicitante))
-      AND t.empresa_cod_ref_adicional IS DISTINCT FROM e.codereferenceadditional;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()
-
-def main():
-    rows = fetch_tickets()
-    conn = psycopg2.connect(DSN)
-    upsert_tickets(conn, rows)
-    cleanup_resolvidos(conn)
-    backfill_cod_ref(conn)
-    conn.close()
-
-if __name__ == "__main__":
-    main()
+      AND lower(trim(e.businessname)) = lower(trim(t.solicit
