@@ -7,11 +7,6 @@ from time import sleep
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN", "").strip()
 
-def _norm(s):
-    if s is None:
-        return None
-    return str(s).strip().lower()
-
 def fetch_tickets_open():
     if not API_TOKEN:
         raise RuntimeError("MOVIDESK_TOKEN vazio")
@@ -44,13 +39,11 @@ def fetch_tickets_open():
                 agent_id = None
             clients = t.get("clients") or []
             created_by = t.get("createdBy") or {}
-
             for c in clients:
                 if isinstance(c, dict) and c.get("id") is not None:
                     person_ids.add(str(c.get("id")))
             if created_by.get("id") is not None:
                 person_ids.add(str(created_by.get("id")))
-
             out.append({
                 "t": t,
                 "responsavel": responsavel,
@@ -65,30 +58,42 @@ def fetch_tickets_open():
 
 def fetch_person_org(person_id):
     url = "https://api.movidesk.com/public/v1/persons"
-    params = {
-        "token": API_TOKEN,
+    attempts = []
+    attempts.append({
         "$select": "id",
         "$expand": "organization($select=businessName,codeReferenceAdditional)",
-        "$filter": f"id eq {int(person_id)}"
-    }
-    r = requests.get(url, params=params, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Persons HTTP {r.status_code}: {r.text}")
-    arr = r.json()
-    if not arr:
-        return None, None
-    org = (arr[0] or {}).get("organization") or {}
-    return org.get("businessName"), org.get("codeReferenceAdditional")
+        "$filter": f"id eq '{person_id}'"
+    })
+    if str(person_id).isdigit():
+        attempts.append({
+            "$select": "id",
+            "$expand": "organization($select=businessName,codeReferenceAdditional)",
+            "$filter": f"id eq {int(person_id)}"
+        })
+    for p in attempts:
+        params = {"token": API_TOKEN}
+        params.update(p)
+        r = requests.get(url, params=params, timeout=60)
+        if r.status_code >= 400:
+            continue
+        arr = r.json()
+        if not arr:
+            continue
+        org = (arr[0] or {}).get("organization") or {}
+        return org.get("businessName"), org.get("codeReferenceAdditional")
+    return None, None
 
 def build_person_org_map(person_ids):
     org_by_person = {}
     for pid in person_ids:
         try:
-            int(pid)
+            name, coderef = fetch_person_org(pid)
         except Exception:
-            continue
-        name, coderef = fetch_person_org(pid)
-        org_by_person[pid] = {"name": name, "coderef": str(coderef) if coderef is not None else None}
+            name, coderef = None, None
+        org_by_person[str(pid)] = {
+            "name": name,
+            "coderef": str(coderef) if coderef is not None else None
+        }
         sleep(0.05)
     return org_by_person
 
@@ -98,7 +103,6 @@ def compute_rows(tickets_raw, org_by_person):
         t = item["t"]
         empresa_nome = None
         empresa_coderef = None
-
         for c in item["clients"]:
             pid = c.get("id")
             if pid is None:
@@ -109,7 +113,6 @@ def compute_rows(tickets_raw, org_by_person):
             if info.get("coderef"):
                 empresa_coderef = info["coderef"]
                 break
-
         if not empresa_coderef:
             cb = item["created_by"] or {}
             pid = cb.get("id")
@@ -119,7 +122,6 @@ def compute_rows(tickets_raw, org_by_person):
                     empresa_nome = info["name"]
                 if info.get("coderef"):
                     empresa_coderef = info["coderef"]
-
         rows.append({
             "id": t["id"],
             "protocol": t.get("protocol"),
