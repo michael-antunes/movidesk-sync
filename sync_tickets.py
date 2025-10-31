@@ -6,6 +6,12 @@ import psycopg2.extras
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN", "").strip()
 
+def _to_int(v):
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
 def _company_from_person(p):
     if not isinstance(p, dict):
         return None
@@ -13,7 +19,37 @@ def _company_from_person(p):
         v = p.get(k)
         if v:
             return v
-    return p.get("businessName")
+    pt = _to_int(p.get("profileType") or p.get("personType"))
+    if pt in (2, 3):
+        bn = p.get("businessName")
+        if bn:
+            return bn
+    return None
+
+def _pick_company_name(clients, created_by):
+    if isinstance(clients, list):
+        for c in clients:
+            pt = _to_int((c or {}).get("profileType") or (c or {}).get("personType"))
+            if pt in (2, 3):
+                company = _company_from_person(c)
+                if company:
+                    return company
+                bn = (c or {}).get("businessName")
+                if bn:
+                    return bn
+        for c in clients:
+            company = _company_from_person(c or {})
+            if company:
+                return company
+    company = _company_from_person(created_by or {})
+    if company:
+        return company
+    if isinstance(clients, list):
+        for c in clients:
+            bn = (c or {}).get("businessName")
+            if bn:
+                return bn
+    return (created_by or {}).get("businessName")
 
 def fetch_tickets():
     if not API_TOKEN:
@@ -40,22 +76,10 @@ def fetch_tickets():
         for t in batch:
             owner = t.get("owner") or {}
             responsavel = owner.get("businessName")
-            owner_id = owner.get("id")
-            try:
-                owner_id = int(owner_id) if owner_id is not None else None
-            except Exception:
-                owner_id = None
-
-            sel = None
-            for c in t.get("clients") or []:
-                if isinstance(c, dict):
-                    sel = c
-                    break
-            if not sel:
-                sel = t.get("createdBy") or {}
-
-            empresa = _company_from_person(sel)
-
+            owner_id = _to_int(owner.get("id"))
+            clients = t.get("clients") or []
+            created_by = t.get("createdBy") or {}
+            nome_empresa = _pick_company_name(clients, created_by)
             out.append({
                 "id": t["id"],
                 "protocol": t.get("protocol"),
@@ -71,7 +95,7 @@ def fetch_tickets():
                 "last_update": t.get("lastUpdate"),
                 "responsavel": responsavel,
                 "agent_id": owner_id,
-                "solicitante": empresa
+                "solicitante": nome_empresa
             })
         if len(batch) < top:
             break
