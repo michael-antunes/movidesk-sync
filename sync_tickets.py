@@ -7,28 +7,32 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN", "").strip()
 
 def fetch_solicitantes():
+    if not API_TOKEN:
+        raise RuntimeError("MOVIDESK_TOKEN vazio")
     url = "https://api.movidesk.com/public/v1/tickets"
     out = []
     skip = 0
-    top = 1000
+    top = 500
     while True:
         params = {
             "token": API_TOKEN,
             "$select": "id",
-            "$expand": "clients($select=id,businessName,emails,profileType),createdBy($select=id,businessName,emails,profileType)",
+            "$expand": "clients,createdBy",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
         }
-        r = requests.get(url, params=params, timeout=60)
-        r.raise_for_status()
+        r = requests.get(url, params=params, timeout=90)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
         batch = r.json()
         if not batch:
             break
         for t in batch:
             sel = None
-            for c in t.get("clients") or []:
-                if c.get("businessName"):
+            cls = t.get("clients") or []
+            for c in cls:
+                if isinstance(c, dict) and c.get("businessName"):
                     sel = c
                     break
             if not sel:
@@ -38,24 +42,19 @@ def fetch_solicitantes():
                 continue
             emails = sel.get("emails") or []
             email = emails[0] if isinstance(emails, list) and emails else None
-            tipo = sel.get("profileType")
-            try:
-                tipo = int(tipo) if tipo is not None else None
-            except Exception:
-                tipo = None
             out.append({
                 "ticket_id": t["id"],
                 "sid": sel.get("id"),
                 "nome": nome,
                 "email": email,
-                "tipo": tipo
+                "tipo": sel.get("profileType") if isinstance(sel.get("profileType"), int) else None
             })
         if len(batch) < top:
             break
         skip += len(batch)
     return out
 
-def update_solicitante(conn, rows):
+def update_db(conn, rows):
     if not rows:
         return
     sql = """
@@ -89,7 +88,7 @@ def backfill_cod_ref(conn):
 def main():
     rows = fetch_solicitantes()
     conn = psycopg2.connect(DSN)
-    update_solicitante(conn, rows)
+    update_db(conn, rows)
     backfill_cod_ref(conn)
     conn.close()
 
