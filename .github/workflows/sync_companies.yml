@@ -19,5 +19,5 @@ jobs:
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          FIELDS_CSV_PATH: data/Campos adicionais do Movidesk.csv
+          FIELDS_CSV_PATH: ${{ vars.FIELDS_CSV_PATH }}
         run: python sync_companies.py
