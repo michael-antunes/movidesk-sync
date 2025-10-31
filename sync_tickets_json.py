@@ -16,7 +16,7 @@ def fetch_tickets_open():
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
             "$expand": (
                 "owner($select=id,businessName),"
-                "clients($expand=organization($select=id,businessName,codeReferenceAdditional);"
+                "clients($expand=organization($select=id,businessName);"
                 "$select=id,businessName,personType,profileType,organization),"
                 "createdBy($select=id,businessName)"
             ),
@@ -72,17 +72,15 @@ def enrich_people(ids):
     return out
 
 def build_json_records(tickets):
+    # Sempre enriquecemos createdBy e todos os clients
     person_ids = set()
     for t in tickets:
         cb = (t.get("createdBy") or {}).get("id")
         if cb is not None:
             person_ids.add(str(cb))
         for c in t.get("clients") or []:
-            if isinstance(c, dict):
-                cid = c.get("id")
-                has_org = isinstance(c.get("organization"), dict)
-                if cid is not None and not has_org:
-                    person_ids.add(str(cid))
+            if isinstance(c, dict) and c.get("id") is not None:
+                person_ids.add(str(c.get("id")))
 
     people = enrich_people(sorted(person_ids))
     records = []
@@ -110,58 +108,39 @@ def build_json_records(tickets):
 
         participants = []
         for pid, info in participants_map.items():
+            # dados do ticket (podem já ter organization sem codeReferenceAdditional)
             from_ticket = None
             for c in t.get("clients") or []:
                 if isinstance(c, dict) and str(c.get("id")) == pid:
                     from_ticket = c
                     break
 
+            # enriquecimento via /persons
             p_enriched = people.get(pid)
-            org_obj = None
+            org_ticket = (from_ticket.get("organization") if from_ticket else None) or {}
+            org_person = (p_enriched.get("organization") if isinstance(p_enriched, dict) else None) or {}
 
-            if from_ticket and isinstance(from_ticket.get("organization"), dict):
-                org = from_ticket["organization"]
+            # compor organization final: id/nome do ticket (se houver), e codeReference do persons
+            org_obj = None
+            if org_ticket or org_person:
                 org_obj = {
-                    "id": org.get("id"),
-                    "businessName": org.get("businessName"),
-                    "codeReferenceAdditional": org.get("codeReferenceAdditional")
+                    "id": org_ticket.get("id") or org_person.get("id"),
+                    "businessName": org_ticket.get("businessName") or org_person.get("businessName"),
+                    "codeReferenceAdditional": org_person.get("codeReferenceAdditional")  # só o persons possui
                 }
 
-            if org_obj is None and isinstance(p_enriched, dict):
-                org = p_enriched.get("organization") or {}
-                if org:
-                    org_obj = {
-                        "id": org.get("id"),
-                        "businessName": org.get("businessName"),
-                        "codeReferenceAdditional": org.get("codeReferenceAdditional")
-                    }
-
-            p_name = None
-            p_email = None
-            p_pt = None
-            p_pr = None
-            if isinstance(p_enriched, dict):
-                p_name = p_enriched.get("businessName")
-                p_email = p_enriched.get("email")
-                p_pt = p_enriched.get("personType")
-                p_pr = p_enriched.get("profileType")
-            if not p_name and from_ticket:
-                p_name = from_ticket.get("businessName")
-
+            p_name = (p_enriched.get("businessName") if isinstance(p_enriched, dict) else None) or info.get("fallback_name")
             participants.append({
-                "id": p_enriched.get("id") if isinstance(p_enriched, dict) and p_enriched.get("id") is not None else pid,
-                "businessName": p_name or info.get("fallback_name"),
-                "profileType": p_pr,
-                "personType": p_pt,
-                "email": p_email,
+                "id": (p_enriched.get("id") if isinstance(p_enriched, dict) and p_enriched.get("id") is not None else pid),
+                "businessName": p_name,
+                "profileType": (p_enriched.get("profileType") if isinstance(p_enriched, dict) else None),
+                "personType": (p_enriched.get("personType") if isinstance(p_enriched, dict) else None),
+                "email": (p_enriched.get("email") if isinstance(p_enriched, dict) else None),
                 "organization": org_obj,
                 "roles": sorted(list(info["roles"]))
             })
 
-        full = {
-            "ticket": t,
-            "participants": participants
-        }
+        full = {"ticket": t, "participants": participants}
         records.append({"id": t["id"], "raw": full})
     return records
 
