@@ -14,12 +14,7 @@ def fetch_tickets_open():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": (
-                "owner($select=id,businessName),"
-                "createdBy($select=id,businessName),"
-                "clients($select=id,businessName,personType,profileType),"
-                "clients/organization($select=id,businessName)"
-            ),
+            "$expand": "owner($select=id,businessName),createdBy($select=id,businessName),clients($select=id,businessName,personType,profileType)",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -107,21 +102,14 @@ def build_json_records(tickets):
 
         participants = []
         for pid, info in participants_map.items():
-            from_ticket = None
-            for c in t.get("clients") or []:
-                if isinstance(c, dict) and str(c.get("id")) == pid:
-                    from_ticket = c
-                    break
-
-            p_enriched = people.get(pid)
-            org_ticket = (from_ticket.get("organization") if from_ticket else None) or {}
+            p_enriched = people.get(pid) if people else None
             org_person = (p_enriched.get("organization") if isinstance(p_enriched, dict) else None) or {}
 
             org_obj = None
-            if org_ticket or org_person:
+            if org_person:
                 org_obj = {
-                    "id": org_ticket.get("id") or org_person.get("id"),
-                    "businessName": org_ticket.get("businessName") or org_person.get("businessName"),
+                    "id": org_person.get("id"),
+                    "businessName": org_person.get("businessName"),
                     "codeReferenceAdditional": org_person.get("codeReferenceAdditional")
                 }
 
