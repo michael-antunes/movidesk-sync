@@ -16,7 +16,7 @@ def fetch_tickets_open():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": "owner($select=id,businessName),clients($select=id,businessName),createdBy($select=id,businessName),customFields",
+            "$expand": "owner($select=id,businessName),clients($select=id,businessName),createdBy($select=id,businessName)",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
@@ -99,9 +99,7 @@ INSERT INTO visualizacao_atual.movidesk_tickets_json (id, raw)
 VALUES (%(id)s, %(raw)s)
 ON CONFLICT (id) DO UPDATE SET raw = EXCLUDED.raw;
 """
-    rows = []
-    for r in records:
-        rows.append({"id": r["id"], "raw": psycopg2.extras.Json(r["raw"])})
+    rows = [{"id": r["id"], "raw": psycopg2.extras.Json(r["raw"])} for r in records]
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
     conn.commit()
