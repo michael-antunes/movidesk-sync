@@ -14,17 +14,16 @@ def fetch_tickets_open():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            " $expand ": None  # placeholder, será removido já já
+            "$expand": (
+                "owner($select=id,businessName),"
+                "clients($expand=organization($select=id,businessName,codeReferenceAdditional);"
+                "$select=id,businessName,personType,profileType,organization),"
+                "createdBy($select=id,businessName)"
+            ),
+            "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
+            "$top": top,
+            "$skip": skip
         }
-        # usamos uma string de expand robusta:
-        # - owner: apenas id/nome
-        # - clients: SEM $select (para não perder 'organization')
-        # - createdBy: apenas id/nome
-        params["$expand"] = "owner($select=id,businessName),clients,createdBy($select=id,businessName)"
-        params["$filter"] = "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')"
-        params["$top"] = top
-        params["$skip"] = skip
-
         r = requests.get(url, params=params, timeout=90)
         if r.status_code >= 400:
             raise RuntimeError(f"Tickets HTTP {r.status_code}: {r.text}")
@@ -73,7 +72,6 @@ def enrich_people(ids):
     return out
 
 def build_json_records(tickets):
-    # coleto IDs a enriquecer (só quando o ticket não trouxe organization)
     person_ids = set()
     for t in tickets:
         cb = (t.get("createdBy") or {}).get("id")
@@ -90,7 +88,6 @@ def build_json_records(tickets):
     records = []
 
     for t in tickets:
-        # mapa para deduplicar participantes e agregar "roles"
         participants_map = {}
 
         cb = t.get("createdBy") or {}
@@ -113,13 +110,12 @@ def build_json_records(tickets):
 
         participants = []
         for pid, info in participants_map.items():
-            # base do ticket (pode já ter organization dentro de clients)
             from_ticket = None
             for c in t.get("clients") or []:
                 if isinstance(c, dict) and str(c.get("id")) == pid:
                     from_ticket = c
                     break
-            # enriquecimento (se precisamos)
+
             p_enriched = people.get(pid)
             org_obj = None
 
@@ -140,7 +136,6 @@ def build_json_records(tickets):
                         "codeReferenceAdditional": org.get("codeReferenceAdditional")
                     }
 
-            # dados pessoa
             p_name = None
             p_email = None
             p_pt = None
@@ -150,7 +145,6 @@ def build_json_records(tickets):
                 p_email = p_enriched.get("email")
                 p_pt = p_enriched.get("personType")
                 p_pr = p_enriched.get("profileType")
-
             if not p_name and from_ticket:
                 p_name = from_ticket.get("businessName")
 
@@ -165,8 +159,8 @@ def build_json_records(tickets):
             })
 
         full = {
-            "ticket": t,              # ticket como veio do endpoint (com clients->organization quando disponível)
-            "participants": participants  # participantes deduplicados com organização
+            "ticket": t,
+            "participants": participants
         }
         records.append({"id": t["id"], "raw": full})
     return records
