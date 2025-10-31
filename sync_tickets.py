@@ -17,46 +17,86 @@ def _norm(s):
         return None
     return str(s).strip().lower()
 
-def load_empresas_map(conn):
+def _chunk(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
+def load_empresas_info(conn):
     q = "SELECT id::text AS id_txt, businessname FROM visualizacao_empresa.empresas WHERE businessname IS NOT NULL"
-    m = {}
+    name_to_id = {}
+    id_set = set()
     with conn.cursor() as cur:
         cur.execute(q)
         for id_txt, bn in cur.fetchall():
+            id_set.add(str(id_txt))
             n = _norm(bn)
             if n and id_txt:
-                m[n] = id_txt
-    return m
+                name_to_id[n] = str(id_txt)
+    return name_to_id, id_set
 
-def _guess_company_name(p):
-    if not isinstance(p, dict):
-        return None
-    for k in ("companyBusinessName","companyName","businessNameCompany","organizationName"):
-        v = p.get(k)
-        if v:
-            return v
-    pt = _to_int(p.get("profileType") or p.get("personType"))
-    if pt in (2,3) and p.get("businessName"):
-        return p.get("businessName")
-    return None
+def _build_filter_ids(ids):
+    parts = []
+    for pid in ids:
+        try:
+            int_pid = int(pid)
+            parts.append(f"id eq {int_pid}")
+        except Exception:
+            parts.append(f"id eq '{pid}'")
+    return " or ".join(parts)
 
-def _pick_empresa_id(sel, empresas_map):
-    if not isinstance(sel, dict):
-        return None
-    for k in ("organizationId","organizationID","organization_id"):
-        v = sel.get(k)
-        if v is not None:
-            return str(v)
-    name = _guess_company_name(sel)
-    if name:
-        return empresas_map.get(_norm(name))
-    return None
+def fetch_person_org_map(person_ids):
+    url = "https://api.movidesk.com/public/v1/persons"
+    org_by_person = {}
+    ids_list = [pid for pid in person_ids if pid is not None]
+    for chunk in _chunk(ids_list, 25):
+        params = {
+            "token": API_TOKEN,
+            "$select": "id",
+            "$expand": "organization($select=id,businessName,codeReferenceAdditional)",
+            "$filter": _build_filter_ids(chunk)
+        }
+        r = requests.get(url, params=params, timeout=90)
+        if r.status_code >= 400:
+            params = {
+                "token": API_TOKEN,
+                "$select": "id,organizationId,organizationBusinessName,organizationCodeReferenceAdditional",
+                "$filter": _build_filter_ids(chunk)
+            }
+            r = requests.get(url, params=params, timeout=90)
+            if r.status_code >= 400:
+                params = {
+                    "token": API_TOKEN,
+                    "$filter": _build_filter_ids(chunk)
+                }
+                r = requests.get(url, params=params, timeout=90)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"Persons HTTP {r.status_code}: {r.text}")
+        arr = r.json()
+        for p in arr:
+            pid = str(p.get("id"))
+            org = p.get("organization") or {}
+            org_id = org.get("id")
+            org_name = org.get("businessName")
+            if not org_id:
+                org_id = p.get("organizationId")
+            if not org_name:
+                org_name = p.get("organizationBusinessName")
+            org_code_ref = org.get("codeReferenceAdditional") or p.get("organizationCodeReferenceAdditional")
+            if pid:
+                org_by_person[pid] = {
+                    "org_id": str(org_id) if org_id is not None else None,
+                    "org_name": org_name,
+                    "org_code_ref": org_code_ref
+                }
+    return org_by_person
 
-def fetch_tickets(empresas_map):
+def fetch_tickets():
     if not API_TOKEN:
         raise RuntimeError("MOVIDESK_TOKEN vazio")
     url = "https://api.movidesk.com/public/v1/tickets"
     out = []
+    person_ids = set()
     skip = 0
     top = 500
     while True:
@@ -78,35 +118,78 @@ def fetch_tickets(empresas_map):
             owner = t.get("owner") or {}
             responsavel = owner.get("businessName")
             owner_id = _to_int(owner.get("id"))
-            empresa_id = None
             clients = t.get("clients") or []
+            created_by = t.get("createdBy") or {}
             for c in clients:
-                empresa_id = _pick_empresa_id(c, empresas_map)
-                if empresa_id:
-                    break
-            if not empresa_id:
-                empresa_id = _pick_empresa_id(t.get("createdBy") or {}, empresas_map)
+                cid = c.get("id")
+                if cid is not None:
+                    person_ids.add(str(cid))
+            if created_by.get("id") is not None:
+                person_ids.add(str(created_by.get("id")))
             out.append({
-                "id": t["id"],
-                "protocol": t.get("protocol"),
-                "type": t.get("type"),
-                "subject": t.get("subject"),
-                "status": t.get("status"),
-                "base_status": t.get("baseStatus"),
-                "owner_team": t.get("ownerTeam"),
-                "service_first_level": t.get("serviceFirstLevel"),
-                "service_second_level": t.get("serviceSecondLevel"),
-                "service_third_level": t.get("serviceThirdLevel"),
-                "created_date": t.get("createdDate"),
-                "last_update": t.get("lastUpdate"),
+                "t": t,
                 "responsavel": responsavel,
-                "agent_id": owner_id,
-                "empresa_id": empresa_id
+                "owner_id": owner_id,
+                "clients": clients,
+                "created_by": created_by
             })
         if len(batch) < top:
             break
         skip += len(batch)
-    return out
+    return out, person_ids
+
+def compute_rows(tickets_raw, person_org, empresas_name_to_id, empresas_id_set):
+    rows = []
+    for item in tickets_raw:
+        t = item["t"]
+        empresa_id = None
+        for c in item["clients"]:
+            cid = c.get("id")
+            if cid is None:
+                continue
+            info = person_org.get(str(cid)) or {}
+            oid = info.get("org_id")
+            oname = info.get("org_name")
+            if oid and oid in empresas_id_set:
+                empresa_id = oid
+                break
+            if not empresa_id and oname:
+                mid = empresas_name_to_id.get(_norm(oname))
+                if mid:
+                    empresa_id = mid
+                    break
+        if not empresa_id:
+            cb = item["created_by"]
+            cid = cb.get("id")
+            if cid is not None:
+                info = person_org.get(str(cid)) or {}
+                oid = info.get("org_id")
+                oname = info.get("org_name")
+                if oid and oid in empresas_id_set:
+                    empresa_id = oid
+                elif oname:
+                    mid = empresas_name_to_id.get(_norm(oname))
+                    if mid:
+                        empresa_id = mid
+        tdict = {
+            "id": t["id"],
+            "protocol": t.get("protocol"),
+            "type": t.get("type"),
+            "subject": t.get("subject"),
+            "status": t.get("status"),
+            "base_status": t.get("baseStatus"),
+            "owner_team": t.get("ownerTeam"),
+            "service_first_level": t.get("serviceFirstLevel"),
+            "service_second_level": t.get("serviceSecondLevel"),
+            "service_third_level": t.get("serviceThirdLevel"),
+            "created_date": t.get("createdDate"),
+            "last_update": t.get("lastUpdate"),
+            "responsavel": item["responsavel"],
+            "agent_id": item["owner_id"],
+            "empresa_id": str(empresa_id) if empresa_id is not None else None
+        }
+        rows.append(tdict)
+    return rows
 
 def upsert_tickets(conn, rows):
     if not rows:
@@ -137,7 +220,7 @@ ON CONFLICT (id) DO UPDATE SET
   empresa_id = EXCLUDED.empresa_id;
 """
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, sql, rows, page_size=300)
+        psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
     conn.commit()
 
 def cleanup_resolvidos(conn):
@@ -163,8 +246,12 @@ WHERE e.id::text = t.empresa_id
 
 def main():
     conn = psycopg2.connect(DSN)
-    empresas_map = load_empresas_map(conn)
-    rows = fetch_tickets(empresas_map)
+    empresas_name_to_id, empresas_id_set = load_empresas_info(conn)
+    tickets_raw, person_ids = fetch_tickets()
+    person_org = {}
+    if person_ids:
+        person_org = fetch_person_org_map(person_ids)
+    rows = compute_rows(tickets_raw, person_org, empresas_name_to_id, empresas_id_set)
     upsert_tickets(conn, rows)
     cleanup_resolvidos(conn)
     backfill_cod_ref(conn)
