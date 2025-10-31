@@ -12,43 +12,30 @@ def _to_int(v):
     except Exception:
         return None
 
-def _company_from_person(p):
-    if not isinstance(p, dict):
-        return None
-    for k in ("organizationBusinessName", "companyBusinessName", "companyName", "businessNameCompany"):
-        v = p.get(k)
-        if v:
-            return v
-    pt = _to_int(p.get("profileType") or p.get("personType"))
-    if pt in (2, 3):
-        bn = p.get("businessName")
-        if bn:
-            return bn
-    return None
-
 def _pick_company_name(clients, created_by):
     if isinstance(clients, list):
         for c in clients:
-            pt = _to_int((c or {}).get("profileType") or (c or {}).get("personType"))
-            if pt in (2, 3):
-                company = _company_from_person(c)
-                if company:
-                    return company
-                bn = (c or {}).get("businessName")
-                if bn:
-                    return bn
+            if not isinstance(c, dict):
+                continue
+            org = c.get("organizationBusinessName")
+            if org:
+                return org
         for c in clients:
-            company = _company_from_person(c or {})
-            if company:
-                return company
-    company = _company_from_person(created_by or {})
-    if company:
-        return company
+            if not isinstance(c, dict):
+                continue
+            pt = _to_int(c.get("profileType") or c.get("personType"))
+            if pt in (2, 3) and c.get("businessName"):
+                return c.get("businessName")
+    org = (created_by or {}).get("organizationBusinessName")
+    if org:
+        return org
+    pt = _to_int((created_by or {}).get("profileType") or (created_by or {}).get("personType"))
+    if pt in (2, 3) and (created_by or {}).get("businessName"):
+        return (created_by or {}).get("businessName")
     if isinstance(clients, list):
         for c in clients:
-            bn = (c or {}).get("businessName")
-            if bn:
-                return bn
+            if isinstance(c, dict) and c.get("businessName"):
+                return c.get("businessName")
     return (created_by or {}).get("businessName")
 
 def fetch_tickets():
@@ -62,7 +49,9 @@ def fetch_tickets():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": "owner,clients,createdBy",
+            "$expand": "owner($select=id,businessName),"
+                       "clients($select=id,businessName,organizationBusinessName,personType,profileType),"
+                       "createdBy($select=id,businessName,organizationBusinessName,personType,profileType)",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
