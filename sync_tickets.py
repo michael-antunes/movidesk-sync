@@ -87,30 +87,30 @@ def upsert_tickets(conn, rows):
     if not rows:
         return
     sql = """
-    INSERT INTO visualizacao_atual.movidesk_tickets_abertos
-      (id, protocol, subject, type, status, base_status, owner_team,
-       service_first_level, service_second_level, service_third_level,
-       created_date, last_update, responsavel, agent_id, solicitante)
-    VALUES
-      (%(id)s, %(protocol)s, %(subject)s, %(type)s, %(status)s, %(base_status)s, %(owner_team)s,
-       %(service_first_level)s, %(service_second_level)s, %(service_third_level)s,
-       %(created_date)s, %(last_update)s, %(responsavel)s, %(agent_id)s, %(solicitante)s)
-    ON CONFLICT (id) DO UPDATE SET
-      protocol = EXCLUDED.protocol,
-      subject = EXCLUDED.subject,
-      type = EXCLUDED.type,
-      status = EXCLUDED.status,
-      base_status = EXCLUDED.base_status,
-      owner_team = EXCLUDED.owner_team,
-      service_first_level = EXCLUDED.service_first_level,
-      service_second_level = EXCLUDED.service_second_level,
-      service_third_level = EXCLUDED.service_third_level,
-      created_date = EXCLUDED.created_date,
-      last_update = EXCLUDED.last_update,
-      responsavel = EXCLUDED.responsavel,
-      agent_id = EXCLUDED.agent_id,
-      solicitante = EXCLUDED.solicitante;
-    """
+INSERT INTO visualizacao_atual.movidesk_tickets_abertos
+  (id, protocol, subject, type, status, base_status, owner_team,
+   service_first_level, service_second_level, service_third_level,
+   created_date, last_update, responsavel, agent_id, solicitante)
+VALUES
+  (%(id)s, %(protocol)s, %(subject)s, %(type)s, %(status)s, %(base_status)s, %(owner_team)s,
+   %(service_first_level)s, %(service_second_level)s, %(service_third_level)s,
+   %(created_date)s, %(last_update)s, %(responsavel)s, %(agent_id)s, %(solicitante)s)
+ON CONFLICT (id) DO UPDATE SET
+  protocol = EXCLUDED.protocol,
+  subject = EXCLUDED.subject,
+  type = EXCLUDED.type,
+  status = EXCLUDED.status,
+  base_status = EXCLUDED.base_status,
+  owner_team = EXCLUDED.owner_team,
+  service_first_level = EXCLUDED.service_first_level,
+  service_second_level = EXCLUDED.service_second_level,
+  service_third_level = EXCLUDED.service_third_level,
+  created_date = EXCLUDED.created_date,
+  last_update = EXCLUDED.last_update,
+  responsavel = EXCLUDED.responsavel,
+  agent_id = EXCLUDED.agent_id,
+  solicitante = EXCLUDED.solicitante;
+"""
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=300)
     conn.commit()
@@ -118,16 +118,32 @@ def upsert_tickets(conn, rows):
 def cleanup_resolvidos(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            DELETE FROM visualizacao_atual.movidesk_tickets_abertos t
-            USING visualizacao_resolvidos.tickets_resolvidos r
-            WHERE r.ticket_id = t.id
-        """)
+DELETE FROM visualizacao_atual.movidesk_tickets_abertos t
+USING visualizacao_resolvidos.tickets_resolvidos r
+WHERE r.ticket_id = t.id
+""")
     conn.commit()
 
 def backfill_cod_ref(conn):
     sql = """
-    UPDATE visualizacao_atual.movidesk_tickets_abertos t
-    SET empresa_cod_ref_adicional = e.codereferenceadditional
-    FROM visualizacao_empresa.empresas e
-    WHERE e.businessname IS NOT NULL
-      AND lower(trim(e.businessname)) = lower(trim(t.solicit
+UPDATE visualizacao_atual.movidesk_tickets_abertos t
+SET empresa_cod_ref_adicional = e.codereferenceadditional
+FROM visualizacao_empresa.empresas e
+WHERE e.businessname IS NOT NULL
+  AND lower(trim(e.businessname)) = lower(trim(t.solicitante))
+  AND t.empresa_cod_ref_adicional IS DISTINCT FROM e.codereferenceadditional;
+"""
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+def main():
+    rows = fetch_tickets()
+    conn = psycopg2.connect(DSN)
+    upsert_tickets(conn, rows)
+    cleanup_resolvidos(conn)
+    backfill_cod_ref(conn)
+    conn.close()
+
+if __name__ == "__main__":
+    main()
