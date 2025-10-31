@@ -24,7 +24,7 @@ def fetch_companies_filtered(filter_expr=None):
     items, skip, top = [], 0, 100
     with requests.Session() as s:
         while True:
-            params = {"token": API_TOKEN, "$expand": "customFieldValues,phones", "$top": top, "$skip": skip}
+            params = {"token": API_TOKEN, "$expand": "customFieldValues", "$top": top, "$skip": skip}
             if filter_expr:
                 params["$filter"] = filter_expr
             r = get_with_retry(s, url, params)
@@ -39,10 +39,16 @@ def fetch_companies_filtered(filter_expr=None):
     return items
 
 def fetch_companies():
-    x = fetch_companies_filtered("personType eq 2")
+    try:
+        x = fetch_companies_filtered("personType eq 2")
+    except requests.HTTPError:
+        x = None
     if x:
         return x
-    y = fetch_companies_filtered(None)
+    try:
+        y = fetch_companies_filtered(None)
+    except requests.HTTPError:
+        y = []
     return [i for i in y if str(i.get("personType")) == "2"]
 
 def try_load_person_fields(csv_path):
