@@ -9,11 +9,6 @@ DSN = os.getenv("NEON_DSN", "").strip()
 def _company_from_person(p):
     if not isinstance(p, dict):
         return None
-    org = p.get("organization") or {}
-    if isinstance(org, dict):
-        name = org.get("businessName") or org.get("name")
-        if name:
-            return name
     for k in ("organizationBusinessName", "companyBusinessName", "companyName", "businessNameCompany"):
         v = p.get(k)
         if v:
@@ -31,7 +26,7 @@ def fetch_tickets():
         params = {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": "owner,clients($expand=organization),createdBy($expand=organization)",
+            "$expand": "owner,clients,createdBy",
             "$filter": "(status eq 'Em atendimento' or status eq 'Aguardando' or status eq 'Novo')",
             "$top": top,
             "$skip": skip
