@@ -1,8 +1,8 @@
 name: sync-json
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
 jobs:
   sync:
     runs-on: ubuntu-latest
