@@ -1,6 +1,10 @@
 name: sync-json
 on:
   workflow_dispatch:
+    inputs:
+      debug_ticket_id:
+        description: Ticket para dump completo (opcional)
+        required: false
   schedule:
     - cron: "*/30 * * * *"
 jobs:
@@ -15,4 +19,5 @@ jobs:
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_DEBUG_TICKET_ID: ${{ inputs.debug_ticket_id }}
         run: python sync_tickets_json.py
