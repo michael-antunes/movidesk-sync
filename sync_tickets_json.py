@@ -8,6 +8,7 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN", "").strip()
 STATUSES = ["Em atendimento","Aguardando","Novo"]
 PERSON_CACHE = {}
+DEBUG_TICKET_ID = os.getenv("MOVIDESK_DEBUG_TICKET_ID")
 
 def fetch_open_ticket_ids():
     url = "https://api.movidesk.com/public/v1/tickets"
@@ -38,7 +39,7 @@ def fetch_ticket_detail(ticket_id):
         {
             "token": API_TOKEN,
             "$select": "id,protocol,type,subject,status,baseStatus,ownerTeam,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,createdDate,lastUpdate",
-            "$expand": "owner($select=id,businessName),createdBy($select=id,businessName),clients($select=id,businessName,personType,profileType;$expand=organization($select=id,businessName))"
+            "$expand": "owner($select=id,businessName),createdBy($select=id,businessName),clients($select=id,businessName,personType,profileType;$expand=organization($select=id,businessName,codeReferenceAdditional))"
         },
         {
             "token": API_TOKEN,
@@ -198,6 +199,12 @@ create table if not exists visualizacao_atual.person_org_override (
   note text,
   updated_at timestamptz default now()
 )""")
+        cur.execute("""
+create table if not exists visualizacao_atual.movidesk_ticket_debug (
+  ticket_id integer primary key,
+  payload jsonb not null,
+  created_at timestamptz default now()
+)""")
     conn.commit()
 
 def upsert_tickets(conn, records):
@@ -258,9 +265,56 @@ set org_id = excluded.org_id,
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
     conn.commit()
 
+def debug_dump_ticket(conn, ticket_id):
+    base = f"https://api.movidesk.com/public/v1/tickets/{ticket_id}"
+    r1 = requests.get(base, params={"token": API_TOKEN}, timeout=90)
+    if r1.status_code >= 400:
+        raise RuntimeError(f"Debug ticket HTTP {r1.status_code}: {r1.text}")
+    raw_ticket = r1.json()
+    clients = []
+    try:
+        clients = raw_ticket.get("clients") or []
+    except Exception:
+        clients = []
+    person_ids = []
+    for c in clients:
+        if isinstance(c, dict) and c.get("id"):
+            person_ids.append(str(c.get("id")))
+    persons = {}
+    for pid in person_ids:
+        payload, src = fetch_person_payload(pid)
+        persons[pid] = {"payload": payload, "source": src}
+    resolved = []
+    for c in clients:
+        if isinstance(c, dict) and c.get("id"):
+            pid = str(c["id"])
+            payload = persons.get(pid, {}).get("payload")
+            org = select_org_from_person_payload(payload)
+            resolved.append({
+                "personId": pid,
+                "personName": c.get("businessName"),
+                "resolvedOrganization": org
+            })
+    dump = {
+        "raw_ticket": raw_ticket,
+        "persons": persons,
+        "resolved_clients": resolved
+    }
+    with conn.cursor() as cur:
+        cur.execute("""
+insert into visualizacao_atual.movidesk_ticket_debug (ticket_id, payload, created_at)
+values (%s, %s, now())
+on conflict (ticket_id) do update set payload = excluded.payload, created_at = now()
+""", (int(ticket_id), psycopg2.extras.Json(dump)))
+    conn.commit()
+
 def main():
     if not API_TOKEN or not DSN:
         raise RuntimeError("MOVIDESK_TOKEN e NEON_DSN são obrigatórios")
+    conn = psycopg2.connect(DSN)
+    ensure_tables(conn)
+    if DEBUG_TICKET_ID:
+        debug_dump_ticket(conn, DEBUG_TICKET_ID)
     ids = fetch_open_ticket_ids()
     details = []
     with ThreadPoolExecutor(max_workers=8) as ex:
@@ -281,8 +335,6 @@ def main():
                 pid = p.get("id")
                 if pid:
                     all_persons.add(str(pid))
-    conn = psycopg2.connect(DSN)
-    ensure_tables(conn)
     upsert_tickets(conn, records)
     upsert_person_map(conn, sorted(all_persons))
     cleanup_resolved(conn)
