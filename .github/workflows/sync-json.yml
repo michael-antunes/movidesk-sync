@@ -6,7 +6,7 @@ on:
         description: Ticket para dump completo (opcional)
         required: false
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/2 * * * *"
 jobs:
   sync:
     runs-on: ubuntu-latest
