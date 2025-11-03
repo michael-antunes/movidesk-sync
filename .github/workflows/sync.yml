@@ -1,49 +1,18 @@
-name: Sync Movidesk -> Neon / Backlog
-
+name: sync
 on:
-  # roda todo início de hora (UTC)
-  schedule:
-    - cron: '30 9 * * *'
-  # permite rodar manualmente pelo botão “Run workflow”
   workflow_dispatch:
-
+  schedule:
+    - cron: "*/20 * * * *"
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      # 1) Puxa o código
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      # 2) Configura Python
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
-
-      # 3) Instala dependências
-      - name: Install dependencies
-        run: pip install requests psycopg2-binary
-
-      # 4) Limpa a tabela do Neon
-      - name: Clear Neon table
-        env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          python - <<EOF
-          import os
-          import psycopg2
-          conn = psycopg2.connect(os.getenv("NEON_DSN"))
-          with conn.cursor() as cur:
-              cur.execute("TRUNCATE TABLE visualizacao_atual.movidesk_tickets_abertos;")
-          conn.commit()
-          conn.close()
-          EOF
-
-      # 5) Executa seu script de fetch + insert
-      - name: Run  script
-        env:
+          python-version: "3.11"
+      - run: pip install requests psycopg2-binary
+      - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN:       ${{ secrets.NEON_DSN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python sync_tickets.py
