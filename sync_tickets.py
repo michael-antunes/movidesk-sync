@@ -7,6 +7,7 @@ import psycopg2.extras
 API_BASE = "https://api.movidesk.com/public/v1"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
+FALLBACK_PERSON = os.getenv("MOVIDESK_FALLBACK_PERSON_ORG", "0") == "1"
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -21,14 +22,7 @@ def _req(url, params, timeout=90):
             continue
         if r.status_code == 404:
             return []
-        try:
-            r.raise_for_status()
-        except requests.HTTPError:
-            try:
-                print(f"HTTP {r.status_code} -> {r.text[:600]}")
-            except Exception:
-                pass
-            raise
+        r.raise_for_status()
         return r.json() if r.text else []
 
 def fetch_open_tickets():
@@ -41,18 +35,27 @@ def fetch_open_tickets():
         "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
         "createdDate","lastUpdate"
     ])
-    expand = "owner,clients,clients.organization"
-    movi_filter = "(baseStatus ne 'Cancelado' and baseStatus ne 'Resolvido' and baseStatus ne 'Fechado')"
+    expand_options = [
+        "owner,clients($expand=organization)",
+        "owner,clients"
+    ]
+    expand_idx = 0
     items = []
     while True:
-        page = _req(url, {
-            "token": API_TOKEN,
-            "$select": select_fields,
-            "$expand": expand,
-            "$filter": movi_filter,
-            "$top": top,
-            "$skip": skip
-        }) or []
+        try:
+            page = _req(url, {
+                "token": API_TOKEN,
+                "$select": select_fields,
+                "$expand": expand_options[expand_idx],
+                "$filter": "(baseStatus ne 'Cancelado' and baseStatus ne 'Resolvido' and baseStatus ne 'Fechado')",
+                "$top": top,
+                "$skip": skip
+            }) or []
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400 and expand_idx == 0:
+                expand_idx = 1
+                continue
+            raise
         if not isinstance(page, list) or not page:
             break
         items.extend(page)
@@ -69,26 +72,54 @@ def iint(x):
     except Exception:
         return None
 
+def get_person_org(person_id):
+    if not FALLBACK_PERSON or not person_id:
+        return None, None, None
+    url = f"{API_BASE}/persons"
+    data = _req(url, {
+        "token": API_TOKEN,
+        "$select": "id",
+        "$filter": f"id eq '{person_id}'",
+        "$expand": "organizations"
+    }) or []
+    if not data or not isinstance(data, list):
+        return None, None, None
+    orgs = (data[0] or {}).get("organizations") or []
+    if not orgs:
+        return None, None, None
+    o = orgs[0] or {}
+    return o.get("id"), o.get("businessName"), o.get("codeReferenceAdditional")
+
 def map_row(t):
     tid = t.get("id")
     if isinstance(tid, str) and tid.isdigit():
         tid = int(tid)
+
     owner = t.get("owner") or {}
     responsavel = owner.get("businessName")
     agent_id = iint(owner.get("id"))
+
     clients = t.get("clients") or []
     c0 = clients[0] if isinstance(clients, list) and clients else {}
     first_client_name = c0.get("businessName")
+    first_client_id = c0.get("id")
+
     empresa_id = None
     empresa_nome = None
     empresa_codref = None
+
     org = c0.get("organization") or {}
     if isinstance(org, dict) and org:
         empresa_id = org.get("id")
         empresa_nome = org.get("businessName")
         empresa_codref = org.get("codeReferenceAdditional")
+    elif FALLBACK_PERSON:
+        eid, enome, ecod = get_person_org(first_client_id)
+        empresa_id, empresa_nome, empresa_codref = eid, enome, ecod
+
     if not empresa_nome:
         empresa_nome = first_client_name
+
     return {
         "id": tid,
         "protocol": t.get("protocol"),
