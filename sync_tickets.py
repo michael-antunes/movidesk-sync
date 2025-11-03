@@ -21,7 +21,14 @@ def _req(url, params, timeout=90):
             continue
         if r.status_code == 404:
             return []
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            try:
+                print(f"HTTP {r.status_code} -> {r.text[:600]}")
+            except Exception:
+                pass
+            raise
         return r.json() if r.text else []
 
 def fetch_open_tickets():
@@ -34,7 +41,7 @@ def fetch_open_tickets():
         "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
         "createdDate","lastUpdate"
     ])
-    expand = "owner($select=id,businessName),clients($select=id,businessName,personType;$expand=organization($select=id,businessName,codeReferenceAdditional))"
+    expand = "owner,clients,clients.organization"
     movi_filter = "(baseStatus ne 'Cancelado' and baseStatus ne 'Resolvido' and baseStatus ne 'Fechado')"
     items = []
     while True:
@@ -80,9 +87,6 @@ def map_row(t):
         empresa_id = org.get("id")
         empresa_nome = org.get("businessName")
         empresa_codref = org.get("codeReferenceAdditional")
-    elif c0.get("personType") == 2:
-        empresa_id = c0.get("id")
-        empresa_nome = c0.get("businessName")
     if not empresa_nome:
         empresa_nome = first_client_name
     return {
