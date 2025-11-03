@@ -1,17 +1,21 @@
-name: sync
+name: Sync Movidesk -> Tickets abertos
 on:
   workflow_dispatch:
   schedule:
     - cron: "*/20 * * * *"
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+
       - run: pip install requests psycopg2-binary
+
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
