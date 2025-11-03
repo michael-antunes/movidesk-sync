@@ -6,7 +6,6 @@ import psycopg2.extras
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
-# Status que consideramos "abertos"
 OPEN_STATUSES = ["Em atendimento", "Aguardando", "Novo"]
 
 session = requests.Session()
@@ -14,11 +13,9 @@ session.headers.update({"Accept": "application/json"})
 
 
 def fetch_open_ids():
-    """Lista todos os IDs de tickets abertos, paginação por skip/top."""
     url = "https://api.movidesk.com/public/v1/tickets"
     ids, skip, top = [], 0, 1000
     movi_filter = "(" + " or ".join([f"status eq '{s}'" for s in OPEN_STATUSES]) + ")"
-
     while True:
         r = session.get(
             url,
@@ -44,15 +41,10 @@ def fetch_open_ids():
         if len(page) < top:
             break
         skip += len(page)
-
     return ids
 
 
 def fetch_ticket_by_id(ticket_id):
-    """
-    Chama como seu DEV: /tickets?id={id} (sem $select/$expand).
-    Assim garantimos que, quando houver, vem clients[0].organization.
-    """
     url = "https://api.movidesk.com/public/v1/tickets"
     r = session.get(url, params={"token": API_TOKEN, "id": ticket_id}, timeout=90)
     if r.status_code == 404:
@@ -64,6 +56,36 @@ def fetch_ticket_by_id(ticket_id):
     return None
 
 
+def fetch_person_org(person_id):
+    url = "https://api.movidesk.com/public/v1/persons"
+    r = session.get(
+        url,
+        params={
+            "token": API_TOKEN,
+            "$select": "id,businessName",
+            "$filter": f"id eq '{person_id}'",
+            "$expand": "organizations($select=id,businessName,codeReferenceAdditional)",
+        },
+        timeout=90,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    items = r.json() or []
+    if not isinstance(items, list) or not items:
+        return None
+    p = items[0] or {}
+    orgs = p.get("organizations") or []
+    if not isinstance(orgs, list) or not orgs:
+        return None
+    o = orgs[0] or {}
+    return (
+        str(o.get("id")) if o.get("id") is not None else None,
+        o.get("businessName"),
+        o.get("codeReferenceAdditional"),
+    )
+
+
 def coerce_int(v):
     try:
         return int(v) if str(v).isdigit() else None
@@ -72,7 +94,6 @@ def coerce_int(v):
 
 
 def map_ticket_to_row(t):
-    """Monta o dicionário alinhado com a tabela visualizacao_atual.movidesk_tickets_abertos."""
     tid = t.get("id")
     if isinstance(tid, str) and tid.isdigit():
         tid = int(tid)
@@ -81,16 +102,21 @@ def map_ticket_to_row(t):
     responsavel = owner.get("businessName")
     agent_id = coerce_int(owner.get("id"))
 
-    # === lógica do DEV ===
-    # clients[0]["businessName"] e, se existir, clients[0]["organization"]["businessName"]
     clients = t.get("clients") or []
     first = clients[0] if isinstance(clients, list) and clients else {}
     first_client_name = (first or {}).get("businessName")
     org = (first or {}).get("organization") or {}
 
     empresa_id = org.get("id") if isinstance(org, dict) else None
-    empresa_nome = (org.get("businessName") if isinstance(org, dict) and org.get("businessName") else first_client_name)
+    empresa_nome = org.get("businessName") if isinstance(org, dict) else None
     empresa_codref = org.get("codeReferenceAdditional") if isinstance(org, dict) else None
+
+    if empresa_id is None and first and first.get("id"):
+        alt = fetch_person_org(first.get("id"))
+        if alt:
+            empresa_id, empresa_nome, empresa_codref = alt
+        if empresa_nome is None:
+            empresa_nome = first_client_name
 
     row = {
         "id": tid,
@@ -154,21 +180,17 @@ def upsert_rows(conn, rows):
 
 
 def delete_rows_not_in(conn, open_ids):
-    """Remove da tabela IDs que não estão mais abertos (fechados/resolvidos/cancelados)."""
     if not open_ids:
         with conn.cursor() as cur:
             cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
         conn.commit()
         return
-
     with conn.cursor() as cur:
         cur.execute("select id from visualizacao_atual.movidesk_tickets_abertos")
         existing = [r[0] for r in cur.fetchall()]
-
     to_delete = [i for i in existing if i not in set(open_ids)]
     if not to_delete:
         return
-
     chunk = 1000
     with conn.cursor() as cur:
         for i in range(0, len(to_delete), chunk):
@@ -181,17 +203,14 @@ def delete_rows_not_in(conn, open_ids):
 
 def main():
     if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-
+        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN.")
     open_ids = fetch_open_ids()
-
     rows = []
     for tid in open_ids:
         t = fetch_ticket_by_id(tid)
         if not isinstance(t, dict):
             continue
         rows.append(map_ticket_to_row(t))
-
     conn = psycopg2.connect(NEON_DSN)
     try:
         upsert_rows(conn, rows)
