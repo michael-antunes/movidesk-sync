@@ -39,6 +39,7 @@ def fetch_open_tickets():
         "owner,clients($expand=organization)",
         "owner,clients"
     ]
+    filtro = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
     expand_idx = 0
     items = []
     while True:
@@ -47,7 +48,7 @@ def fetch_open_tickets():
                 "token": API_TOKEN,
                 "$select": select_fields,
                 "$expand": expand_options[expand_idx],
-                "$filter": "(baseStatus ne 'Cancelado' and baseStatus ne 'Resolvido' and baseStatus ne 'Fechado')",
+                "$filter": filtro,
                 "$top": top,
                 "$skip": skip
             }) or []
