@@ -15,6 +15,7 @@ jobs:
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          DB_SCHEMA: public
           MOVIDESK_PAGE_SIZE: "300"
           MOVIDESK_THROTTLE: "0.25"
           CF_31679: "31679"
