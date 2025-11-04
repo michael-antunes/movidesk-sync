@@ -5,20 +5,13 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
 CF_IDS = {
-    "csat": "137641",
-    "aberto_via": "184387",
-    "work_item": "215636",
-    "problema_generalizado": "129782",
-    "plantao": "111727",
-    "aud_comentario": "96132",
-    "aud_data": "99086",
-    "aud_solucao_aprov": "98922",
-    "mesclado": "141736",
-    "primeiro_resp": "227413",
+    "csat":"137641","aberto_via":"184387","work_item":"215636","problema_generalizado":"129782",
+    "plantao":"111727","aud_comentario":"96132","aud_data":"99086","aud_solucao_aprov":"98922",
+    "mesclado":"141736","primeiro_resp":"227413"
 }
 
 http = requests.Session()
-http.headers.update({"Accept": "application/json"})
+http.headers.update({"Accept":"application/json"})
 
 def _req(url, params, timeout=90):
     while True:
@@ -29,7 +22,7 @@ def _req(url, params, timeout=90):
         r.raise_for_status(); return r.json() if r.text else {}
 
 def to_bool(v):
-    s = str(v).strip().lower()
+    s=str(v).strip().lower()
     return s in ("true","1","sim","yes","y")
 
 def to_ts(v):
@@ -44,8 +37,8 @@ def count_public_actions(actions):
     for a in actions:
         if a is None: continue
         if a.get("isPublic") is True: n+=1; continue
-        t = str(a.get("type") or "").lower()
-        v = str(a.get("visibility") or "").lower()
+        t=str(a.get("type") or "").lower()
+        v=str(a.get("visibility") or "").lower()
         if t in ("public","publicreply","publicnote","email","message") or v=="public": n+=1
     return n
 
@@ -53,12 +46,14 @@ def transitions(actions):
     r=None; c=None
     if isinstance(actions, list):
         for a in actions:
-            bs = str(a.get("baseStatus") or a.get("newBaseStatus") or "").lower()
-            dt = a.get("createdDate") or a.get("date") or a.get("created")
+            bs=str(a.get("baseStatus") or a.get("newBaseStatus") or a.get("status") or "").lower()
+            dt=a.get("createdDate") or a.get("date") or a.get("created")
             if not dt: continue
-            if "resolved" in bs and r is None: r = dt
-            if "closed"  in bs and c is None: c = dt
-    return r, c
+            if ("resolved" in bs) or ("resolvido" in bs):
+                if r is None: r=dt
+            if ("closed" in bs) or ("fechado" in bs):
+                if c is None: c=dt
+    return r,c
 
 def get_cf(cfs, cid):
     if not isinstance(cfs, list): return None
@@ -67,12 +62,12 @@ def get_cf(cfs, cid):
     return None
 
 def map_row(t):
-    owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    c0 = clients[0] if clients else {}
-    org = c0.get("organization") or {}
-    actions = t.get("actions") or []
-    cfields = t.get("customFields") or []
+    owner=t.get("owner") or {}
+    clients=t.get("clients") or []
+    c0=clients[0] if clients else {}
+    org=c0.get("organization") or {}
+    actions=t.get("actions") or []
+    cfields=t.get("customFields") or []
     resolved_at, closed_at = transitions(actions)
     return {
         "id": int(t.get("id")) if str(t.get("id")).isdigit() else None,
@@ -149,34 +144,51 @@ on conflict (id) do update set
 """
 
 def pending_ids(conn, limit=400):
+    overlap_min = int(os.getenv("DETAIL_OVERLAP_MIN","30"))
     with conn.cursor() as cur:
-        cur.execute("select max(last_detail_run_at) from visualizacao_resolvidos.sync_control")
-        since = cur.fetchone()[0]
+        cur.execute("select max(coalesce(last_detail_run_at,'epoch'::timestamptz)) from visualizacao_resolvidos.sync_control")
+        since = cur.fetchone()[0] or datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
+        since -= datetime.timedelta(minutes=overlap_min)
         cur.execute("""
             select ticket_id
-            from visualizacao_resolvidos.detail_control
-            where last_update > coalesce(%s::timestamptz, 'epoch'::timestamptz)
-            order by last_update asc
-            limit %s
+              from visualizacao_resolvidos.detail_control
+             where last_update > %s
+          order by last_update asc
+             limit %s
         """, (since, limit))
-        return [r[0] for r in cur.fetchall()]
+        ids = [r[0] for r in cur.fetchall()]
+    return ids, since
+
+def mini_index_ids(since_iso, limit=200):
+    url = f"{API_BASE}/tickets"
+    top = min(limit, int(os.getenv("MOVIDESK_PAGE_SIZE","200")))
+    select_fields = "id,lastUpdate"
+    status_filter = " or ".join([
+        "baseStatus eq 'Resolved'","baseStatus eq 'Closed'","baseStatus eq 'Canceled'",
+        "baseStatus eq 'Resolvido'","baseStatus eq 'Fechado'","baseStatus eq 'Cancelado'"
+    ])
+    filtro = f"({status_filter}) and lastUpdate ge {since_iso}"
+    page = _req(url, {"token":API_TOKEN,"$select":select_fields,"$filter":filtro,"$top":top,"$skip":0}) or []
+    return [int(x["id"]) for x in page if str(x.get("id","")).isdigit()]
 
 def fetch_detail(ticket_id):
     url = f"{API_BASE}/tickets/{ticket_id}"
-    return _req(url, {"token": API_TOKEN, "$expand": "owner,clients($expand=organization),actions,customFields"}) or {}
+    return _req(url, {"token":API_TOKEN,"$expand":"owner,clients($expand=organization),actions,customFields"}) or {}
 
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
     conn = psycopg2.connect(NEON_DSN)
-    with conn.cursor() as cur:
-        cur.execute("set time zone 'UTC'")
+    with conn.cursor() as cur: cur.execute("set time zone 'UTC'")
     conn.commit()
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     batch = int(os.getenv("DETAIL_BATCH","200"))
     force_ids = [int(x) for x in os.getenv("DETAIL_FORCE_IDS","").split(",") if x.strip().isdigit()]
     try:
-        ids = pending_ids(conn, batch)
-        ids = list(dict.fromkeys(ids + force_ids))  # sem duplicatas, força primeiro
+        ids, since = pending_ids(conn, batch)
+        if not ids:
+            since_iso = since.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00","Z")
+            ids = mini_index_ids(since_iso, limit=batch)
+        ids = list(dict.fromkeys(force_ids + ids))
         rows=[]
         for tid in ids:
             t = fetch_detail(tid)
@@ -188,15 +200,14 @@ def main():
                 psycopg2.extras.execute_batch(cur, UPSERT_DETAIL_CTRL, rows, page_size=200)
                 psycopg2.extras.execute_batch(cur, UPSERT_TICKETS, rows, page_size=200)
             conn.commit()
-        with conn.cursor() as cur:
-            cur.execute("""
-                update visualizacao_resolvidos.sync_control
-                   set last_detail_run_at = now()
-            """)
-            if cur.rowcount == 0:
-                cur.execute("insert into visualizacao_resolvidos.sync_control (last_detail_run_at) values (now())")
-        conn.commit()
-        print(f"DETAIL: rows={len(rows)} ids={ids[:5]}")
+            max_processed = max([to_ts(r["last_update"]) for r in rows if r.get("last_update")], default=None)
+            if max_processed:
+                with conn.cursor() as cur:
+                    cur.execute("update visualizacao_resolvidos.sync_control set last_detail_run_at = GREATEST(coalesce(last_detail_run_at,'epoch'::timestamptz), %s)", (max_processed,))
+                    if cur.rowcount == 0:
+                        cur.execute("insert into visualizacao_resolvidos.sync_control (last_detail_run_at) values (%s)", (max_processed,))
+                conn.commit()
+        print(f"DETAIL processed={len(rows)}")
     finally:
         conn.close()
 
