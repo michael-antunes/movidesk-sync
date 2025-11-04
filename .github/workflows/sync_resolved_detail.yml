@@ -1,23 +1,22 @@
-name: Sync Movidesk -> Detalhe (resolucao_por_status)
-
+name: Movidesk - Tickets resolvidos (detail)
 on:
-  workflow_run:
-    workflows:
-      - Sync Movidesk -> Index (tickets_resolvidos)
-    types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
 
 jobs:
   detail:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    env:
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-      NEON_DSN: ${{ secrets.NEON_DSN }}
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - run: python sync_resolved_detail.py
+      - env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_THROTTLE: "0.25"
+          DETAIL_BATCH: "300"
+          MOVIDESK_OPENING_METHOD_FIELD_IDS: ""  # preencha com IDs se souber, ex: "cf_forma_abertura,12345"
+        run: python sync_resolved_detail.py
