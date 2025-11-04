@@ -3,10 +3,13 @@ import time
 import requests
 import psycopg2
 import psycopg2.extras
+from psycopg2 import sql
 
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
+DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "300"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 
@@ -136,6 +139,15 @@ def normalize(p):
         "cf_217659": _get_cf_value(cf, CF_217659),
     }
 
+def ensure_schema(conn):
+    with conn.cursor() as cur:
+        try:
+            cur.execute(sql.SQL('create schema if not exists {}').format(sql.Identifier(DB_SCHEMA)))
+        except Exception:
+            pass
+        cur.execute(sql.SQL('set search_path to {}').format(sql.Identifier(DB_SCHEMA)))
+    conn.commit()
+
 def ensure_table(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -242,6 +254,7 @@ def main():
     rows = [normalize(p) for p in data if isinstance(p, dict)]
     conn = psycopg2.connect(NEON_DSN)
     try:
+        ensure_schema(conn)
         ensure_table(conn)
         n = upsert_rows(conn, rows)
         print(f"EMPRESAS upsert: {n}")
