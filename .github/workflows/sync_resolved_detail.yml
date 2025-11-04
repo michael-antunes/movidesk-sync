@@ -1,7 +1,7 @@
-name: Sync Movidesk -> tickets_resolvidos (detail)
+name: Sync Movidesk -> Detalhes resolvidos
 on:
   schedule:
-    - cron: "10 * * * *"
+    - cron: "5-59/15 * * * *"
   workflow_dispatch: {}
 jobs:
   run:
@@ -17,4 +17,5 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_PAGE_SIZE: "500"
           MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_INDEX_DAYS: "180"
         run: python sync_resolved_detail.py
