@@ -9,10 +9,10 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "300"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-
-CF_TENANT_URL_HITS = int(os.getenv("CF_TENANT_URL_HITS", "31679"))
-CF_PROPERTY = int(os.getenv("CF_PROPERTY", "217664"))
-CF_NOME_OMIE = int(os.getenv("CF_NOME_OMIE", "217659"))
+CF_31679 = int(os.getenv("CF_31679", "31679"))
+CF_217664 = int(os.getenv("CF_217664", "217664"))
+CF_217659 = int(os.getenv("CF_217659", "217659"))
+CF_217662 = int(os.getenv("CF_217662", "217662"))
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -21,8 +21,7 @@ def _req(url, params, timeout=90):
     while True:
         r = http.get(url, params=params, timeout=timeout)
         if r.status_code in (429, 503):
-            retry = r.headers.get("retry-after")
-            wait = int(retry) if str(retry).isdigit() else 60
+            wait = int(r.headers.get("retry-after", "60")) if str(r.headers.get("retry-after", "")).isdigit() else 60
             time.sleep(wait)
             continue
         if r.status_code == 404:
@@ -58,8 +57,21 @@ def _get_cf_value(cf_list, field_id):
 def fetch_companies():
     url = f"{API_BASE}/persons"
     select_fields = ",".join([
-        "id","businessName","corporateName","cpfCnpj",
-        "codeReferenceAdditional","isActive","createdDate","changedDate"
+        "id",
+        "businessName",
+        "corporateName",
+        "cpfCnpj",
+        "isActive",
+        "personType",
+        "username",
+        "classification",
+        "timeZoneId",
+        "createdBy",
+        "createDate",
+        "changedBy",
+        "changedDate",
+        "observation",
+        "codeReferenceAdditionalAccessProfile"
     ])
     expand = "customFieldValues"
     filtro = "personType eq 2"
@@ -91,56 +103,138 @@ def iint(x):
         return None
 
 def normalize(p):
-    pid = iint(p.get("id"))
     cf = p.get("customFieldValues") or []
-    tenant = _get_cf_value(cf, CF_TENANT_URL_HITS)
-    prop = _get_cf_value(cf, CF_PROPERTY)
-    omie = _get_cf_value(cf, CF_NOME_OMIE)
     return {
-        "id": pid,
-        "business_name": p.get("businessName"),
-        "tenant_url_hits": tenant,
-        "property": prop,
-        "nome_na_omie": omie
+        "id": iint(p.get("id")),
+        "bussineessname": p.get("businessName"),
+        "corporatename": p.get("corporateName"),
+        "cpfcnpj": p.get("cpfCnpj"),
+        "isactive": bool(p.get("isActive")) if p.get("isActive") is not None else None,
+        "persontype": iint(p.get("personType")),
+        "username": p.get("username"),
+        "classification": p.get("classification"),
+        "timezoneid": p.get("timeZoneId"),
+        "createdby": p.get("createdBy") or p.get("createBy") or p.get("createdby") or p.get("createdBy"),
+        "createdate": p.get("createDate"),
+        "chagebdy": p.get("changedBy"),
+        "changeddate": p.get("changedDate"),
+        "observation": p.get("observation"),
+        "codereferenceadditionalaccessprofile": p.get("codeReferenceAdditionalAccessProfile"),
+        "cf_217662": _get_cf_value(cf, CF_217662),
+        "cf_31679": _get_cf_value(cf, CF_31679),
+        "cf_217664": _get_cf_value(cf, CF_217664),
+        "cf_217659": _get_cf_value(cf, CF_217659),
     }
 
-def ensure_columns(conn):
+def ensure_table(conn):
     with conn.cursor() as cur:
-        cur.execute("alter table if exists empresa add column if not exists tenant_url_hits text")
-        cur.execute("alter table if exists empresa add column if not exists property text")
-        cur.execute("alter table if exists empresa add column if not exists nome_na_omie text")
+        cur.execute("""
+        create table if not exists empresa(
+            id bigint primary key,
+            bussineessname text,
+            corporatename text,
+            cpfcnpj text,
+            isactive boolean,
+            persontype int,
+            username text,
+            classification text,
+            timezoneid text,
+            createdby text,
+            createdate timestamptz,
+            chagebdy text,
+            changeddate timestamptz,
+            observation text,
+            codereferenceadditionalaccessprofile text,
+            cf_217662 text,
+            cf_31679 text,
+            cf_217664 text,
+            cf_217659 text
+        )
+        """)
+        cur.execute("alter table empresa add column if not exists bussineessname text")
+        cur.execute("alter table empresa add column if not exists corporatename text")
+        cur.execute("alter table empresa add column if not exists cpfcnpj text")
+        cur.execute("alter table empresa add column if not exists isactive boolean")
+        cur.execute("alter table empresa add column if not exists persontype int")
+        cur.execute("alter table empresa add column if not exists username text")
+        cur.execute("alter table empresa add column if not exists classification text")
+        cur.execute("alter table empresa add column if not exists timezoneid text")
+        cur.execute("alter table empresa add column if not exists createdby text")
+        cur.execute("alter table empresa add column if not exists createdate timestamptz")
+        cur.execute("alter table empresa add column if not exists chagebdy text")
+        cur.execute("alter table empresa add column if not exists changeddate timestamptz")
+        cur.execute("alter table empresa add column if not exists observation text")
+        cur.execute("alter table empresa add column if not exists codereferenceadditionalaccessprofile text")
+        cur.execute("alter table empresa add column if not exists cf_217662 text")
+        cur.execute("alter table empresa add column if not exists cf_31679 text")
+        cur.execute("alter table empresa add column if not exists cf_217664 text")
+        cur.execute("alter table empresa add column if not exists cf_217659 text")
     conn.commit()
 
-def update_only(conn, rows):
+def upsert_rows(conn, rows):
+    rows = [r for r in rows if r.get("id") is not None]
     if not rows:
         return 0
-    values = [(r["id"], r["tenant_url_hits"], r["property"], r["nome_na_omie"]) for r in rows if r.get("id") is not None]
-    if not values:
-        return 0
+    cols = [
+        "id",
+        "bussineessname",
+        "corporatename",
+        "cpfcnpj",
+        "isactive",
+        "persontype",
+        "username",
+        "classification",
+        "timezoneid",
+        "createdby",
+        "createdate",
+        "chagebdy",
+        "changeddate",
+        "observation",
+        "codereferenceadditionalaccessprofile",
+        "cf_217662",
+        "cf_31679",
+        "cf_217664",
+        "cf_217659"
+    ]
+    values = [[r.get(c) for c in cols] for r in rows]
     with conn.cursor() as cur:
-        template = "(%s,%s,%s,%s)"
-        sql = """
-            update empresa e
-               set tenant_url_hits = v.tenant_url_hits,
-                   property = v.property,
-                   nome_na_omie = v.nome_na_omie
-              from (values %s) as v(id, tenant_url_hits, property, nome_na_omie)
-             where e.id = v.id
+        template = "(" + ",".join(["%s"] * len(cols)) + ")"
+        insert_sql = f"""
+            insert into empresa ({",".join(cols)}) values %s
+            on conflict (id) do update set
+                bussineessname=excluded.bussineessname,
+                corporatename=excluded.corporatename,
+                cpfcnpj=excluded.cpfcnpj,
+                isactive=excluded.isactive,
+                persontype=excluded.persontype,
+                username=excluded.username,
+                classification=excluded.classification,
+                timezoneid=excluded.timezoneid,
+                createdby=excluded.createdby,
+                createdate=excluded.createdate,
+                chagebdy=excluded.chagebdy,
+                changeddate=excluded.changeddate,
+                observation=excluded.observation,
+                codereferenceadditionalaccessprofile=excluded.codereferenceadditionalaccessprofile,
+                cf_217662=excluded.cf_217662,
+                cf_31679=excluded.cf_31679,
+                cf_217664=excluded.cf_217664,
+                cf_217659=excluded.cf_217659
         """
-        psycopg2.extras.execute_values(cur, sql, values, template=template)
+        psycopg2.extras.execute_values(cur, insert_sql, values, template=template, page_size=1000)
     conn.commit()
     return len(values)
 
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-    companies = fetch_companies()
-    rows = [normalize(p) for p in companies if isinstance(p, dict)]
+    data = fetch_companies()
+    rows = [normalize(p) for p in data if isinstance(p, dict)]
     conn = psycopg2.connect(NEON_DSN)
     try:
-        ensure_columns(conn)
-        n = update_only(conn, rows)
-        print(f"EMPRESAS atualizadas: {n}")
+        ensure_table(conn)
+        n = upsert_rows(conn, rows)
+        print(f"EMPRESAS upsert: {n}")
     finally:
         conn.close()
 
