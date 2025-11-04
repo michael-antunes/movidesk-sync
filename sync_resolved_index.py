@@ -56,10 +56,10 @@ def fetch_changed(since_iso):
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     skip = 0
     select_fields = "id,lastUpdate,baseStatus"
-    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso!r}"
+    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso}"
     items = []
     while True:
-        page = _req(url, {"token": API_TOKEN, "$select": select_fields, "$filter": filtro, "$top": top, "$skip": skip}) or []
+        page = _req(url, {"token": API_TOKEN, "$select": select_fields, "$filter": filtro, "$orderby": "lastUpdate asc", "$top": top, "$skip": skip}) or []
         if not isinstance(page, list) or not page:
             break
         items.extend(page)
