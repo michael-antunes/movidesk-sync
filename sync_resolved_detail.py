@@ -28,24 +28,20 @@ def to_ts(v):
 
 def iint(x):
     try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
+        s=str(x); return int(s) if s.isdigit() else None
     except: return None
 
 def get_person_org(person_id):
-    if not FALLBACK_PERSON or not person_id:
-        return None, None, None
+    if not FALLBACK_PERSON or not person_id: return None, None, None
     data = _req(f"{API_BASE}/persons", {
         "token": API_TOKEN,
         "$select": "id",
         "$filter": f"id eq '{person_id}'",
         "$expand": "organizations"
     }) or []
-    if not data or not isinstance(data, list):
-        return None, None, None
+    if not data or not isinstance(data, list): return None, None, None
     orgs = (data[0] or {}).get("organizations") or []
-    if not orgs:
-        return None, None, None
+    if not orgs: return None, None, None
     o = orgs[0] or {}
     return o.get("id"), o.get("businessName"), o.get("codeReferenceAdditional")
 
@@ -164,18 +160,12 @@ def pending_ids(conn, limit=400):
 
 def fetch_detail(ticket_id):
     url = f"{API_BASE}/tickets/{ticket_id}"
-    expand = ",".join([
-        "owner",
-        "clients($expand=organization)",
-        "actions",
-        "customFields"
-    ])
-    fields = ",".join([
-        "id","status","lastUpdate","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-        "urgency","owner/id","owner/businessName","clients/id","clients/businessName",
-        "clients/organization/id","clients/organization/businessName"
-    ])
-    return _req(url, {"token":API_TOKEN, "$select":fields, "$expand":expand}) or {}
+    try:
+        return _req(url, {"token":API_TOKEN, "$expand":"owner,clients($expand=organization),actions,customFields,createdBy"}) or {}
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            return _req(url, {"token":API_TOKEN, "$expand":"owner,clients,actions,customFields,createdBy"}) or {}
+        raise
 
 def map_row(t):
     owner = t.get("owner") or {}
