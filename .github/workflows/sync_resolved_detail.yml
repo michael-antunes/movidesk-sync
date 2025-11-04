@@ -18,6 +18,7 @@ jobs:
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
           begin;
           create schema if not exists visualizacao_resolvidos;
+          alter table if exists visualizacao_resolvidos.detail_control drop column if exists synced_at;
           do $$
           begin
             if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
