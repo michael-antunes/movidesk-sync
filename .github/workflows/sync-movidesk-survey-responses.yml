@@ -16,8 +16,7 @@ jobs:
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_SURVEY_DAYS: "120"
           MOVIDESK_PAGE_SIZE: "100"
           MOVIDESK_THROTTLE: "0.3"
-          MOVIDESK_OVERLAP_MIN: "10080"
+          FORCE_BACKFILL_DAYS: "1"
         run: python sync_survey_responses.py
