@@ -1,5 +1,5 @@
-import os, json, time, math, concurrent.futures, requests, psycopg2
-from datetime import datetime, timezone
+import os, json, time, concurrent.futures, requests, psycopg2
+from datetime import datetime
 
 NEON_DSN = os.getenv("NEON_DSN")
 MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -14,10 +14,19 @@ def ensure_schema():
     conn = pg()
     cur = conn.cursor()
     cur.execute(f"create schema if not exists {SCHEMA}")
-    cur.execute(f"create table if not exists {SCHEMA}.detail_control (ticket_id bigint primary key, last_update timestamptz not null, synced_at timestamptz null)")
-    cur.execute(f"create table if not exists {SCHEMA}.tickets_resolvidos (ticket_id bigint primary key, last_update timestamptz not null, detail jsonb not null, updated_at timestamptz not null default now())")
+    cur.execute(f"create table if not exists {SCHEMA}.detail_control (ticket_id bigint primary key)")
+    cur.execute(f"alter table {SCHEMA}.detail_control add column if not exists last_update timestamptz")
+    cur.execute(f"alter table {SCHEMA}.detail_control add column if not exists synced_at timestamptz")
+    cur.execute(f"create table if not exists {SCHEMA}.tickets_resolvidos (ticket_id bigint primary key)")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists last_update timestamptz")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists detail jsonb")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos add column if not exists updated_at timestamptz default now()")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos alter column updated_at set default now()")
+    cur.execute(f"update {SCHEMA}.tickets_resolvidos set detail='{{}}'::jsonb where detail is null")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos alter column detail set default '{{}}'::jsonb")
+    cur.execute(f"alter table {SCHEMA}.tickets_resolvidos alter column detail set not null")
     cur.execute(f"create index if not exists ix_tr_last_update on {SCHEMA}.tickets_resolvidos(last_update)")
-    cur.execute(f"create index if not exists ix_tr_gin on {SCHEMA}.tickets_resolvidos using gin(detail jsonb_path_ops)")
+    cur.execute(f"create index if not exists ix_tr_gin on {SCHEMA}.tickets_resolvidos using gin(detail)")
     conn.commit()
     cur.close()
     conn.close()
@@ -40,7 +49,6 @@ def load_pending_ids():
 def session():
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {MOVIDESK_TOKEN}"})
-    s.timeout = 60
     return s
 
 def fetch_detail(sess, tid):
@@ -49,7 +57,7 @@ def fetch_detail(sess, tid):
         f"https://api.movidesk.com/public/v1/tickets/past/{tid}?$expand=clients,owner,actions,createdBy,resolvedBy,team,resolvedIn,customFields"
     ]
     for u in urls:
-        r = sess.get(u)
+        r = sess.get(u, timeout=60)
         if r.status_code == 200:
             return r.json()
         if r.status_code in (404, 410):
@@ -78,13 +86,13 @@ def upsert_detail(conn, tid, last_update, detail):
     cur.close()
 
 def worker(args):
-    tid, lu_iso = args
+    tid, lu = args
     sess = session()
     detail = fetch_detail(sess, tid)
     if detail is None:
         return (tid, False)
     conn = pg()
-    upsert_detail(conn, tid, lu_iso, detail)
+    upsert_detail(conn, tid, lu, detail)
     conn.close()
     return (tid, True)
 
