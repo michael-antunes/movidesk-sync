@@ -17,6 +17,5 @@ jobs:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
-          DETAIL_BATCH: "300"
-          MOVIDESK_OPENING_METHOD_FIELD_IDS: ""  # preencha com IDs se souber, ex: "cf_forma_abertura,12345"
+          DETAIL_BATCH: "200"
         run: python sync_resolved_detail.py
