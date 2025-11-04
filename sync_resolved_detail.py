@@ -150,9 +150,8 @@ on conflict (id) do update set
 
 def pending_ids(conn, limit=400):
     with conn.cursor() as cur:
-        cur.execute("select last_detail_run_at from visualizacao_resolvidos.sync_control order by last_detail_run_at desc nulls last limit 1")
-        row = cur.fetchone()
-        since = row[0] if row else None
+        cur.execute("select max(last_detail_run_at) from visualizacao_resolvidos.sync_control")
+        since = cur.fetchone()[0]
         cur.execute("""
             select ticket_id
             from visualizacao_resolvidos.detail_control
@@ -174,8 +173,10 @@ def main():
     conn.commit()
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     batch = int(os.getenv("DETAIL_BATCH","200"))
+    force_ids = [int(x) for x in os.getenv("DETAIL_FORCE_IDS","").split(",") if x.strip().isdigit()]
     try:
         ids = pending_ids(conn, batch)
+        ids = list(dict.fromkeys(ids + force_ids))  # sem duplicatas, força primeiro
         rows=[]
         for tid in ids:
             t = fetch_detail(tid)
@@ -188,11 +189,14 @@ def main():
                 psycopg2.extras.execute_batch(cur, UPSERT_TICKETS, rows, page_size=200)
             conn.commit()
         with conn.cursor() as cur:
-            cur.execute("update visualizacao_resolvidos.sync_control set last_detail_run_at = now()")
+            cur.execute("""
+                update visualizacao_resolvidos.sync_control
+                   set last_detail_run_at = now()
+            """)
             if cur.rowcount == 0:
                 cur.execute("insert into visualizacao_resolvidos.sync_control (last_detail_run_at) values (now())")
         conn.commit()
-        print(f"DETAIL: {len(rows)} tickets")
+        print(f"DETAIL: rows={len(rows)} ids={ids[:5]}")
     finally:
         conn.close()
 
