@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import psycopg2
 import psycopg2.extras
@@ -8,7 +9,10 @@ from psycopg2 import sql
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
-DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+
+DB_SCHEMA = os.getenv("DB_SCHEMA", "visualizacao_empresa")
+TABLE_NAME = os.getenv("TABLE_NAME", "empresas")
+PRUNE_COLUMNS = os.getenv("PRUNE_COLUMNS", "true").lower() in ("1","true","yes","y")
 
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "300"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
@@ -17,6 +21,29 @@ CF_31679 = int(os.getenv("CF_31679", "31679"))
 CF_217664 = int(os.getenv("CF_217664", "217664"))
 CF_217659 = int(os.getenv("CF_217659", "217659"))
 CF_217662 = int(os.getenv("CF_217662", "217662"))
+
+KEEP_COLS = [
+    "id",
+    "businessname",
+    "corporatename",
+    "cpfcnpj",
+    "isactive",
+    "persontype",
+    "username",
+    "classification",
+    "timezoneid",
+    "createdby",
+    "createddate",
+    "changedby",
+    "changeddate",
+    "observations",
+    "codereferenceadditional",
+    "accessprofile",
+    "tenant_url_do_hits",
+    "property",
+    "nome_na_omie",
+    "cf_217662",
+]
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -33,21 +60,40 @@ def _req(url, params, timeout=90):
             return []
         if r.status_code >= 400:
             try:
-                print("HTTP ERROR", r.status_code, r.text[:1000])
+                print("HTTP ERROR", r.status_code, r.text[:1200])
             except Exception:
                 pass
             r.raise_for_status()
         return r.json() if r.text else []
 
-def _first_item_label(e):
-    items = e.get("items")
-    if isinstance(items, list) and items:
-        for it in items:
+def to_text(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s != "" else None
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        parts = []
+        for it in v:
             if isinstance(it, dict):
-                v = it.get("customFieldItem") or it.get("text") or it.get("value")
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-    return None
+                parts.append(to_text(it.get("customFieldItem") or it.get("text") or it.get("value") or it.get("name") or it.get("title") or it.get("label") or it))
+            else:
+                parts.append(to_text(it))
+        parts = [p for p in parts if p]
+        return " | ".join(parts) if parts else None
+    if isinstance(v, dict):
+        inner = v.get("customFieldItem") or v.get("text") or v.get("value") or v.get("name") or v.get("title") or v.get("label")
+        if inner is not None:
+            return to_text(inner)
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+    return str(v)
 
 def _get_cf_value(cf_list, field_id):
     if not isinstance(cf_list, list):
@@ -58,10 +104,10 @@ def _get_cf_value(cf_list, field_id):
                 continue
         except Exception:
             continue
-        v = e.get("value") or e.get("text") or e.get("optionValue") or _first_item_label(e)
-        if isinstance(v, str):
-            return v.strip() or None
-        return None
+        v = e.get("value") or e.get("text") or e.get("optionValue") or e.get("items") or e.get("item")
+        t = to_text(v)
+        if t:
+            return t
     return None
 
 def fetch_companies():
@@ -87,163 +133,95 @@ def fetch_companies():
         time.sleep(THROTTLE)
     return items
 
-def iint(x):
-    try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
-    except Exception:
-        return None
-
-def bbool(x):
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, float)):
-        return bool(x)
-    if isinstance(x, str):
-        t = x.strip().lower()
-        if t in ("true","1","t","y","yes","sim"):
-            return True
-        if t in ("false","0","f","n","no","nao","não"):
-            return False
-    return None
-
-def g(obj, *keys):
+def g(d, *keys):
     for k in keys:
-        if isinstance(obj, dict) and k in obj:
-            v = obj.get(k)
-            if v is not None:
-                return v
+        if isinstance(d, dict) and k in d and d.get(k) is not None:
+            return d.get(k)
     return None
 
 def normalize(p):
     cf = p.get("customFieldValues") or []
     return {
-        "id": iint(p.get("id")),
-        "bussineessname": g(p, "businessName"),
-        "corporatename": g(p, "corporateName"),
-        "cpfcnpj": g(p, "cpfCnpj"),
-        "isactive": bbool(g(p, "isActive")),
-        "persontype": iint(g(p, "personType")),
-        "username": g(p, "username"),
-        "classification": g(p, "classification"),
-        "timezoneid": g(p, "timeZoneId"),
-        "createdby": g(p, "createdBy"),
-        "createdate": g(p, "createdDate"),
-        "chagebdy": g(p, "changedBy"),
-        "changeddate": g(p, "changedDate"),
-        "observation": g(p, "observation"),
-        "codereferenceadditionalaccessprofile": g(p, "codeReferenceAdditionalAccessProfile"),
+        "id": to_text(g(p, "id")),
+        "businessname": to_text(g(p, "businessName")),
+        "corporatename": to_text(g(p, "corporateName")),
+        "cpfcnpj": to_text(g(p, "cpfCnpj")),
+        "isactive": to_text(g(p, "isActive")),
+        "persontype": to_text(g(p, "personType")),
+        "username": to_text(g(p, "username")),
+        "classification": to_text(g(p, "classification")),
+        "timezoneid": to_text(g(p, "timeZoneId")),
+        "createdby": to_text(g(p, "createdBy")),
+        "createddate": to_text(g(p, "createdDate", "createDate")),
+        "changedby": to_text(g(p, "changedBy")),
+        "changeddate": to_text(g(p, "changedDate")),
+        "observations": to_text(g(p, "observation", "observations")),
+        "codereferenceadditional": to_text(g(p, "codeReferenceAdditional")),
+        "accessprofile": to_text(g(p, "accessProfile")),
+        "tenant_url_do_hits": _get_cf_value(cf, CF_31679),
+        "property": _get_cf_value(cf, CF_217664),
+        "nome_na_omie": _get_cf_value(cf, CF_217659),
         "cf_217662": _get_cf_value(cf, CF_217662),
-        "cf_31679": _get_cf_value(cf, CF_31679),
-        "cf_217664": _get_cf_value(cf, CF_217664),
-        "cf_217659": _get_cf_value(cf, CF_217659),
     }
 
 def ensure_schema(conn):
     with conn.cursor() as cur:
-        try:
-            cur.execute(sql.SQL('create schema if not exists {}').format(sql.Identifier(DB_SCHEMA)))
-        except Exception:
-            pass
+        cur.execute(sql.SQL('create schema if not exists {}').format(sql.Identifier(DB_SCHEMA)))
         cur.execute(sql.SQL('set search_path to {}').format(sql.Identifier(DB_SCHEMA)))
     conn.commit()
 
 def ensure_table(conn):
+    cols_def = ", ".join([f"{c} text" for c in KEEP_COLS if c != "id"])
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL('create table if not exists {}.{} (id text primary key)').format(sql.Identifier(DB_SCHEMA), sql.Identifier(TABLE_NAME)))
+        for c in KEEP_COLS:
+            if c == "id":
+                continue
+            cur.execute(sql.SQL("alter table {}.{} add column if not exists {} text").format(sql.Identifier(DB_SCHEMA), sql.Identifier(TABLE_NAME), sql.Identifier(c)))
+    conn.commit()
+
+def prune_unused_columns(conn):
+    if not PRUNE_COLUMNS:
+        return
     with conn.cursor() as cur:
         cur.execute("""
-        create table if not exists empresa(
-            id bigint primary key,
-            bussineessname text,
-            corporatename text,
-            cpfcnpj text,
-            isactive boolean,
-            persontype int,
-            username text,
-            classification text,
-            timezoneid text,
-            createdby text,
-            createdate timestamptz,
-            chagebdy text,
-            changeddate timestamptz,
-            observation text,
-            codereferenceadditionalaccessprofile text,
-            cf_217662 text,
-            cf_31679 text,
-            cf_217664 text,
-            cf_217659 text
-        )
-        """)
-        cur.execute("alter table empresa add column if not exists bussineessname text")
-        cur.execute("alter table empresa add column if not exists corporatename text")
-        cur.execute("alter table empresa add column if not exists cpfcnpj text")
-        cur.execute("alter table empresa add column if not exists isactive boolean")
-        cur.execute("alter table empresa add column if not exists persontype int")
-        cur.execute("alter table empresa add column if not exists username text")
-        cur.execute("alter table empresa add column if not exists classification text")
-        cur.execute("alter table empresa add column if not exists timezoneid text")
-        cur.execute("alter table empresa add column if not exists createdby text")
-        cur.execute("alter table empresa add column if not exists createdate timestamptz")
-        cur.execute("alter table empresa add column if not exists chagebdy text")
-        cur.execute("alter table empresa add column if not exists changeddate timestamptz")
-        cur.execute("alter table empresa add column if not exists observation text")
-        cur.execute("alter table empresa add column if not exists codereferenceadditionalaccessprofile text")
-        cur.execute("alter table empresa add column if not exists cf_217662 text")
-        cur.execute("alter table empresa add column if not exists cf_31679 text")
-        cur.execute("alter table empresa add column if not exists cf_217664 text")
-        cur.execute("alter table empresa add column if not exists cf_217659 text")
+            select column_name
+            from information_schema.columns
+            where table_schema = %s and table_name = %s
+        """, (DB_SCHEMA, TABLE_NAME))
+        existing = [r[0] for r in cur.fetchall()]
+    to_drop = [c for c in existing if c not in KEEP_COLS]
+    if not to_drop:
+        return
+    with conn.cursor() as cur:
+        for c in to_drop:
+            q = sql.SQL("alter table {}.{} drop column if exists {} cascade").format(
+                sql.Identifier(DB_SCHEMA), sql.Identifier(TABLE_NAME), sql.Identifier(c)
+            )
+            cur.execute(q)
     conn.commit()
 
 def upsert_rows(conn, rows):
-    rows = [r for r in rows if r.get("id") is not None]
+    rows = [r for r in rows if r.get("id")]
     if not rows:
         return 0
-    cols = [
-        "id",
-        "bussineessname",
-        "corporatename",
-        "cpfcnpj",
-        "isactive",
-        "persontype",
-        "username",
-        "classification",
-        "timezoneid",
-        "createdby",
-        "createdate",
-        "chagebdy",
-        "changeddate",
-        "observation",
-        "codereferenceadditionalaccessprofile",
-        "cf_217662",
-        "cf_31679",
-        "cf_217664",
-        "cf_217659"
-    ]
+    cols = KEEP_COLS
     values = [[r.get(c) for c in cols] for r in rows]
     with conn.cursor() as cur:
         template = "(" + ",".join(["%s"] * len(cols)) + ")"
-        insert_sql = f"""
-            insert into empresa ({",".join(cols)}) values %s
+        insert_sql = sql.SQL("""
+            insert into {}.{} ({cols}) values %s
             on conflict (id) do update set
-                bussineessname=excluded.bussineessname,
-                corporatename=excluded.corporatename,
-                cpfcnpj=excluded.cpfcnpj,
-                isactive=excluded.isactive,
-                persontype=excluded.persontype,
-                username=excluded.username,
-                classification=excluded.classification,
-                timezoneid=excluded.timezoneid,
-                createdby=excluded.createdby,
-                createdate=excluded.createdate,
-                chagebdy=excluded.chagebdy,
-                changeddate=excluded.changeddate,
-                observation=excluded.observation,
-                codereferenceadditionalaccessprofile=excluded.codereferenceadditionalaccessprofile,
-                cf_217662=excluded.cf_217662,
-                cf_31679=excluded.cf_31679,
-                cf_217664=excluded.cf_217664,
-                cf_217659=excluded.cf_217659
-        """
-        psycopg2.extras.execute_values(cur, insert_sql, values, template=template, page_size=1000)
+            {updates}
+        """).format(
+            sql.Identifier(DB_SCHEMA),
+            sql.Identifier(TABLE_NAME),
+            cols=sql.SQL(",").join(map(sql.Identifier, cols)),
+            updates=sql.SQL(",").join(
+                sql.SQL("{}=excluded.{}").format(sql.Identifier(c), sql.Identifier(c)) for c in cols if c != "id"
+            ),
+        )
+        psycopg2.extras.execute_values(cur, insert_sql.as_string(conn), values, template=template, page_size=1000)
     conn.commit()
     return len(values)
 
@@ -256,6 +234,7 @@ def main():
     try:
         ensure_schema(conn)
         ensure_table(conn)
+        prune_unused_columns(conn)
         n = upsert_rows(conn, rows)
         print(f"EMPRESAS upsert: {n}")
     finally:
