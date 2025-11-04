@@ -1,7 +1,23 @@
-import time, requests, pandas as pd, psycopg2
+import os, time, requests, pandas as pd, psycopg2
+from pathlib import Path
 
-TOKEN = "SEU_TOKEN_MOVIDESK"
-NEON_URL = "SUA_NEON_DATABASE_URL"
+TOKEN_CONST = "COLOQUE_SEU_TOKEN_MOVIDESK_AQUI"
+NEON_CONST = "COLOQUE_SUA_NEON_DATABASE_URL_AQUI"
+
+def read_first_line(p):
+    try:
+        return Path(p).read_text(encoding="utf-8").strip()
+    except:
+        return None
+
+TOKEN = os.getenv("MOVIDESK_TOKEN") or read_first_line("movidesk.token") or TOKEN_CONST
+NEON_URL = os.getenv("NEON_DATABASE_URL") or read_first_line("neon.url") or NEON_CONST
+
+if not TOKEN or TOKEN.startswith("COLOQUE_"):
+    raise SystemExit("Faltou o token do Movidesk. Defina MOVIDESK_TOKEN, ou crie o arquivo movidesk.token, ou edite TOKEN_CONST.")
+if not NEON_URL or NEON_URL.startswith("COLOQUE_"):
+    raise SystemExit("Faltou a URL do Neon. Defina NEON_DATABASE_URL, ou crie o arquivo neon.url, ou edite NEON_CONST.")
+
 BASE = "https://api.movidesk.com/public/v1/persons"
 TOP = 100
 skip = 0
@@ -20,11 +36,19 @@ def pick_cf(cf_list, cf_id):
                     return ", ".join(names)
     return None
 
+def get_page(url):
+    for i in range(5):
+        r = requests.get(url, timeout=60)
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            time.sleep(1.5 * (i + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+
 while True:
     url = f"{BASE}?token={TOKEN}&$filter=personType eq 2&$select=id,businessName,customFieldValues&$expand=customFieldValues&$orderby=id asc&$top={TOP}&$skip={skip}"
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    data = r.json()
+    data = get_page(url)
     if not data:
         break
     for p in data:
@@ -37,7 +61,7 @@ while True:
             "cf_31679": pick_cf(cfs, 31679)
         })
     skip += TOP
-    time.sleep(0.5)
+    time.sleep(0.4)
 
 df = pd.DataFrame(rows)
 df.to_csv("empresas_movidesk.csv", index=False, encoding="utf-8")
@@ -53,16 +77,17 @@ create table if not exists empresa (
   cf_31679 text
 )
 """)
-args = [tuple(r) for r in df[["id","businessname","nome_na_omie","property","cf_31679"]].values]
-cur.executemany("""
-insert into empresa (id,businessname,nome_na_omie,property,cf_31679)
-values (%s,%s,%s,%s,%s)
-on conflict (id) do update set
-  businessname=excluded.businessname,
-  nome_na_omie=excluded.nome_na_omie,
-  property=excluded.property,
-  cf_31679=excluded.cf_31679
-""", args)
+if not df.empty:
+    args = [tuple(r) for r in df[["id","businessname","nome_na_omie","property","cf_31679"]].values]
+    cur.executemany("""
+    insert into empresa (id,businessname,nome_na_omie,property,cf_31679)
+    values (%s,%s,%s,%s,%s)
+    on conflict (id) do update set
+      businessname=excluded.businessname,
+      nome_na_omie=excluded.nome_na_omie,
+      property=excluded.property,
+      cf_31679=excluded.cf_31679
+    """, args)
 conn.commit()
 cur.close()
 conn.close()
