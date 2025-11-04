@@ -14,17 +14,43 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: psql "$NEON_DSN" -v ON_ERROR_STOP=1 -f migrations/2025-11-04_force_recreate_resolved.sql
+        run: |
+          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+          begin;
+          create schema if not exists visualizacao_resolvidos;
+          do $$
+          begin
+            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
+              execute 'alter table visualizacao_resolvidos.sync_control drop column last_index_run_at';
+            end if;
+            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_detail_run_at') then
+              execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
+            end if;
+          end $$;
+          update visualizacao_resolvidos.sync_control set name='tickets_resolvidos' where name in ('tr_lastresolved','tr_lastResolved','tickets_resolved');
+          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('detail_control', now() - interval '180 days') on conflict (name) do nothing;
+          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('tickets_resolvidos', now() - interval '180 days') on conflict (name) do nothing;
+          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
+          drop table if exists visualizacao_resolvidos.tickets_resolvidos cascade;
+          create table visualizacao_resolvidos.tickets_resolvidos (
+            ticket_id integer primary key,
+            status text not null,
+            last_resolved_at timestamptz,
+            last_closed_at timestamptz,
+            responsible_id bigint,
+            responsible_name text,
+            organization_id text,
+            organization_name text
+          );
+          commit;
+          SQL
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           set -e
-          C1=$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")
-          test "$C1" = "8"
-          NUL=$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")
-          test "$NUL" = "YES"
-          NAMES=$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")
-          test "$NAMES" = "detail_control,tickets_resolvidos"
+          test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "8"
+          test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")" = "YES"
+          test "$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")" = "detail_control,tickets_resolvidos"
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
