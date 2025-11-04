@@ -1,20 +1,19 @@
-name: Sync Companies
+name: Sync Movidesk -> Tickets abertos
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "*/20 * * * *"
+
 jobs:
-  run:
+  sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-      - run: python -m pip install --upgrade pip
-      - run: pip install -r requirements.txt
-      - run: python scripts/sync_companies.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: empresas_movidesk
-          path: empresas_movidesk.csv
+      - run: pip install requests psycopg2-binary
+      - env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: python sync_tickets.py
