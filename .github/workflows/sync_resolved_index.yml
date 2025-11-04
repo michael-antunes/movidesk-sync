@@ -11,6 +11,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: psql "$NEON_DSN" -v ON_ERROR_STOP=1 -f migrations/2025-11-04_force_recreate_resolved.sql
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
