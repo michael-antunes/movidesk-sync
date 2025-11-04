@@ -5,9 +5,16 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
 CF_IDS = {
-    "csat":"137641","aberto_via":"184387","work_item":"215636","problema_generalizado":"129782",
-    "plantao":"111727","aud_comentario":"96132","aud_data":"99086","aud_solucao_aprov":"98922",
-    "mesclado":"141736","primeiro_resp":"227413"
+    "csat":"137641",
+    "aberto_via":"184387",
+    "work_item":"215636",
+    "problema_generalizado":"129782",
+    "plantao":"111727",
+    "aud_comentario":"96132",
+    "aud_data":"99086",
+    "aud_solucao_aprov":"98922",
+    "mesclado":"141736",
+    "primeiro_resp":"227413",
 }
 
 http = requests.Session()
@@ -31,6 +38,12 @@ def to_ts(v):
         return datetime.datetime.fromisoformat(str(v).replace("Z","+00:00"))
     except: return None
 
+def get_cf(cfs, cid):
+    if not isinstance(cfs, list): return None
+    for f in cfs:
+        if str(f.get("id")) == cid: return f.get("value")
+    return None
+
 def count_public_actions(actions):
     if not isinstance(actions, list): return 0
     n=0
@@ -48,18 +61,22 @@ def transitions(actions):
         for a in actions:
             bs=str(a.get("baseStatus") or a.get("newBaseStatus") or a.get("status") or "").lower()
             dt=a.get("createdDate") or a.get("date") or a.get("created")
-            if not dt: continue
-            if ("resolved" in bs) or ("resolvido" in bs):
-                if r is None: r=dt
-            if ("closed" in bs) or ("fechado" in bs):
-                if c is None: c=dt
+            if dt:
+                if ("resolved" in bs) or ("resolvido" in bs):
+                    if r is None: r=dt
+                if ("closed" in bs) or ("fechado" in bs):
+                    if c is None: c=dt
+            changes=a.get("changes") or []
+            for ch in changes:
+                f=str(ch.get("field") or "").lower()
+                nv=str(ch.get("newValue") or "").lower()
+                cd=ch.get("date") or dt
+                if f in ("basestatus","status"):
+                    if ("resolved" in nv) or ("resolvido" in nv):
+                        if r is None: r=cd
+                    if ("closed" in nv) or ("fechado" in nv):
+                        if c is None: c=cd
     return r,c
-
-def get_cf(cfs, cid):
-    if not isinstance(cfs, list): return None
-    for f in cfs:
-        if str(f.get("id")) == cid: return f.get("value")
-    return None
 
 def map_row(t):
     owner=t.get("owner") or {}
@@ -89,14 +106,12 @@ def map_row(t):
         "cf_96132_aud_comentario": get_cf(cfields, CF_IDS["aud_comentario"]),
         "cf_99086_aud_data_auditoria": to_ts(get_cf(cfields, CF_IDS["aud_data"])),
         "cf_98922_aud_solucao_aprovada": to_bool(get_cf(cfields, CF_IDS["aud_solucao_aprov"])) if get_cf(cfields, CF_IDS["aud_solucao_aprov"]) is not None else None,
-        "urgency": t.get("urgency"),
+        "urgency": int(t.get("urgency")) if str(t.get("urgency") or "").isdigit() else None,
         "cf_141736_mesclado": to_bool(get_cf(cfields, CF_IDS["mesclado"])) if get_cf(cfields, CF_IDS["mesclado"]) is not None else None,
         "cf_227413_primeiro_responsavel": get_cf(cfields, CF_IDS["primeiro_resp"]),
-        "resolved_at": resolved_at,
-        "closed_at": closed_at,
+        "resolved_at": to_ts(resolved_at),
+        "closed_at": to_ts(closed_at),
         "last_update": t.get("lastUpdate"),
-        "raw_actions": psycopg2.extras.Json(actions),
-        "raw_custom_fields": psycopg2.extras.Json(cfields)
     }
 
 UPSERT_DETAIL_CTRL = """
@@ -157,23 +172,11 @@ def pending_ids(conn, limit=400):
              limit %s
         """, (since, limit))
         ids = [r[0] for r in cur.fetchall()]
-    return ids, since
-
-def mini_index_ids(since_iso, limit=200):
-    url = f"{API_BASE}/tickets"
-    top = min(limit, int(os.getenv("MOVIDESK_PAGE_SIZE","200")))
-    select_fields = "id,lastUpdate"
-    status_filter = " or ".join([
-        "baseStatus eq 'Resolved'","baseStatus eq 'Closed'","baseStatus eq 'Canceled'",
-        "baseStatus eq 'Resolvido'","baseStatus eq 'Fechado'","baseStatus eq 'Cancelado'"
-    ])
-    filtro = f"({status_filter}) and lastUpdate ge {since_iso}"
-    page = _req(url, {"token":API_TOKEN,"$select":select_fields,"$filter":filtro,"$top":top,"$skip":0}) or []
-    return [int(x["id"]) for x in page if str(x.get("id","")).isdigit()]
+    return ids
 
 def fetch_detail(ticket_id):
     url = f"{API_BASE}/tickets/{ticket_id}"
-    return _req(url, {"token":API_TOKEN,"$expand":"owner,clients($expand=organization),actions,customFields"}) or {}
+    return _req(url, {"token": API_TOKEN, "$expand":"owner,clients($expand=organization),actions,customFields"}) or {}
 
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
@@ -184,10 +187,7 @@ def main():
     batch = int(os.getenv("DETAIL_BATCH","200"))
     force_ids = [int(x) for x in os.getenv("DETAIL_FORCE_IDS","").split(",") if x.strip().isdigit()]
     try:
-        ids, since = pending_ids(conn, batch)
-        if not ids:
-            since_iso = since.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00","Z")
-            ids = mini_index_ids(since_iso, limit=batch)
+        ids = pending_ids(conn, batch)
         ids = list(dict.fromkeys(force_ids + ids))
         rows=[]
         for tid in ids:
