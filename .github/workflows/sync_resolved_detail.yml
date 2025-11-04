@@ -1,14 +1,8 @@
-name: Sync Movidesk -> Tickets resolvidos (detail)
-
+name: Movidesk - Tickets resolvidos (detail)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"
-
-concurrency:
-  group: sync-resolved-detail
-  cancel-in-progress: true
-
+    - cron: "*/15 * * * *"
 jobs:
   detail:
     runs-on: ubuntu-latest
@@ -21,9 +15,6 @@ jobs:
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_THROTTLE: "0.25"
-          DETAIL_BATCH: "200"
-          DETAIL_OVERLAP_MIN: "30"
-          MOVIDESK_FALLBACK_PERSON_ORG: "1"
-          # DETAIL_FORCE_IDS: "291721,291726"
+          CONCURRENCY: "8"
+          BATCH_LIMIT: "2000"
         run: python sync_resolved_detail.py
