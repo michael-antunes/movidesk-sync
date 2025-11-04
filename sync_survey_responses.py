@@ -31,19 +31,31 @@ def iint(x):
     except Exception:
         return None
 
-def fetch_smiley_responses():
+def to_iso_z(dt):
+    return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00","Z")
+
+def get_since_from_db(conn, days_back, overlap_minutes):
+    with conn.cursor() as cur:
+        cur.execute("select max(response_date) from visualizacao_satisfacao.movidesk_pesquisa_satisfacao_respostas")
+        row = cur.fetchone()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    if row and row[0]:
+        since = row[0] - datetime.timedelta(minutes=overlap_minutes)
+        floor = now_utc - datetime.timedelta(days=days_back)
+        return max(since, floor)
+    return now_utc - datetime.timedelta(days=days_back)
+
+def fetch_smiley_responses(since_iso):
     url = f"{API_BASE}/survey/responses"
     limit = max(1, min(100, int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))))
     throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
-    days_back = int(os.getenv("MOVIDESK_SURVEY_DAYS", "120"))
-    start_dt = (datetime.datetime.utcnow() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%dT00:00:00Z")
     starting_after = None
     items = []
     while True:
         params = {
             "token": API_TOKEN,
             "type": 2,
-            "responseDateGreaterThan": start_dt,
+            "responseDateGreaterThan": since_iso,
             "limit": limit
         }
         if starting_after:
@@ -51,8 +63,7 @@ def fetch_smiley_responses():
         page = _req(url, params) or {}
         page_items = page.get("items") or []
         items.extend(page_items)
-        has_more = bool(page.get("hasMore"))
-        if not page_items or not has_more:
+        if not page_items or not bool(page.get("hasMore")):
             break
         starting_after = page_items[-1].get("id")
         time.sleep(throttle)
@@ -93,12 +104,23 @@ def upsert_rows(conn, rows):
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-    resp = fetch_smiley_responses()
-    rows = [map_row(x) for x in resp if isinstance(x, dict)]
+
+    days_back = int(os.getenv("MOVIDESK_SURVEY_DAYS", "120"))
+    overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
+    force_backfill_days = os.getenv("FORCE_BACKFILL_DAYS")
+
     conn = psycopg2.connect(NEON_DSN)
     try:
+        if force_backfill_days and force_backfill_days.isdigit():
+            since_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=int(force_backfill_days))
+        else:
+            since_dt = get_since_from_db(conn, days_back, overlap_minutes)
+        since_iso = to_iso_z(since_dt)
+
+        resp = fetch_smiley_responses(since_iso)
+        rows = [map_row(x) for x in resp if isinstance(x, dict)]
         n = upsert_rows(conn, rows)
-        print(f"UPSERT: {n} respostas.")
+        print(f"DESDE {since_iso} | UPSERT: {n} respostas.")
     finally:
         conn.close()
 
