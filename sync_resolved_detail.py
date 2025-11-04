@@ -150,26 +150,28 @@ on conflict (id) do update set
 
 def pending_ids(conn, limit=400):
     with conn.cursor() as cur:
+        cur.execute("select last_detail_run_at from visualizacao_resolvidos.sync_control order by last_detail_run_at desc nulls last limit 1")
+        row = cur.fetchone()
+        since = row[0] if row else None
         cur.execute("""
-            select dc.ticket_id
-              from visualizacao_resolvidos.detail_control dc
-         left join visualizacao_resolvidos.sync_control sc on sc.id=1
-             where dc.last_update > coalesce(sc.last_detail_run_at, 'epoch'::timestamptz)
-          order by dc.last_update asc
-             limit %s
-        """, (limit,))
+            select ticket_id
+            from visualizacao_resolvidos.detail_control
+            where last_update > coalesce(%s::timestamptz, 'epoch'::timestamptz)
+            order by last_update asc
+            limit %s
+        """, (since, limit))
         return [r[0] for r in cur.fetchall()]
 
 def fetch_detail(ticket_id):
     url = f"{API_BASE}/tickets/{ticket_id}"
-    return _req(url, {
-        "token": API_TOKEN,
-        "$expand": "owner,clients($expand=organization),actions,customFields"
-    }) or {}
+    return _req(url, {"token": API_TOKEN, "$expand": "owner,clients($expand=organization),actions,customFields"}) or {}
 
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
     conn = psycopg2.connect(NEON_DSN)
+    with conn.cursor() as cur:
+        cur.execute("set time zone 'UTC'")
+    conn.commit()
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     batch = int(os.getenv("DETAIL_BATCH","200"))
     try:
@@ -186,7 +188,9 @@ def main():
                 psycopg2.extras.execute_batch(cur, UPSERT_TICKETS, rows, page_size=200)
             conn.commit()
         with conn.cursor() as cur:
-            cur.execute("update visualizacao_resolvidos.sync_control set last_detail_run_at = now() where id=1")
+            cur.execute("update visualizacao_resolvidos.sync_control set last_detail_run_at = now()")
+            if cur.rowcount == 0:
+                cur.execute("insert into visualizacao_resolvidos.sync_control (last_detail_run_at) values (now())")
         conn.commit()
         print(f"DETAIL: {len(rows)} tickets")
     finally:
