@@ -9,6 +9,7 @@ API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "300"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+
 CF_31679 = int(os.getenv("CF_31679", "31679"))
 CF_217664 = int(os.getenv("CF_217664", "217664"))
 CF_217659 = int(os.getenv("CF_217659", "217659"))
@@ -21,12 +22,18 @@ def _req(url, params, timeout=90):
     while True:
         r = http.get(url, params=params, timeout=timeout)
         if r.status_code in (429, 503):
-            wait = int(r.headers.get("retry-after", "60")) if str(r.headers.get("retry-after", "")).isdigit() else 60
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
             time.sleep(wait)
             continue
         if r.status_code == 404:
             return []
-        r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                print("HTTP ERROR", r.status_code, r.text[:1000])
+            except Exception:
+                pass
+            r.raise_for_status()
         return r.json() if r.text else []
 
 def _first_item_label(e):
@@ -56,31 +63,13 @@ def _get_cf_value(cf_list, field_id):
 
 def fetch_companies():
     url = f"{API_BASE}/persons"
-    select_fields = ",".join([
-        "id",
-        "businessName",
-        "corporateName",
-        "cpfCnpj",
-        "isActive",
-        "personType",
-        "username",
-        "classification",
-        "timeZoneId",
-        "createdBy",
-        "createDate",
-        "changedBy",
-        "changedDate",
-        "observation",
-        "codeReferenceAdditionalAccessProfile"
-    ])
-    expand = "customFieldValues"
     filtro = "personType eq 2"
+    expand = "customFieldValues"
     skip = 0
     items = []
     while True:
         page = _req(url, {
             "token": API_TOKEN,
-            "$select": select_fields,
             "$expand": expand,
             "$filter": filtro,
             "$top": PAGE_SIZE,
@@ -102,24 +91,45 @@ def iint(x):
     except Exception:
         return None
 
+def bbool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        t = x.strip().lower()
+        if t in ("true","1","t","y","yes","sim"):
+            return True
+        if t in ("false","0","f","n","no","nao","não"):
+            return False
+    return None
+
+def g(obj, *keys):
+    for k in keys:
+        if isinstance(obj, dict) and k in obj:
+            v = obj.get(k)
+            if v is not None:
+                return v
+    return None
+
 def normalize(p):
     cf = p.get("customFieldValues") or []
     return {
         "id": iint(p.get("id")),
-        "bussineessname": p.get("businessName"),
-        "corporatename": p.get("corporateName"),
-        "cpfcnpj": p.get("cpfCnpj"),
-        "isactive": bool(p.get("isActive")) if p.get("isActive") is not None else None,
-        "persontype": iint(p.get("personType")),
-        "username": p.get("username"),
-        "classification": p.get("classification"),
-        "timezoneid": p.get("timeZoneId"),
-        "createdby": p.get("createdBy") or p.get("createBy") or p.get("createdby") or p.get("createdBy"),
-        "createdate": p.get("createDate"),
-        "chagebdy": p.get("changedBy"),
-        "changeddate": p.get("changedDate"),
-        "observation": p.get("observation"),
-        "codereferenceadditionalaccessprofile": p.get("codeReferenceAdditionalAccessProfile"),
+        "bussineessname": g(p, "businessName"),
+        "corporatename": g(p, "corporateName"),
+        "cpfcnpj": g(p, "cpfCnpj"),
+        "isactive": bbool(g(p, "isActive")),
+        "persontype": iint(g(p, "personType")),
+        "username": g(p, "username"),
+        "classification": g(p, "classification"),
+        "timezoneid": g(p, "timeZoneId"),
+        "createdby": g(p, "createdBy"),
+        "createdate": g(p, "createdDate"),
+        "chagebdy": g(p, "changedBy"),
+        "changeddate": g(p, "changedDate"),
+        "observation": g(p, "observation"),
+        "codereferenceadditionalaccessprofile": g(p, "codeReferenceAdditionalAccessProfile"),
         "cf_217662": _get_cf_value(cf, CF_217662),
         "cf_31679": _get_cf_value(cf, CF_31679),
         "cf_217664": _get_cf_value(cf, CF_217664),
