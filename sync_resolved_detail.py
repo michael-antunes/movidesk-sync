@@ -64,50 +64,6 @@ def norm_ts(x):
         return None
     return s
 
-def extract_labels_list(v):
-    if v is None:
-        return None
-    if isinstance(v, list):
-        out = []
-        for i in v:
-            if isinstance(i, dict):
-                out.append(str(i.get("label") or i.get("name") or i.get("value") or i.get("text") or ""))
-            else:
-                out.append(str(i))
-        out = [x for x in out if x]
-        return ", ".join(out) if out else None
-    if isinstance(v, dict):
-        return str(v.get("label") or v.get("name") or v.get("value") or v.get("text") or None)
-    return str(v)
-
-def iter_custom_field_entries(t):
-    lists = []
-    for k in ("customFields", "customFieldValues", "fields"):
-        v = t.get(k)
-        if isinstance(v, list):
-            lists.append(v)
-    out = []
-    for L in lists:
-        for it in L:
-            if isinstance(it, dict):
-                out.append(it)
-    return out
-
-def get_aberto_via(t):
-    items = iter_custom_field_entries(t)
-    for cf in items:
-        fid = cf.get("id") or cf.get("fieldId") or cf.get("customFieldId")
-        if str(fid) == "184387":
-            val = cf.get("value")
-            if val in ("", None):
-                val = cf.get("currentValue")
-            if val in ("", None):
-                val = cf.get("values")
-            if val in ("", None):
-                val = cf.get("items")
-            return extract_labels_list(val)
-    return None
-
 def fetch_details(since_iso):
     url = f"{API_BASE}/tickets"
     top = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
@@ -117,30 +73,19 @@ def fetch_details(since_iso):
         "id","status","baseStatus","resolvedIn","closedIn","lastUpdate",
         "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
     ])
-    expand_options = [
-        "owner,clients($expand=organization),customFields",
-        "owner,clients($expand=organization),customFieldValues",
-        "owner,clients($expand=organization)"
-    ]
+    expand = "owner,clients($expand=organization)"
     filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge " + since_iso
-    expand_idx = 0
     items = []
     while True:
-        try:
-            page = _req(url, {
-                "token": API_TOKEN,
-                "$select": select_fields,
-                "$expand": expand_options[expand_idx],
-                "$filter": filtro,
-                "$orderby": "lastUpdate asc",
-                "$top": top,
-                "$skip": skip
-            }) or []
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 400 and expand_idx < len(expand_options) - 1:
-                expand_idx += 1
-                continue
-            raise
+        page = _req(url, {
+            "token": API_TOKEN,
+            "$select": select_fields,
+            "$expand": expand,
+            "$filter": filtro,
+            "$orderby": "lastUpdate asc",
+            "$top": top,
+            "$skip": skip
+        }) or []
         if not isinstance(page, list) or not page:
             break
         items.extend(page)
@@ -170,7 +115,6 @@ def map_row(t):
         "responsible_name": owner.get("businessName"),
         "organization_id": org.get("id"),
         "organization_name": org.get("businessName"),
-        "aberto_via_184387": get_aberto_via(t),
         "origin": t.get("origin") or t.get("originName"),
         "category": t.get("category"),
         "urgency": t.get("urgency"),
@@ -181,9 +125,9 @@ def map_row(t):
 
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name,aberto_via_184387,origin,category,urgency,service_first_level,service_second_level,service_third_level)
+(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name,origin,category,urgency,service_first_level,service_second_level,service_third_level)
 values
-(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(aberto_via_184387)s,%(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s)
+(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s)
 on conflict (ticket_id) do update set
   status = excluded.status,
   last_resolved_at = excluded.last_resolved_at,
@@ -192,7 +136,6 @@ on conflict (ticket_id) do update set
   responsible_name = excluded.responsible_name,
   organization_id = excluded.organization_id,
   organization_name = excluded.organization_name,
-  aberto_via_184387 = excluded.aberto_via_184387,
   origin = excluded.origin,
   category = excluded.category,
   urgency = excluded.urgency,
