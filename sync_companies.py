@@ -1,94 +1,148 @@
-import os, time, requests, pandas as pd, psycopg2
-from pathlib import Path
+import os
+import time
+import requests
+import psycopg2
+import psycopg2.extras
 
-TOKEN_CONST = "COLOQUE_SEU_TOKEN_MOVIDESK_AQUI"
-NEON_CONST = "COLOQUE_SUA_NEON_DATABASE_URL_AQUI"
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+NEON_DSN = os.getenv("NEON_DSN")
+PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "300"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 
-def read_first_line(p):
-    try:
-        return Path(p).read_text(encoding="utf-8").strip()
-    except:
-        return None
+CF_TENANT_URL_HITS = int(os.getenv("CF_TENANT_URL_HITS", "31679"))
+CF_PROPERTY = int(os.getenv("CF_PROPERTY", "217664"))
+CF_NOME_OMIE = int(os.getenv("CF_NOME_OMIE", "217659"))
 
-TOKEN = os.getenv("MOVIDESK_TOKEN") or read_first_line("movidesk.token") or TOKEN_CONST
-NEON_URL = os.getenv("NEON_DATABASE_URL") or read_first_line("neon.url") or NEON_CONST
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
-if not TOKEN or TOKEN.startswith("COLOQUE_"):
-    raise SystemExit("Faltou o token do Movidesk. Defina MOVIDESK_TOKEN, ou crie o arquivo movidesk.token, ou edite TOKEN_CONST.")
-if not NEON_URL or NEON_URL.startswith("COLOQUE_"):
-    raise SystemExit("Faltou a URL do Neon. Defina NEON_DATABASE_URL, ou crie o arquivo neon.url, ou edite NEON_CONST.")
+def _req(url, params, timeout=90):
+    while True:
+        r = http.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json() if r.text else []
 
-BASE = "https://api.movidesk.com/public/v1/persons"
-TOP = 100
-skip = 0
-rows = []
-
-def pick_cf(cf_list, cf_id):
-    for cf in cf_list or []:
-        if str(cf.get("customFieldId")) == str(cf_id):
-            v = cf.get("value")
-            if v not in [None, ""]:
-                return str(v)
-            items = cf.get("items") or []
-            if items:
-                names = [i.get("customFieldItem") for i in items if i.get("customFieldItem")]
-                if names:
-                    return ", ".join(names)
+def _first_item_label(e):
+    items = e.get("items")
+    if isinstance(items, list) and items:
+        for it in items:
+            if isinstance(it, dict):
+                v = it.get("customFieldItem") or it.get("text") or it.get("value")
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
     return None
 
-def get_page(url):
-    for i in range(5):
-        r = requests.get(url, timeout=60)
-        if r.status_code == 429 or 500 <= r.status_code < 600:
-            time.sleep(1.5 * (i + 1))
+def _get_cf_value(cf_list, field_id):
+    if not isinstance(cf_list, list):
+        return None
+    for e in cf_list:
+        try:
+            if int(str(e.get("customFieldId"))) != int(field_id):
+                continue
+        except Exception:
             continue
-        r.raise_for_status()
-        return r.json()
-    r.raise_for_status()
+        v = e.get("value") or e.get("text") or e.get("optionValue") or _first_item_label(e)
+        if isinstance(v, str):
+            return v.strip() or None
+        return None
+    return None
 
-while True:
-    url = f"{BASE}?token={TOKEN}&$filter=personType eq 2&$select=id,businessName,customFieldValues&$expand=customFieldValues&$orderby=id asc&$top={TOP}&$skip={skip}"
-    data = get_page(url)
-    if not data:
-        break
-    for p in data:
-        cfs = p.get("customFieldValues") or []
-        rows.append({
-            "id": str(p.get("id")),
-            "businessname": p.get("businessName"),
-            "nome_na_omie": pick_cf(cfs, 217659),
-            "property": pick_cf(cfs, 217664),
-            "cf_31679": pick_cf(cfs, 31679)
-        })
-    skip += TOP
-    time.sleep(0.4)
+def fetch_companies():
+    url = f"{API_BASE}/persons"
+    select_fields = ",".join([
+        "id","businessName","corporateName","cpfCnpj",
+        "codeReferenceAdditional","isActive","createdDate","changedDate"
+    ])
+    expand = "customFieldValues"
+    filtro = "personType eq 2"
+    skip = 0
+    items = []
+    while True:
+        page = _req(url, {
+            "token": API_TOKEN,
+            "$select": select_fields,
+            "$expand": expand,
+            "$filter": filtro,
+            "$top": PAGE_SIZE,
+            "$skip": skip
+        }) or []
+        if not isinstance(page, list) or not page:
+            break
+        items.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        skip += len(page)
+        time.sleep(THROTTLE)
+    return items
 
-df = pd.DataFrame(rows)
-df.to_csv("empresas_movidesk.csv", index=False, encoding="utf-8")
+def iint(x):
+    try:
+        s = str(x)
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
 
-conn = psycopg2.connect(NEON_URL)
-cur = conn.cursor()
-cur.execute("""
-create table if not exists empresa (
-  id text primary key,
-  businessname text,
-  nome_na_omie text,
-  property text,
-  cf_31679 text
-)
-""")
-if not df.empty:
-    args = [tuple(r) for r in df[["id","businessname","nome_na_omie","property","cf_31679"]].values]
-    cur.executemany("""
-    insert into empresa (id,businessname,nome_na_omie,property,cf_31679)
-    values (%s,%s,%s,%s,%s)
-    on conflict (id) do update set
-      businessname=excluded.businessname,
-      nome_na_omie=excluded.nome_na_omie,
-      property=excluded.property,
-      cf_31679=excluded.cf_31679
-    """, args)
-conn.commit()
-cur.close()
-conn.close()
-print("OK")
+def normalize(p):
+    pid = iint(p.get("id"))
+    cf = p.get("customFieldValues") or []
+    tenant = _get_cf_value(cf, CF_TENANT_URL_HITS)
+    prop = _get_cf_value(cf, CF_PROPERTY)
+    omie = _get_cf_value(cf, CF_NOME_OMIE)
+    return {
+        "id": pid,
+        "business_name": p.get("businessName"),
+        "tenant_url_hits": tenant,
+        "property": prop,
+        "nome_na_omie": omie
+    }
+
+def ensure_columns(conn):
+    with conn.cursor() as cur:
+        cur.execute("alter table if exists empresa add column if not exists tenant_url_hits text")
+        cur.execute("alter table if exists empresa add column if not exists property text")
+        cur.execute("alter table if exists empresa add column if not exists nome_na_omie text")
+    conn.commit()
+
+def update_only(conn, rows):
+    if not rows:
+        return 0
+    values = [(r["id"], r["tenant_url_hits"], r["property"], r["nome_na_omie"]) for r in rows if r.get("id") is not None]
+    if not values:
+        return 0
+    with conn.cursor() as cur:
+        template = "(%s,%s,%s,%s)"
+        sql = """
+            update empresa e
+               set tenant_url_hits = v.tenant_url_hits,
+                   property = v.property,
+                   nome_na_omie = v.nome_na_omie
+              from (values %s) as v(id, tenant_url_hits, property, nome_na_omie)
+             where e.id = v.id
+        """
+        psycopg2.extras.execute_values(cur, sql, values, template=template)
+    conn.commit()
+    return len(values)
+
+def main():
+    if not API_TOKEN or not NEON_DSN:
+        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+    companies = fetch_companies()
+    rows = [normalize(p) for p in companies if isinstance(p, dict)]
+    conn = psycopg2.connect(NEON_DSN)
+    try:
+        ensure_columns(conn)
+        n = update_only(conn, rows)
+        print(f"EMPRESAS atualizadas: {n}")
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
