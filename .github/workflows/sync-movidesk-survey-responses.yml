@@ -1,4 +1,4 @@
-name: Sync Movidesk -> Pesquisa de satisfação (Faces)
+name: Sync Movidesk -> Pesquisa de satisfação (Faces) incremental
 on:
   workflow_dispatch:
   schedule:
@@ -19,4 +19,5 @@ jobs:
           MOVIDESK_SURVEY_DAYS: "120"
           MOVIDESK_PAGE_SIZE: "100"
           MOVIDESK_THROTTLE: "0.3"
+          MOVIDESK_OVERLAP_MIN: "10080"
         run: python sync_survey_responses.py
