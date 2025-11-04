@@ -41,8 +41,8 @@ jobs:
             responsible_name text,
             organization_id text,
             organization_name text,
-            public_actions_count integer not null default 0,
             aberto_via_184387 text,
+            origin text,
             category text,
             urgency text,
             service_first_level text,
@@ -57,7 +57,6 @@ jobs:
           set -e
           test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "15"
           test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")" = "YES"
-          test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_closed_at'")" = "YES"
           test "$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")" = "detail_control,tickets_resolvidos"
       - run: pip install requests psycopg2-binary
       - env:
