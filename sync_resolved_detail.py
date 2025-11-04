@@ -62,29 +62,6 @@ def count_public_actions(actions):
         if t in ("public","publicreply","publicnote","email","message") or v=="public": n+=1
     return n
 
-def transitions(actions):
-    r=None; c=None
-    if isinstance(actions, list):
-        for a in actions:
-            dt=a.get("createdDate") or a.get("date")
-            bs=str(a.get("baseStatus") or a.get("newBaseStatus") or a.get("status") or "").lower()
-            if dt:
-                if ("resolved" in bs) or ("resolvido" in bs):
-                    if r is None: r=dt
-                if ("closed" in bs) or ("fechado" in bs):
-                    if c is None: c=dt
-            chs=a.get("changes") or []
-            for ch in chs:
-                f=str(ch.get("field") or "").lower()
-                nv=str(ch.get("newValue") or "").lower()
-                cd=ch.get("date") or dt
-                if f in ("basestatus","status"):
-                    if ("resolved" in nv) or ("resolvido" in nv):
-                        if r is None: r=cd
-                    if ("closed" in nv) or ("fechado" in nv):
-                        if c is None: c=cd
-    return r,c
-
 CF = {
     "csat":"137641",
     "aberto_via":"184387",
@@ -99,11 +76,9 @@ CF = {
 }
 
 UPSERT_DETAIL_CTRL = """
-insert into visualizacao_resolvidos.detail_control (ticket_id,resolved_at,closed_at,last_update)
-values (%(id)s,%(resolved_at)s,%(closed_at)s,%(last_update)s)
+insert into visualizacao_resolvidos.detail_control (ticket_id,last_update)
+values (%(id)s,%(last_update)s)
 on conflict (ticket_id) do update set
-  resolved_at = coalesce(excluded.resolved_at, visualizacao_resolvidos.detail_control.resolved_at),
-  closed_at   = coalesce(excluded.closed_at,   visualizacao_resolvidos.detail_control.closed_at),
   last_update = excluded.last_update
 """
 
@@ -191,7 +166,6 @@ def map_row(t):
 
     actions = t.get("actions") or []
     cfields = t.get("customFields") or []
-    resolved_at, closed_at = transitions(actions)
 
     return {
         "id": iint(t.get("id")),
@@ -216,8 +190,6 @@ def map_row(t):
         "urgency": iint(t.get("urgency")),
         "cf_141736_mesclado": to_bool(get_cf(cfields, CF["mesclado"])) if get_cf(cfields, CF["mesclado"]) is not None else None,
         "cf_227413_primeiro_responsavel": get_cf(cfields, CF["primeiro_resp"]),
-        "resolved_at": to_ts(resolved_at),
-        "closed_at": to_ts(closed_at),
         "last_update": t.get("lastUpdate"),
     }
 
