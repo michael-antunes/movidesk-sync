@@ -17,7 +17,8 @@ jobs:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_PAGE_SIZE: "300"
           MOVIDESK_THROTTLE: "0.25"
-          CF_TENANT_URL_HITS: "31679"
-          CF_PROPERTY: "217664"
-          CF_NOME_OMIE: "217659"
+          CF_31679: "31679"
+          CF_217664: "217664"
+          CF_217659: "217659"
+          CF_217662: "217662"
         run: python sync_companies.py
