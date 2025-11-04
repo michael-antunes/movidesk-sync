@@ -66,24 +66,46 @@ def norm_ts(x):
 
 def count_public_actions(t):
     acts = t.get("actions") or []
-    return sum(1 for a in acts if isinstance(a, dict) and a.get("isPublic") is True)
+    n = 0
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        if a.get("isPublic") is True:
+            n += 1
+            continue
+        tp = a.get("type")
+        if isinstance(tp, str) and tp.lower() == "public":
+            n += 1
+    return n
+
+def extract_labels_list(v):
+    if v is None:
+        return None
+    if isinstance(v, list):
+        out = []
+        for i in v:
+            if isinstance(i, dict):
+                out.append(str(i.get("label") or i.get("name") or i.get("value") or ""))
+            else:
+                out.append(str(i))
+        out = [x for x in out if x]
+        return ", ".join(out) if out else None
+    if isinstance(v, dict):
+        return str(v.get("label") or v.get("name") or v.get("value") or None)
+    return str(v)
 
 def get_aberto_via(cf_list):
     if not isinstance(cf_list, list):
         return None
     for cf in cf_list:
-        fid = cf.get("id") or cf.get("fieldId")
+        if not isinstance(cf, dict):
+            continue
+        fid = cf.get("id") or cf.get("fieldId") or cf.get("customFieldId")
         if str(fid) == "184387":
-            val = cf.get("value") or cf.get("currentValue") or cf.get("values")
-            if isinstance(val, list):
-                out = []
-                for v in val:
-                    if isinstance(v, dict):
-                        out.append(str(v.get("label") or v.get("value") or v.get("name") or ""))
-                    else:
-                        out.append(str(v))
-                return ", ".join([x for x in out if x])
-            return str(val) if val is not None else None
+            val = (cf.get("value") if cf.get("value") not in (None, "") else None) \
+                  or (cf.get("currentValue") if cf.get("currentValue") not in (None, "") else None) \
+                  or (cf.get("values") if cf.get("values") not in (None, "") else None)
+            return extract_labels_list(val)
     return None
 
 def fetch_details(since_iso):
@@ -96,8 +118,9 @@ def fetch_details(since_iso):
         "category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
     ])
     expand_options = [
-        "owner,clients($expand=organization),actions($select=isPublic;$top=2000),customFields",
-        "owner,clients($expand=organization),actions($select=isPublic),customFields",
+        "owner,clients($expand=organization),actions($select=isPublic,type;$top=2000),customFields",
+        "owner,clients($expand=organization),actions($top=2000),customFields",
+        "owner,clients($expand=organization),customFields",
         "owner,clients($expand=organization)"
     ]
     filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge " + since_iso
@@ -137,6 +160,9 @@ def map_row(t):
     c0 = clients[0] if isinstance(clients, list) and clients else {}
     org = c0.get("organization") or {}
     cf = t.get("customFields") or []
+    s1 = t.get("serviceFirstLevel")
+    s2 = t.get("serviceSecondLevel")
+    s3 = t.get("serviceThirdLevel")
     return {
         "ticket_id": tid,
         "status": (t.get("baseStatus") or t.get("status") or None),
@@ -150,9 +176,9 @@ def map_row(t):
         "aberto_via_184387": get_aberto_via(cf),
         "category": t.get("category"),
         "urgency": t.get("urgency"),
-        "service_first_level": t.get("serviceFirstLevel"),
-        "service_second_level": t.get("serviceSecondLevel"),
-        "service_third_level": t.get("serviceThirdLevel")
+        "service_first_level": s3,
+        "service_second_level": s2,
+        "service_third_level": s1
     }
 
 UPSERT_SQL = """
