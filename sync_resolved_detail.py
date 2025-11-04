@@ -3,7 +3,19 @@ import os, time, requests, psycopg2, psycopg2.extras, datetime
 API_BASE = "https://api.movidesk.com/public/v1"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
-OPENING_METHOD_FIELD_IDS = [x.strip() for x in os.getenv("MOVIDESK_OPENING_METHOD_FIELD_IDS","").split(",") if x.strip()]
+
+CF_IDS = {
+    "csat": "137641",
+    "aberto_via": "184387",
+    "work_item": "215636",
+    "problema_generalizado": "129782",
+    "plantao": "111727",
+    "aud_comentario": "96132",
+    "aud_data": "99086",
+    "aud_solucao_aprov": "98922",
+    "mesclado": "141736",
+    "primeiro_resp": "227413",
+}
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -16,39 +28,43 @@ def _req(url, params, timeout=90):
         if r.status_code == 404: return {}
         r.raise_for_status(); return r.json() if r.text else {}
 
-def pick_opening_method(custom_fields):
-    if not isinstance(custom_fields, list): return None
-    for f in custom_fields:
-        fid = str(f.get("id") or "")
-        label = str(f.get("label") or "")
-        val = f.get("value")
-        if OPENING_METHOD_FIELD_IDS and fid in OPENING_METHOD_FIELD_IDS:
-            return val if isinstance(val, str) else (str(val) if val is not None else None)
-        if "forma de abertura" in label.lower():
-            return val if isinstance(val, str) else (str(val) if val is not None else None)
-    return None
+def to_bool(v):
+    s = str(v).strip().lower()
+    return s in ("true","1","sim","yes","y")
+
+def to_ts(v):
+    try:
+        if not v: return None
+        return datetime.datetime.fromisoformat(str(v).replace("Z","+00:00"))
+    except: return None
 
 def count_public_actions(actions):
     if not isinstance(actions, list): return 0
-    n = 0
+    n=0
     for a in actions:
         if a is None: continue
-        if a.get("isPublic") is True: n += 1; continue
+        if a.get("isPublic") is True: n+=1; continue
         t = str(a.get("type") or "").lower()
         v = str(a.get("visibility") or "").lower()
-        if t in ("public","publicreply","publicnote","email","message") or v == "public": n += 1
+        if t in ("public","publicreply","publicnote","email","message") or v=="public": n+=1
     return n
 
-def status_transition_dates(actions):
-    resolved_at = None; closed_at = None
+def transitions(actions):
+    r=None; c=None
     if isinstance(actions, list):
         for a in actions:
             bs = str(a.get("baseStatus") or a.get("newBaseStatus") or "").lower()
-            dt = a.get("createdDate") or a.get("date") or a.get("created") or None
+            dt = a.get("createdDate") or a.get("date") or a.get("created")
             if not dt: continue
-            if "resolved" in bs and resolved_at is None: resolved_at = dt
-            if "closed" in bs and closed_at is None: closed_at = dt
-    return resolved_at, closed_at
+            if "resolved" in bs and r is None: r = dt
+            if "closed"  in bs and c is None: c = dt
+    return r, c
+
+def get_cf(cfs, cid):
+    if not isinstance(cfs, list): return None
+    for f in cfs:
+        if str(f.get("id")) == cid: return f.get("value")
+    return None
 
 def map_row(t):
     owner = t.get("owner") or {}
@@ -57,103 +73,90 @@ def map_row(t):
     org = c0.get("organization") or {}
     actions = t.get("actions") or []
     cfields = t.get("customFields") or []
-    resolved_at, closed_at = status_transition_dates(actions)
-    opening_method = pick_opening_method(cfields)
+    resolved_at, closed_at = transitions(actions)
     return {
         "id": int(t.get("id")) if str(t.get("id")).isdigit() else None,
-        "protocol": t.get("protocol"),
-        "subject": t.get("subject"),
-        "type": t.get("type"),
         "status": t.get("status"),
-        "base_status": t.get("baseStatus"),
-        "owner_team": t.get("ownerTeam"),
+        "responsible_id": int(owner.get("id")) if str(owner.get("id") or "").isdigit() else None,
+        "responsible_name": owner.get("businessName"),
         "service_first_level": t.get("serviceFirstLevel"),
         "service_second_level": t.get("serviceSecondLevel"),
         "service_third_level": t.get("serviceThirdLevel"),
-        "created_date": t.get("createdDate"),
-        "last_update": t.get("lastUpdate"),
+        "cf_137641_avaliado_csat": to_bool(get_cf(cfields, CF_IDS["csat"])) if get_cf(cfields, CF_IDS["csat"]) is not None else None,
+        "cf_184387_aberto_via": get_cf(cfields, CF_IDS["aberto_via"]),
+        "organization_id": str(org.get("id")) if org.get("id") is not None else None,
+        "organization_name": org.get("businessName") or c0.get("businessName"),
+        "public_actions_count": count_public_actions(actions),
+        "category": t.get("category"),
+        "cf_215636_id_work_item": str(get_cf(cfields, CF_IDS["work_item"])) if get_cf(cfields, CF_IDS["work_item"]) is not None else None,
+        "cf_129782_problema_generalizado": to_bool(get_cf(cfields, CF_IDS["problema_generalizado"])) if get_cf(cfields, CF_IDS["problema_generalizado"]) is not None else None,
+        "cf_111727_atendimento_plantao": to_bool(get_cf(cfields, CF_IDS["plantao"])) if get_cf(cfields, CF_IDS["plantao"]) is not None else None,
+        "cf_96132_aud_comentario": get_cf(cfields, CF_IDS["aud_comentario"]),
+        "cf_99086_aud_data_auditoria": to_ts(get_cf(cfields, CF_IDS["aud_data"])),
+        "cf_98922_aud_solucao_aprovada": to_bool(get_cf(cfields, CF_IDS["aud_solucao_aprov"])) if get_cf(cfields, CF_IDS["aud_solucao_aprov"]) is not None else None,
+        "urgency": t.get("urgency"),
+        "cf_141736_mesclado": to_bool(get_cf(cfields, CF_IDS["mesclado"])) if get_cf(cfields, CF_IDS["mesclado"]) is not None else None,
+        "cf_227413_primeiro_responsavel": get_cf(cfields, CF_IDS["primeiro_resp"]),
         "resolved_at": resolved_at,
         "closed_at": closed_at,
-        "responsavel": owner.get("businessName"),
-        "empresa_cod_ref_adicional": org.get("codeReferenceAdditional"),
-        "agent_id": int(owner.get("id")) if str(owner.get("id") or "").isdigit() else None,
-        "empresa_id": str(org.get("id")) if org.get("id") is not None else None,
-        "empresa_nome": org.get("businessName") or c0.get("businessName"),
-        "csat_avaliado": None,
-        "public_actions_count": count_public_actions(actions),
-        "opening_method": opening_method,
-        "raw_owner": psycopg2.extras.Json(owner),
-        "raw_clients": psycopg2.extras.Json(clients),
+        "last_update": t.get("lastUpdate"),
         "raw_actions": psycopg2.extras.Json(actions),
-        "raw_custom_fields": psycopg2.extras.Json(cfields),
+        "raw_custom_fields": psycopg2.extras.Json(cfields)
     }
 
-UPSERT_SQL = """
+UPSERT_DETAIL_CTRL = """
+insert into visualizacao_resolvidos.detail_control (ticket_id,resolved_at,closed_at,last_update)
+values (%(id)s,%(resolved_at)s,%(closed_at)s,%(last_update)s)
+on conflict (ticket_id) do update set
+  resolved_at = coalesce(excluded.resolved_at, visualizacao_resolvidos.detail_control.resolved_at),
+  closed_at   = coalesce(excluded.closed_at,   visualizacao_resolvidos.detail_control.closed_at),
+  last_update = excluded.last_update
+"""
+
+UPSERT_TICKETS = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(id,protocol,subject,type,status,base_status,owner_team,service_first_level,service_second_level,service_third_level,
- created_date,last_update,resolved_at,closed_at,responsavel,empresa_cod_ref_adicional,agent_id,empresa_id,empresa_nome,
- csat_avaliado,public_actions_count,opening_method,raw_owner,raw_clients,raw_actions,raw_custom_fields)
+(id,status,responsible_id,responsible_name,service_first_level,service_second_level,service_third_level,
+ cf_137641_avaliado_csat,cf_184387_aberto_via,organization_id,organization_name,public_actions_count,category,
+ cf_215636_id_work_item,cf_129782_problema_generalizado,cf_111727_atendimento_plantao,cf_96132_aud_comentario,
+ cf_99086_aud_data_auditoria,cf_98922_aud_solucao_aprovada,urgency,cf_141736_mesclado,cf_227413_primeiro_responsavel)
 values
-(%(id)s,%(protocol)s,%(subject)s,%(type)s,%(status)s,%(base_status)s,%(owner_team)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,
- %(created_date)s,%(last_update)s,%(resolved_at)s,%(closed_at)s,%(responsavel)s,%(empresa_cod_ref_adicional)s,%(agent_id)s,%(empresa_id)s,%(empresa_nome)s,
- %(csat_avaliado)s,%(public_actions_count)s,%(opening_method)s,%(raw_owner)s,%(raw_clients)s,%(raw_actions)s,%(raw_custom_fields)s)
+(%(id)s,%(status)s,%(responsible_id)s,%(responsible_name)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,
+ %(cf_137641_avaliado_csat)s,%(cf_184387_aberto_via)s,%(organization_id)s,%(organization_name)s,%(public_actions_count)s,%(category)s,
+ %(cf_215636_id_work_item)s,%(cf_129782_problema_generalizado)s,%(cf_111727_atendimento_plantao)s,%(cf_96132_aud_comentario)s,
+ %(cf_99086_aud_data_auditoria)s,%(cf_98922_aud_solucao_aprovada)s,%(urgency)s,%(cf_141736_mesclado)s,%(cf_227413_primeiro_responsavel)s)
 on conflict (id) do update set
-  protocol = excluded.protocol,
-  subject = excluded.subject,
-  type = excluded.type,
   status = excluded.status,
-  base_status = excluded.base_status,
-  owner_team = excluded.owner_team,
+  responsible_id = excluded.responsible_id,
+  responsible_name = excluded.responsible_name,
   service_first_level = excluded.service_first_level,
   service_second_level = excluded.service_second_level,
   service_third_level = excluded.service_third_level,
-  created_date = excluded.created_date,
-  last_update = excluded.last_update,
-  resolved_at = coalesce(excluded.resolved_at, visualizacao_resolvidos.tickets_resolvidos.resolved_at),
-  closed_at = coalesce(excluded.closed_at, visualizacao_resolvidos.tickets_resolvidos.closed_at),
-  responsavel = excluded.responsavel,
-  empresa_cod_ref_adicional = excluded.empresa_cod_ref_adicional,
-  agent_id = excluded.agent_id,
-  empresa_id = excluded.empresa_id,
-  empresa_nome = excluded.empresa_nome,
+  cf_137641_avaliado_csat = excluded.cf_137641_avaliado_csat,
+  cf_184387_aberto_via = excluded.cf_184387_aberto_via,
+  organization_id = excluded.organization_id,
+  organization_name = excluded.organization_name,
   public_actions_count = excluded.public_actions_count,
-  opening_method = excluded.opening_method,
-  raw_owner = excluded.raw_owner,
-  raw_clients = excluded.raw_clients,
-  raw_actions = excluded.raw_actions,
-  raw_custom_fields = excluded.raw_custom_fields;
+  category = excluded.category,
+  cf_215636_id_work_item = excluded.cf_215636_id_work_item,
+  cf_129782_problema_generalizado = excluded.cf_129782_problema_generalizado,
+  cf_111727_atendimento_plantao = excluded.cf_111727_atendimento_plantao,
+  cf_96132_aud_comentario = excluded.cf_96132_aud_comentario,
+  cf_99086_aud_data_auditoria = excluded.cf_99086_aud_data_auditoria,
+  cf_98922_aud_solucao_aprovada = excluded.cf_98922_aud_solucao_aprovada,
+  urgency = excluded.urgency,
+  cf_141736_mesclado = excluded.cf_141736_mesclado,
+  cf_227413_primeiro_responsavel = excluded.cf_227413_primeiro_responsavel
 """
 
-def update_detail_control(conn, rows):
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur,
-            "insert into visualizacao_resolvidos.detail_control (ticket_id,last_update,resolved_at,closed_at,synced_at) values (%s,%s,%s,%s,now()) on conflict (ticket_id) do update set last_update=excluded.last_update,resolved_at=excluded.resolved_at,closed_at=excluded.closed_at,synced_at=now()",
-            [(r["id"], r["last_update"], r["resolved_at"], r["closed_at"]) for r in rows], page_size=300)
-    conn.commit()
-
-def update_csat_flags(conn, ids):
-    if not ids: return
+def pending_ids(conn, limit=400):
     with conn.cursor() as cur:
         cur.execute("""
-            update visualizacao_resolvidos.tickets_resolvidos t
-            set csat_avaliado = exists (
-                select 1
-                from visualizacao_satisfacao.movidesk_pesquisa_satisfacao_respostas s
-                where s.ticket_id = t.id
-            )
-            where t.id = any(%s)
-        """, (ids,))
-    conn.commit()
-
-def get_pending_ids(conn, limit=400):
-    with conn.cursor() as cur:
-        cur.execute("""
-            select i.id
-            from visualizacao_resolvidos.tickets_resolvidos i
-            left join visualizacao_resolvidos.detail_control d on d.ticket_id = i.id
-            where d.ticket_id is null or i.last_update > coalesce(d.last_update, 'epoch'::timestamptz)
-            order by i.last_update desc
-            limit %s
+            select dc.ticket_id
+              from visualizacao_resolvidos.detail_control dc
+         left join visualizacao_resolvidos.sync_control sc on sc.id=1
+             where dc.last_update > coalesce(sc.last_detail_run_at, 'epoch'::timestamptz)
+          order by dc.last_update asc
+             limit %s
         """, (limit,))
         return [r[0] for r in cur.fetchall()]
 
@@ -167,21 +170,25 @@ def fetch_detail(ticket_id):
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
     conn = psycopg2.connect(NEON_DSN)
+    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
+    batch = int(os.getenv("DETAIL_BATCH","200"))
     try:
-        ids = get_pending_ids(conn, int(os.getenv("DETAIL_BATCH","300")))
-        rows = []
+        ids = pending_ids(conn, batch)
+        rows=[]
         for tid in ids:
             t = fetch_detail(tid)
             if not isinstance(t, dict) or not t: continue
             rows.append(map_row(t))
-            time.sleep(float(os.getenv("MOVIDESK_THROTTLE","0.2")))
+            time.sleep(throttle)
         if rows:
             with conn.cursor() as cur:
-                psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
+                psycopg2.extras.execute_batch(cur, UPSERT_DETAIL_CTRL, rows, page_size=200)
+                psycopg2.extras.execute_batch(cur, UPSERT_TICKETS, rows, page_size=200)
             conn.commit()
-            update_detail_control(conn, rows)
-            update_csat_flags(conn, [r["id"] for r in rows])
-        print(f"DETAIL UPSERT: {len(rows)}")
+        with conn.cursor() as cur:
+            cur.execute("update visualizacao_resolvidos.sync_control set last_detail_run_at = now() where id=1")
+        conn.commit()
+        print(f"DETAIL: {len(rows)} tickets")
     finally:
         conn.close()
 
