@@ -64,17 +64,41 @@ def norm_ts(x):
         return None
     return s
 
+def count_public_actions(t):
+    acts = t.get("actions") or []
+    return sum(1 for a in acts if isinstance(a, dict) and a.get("isPublic") is True)
+
+def get_aberto_via(cf_list):
+    if not isinstance(cf_list, list):
+        return None
+    for cf in cf_list:
+        fid = cf.get("id") or cf.get("fieldId")
+        if str(fid) == "184387":
+            val = cf.get("value") or cf.get("currentValue") or cf.get("values")
+            if isinstance(val, list):
+                out = []
+                for v in val:
+                    if isinstance(v, dict):
+                        out.append(str(v.get("label") or v.get("value") or v.get("name") or ""))
+                    else:
+                        out.append(str(v))
+                return ", ".join([x for x in out if x])
+            return str(val) if val is not None else None
+    return None
+
 def fetch_details(since_iso):
     url = f"{API_BASE}/tickets"
     top = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
     skip = 0
     select_fields = ",".join([
-        "id","status","baseStatus","resolvedIn","closedIn","lastUpdate"
+        "id","status","baseStatus","resolvedIn","closedIn","lastUpdate",
+        "category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
     ])
     expand_options = [
-        "owner,clients($expand=organization)",
-        "owner,clients"
+        "owner,clients($expand=organization),actions($select=isPublic;$top=2000),customFields",
+        "owner,clients($expand=organization),actions($select=isPublic),customFields",
+        "owner,clients($expand=organization)"
     ]
     filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge " + since_iso
     expand_idx = 0
@@ -91,8 +115,8 @@ def fetch_details(since_iso):
                 "$skip": skip
             }) or []
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 400 and expand_idx == 0:
-                expand_idx = 1
+            if e.response is not None and e.response.status_code == 400 and expand_idx < len(expand_options) - 1:
+                expand_idx += 1
                 continue
             raise
         if not isinstance(page, list) or not page:
@@ -112,6 +136,7 @@ def map_row(t):
     clients = t.get("clients") or []
     c0 = clients[0] if isinstance(clients, list) and clients else {}
     org = c0.get("organization") or {}
+    cf = t.get("customFields") or []
     return {
         "ticket_id": tid,
         "status": (t.get("baseStatus") or t.get("status") or None),
@@ -120,14 +145,21 @@ def map_row(t):
         "responsible_id": iint(owner.get("id")),
         "responsible_name": owner.get("businessName"),
         "organization_id": org.get("id"),
-        "organization_name": org.get("businessName")
+        "organization_name": org.get("businessName"),
+        "public_actions_count": int(count_public_actions(t)),
+        "aberto_via_184387": get_aberto_via(cf),
+        "category": t.get("category"),
+        "urgency": t.get("urgency"),
+        "service_first_level": t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level": t.get("serviceThirdLevel")
     }
 
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name)
+(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name,public_actions_count,aberto_via_184387,category,urgency,service_first_level,service_second_level,service_third_level)
 values
-(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s)
+(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(public_actions_count)s,%(aberto_via_184387)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s)
 on conflict (ticket_id) do update set
   status = excluded.status,
   last_resolved_at = excluded.last_resolved_at,
@@ -135,7 +167,14 @@ on conflict (ticket_id) do update set
   responsible_id = excluded.responsible_id,
   responsible_name = excluded.responsible_name,
   organization_id = excluded.organization_id,
-  organization_name = excluded.organization_name
+  organization_name = excluded.organization_name,
+  public_actions_count = excluded.public_actions_count,
+  aberto_via_184387 = excluded.aberto_via_184387,
+  category = excluded.category,
+  urgency = excluded.urgency,
+  service_first_level = excluded.service_first_level,
+  service_second_level = excluded.service_second_level,
+  service_third_level = excluded.service_third_level
 """
 
 def upsert_details(conn, rows):
