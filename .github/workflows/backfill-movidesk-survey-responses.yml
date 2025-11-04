@@ -1,0 +1,22 @@
+name: Backfill Movidesk -> Pesquisa de satisfação (Faces) semanal
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests psycopg2-binary
+      - env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_PAGE_SIZE: "100"
+          MOVIDESK_THROTTLE: "0.3"
+          FORCE_BACKFILL_DAYS: "365"
+        run: python sync_survey_responses.py
