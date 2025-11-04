@@ -18,16 +18,23 @@ def _req(url, params, timeout=90):
 def iso_z(dt):
     return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00","Z")
 
-def get_since(conn):
-    overlap_min = int(os.getenv("MOVIDESK_OVERLAP_MIN","60"))
+def get_since_utc(conn):
+    overlap_min = int(os.getenv("MOVIDESK_OVERLAP_MIN","1440"))
     days_back = int(os.getenv("MOVIDESK_INDEX_DAYS","180"))
-    floor = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_back)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    floor = now_utc - datetime.timedelta(days=days_back)
     with conn.cursor() as cur:
-        cur.execute("select last_index_run_at from visualizacao_resolvidos.sync_control order by last_index_run_at desc nulls last limit 1")
-        row = cur.fetchone()
-    if row and row[0]:
-        return max(row[0] - datetime.timedelta(minutes=overlap_min), floor)
-    return floor
+        cur.execute("select max(last_index_run_at) from visualizacao_resolvidos.sync_control")
+        last_index = cur.fetchone()[0]
+        cur.execute("select max(last_update) from visualizacao_resolvidos.detail_control")
+        max_detail = cur.fetchone()[0]
+    cands = []
+    if last_index: cands.append(last_index - datetime.timedelta(minutes=overlap_min))
+    if max_detail: cands.append(max_detail - datetime.timedelta(minutes=overlap_min))
+    if not cands: return floor
+    since = min(cands)
+    if since < floor: since = floor
+    return since
 
 def fetch_index(since_iso):
     url = f"{API_BASE}/tickets"
@@ -46,16 +53,22 @@ def fetch_index(since_iso):
     return out
 
 def upsert_detail_control(conn, items):
+    if not items: return 0
+    rows = [(int(i["id"]), i.get("lastUpdate")) for i in items if str(i.get("id","")).isdigit()]
+    if not rows: return 0
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur,
             "insert into visualizacao_resolvidos.detail_control (ticket_id,last_update) values (%s,%s) on conflict (ticket_id) do update set last_update=excluded.last_update",
-            [(int(i["id"]), i.get("lastUpdate")) for i in items if str(i.get("id","")).isdigit()],
-            page_size=300
+            rows, page_size=500
         )
-        cur.execute("update visualizacao_resolvidos.sync_control set last_index_run_at = now()")
+        cur.execute("""
+            update visualizacao_resolvidos.sync_control
+               set last_index_run_at = now()
+        """)
         if cur.rowcount == 0:
             cur.execute("insert into visualizacao_resolvidos.sync_control (last_index_run_at) values (now())")
     conn.commit()
+    return len(rows)
 
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
@@ -64,11 +77,11 @@ def main():
         cur.execute("set time zone 'UTC'")
     conn.commit()
     try:
-        since = iso_z(get_since(conn))
-        items = fetch_index(since)
-        if items:
-            upsert_detail_control(conn, items)
-        print(f"INDEX: {len(items)} tickets")
+        since_dt = get_since_utc(conn)
+        since_iso = iso_z(since_dt)
+        items = fetch_index(since_iso)
+        n = upsert_detail_control(conn, items)
+        print(f"INDEX: since={since_iso} | rows={n}")
     finally:
         conn.close()
 
