@@ -35,14 +35,12 @@ def fetch_tickets(since_iso):
     top = int(os.getenv("MOVIDESK_PAGE_SIZE","500"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     skip = 0
-    select_fields = ",".join([
-        "id","status","baseStatus","resolvedIn","closedIn","lastUpdate"
-    ])
+    select_fields = ",".join(["id","status","baseStatus","resolvedIn","closedIn","lastUpdate"])
     expand = "owner,clients($expand=organization)"
-    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso!r}"
+    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso}"
     items = []
     while True:
-        page = _req(url, {"token": API_TOKEN, "$select": select_fields, "$expand": expand, "$filter": filtro, "$top": top, "$skip": skip}) or []
+        page = _req(url, {"token": API_TOKEN, "$select": select_fields, "$expand": expand, "$filter": filtro, "$orderby": "lastUpdate asc", "$top": top, "$skip": skip}) or []
         if not isinstance(page, list) or not page:
             break
         items.extend(page)
@@ -61,12 +59,14 @@ def map_row(t):
     org = {}
     if isinstance(clients, list) and clients:
         org = clients[0].get("organization") or {}
+    rid = owner.get("id")
+    rid_val = int(rid) if str(rid).isdigit() else None
     return {
         "ticket_id": tid,
         "status": t.get("baseStatus") or t.get("status"),
         "last_resolved_at": t.get("resolvedIn"),
         "last_closed_at": t.get("closedIn"),
-        "responsible_id": psycopg2.extras.Json(None) if owner.get("id") is None else int(owner.get("id")) if str(owner.get("id")).isdigit() else None,
+        "responsible_id": rid_val,
         "responsible_name": owner.get("businessName"),
         "organization_id": str(org.get("id")) if org.get("id") is not None else None,
         "organization_name": org.get("businessName")
