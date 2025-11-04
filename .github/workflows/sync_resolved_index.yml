@@ -14,7 +14,24 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: psql "$NEON_DSN" -v ON_ERROR_STOP=1 -f migrations/2025-11-04_force_recreate_resolved.sql
+        run: |
+          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+          begin;
+          create schema if not exists visualizacao_resolvidos;
+          do $$
+          begin
+            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
+              execute 'alter table visualizacao_resolvidos.sync_control drop column last_index_run_at';
+            end if;
+            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_detail_run_at') then
+              execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
+            end if;
+          end $$;
+          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('detail_control', now() - interval '180 days') on conflict (name) do nothing;
+          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('tickets_resolvidos', now() - interval '180 days') on conflict (name) do nothing;
+          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
+          commit;
+          SQL
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
