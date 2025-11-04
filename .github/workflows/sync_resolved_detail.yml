@@ -28,7 +28,6 @@ jobs:
               execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
             end if;
           end $$;
-          update visualizacao_resolvidos.sync_control set name='tickets_resolvidos' where name in ('tr_lastresolved','tr_lastResolved','tickets_resolved');
           insert into visualizacao_resolvidos.sync_control(name,last_update) values ('detail_control', now() - interval '180 days') on conflict (name) do nothing;
           insert into visualizacao_resolvidos.sync_control(name,last_update) values ('tickets_resolvidos', now() - interval '180 days') on conflict (name) do nothing;
           delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
@@ -41,7 +40,14 @@ jobs:
             responsible_id bigint,
             responsible_name text,
             organization_id text,
-            organization_name text
+            organization_name text,
+            public_actions_count integer not null default 0,
+            aberto_via_184387 text,
+            category text,
+            urgency text,
+            service_first_level text,
+            service_second_level text,
+            service_third_level text
           );
           commit;
           SQL
@@ -49,8 +55,9 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           set -e
-          test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "8"
+          test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "15"
           test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")" = "YES"
+          test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_closed_at'")" = "YES"
           test "$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")" = "detail_control,tickets_resolvidos"
       - run: pip install requests psycopg2-binary
       - env:
