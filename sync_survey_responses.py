@@ -70,7 +70,7 @@ def map_row(r):
     }
 
 UPSERT_SQL = """
-insert into visualizacao_atual.movidesk_pesquisa_satisfacao_respostas
+insert into visualizacao_satisfacao.movidesk_pesquisa_satisfacao_respostas
 (id,ticket_id,type,question_id,client_id,response_date,value)
 values (%(id)s,%(ticket_id)s,%(type)s,%(question_id)s,%(client_id)s,%(response_date)s,%(value)s)
 on conflict (id) do update set
