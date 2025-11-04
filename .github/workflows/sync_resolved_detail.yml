@@ -1,10 +1,10 @@
-name: Movidesk - Tickets resolvidos (detail)
+name: Sync Movidesk -> tickets_resolvidos (detail)
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "10 * * * *"
+  workflow_dispatch: {}
 jobs:
-  detail:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,6 +15,6 @@ jobs:
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          CONCURRENCY: "8"
-          BATCH_LIMIT: "2000"
+          MOVIDESK_PAGE_SIZE: "500"
+          MOVIDESK_THROTTLE: "0.25"
         run: python sync_resolved_detail.py
