@@ -18,5 +18,6 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_PAGE_SIZE: "100"
           MOVIDESK_THROTTLE: "0.3"
+          MOVIDESK_TICKETS_CHUNK: "12"
           FORCE_BACKFILL_DAYS: "1"
         run: python sync_survey_responses.py
