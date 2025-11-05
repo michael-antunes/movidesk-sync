@@ -28,11 +28,7 @@ jobs:
               execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
             end if;
           end $$;
-          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('detail_control', now() - interval '180 days') on conflict (name) do nothing;
-          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('tickets_resolvidos', now() - interval '180 days') on conflict (name) do nothing;
-          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
-          drop table if exists visualizacao_resolvidos.tickets_resolvidos cascade;
-          create table visualizacao_resolvidos.tickets_resolvidos (
+          create table if not exists visualizacao_resolvidos.tickets_resolvidos (
             ticket_id integer primary key,
             status text not null,
             last_resolved_at timestamptz,
@@ -48,6 +44,34 @@ jobs:
             service_second_level text,
             service_third_level text
           );
+          do $$
+          begin
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='origin') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column origin text';
+            end if;
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='category') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column category text';
+            end if;
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='urgency') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column urgency text';
+            end if;
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_first_level') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_first_level text';
+            end if;
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_second_level') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_second_level text';
+            end if;
+            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_third_level') then
+              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_third_level text';
+            end if;
+          end $$;
+          insert into visualizacao_resolvidos.sync_control(name,last_update)
+          values ('detail_control', now() - interval '180 days')
+          on conflict (name) do nothing;
+          insert into visualizacao_resolvidos.sync_control(name,last_update)
+          values ('tickets_resolvidos', now() - interval '180 days')
+          on conflict (name) do nothing;
+          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
           commit;
           SQL
       - env:
