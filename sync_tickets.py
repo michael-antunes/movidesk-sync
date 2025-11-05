@@ -1,4 +1,4 @@
-import os, time, datetime, requests, psycopg2, psycopg2.extras
+import os, time, requests, psycopg2, psycopg2.extras
 
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -13,18 +13,15 @@ def req(url, params=None, timeout=90):
     while True:
         r = http.get(url, params=params, timeout=timeout)
         if r.status_code in (429,503):
-            ra = r.headers.get("retry-after")
-            wait = int(ra) if ra and str(ra).isdigit() else 60
-            time.sleep(wait)
-            continue
+            ra = r.headers.get("retry-after"); wait = int(ra) if ra and str(ra).isdigit() else 60
+            time.sleep(wait); continue
         if r.status_code == 404:
             return []
         r.raise_for_status()
         return r.json() if r.text else []
 
 def fetch_open():
-    url = f"{API_BASE}/tickets"
-    skip = 0
+    url = f"{API_BASE}/tickets"; skip = 0
     fil = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
     sel = ",".join([
         "id","subject","type","status","baseStatus","ownerTeam",
@@ -35,36 +32,24 @@ def fetch_open():
     items = []
     while True:
         page = req(url, {
-            "token": TOKEN,
-            "$select": sel,
-            "$expand": exp,
-            "$filter": fil,
-            "$orderby": "lastUpdate asc",
-            "$top": TOP,
-            "$skip": skip
+            "token": TOKEN, "$select": sel, "$expand": exp, "$filter": fil,
+            "$orderby": "lastUpdate asc", "$top": TOP, "$skip": skip
         }) or []
-        if not page:
-            break
+        if not page: break
         items.extend(page)
-        if len(page) < TOP:
-            break
-        skip += len(page)
-        time.sleep(THROTTLE)
+        if len(page) < TOP: break
+        skip += len(page); time.sleep(THROTTLE)
     return items
 
 def iint(x):
     try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
-    except:
-        return None
+        s = str(x); return int(s) if s.isdigit() else None
+    except: return None
 
 def norm_ts(x):
-    if not x:
-        return None
+    if not x: return None
     s = str(x).strip()
-    if not s or s.startswith("0001-01-01"):
-        return None
+    if not s or s.startswith("0001-01-01"): return None
     return s
 
 def map_row(t):
@@ -72,6 +57,7 @@ def map_row(t):
     c0 = clients[0] if isinstance(clients, list) and clients else {}
     org = c0.get("organization") or {}
     created_by = t.get("createdBy") or {}
+    created_val = norm_ts(t.get("createdDate"))
     return {
         "id": iint(t.get("id")) if str(t.get("id","")).isdigit() else t.get("id"),
         "subject": t.get("subject"),
@@ -84,7 +70,7 @@ def map_row(t):
         "service_third_level": t.get("serviceThirdLevel"),
         "category": t.get("category"),
         "urgency": t.get("urgency"),
-        "created_at": norm_ts(t.get("createdDate")),
+        "created_date": created_val,
         "last_update": norm_ts(t.get("lastUpdate")),
         "empresa_id": org.get("id"),
         "empresa_nome": org.get("businessName"),
@@ -108,26 +94,22 @@ def build_sql(cols):
     insert_cols = ",".join(cols)
     values = ",".join([f"%({c})s" for c in cols])
     sets = ",".join([f"{c}=excluded.{c}" for c in cols_wo_id])
-    sql = f"""
+    return f"""
     insert into visualizacao_atual.movidesk_tickets_abertos ({insert_cols})
     values ({values})
     on conflict (id) do update set {sets}
     """
-    return sql
 
 def upsert_rows(conn, rows):
-    if not rows:
-        return 0
+    if not rows: return 0
     table_cols = get_table_columns(conn)
     wanted = ["id","subject","type","status","base_status","owner_team",
               "service_first_level","service_second_level","service_third_level",
-              "category","urgency","created_at","last_update",
+              "category","urgency","created_date","last_update",
               "empresa_id","empresa_nome","requester_id","requester_name"]
     cols = [c for c in wanted if c in table_cols]
     sql = build_sql(cols)
-    payload = []
-    for r in rows:
-        payload.append({c: r.get(c) for c in cols})
+    payload = [{c: r.get(c) for c in cols} for r in rows]
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, sql, payload, page_size=200)
     conn.commit()
