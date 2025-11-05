@@ -78,17 +78,18 @@ def fetch_smiley_responses(since_iso):
     return items
 
 def fetch_ticket_status_map(ticket_ids):
-    ids = [str(i) for i in ticket_ids if str(i).isdigit()]
+    ids = [int(x) for x in ticket_ids if str(x).isdigit()]
     if not ids:
         return {}
     url = f"{API_BASE}/tickets"
-    top = int(os.getenv("MOVIDESK_TICKETS_TOP", "200"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
-    chunk = max(1, min(80, int(os.getenv("MOVIDESK_TICKETS_CHUNK", "50"))))
+    hard_chunk = max(1, min(50, int(os.getenv("MOVIDESK_TICKETS_CHUNK", "12"))))
+    top_default = max(1, int(os.getenv("MOVIDESK_TICKETS_TOP", "200")))
     out = {}
-    for i in range(0, len(ids), chunk):
-        batch = ids[i:i+chunk]
-        filtro = " or ".join([f"id eq {x}" for x in batch])
+
+    def fetch_batch(batch_ids):
+        top = min(top_default, max(1, len(batch_ids)))
+        filtro = " or ".join([f"id eq {i}" for i in batch_ids])
         skip = 0
         while True:
             page = _req_list(url, {"token": API_TOKEN, "$select": "id,baseStatus", "$filter": filtro, "$top": top, "$skip": skip}) or []
@@ -96,13 +97,41 @@ def fetch_ticket_status_map(ticket_ids):
                 break
             for t in page:
                 tid = t.get("id")
-                if isinstance(tid, str) and tid.isdigit():
+                try:
                     tid = int(tid)
+                except Exception:
+                    continue
                 out[tid] = t.get("baseStatus")
             if len(page) < top:
                 break
             skip += len(page)
             time.sleep(throttle)
+
+    def fetch_safe(batch_ids):
+        try:
+            fetch_batch(batch_ids)
+        except requests.HTTPError as e:
+            sc = getattr(e.response, "status_code", None)
+            if sc == 400 and len(batch_ids) > 1:
+                mid = len(batch_ids) // 2
+                left = batch_ids[:mid]
+                right = batch_ids[mid:]
+                if left:
+                    fetch_safe(left)
+                if right:
+                    fetch_safe(right)
+            elif sc == 400 and len(batch_ids) == 1:
+                try:
+                    fetch_batch(batch_ids)
+                except Exception:
+                    pass
+            else:
+                raise
+
+    for i in range(0, len(ids), hard_chunk):
+        fetch_safe(ids[i:i+hard_chunk])
+        time.sleep(throttle)
+
     return out
 
 def map_row(r):
