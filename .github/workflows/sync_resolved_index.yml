@@ -1,7 +1,7 @@
 name: Sync Movidesk -> Index resolvidos
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 jobs:
   run:
