@@ -13,13 +13,16 @@ jobs:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
+      # --- DDL tickets_resolvidos (mantém igual ao que você já usa) ---
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
           begin;
           create schema if not exists visualizacao_resolvidos;
+
           alter table if exists visualizacao_resolvidos.detail_control drop column if exists synced_at;
+
           do $$
           begin
             if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
@@ -29,6 +32,7 @@ jobs:
               execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
             end if;
           end $$;
+
           create table if not exists visualizacao_resolvidos.tickets_resolvidos (
             ticket_id integer primary key,
             status text not null,
@@ -45,159 +49,24 @@ jobs:
             service_second_level text,
             service_third_level text
           );
-          do $$
-          begin
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='origin') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column origin text';
-            end if;
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='category') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column category text';
-            end if;
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='urgency') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column urgency text';
-            end if;
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_first_level') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_first_level text';
-            end if;
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_second_level') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_second_level text';
-            end if;
-            if not exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='service_third_level') then
-              execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column service_third_level text';
-            end if;
-          end $$;
+
           insert into visualizacao_resolvidos.sync_control(name,last_update)
           values ('detail_control', now() - interval '180 days')
           on conflict (name) do nothing;
+
           insert into visualizacao_resolvidos.sync_control(name,last_update)
           values ('tickets_resolvidos', now() - interval '180 days')
           on conflict (name) do nothing;
+
           delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
+
           commit;
           SQL
 
+      # --- DDL resolvidos_acoes: trata JSON/HTML no Neon e cria colunas geradas ---
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
           begin;
-          create schema if not exists visualizacao_resolvidos;
-          create table if not exists visualizacao_resolvidos.resolvidos_acoes (
-            ticket_id integer primary key,
-            acoes jsonb not null
-          );
-          create or replace function visualizacao_resolvidos._cleanup_html(t text)
-          returns text
-          language sql
-          immutable
-          as $$
-            select nullif(
-              btrim(
-                regexp_replace(
-                  regexp_replace(
-                    regexp_replace(coalesce($1,''),'(?is)<script.*?</script>',' ','g'),
-                    '(?is)<style.*?</style>',' ','g'
-                  ),
-                  '(?is)<[^>]+>',' ','g'
-                )
-              ),
-              ''
-            )
-          $$;
-          create or replace function visualizacao_resolvidos._action_text(e jsonb)
-          returns text
-          language sql
-          immutable
-          as $$
-            select nullif(
-              btrim(
-                coalesce(
-                  nullif(e->>'description',''),
-                  visualizacao_resolvidos._cleanup_html(e->>'htmlDescription')
-                )
-              ),
-              ''
-            )
-          $$;
-          create or replace function visualizacao_resolvidos.count_desc_by_type(j jsonb, t int)
-          returns integer
-          language sql
-          immutable
-          as $$
-            select coalesce(count(*),0)
-            from jsonb_array_elements(coalesce($1,'[]'::jsonb)) e(elem)
-            where coalesce((e.elem->>'isDeleted')::boolean,false) = false
-              and (e.elem->>'type') ~ '^\d+$'
-              and (e.elem->>'type')::int = $2
-              and visualizacao_resolvidos._action_text(e.elem) is not null
-          $$;
-          alter table visualizacao_resolvidos.resolvidos_acoes
-            drop column if exists qtd_acoes_descricao_publi,
-            drop column if exists qtd_acoes_descricao_inter;
-          alter table visualizacao_resolvidos.resolvidos_acoes
-            add column qtd_acoes_descricao_publi integer
-              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,2)) stored,
-            add column qtd_acoes_descricao_inter integer
-              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,1)) stored;
-          commit;
-          SQL
-
-      - env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
-          begin;
-          create or replace view visualizacao_resolvidos.vw_resolvidos_all_ids as
-          select ticket_id from visualizacao_resolvidos.tickets_resolvidos
-          union
-          select ticket_id from visualizacao_resolvidos.resolvidos_acoes
-          union
-          select ticket_id from visualizacao_resolvidos.detail_control;
-          create or replace view visualizacao_resolvidos.vw_resolvidos_missing_por_tabela as
-          select 'tickets_resolvidos'::text as table_name, a.ticket_id
-          from visualizacao_resolvidos.vw_resolvidos_all_ids a
-          left join visualizacao_resolvidos.tickets_resolvidos t using (ticket_id)
-          where t.ticket_id is null
-          union all
-          select 'resolvidos_acoes', a.ticket_id
-          from visualizacao_resolvidos.vw_resolvidos_all_ids a
-          left join visualizacao_resolvidos.resolvidos_acoes r using (ticket_id)
-          where r.ticket_id is null
-          union all
-          select 'detail_control', a.ticket_id
-          from visualizacao_resolvidos.vw_resolvidos_all_ids a
-          left join visualizacao_resolvidos.detail_control d using (ticket_id)
-          where d.ticket_id is null;
-          create or replace view visualizacao_resolvidos.vw_resolvidos_consistencia_status as
-          select
-            (select count(*) from visualizacao_resolvidos.tickets_resolvidos) as tickets_resolvidos_cnt,
-            (select count(*) from visualizacao_resolvidos.resolvidos_acoes) as resolvidos_acoes_cnt,
-            (select count(*) from visualizacao_resolvidos.detail_control) as detail_control_cnt,
-            (select count(*) from visualizacao_resolvidos.vw_resolvidos_missing_por_tabela where table_name='tickets_resolvidos') as missing_tickets_resolvidos,
-            (select count(*) from visualizacao_resolvidos.vw_resolvidos_missing_por_tabela where table_name='resolvidos_acoes') as missing_resolvidos_acoes,
-            (select count(*) from visualizacao_resolvidos.vw_resolvidos_missing_por_tabela where table_name='detail_control') as missing_detail_control,
-            ((select count(*) from visualizacao_resolvidos.vw_resolvidos_missing_por_tabela)=0) as ok;
-          create or replace view visualizacao_resolvidos.vw_responsavel_abertovia as
-          select
-            t.ticket_id,
-            t.responsible_id,
-            t.responsible_name,
-            t.origin,
-            case
-              when (t.origin ~ '^\d+$' and (t.origin::int) in (5,18,20,22,23,25)) then 'Chat'
-              when (t.origin ~ '^\d+$' and (t.origin::int) in (2,13,14,15,16,21)) then 'Telefone'
-              when (t.origin ~ '^\d+$' and (t.origin::int) in (1,3,4,6,7,8,9,10,11,12,17,19,24)) then 'Portal/Email'
-              else 'Portal/Email'
-            end as aberto_via
-          from visualizacao_resolvidos.tickets_resolvidos t;
-          commit;
-          SQL
-
-      - run: pip install requests psycopg2-binary
-      - env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_PAGE_SIZE: "500"
-          MOVIDESK_THROTTLE: "0.25"
-          MOVIDESK_INDEX_DAYS: "180"
-        run: python sync_resolved_detail.py
+          create schema if not exists visualiz
