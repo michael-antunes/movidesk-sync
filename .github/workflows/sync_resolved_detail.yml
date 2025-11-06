@@ -21,14 +21,20 @@ jobs:
           begin;
           create schema if not exists visualizacao_resolvidos;
 
-          -- limpeza de colunas antigas do sync_control (idempotente)
           alter table if exists visualizacao_resolvidos.detail_control drop column if exists synced_at;
+
           do $$
           begin
-            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
+            if exists (select 1 from information_schema.columns
+                       where table_schema='visualizacao_resolvidos'
+                         and table_name='sync_control'
+                         and column_name='last_index_run_at') then
               execute 'alter table visualizacao_resolvidos.sync_control drop column last_index_run_at';
             end if;
-            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_detail_run_at') then
+            if exists (select 1 from information_schema.columns
+                       where table_schema='visualizacao_resolvidos'
+                         and table_name='sync_control'
+                         and column_name='last_detail_run_at') then
               execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
             end if;
           end $$;
@@ -58,12 +64,13 @@ jobs:
           values ('tickets_resolvidos', now() - interval '180 days')
           on conflict (name) do nothing;
 
-          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
+          delete from visualizacao_resolvidos.sync_control
+          where name not in ('detail_control','tickets_resolvidos');
 
           commit;
           SQL
 
-      # DDL resolvidos_acoes (sem DROP COLUMN) + funções/trigger + backfill dos contadores
+      # DDL resolvidos_acoes (compatível com colunas GENERATED) + funções
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -77,34 +84,13 @@ jobs:
             acoes jsonb not null default '[]'::jsonb
           );
 
-          do $$
-          begin
-            if not exists (
-              select 1 from information_schema.columns
-              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
-                and column_name='qtd_acoes_descricao_publi'
-            ) then
-              alter table visualizacao_resolvidos.resolvidos_acoes
-                add column qtd_acoes_descricao_publi integer;
-            end if;
-
-            if not exists (
-              select 1 from information_schema.columns
-              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
-                and column_name='qtd_acoes_descricao_inter'
-            ) then
-              alter table visualizacao_resolvidos.resolvidos_acoes
-                add column qtd_acoes_descricao_inter integer;
-            end if;
-          end $$;
-
+          -- Funções IMMU para uso em coluna gerada ou trigger
           create or replace function visualizacao_resolvidos._count_desc_publi(js jsonb)
           returns integer language sql immutable as $$
             select coalesce(sum(
-              case
-                when coalesce((a->>'type')::int,0) = 2
-                 and nullif(a->>'description','') is not null then 1 else 0
-              end
+              case when coalesce((a->>'type')::int,0) = 2
+                    and nullif(a->>'description','') is not null
+                   then 1 else 0 end
             ),0)
             from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
           $$;
@@ -112,42 +98,141 @@ jobs:
           create or replace function visualizacao_resolvidos._count_desc_inter(js jsonb)
           returns integer language sql immutable as $$
             select coalesce(sum(
-              case
-                when coalesce((a->>'type')::int,0) = 1
-                 and nullif(a->>'description','') is not null then 1 else 0
-              end
+              case when coalesce((a->>'type')::int,0) = 1
+                    and nullif(a->>'description','') is not null
+                   then 1 else 0 end
             ),0)
             from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
           $$;
 
+          -- Garante as colunas: se não existirem, cria como GENERATED ALWAYS
+          do $$
+          begin
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos'
+                and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_publi'
+            ) then
+              execute $gx$
+                alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_publi integer
+                  generated always as (visualizacao_resolvidos._count_desc_publi(acoes)) stored
+              $gx$;
+            end if;
+
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos'
+                and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_inter'
+            ) then
+              execute $gx$
+                alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_inter integer
+                  generated always as (visualizacao_resolvidos._count_desc_inter(acoes)) stored
+              $gx$;
+            end if;
+          end $$;
+
+          -- Trigger function que só atualiza colunas NÃO-GERADAS
           create or replace function visualizacao_resolvidos._resolvidos_acoes_fill_counts()
           returns trigger language plpgsql as $$
+          declare
+            is_gen_pub  boolean;
+            is_gen_inter boolean;
           begin
-            new.qtd_acoes_descricao_publi := visualizacao_resolvidos._count_desc_publi(new.acoes);
-            new.qtd_acoes_descricao_inter := visualizacao_resolvidos._count_desc_inter(new.acoes);
+            select (is_generated='ALWAYS') into is_gen_pub
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_publi';
+
+            select (is_generated='ALWAYS') into is_gen_inter
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_inter';
+
+            if not is_gen_pub then
+              new.qtd_acoes_descricao_publi := visualizacao_resolvidos._count_desc_publi(new.acoes);
+            end if;
+            if not is_gen_inter then
+              new.qtd_acoes_descricao_inter := visualizacao_resolvidos._count_desc_inter(new.acoes);
+            end if;
             return new;
           end $$;
 
+          -- (Re)cria o trigger apenas se ao menos uma coluna NÃO for gerada
           do $$
+          declare
+            gen_pub text;
+            gen_inter text;
+            need_trig boolean := false;
           begin
+            select is_generated into gen_pub
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_publi';
+
+            select is_generated into gen_inter
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_inter';
+
+            need_trig := (coalesce(gen_pub,'NEVER') <> 'ALWAYS') or (coalesce(gen_inter,'NEVER') <> 'ALWAYS');
+
             if exists (
               select 1 from pg_trigger
               where tgname='tr_resolvidos_acoes_fill_counts'
                 and tgrelid='visualizacao_resolvidos.resolvidos_acoes'::regclass
             ) then
-              drop trigger tr_resolvidos_acoes_fill_counts on visualizacao_resolvidos.resolvidos_acoes;
+              execute 'drop trigger tr_resolvidos_acoes_fill_counts on visualizacao_resolvidos.resolvidos_acoes';
+            end if;
+
+            if need_trig then
+              execute '
+                create trigger tr_resolvidos_acoes_fill_counts
+                before insert or update of acoes on visualizacao_resolvidos.resolvidos_acoes
+                for each row execute function visualizacao_resolvidos._resolvidos_acoes_fill_counts()
+              ';
             end if;
           end $$;
 
-          create trigger tr_resolvidos_acoes_fill_counts
-          before insert or update of acoes on visualizacao_resolvidos.resolvidos_acoes
-          for each row execute function visualizacao_resolvidos._resolvidos_acoes_fill_counts();
+          -- Backfill apenas para colunas NÃO-GERADAS
+          do $$
+          declare
+            gen_pub text;
+            gen_inter text;
+          begin
+            select is_generated into gen_pub
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_publi';
 
-          -- backfill dos contadores (sem dropar colunas)
-          update visualizacao_resolvidos.resolvidos_acoes
-          set
-            qtd_acoes_descricao_publi = visualizacao_resolvidos._count_desc_publi(acoes),
-            qtd_acoes_descricao_inter = visualizacao_resolvidos._count_desc_inter(acoes);
+            select is_generated into gen_inter
+            from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_inter';
+
+            if coalesce(gen_pub,'NEVER') <> 'ALWAYS' then
+              execute '
+                update visualizacao_resolvidos.resolvidos_acoes
+                   set qtd_acoes_descricao_publi = visualizacao_resolvidos._count_desc_publi(acoes)
+              ';
+            end if;
+
+            if coalesce(gen_inter,'NEVER') <> 'ALWAYS' then
+              execute '
+                update visualizacao_resolvidos.resolvidos_acoes
+                   set qtd_acoes_descricao_inter = visualizacao_resolvidos._count_desc_inter(acoes)
+              ';
+            end if;
+          end $$;
 
           commit;
           SQL
@@ -163,12 +248,12 @@ jobs:
           MOVIDESK_INDEX_DAYS: "180"
         run: python sync_resolved_detail.py
 
-      # (Opcional) sanity check das colunas dependidas pela view
+      # Sanity check: confirma que as colunas existem
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 -Atqc "
-            select 'ok' 
+            select 'ok'
             where exists (
               select 1 from information_schema.columns
               where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
