@@ -1,4 +1,4 @@
-name: Audit Movidesk resolvidos (2d)
+name: Audit Movidesk resolvidos (janela 2 dias)
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -17,3 +17,8 @@ jobs:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python audit_recent_resolved_scan.py
+      - env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
+          psql "$NEON_DSN" -v ON_ERROR_STOP=1 -c \
+            "select coalesce((select missing_total from visualizacao_resolvidos.audit_recent_run order by id desc limit 1),0) as missing_total;"
