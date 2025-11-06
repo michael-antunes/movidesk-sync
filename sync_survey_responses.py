@@ -25,6 +25,19 @@ def _req(url, params, timeout=90):
         r.raise_for_status()
         return r.json() if r.text else {}
 
+def _req_list(url, params, timeout=90):
+    while True:
+        r = http.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json() if r.text else []
+
 def iint(x):
     try:
         return int(str(x))
@@ -52,12 +65,7 @@ def fetch_smiley_responses(since_iso):
     starting_after = None
     items = []
     while True:
-        params = {
-            "token": API_TOKEN,
-            "type": 2,
-            "responseDateGreaterThan": since_iso,
-            "limit": limit
-        }
+        params = {"token": API_TOKEN, "type": 2, "responseDateGreaterThan": since_iso, "limit": limit}
         if starting_after:
             params["startingAfter"] = starting_after
         page = _req(url, params) or {}
@@ -101,14 +109,105 @@ def upsert_rows(conn, rows):
     conn.commit()
     return len(rows)
 
+def _extract_custom_value(ticket, custom_id):
+    pools = []
+    for k in ("customFieldValues", "customFields", "additionalFields", "custom_fields"):
+        v = ticket.get(k)
+        if isinstance(v, list):
+            pools.extend(v)
+    def match(d):
+        for k in ("id", "customFieldId", "fieldId", "customfieldid"):
+            if str(d.get(k, "")).strip() == str(custom_id):
+                return True
+        return False
+    for it in pools:
+        if isinstance(it, dict) and match(it):
+            for vk in ("value", "currentValue", "text", "valueName", "name", "option"):
+                if it.get(vk) not in (None, ""):
+                    val = it.get(vk)
+                    if isinstance(val, list):
+                        return ", ".join([str(x) for x in val])
+                    return str(val)
+            return None
+    return None
+
+def fetch_custom_for_tickets(ticket_ids, custom_id):
+    ids = [int(x) for x in ticket_ids if str(x).isdigit()]
+    if not ids:
+        return {}
+    url = f"{API_BASE}/tickets"
+    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
+    chunk = max(1, min(20, int(os.getenv("MOVIDESK_TICKETS_CHUNK", "10"))))
+    out = {}
+    def fetch_batch(batch):
+        params = {
+            "token": API_TOKEN,
+            "$select": "id",
+            "$expand": "customFieldValues",
+            "$filter": " or ".join([f"id eq {i}" for i in batch]),
+            "$top": max(1, len(batch)),
+            "$skip": 0
+        }
+        page = _req_list(url, params) or []
+        for t in page:
+            try:
+                tid = int(t.get("id"))
+            except Exception:
+                continue
+            out[tid] = _extract_custom_value(t, custom_id)
+    def safe_fetch(batch):
+        try:
+            fetch_batch(batch)
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", None) == 400 and len(batch) > 1:
+                mid = len(batch) // 2
+                safe_fetch(batch[:mid])
+                safe_fetch(batch[mid:])
+            elif getattr(e.response, "status_code", None) == 400 and len(batch) == 1:
+                try:
+                    fetch_batch(batch)
+                except Exception:
+                    pass
+            else:
+                raise
+    for i in range(0, len(ids), chunk):
+        safe_fetch(ids[i:i+chunk])
+        time.sleep(throttle)
+    return out
+
+def update_custom_in_tables(conn, values_map):
+    if not values_map:
+        return 0, 0
+    open_rows = []
+    res_rows = []
+    for tid, val in values_map.items():
+        open_rows.append({"id": int(tid), "val": val if val not in ("", None) else None})
+        res_rows.append({"id": int(tid), "val": val if val not in ("", None) else None})
+    n1 = 0
+    n2 = 0
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, """
+            update visualizacao_atual.movidesk_tickets_abertos
+            set adicional_137641_avaliado_csat = %(val)s
+            where id = %(id)s
+        """, open_rows, page_size=500)
+        n1 = cur.rowcount
+        psycopg2.extras.execute_batch(cur, """
+            update visualizacao_resolvidos.tickets_resolvidos
+            set adicional_137641_avaliado_csat = %(val)s
+            where ticket_id = %(id)s
+        """, res_rows, page_size=500)
+        n2 = cur.rowcount
+    conn.commit()
+    return n1, n2
+
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-
     days_back = int(os.getenv("MOVIDESK_SURVEY_DAYS", "120"))
     overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
     force_backfill_days = os.getenv("FORCE_BACKFILL_DAYS")
-
+    custom_id = int(os.getenv("MOVIDESK_CUSTOM_ID", "137641"))
     conn = psycopg2.connect(NEON_DSN)
     try:
         if force_backfill_days and force_backfill_days.isdigit():
@@ -116,11 +215,16 @@ def main():
         else:
             since_dt = get_since_from_db(conn, days_back, overlap_minutes)
         since_iso = to_iso_z(since_dt)
-
         resp = fetch_smiley_responses(since_iso)
         rows = [map_row(x) for x in resp if isinstance(x, dict)]
         n = upsert_rows(conn, rows)
-        print(f"DESDE {since_iso} | UPSERT: {n} respostas.")
+        tids = sorted({r["ticket_id"] for r in rows if r.get("ticket_id") is not None})
+        if tids:
+            vals = fetch_custom_for_tickets(tids, custom_id)
+            n1, n2 = update_custom_in_tables(conn, vals)
+            print(f"DESDE {since_iso} | UPSERT: {n} respostas | AD137641 abertos atualizados: {n1} | resolvidos atualizados: {n2}")
+        else:
+            print(f"DESDE {since_iso} | UPSERT: {n} respostas | Nenhum ticket para atualizar AD137641")
     finally:
         conn.close()
 
