@@ -1,16 +1,11 @@
-name: Sync Movidesk -> Ações de tickets resolvidos
+name: Setup resolvidos_acoes
 on:
-  schedule:
-    - cron: "15 3 * * *"
   workflow_dispatch: {}
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -20,135 +15,68 @@ jobs:
           create schema if not exists visualizacao_resolvidos;
           create table if not exists visualizacao_resolvidos.resolvidos_acoes (
             ticket_id integer primary key,
-            acoes jsonb not null
+            acoes jsonb not null default '[]'::jsonb
           );
+          do $$
+          begin
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_publi'
+            ) then
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_publi integer;
+            end if;
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_inter'
+            ) then
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_inter integer;
+            end if;
+          end $$;
+          create or replace function visualizacao_resolvidos._count_desc_publi(js jsonb)
+          returns integer language sql immutable as $$
+            select coalesce(sum(
+              case
+                when coalesce((a->>'type')::int,0) = 2
+                 and nullif(a->>'description','') is not null then 1 else 0 end
+            ),0)
+            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
+          $$;
+          create or replace function visualizacao_resolvidos._count_desc_inter(js jsonb)
+          returns integer language sql immutable as $$
+            select coalesce(sum(
+              case
+                when coalesce((a->>'type')::int,0) = 1
+                 and nullif(a->>'description','') is not null then 1 else 0 end
+            ),0)
+            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
+          $$;
+          create or replace function visualizacao_resolvidos._resolvidos_acoes_fill_counts()
+          returns trigger language plpgsql as $$
+          begin
+            new.qtd_acoes_descricao_publi := visualizacao_resolvidos._count_desc_publi(new.acoes);
+            new.qtd_acoes_descricao_inter := visualizacao_resolvidos._count_desc_inter(new.acoes);
+            return new;
+          end $$;
+          do $$
+          begin
+            if exists (
+              select 1 from pg_trigger
+              where tgname='tr_resolvidos_acoes_fill_counts'
+                and tgrelid='visualizacao_resolvidos.resolvidos_acoes'::regclass
+            ) then
+              drop trigger tr_resolvidos_acoes_fill_counts on visualizacao_resolvidos.resolvidos_acoes;
+            end if;
+          end $$;
+          create trigger tr_resolvidos_acoes_fill_counts
+          before insert or update of acoes on visualizacao_resolvidos.resolvidos_acoes
+          for each row execute function visualizacao_resolvidos._resolvidos_acoes_fill_counts();
+          update visualizacao_resolvidos.resolvidos_acoes
+          set
+            qtd_acoes_descricao_publi = visualizacao_resolvidos._count_desc_publi(acoes),
+            qtd_acoes_descricao_inter = visualizacao_resolvidos._count_desc_inter(acoes);
           commit;
           SQL
-      - run: pip install requests psycopg2-binary
-      - env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_PAGE_SIZE: "500"
-          MOVIDESK_THROTTLE: "0.25"
-        run: |
-          python - <<'PY'
-          import os, time, json, datetime, requests, psycopg2, psycopg2.extras
-
-          API_BASE = "https://api.movidesk.com/public/v1"
-          TOKEN = os.getenv("MOVIDESK_TOKEN")
-          DSN = os.getenv("NEON_DSN")
-          TOP = int(os.getenv("MOVIDESK_PAGE_SIZE","500"))
-          THROTTLE = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
-
-          http = requests.Session()
-          http.headers.update({"Accept":"application/json"})
-
-          def req(url, params=None, timeout=90):
-              while True:
-                  r = http.get(url, params=params, timeout=timeout)
-                  if r.status_code in (429,503):
-                      ra = r.headers.get("retry-after")
-                      wait = int(ra) if ra and str(ra).isdigit() else 60
-                      time.sleep(wait); continue
-                  if r.status_code == 404:
-                      return None
-                  r.raise_for_status()
-                  return r.json() if r.text else None
-
-          def as_utc(dt):
-              if dt is None: return None
-              if dt.tzinfo is None: return dt.replace(tzinfo=datetime.timezone.utc)
-              return dt.astimezone(datetime.timezone.utc)
-
-          def iso_z(dt):
-              return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00","Z")
-
-          def get_since(conn):
-              with conn.cursor() as cur:
-                  cur.execute("select last_update from visualizacao_resolvidos.sync_control where name='tickets_resolvidos'")
-                  row = cur.fetchone()
-              base = as_utc(row[0]) if row and row[0] else datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=180)
-              return base - datetime.timedelta(hours=4)
-
-          def fetch_since(since_iso):
-              url = f"{API_BASE}/tickets"
-              skip = 0
-              filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge " + since_iso
-              expand = "actions($top=2000)"
-              items = []
-              while True:
-                  page = req(url, {
-                      "token": TOKEN,
-                      "$select": "id,lastUpdate",
-                      "$expand": expand,
-                      "$filter": filtro,
-                      "$orderby": "lastUpdate asc",
-                      "$top": TOP,
-                      "$skip": skip
-                  }) or []
-                  if not page: break
-                  items.extend(page)
-                  if len(page) < TOP: break
-                  skip += len(page)
-                  time.sleep(THROTTLE)
-              return items
-
-          def get_ticket_by_id(tid):
-              url = f"{API_BASE}/tickets/{int(tid)}"
-              obj = req(url, {
-                  "token": TOKEN,
-                  "$select": "id",
-                  "$expand": "actions($top=2000)"
-              })
-              if obj is None: return None
-              if isinstance(obj, dict): return obj
-              return None
-
-          def upsert_acoes(conn, tickets):
-              rows = []
-              for t in tickets:
-                  if not isinstance(t, dict): continue
-                  tid = t.get("id")
-                  if not str(tid).isdigit(): continue
-                  acts = t.get("actions") or []
-                  rows.append((int(tid), psycopg2.extras.Json(acts, dumps=lambda x: json.dumps(x, ensure_ascii=False))))
-              if not rows: return 0
-              with conn.cursor() as cur:
-                  psycopg2.extras.execute_batch(cur, """
-                      insert into visualizacao_resolvidos.resolvidos_acoes (ticket_id, acoes)
-                      values (%s,%s)
-                      on conflict (ticket_id) do update set acoes = excluded.acoes
-                  """, rows, page_size=200)
-              conn.commit()
-              return len(rows)
-
-          def missing_ids(conn, limit=500):
-              with conn.cursor() as cur:
-                  cur.execute("""
-                      select tr.ticket_id
-                      from visualizacao_resolvidos.tickets_resolvidos tr
-                      left join visualizacao_resolvidos.resolvidos_acoes ra using (ticket_id)
-                      where ra.ticket_id is null
-                      order by tr.ticket_id desc
-                      limit %s
-                  """, (limit,))
-                  return [r[0] for r in cur.fetchall()]
-
-          def main():
-              if not TOKEN or not DSN: raise SystemExit(1)
-              with psycopg2.connect(DSN) as conn:
-                  since = get_since(conn)
-                  items = fetch_since(iso_z(since))
-                  upsert_acoes(conn, items)
-                  ids = missing_ids(conn)
-                  if ids:
-                      fetched = []
-                      for tid in ids:
-                          obj = get_ticket_by_id(tid)
-                          if obj: fetched.append(obj)
-                          time.sleep(THROTTLE)
-                      upsert_acoes(conn, fetched)
-
-          if __name__ == "__main__":
-              main()
-          PY
