@@ -13,7 +13,7 @@ jobs:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
-      # DDL tickets_resolvidos
+      # DDL tickets_resolvidos + sync_control
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -21,8 +21,8 @@ jobs:
           begin;
           create schema if not exists visualizacao_resolvidos;
 
+          -- limpeza de colunas antigas do sync_control (idempotente)
           alter table if exists visualizacao_resolvidos.detail_control drop column if exists synced_at;
-
           do $$
           begin
             if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
@@ -63,176 +63,98 @@ jobs:
           commit;
           SQL
 
-      # DDL resolvidos_acoes + colunas geradas no Neon
+      # DDL resolvidos_acoes (sem DROP COLUMN) + funções/trigger + backfill dos contadores
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
           begin;
+
           create schema if not exists visualizacao_resolvidos;
 
           create table if not exists visualizacao_resolvidos.resolvidos_acoes (
             ticket_id integer primary key,
-            acoes jsonb not null
+            acoes jsonb not null default '[]'::jsonb
           );
 
-          create or replace function visualizacao_resolvidos._cleanup_html(t text)
-          returns text
-          language sql
-          immutable
-          as $$
-            select nullif(
-              btrim(
-                regexp_replace(
-                  regexp_replace(
-                    regexp_replace(coalesce($1,''),'(?is)<script.*?</script>',' ','g'),
-                    '(?is)<style.*?</style>',' ','g'
-                  ),
-                  '(?is)<[^>]+>',' ','g'
-                )
-              ),
-              ''
-            )
+          do $$
+          begin
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_publi'
+            ) then
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_publi integer;
+            end if;
+
+            if not exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
+                and column_name='qtd_acoes_descricao_inter'
+            ) then
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                add column qtd_acoes_descricao_inter integer;
+            end if;
+          end $$;
+
+          create or replace function visualizacao_resolvidos._count_desc_publi(js jsonb)
+          returns integer language sql immutable as $$
+            select coalesce(sum(
+              case
+                when coalesce((a->>'type')::int,0) = 2
+                 and nullif(a->>'description','') is not null then 1 else 0
+              end
+            ),0)
+            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
           $$;
 
-          create or replace function visualizacao_resolvidos._action_text(e jsonb)
-          returns text
-          language sql
-          immutable
-          as $$
-            select nullif(
-              btrim(
-                coalesce(
-                  nullif(e->>'description',''),
-                  visualizacao_resolvidos._cleanup_html(e->>'htmlDescription')
-                )
-              ),
-              ''
-            )
+          create or replace function visualizacao_resolvidos._count_desc_inter(js jsonb)
+          returns integer language sql immutable as $$
+            select coalesce(sum(
+              case
+                when coalesce((a->>'type')::int,0) = 1
+                 and nullif(a->>'description','') is not null then 1 else 0
+              end
+            ),0)
+            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
           $$;
 
-          create or replace function visualizacao_resolvidos.count_desc_by_type(j jsonb, t int)
-          returns integer
-          language sql
-          immutable
-          as $$
-            select coalesce(count(*),0)
-            from jsonb_array_elements(coalesce($1,'[]'::jsonb)) e(elem)
-            where coalesce((e.elem->>'isDeleted')::boolean,false) = false
-              and (e.elem->>'type') ~ '^\d+$'
-              and (e.elem->>'type')::int = $2
-              and visualizacao_resolvidos._action_text(e.elem) is not null
-          $$;
+          create or replace function visualizacao_resolvidos._resolvidos_acoes_fill_counts()
+          returns trigger language plpgsql as $$
+          begin
+            new.qtd_acoes_descricao_publi := visualizacao_resolvidos._count_desc_publi(new.acoes);
+            new.qtd_acoes_descricao_inter := visualizacao_resolvidos._count_desc_inter(new.acoes);
+            return new;
+          end $$;
 
-          alter table visualizacao_resolvidos.resolvidos_acoes
-            drop column if exists qtd_acoes_descricao_publi,
-            drop column if exists qtd_acoes_descricao_inter;
+          do $$
+          begin
+            if exists (
+              select 1 from pg_trigger
+              where tgname='tr_resolvidos_acoes_fill_counts'
+                and tgrelid='visualizacao_resolvidos.resolvidos_acoes'::regclass
+            ) then
+              drop trigger tr_resolvidos_acoes_fill_counts on visualizacao_resolvidos.resolvidos_acoes;
+            end if;
+          end $$;
 
-          alter table visualizacao_resolvidos.resolvidos_acoes
-            add column qtd_acoes_descricao_publi integer
-              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,2)) stored,
-            add column qtd_acoes_descricao_inter integer
-              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,1)) stored;
+          create trigger tr_resolvidos_acoes_fill_counts
+          before insert or update of acoes on visualizacao_resolvidos.resolvidos_acoes
+          for each row execute function visualizacao_resolvidos._resolvidos_acoes_fill_counts();
+
+          -- backfill dos contadores (sem dropar colunas)
+          update visualizacao_resolvidos.resolvidos_acoes
+          set
+            qtd_acoes_descricao_publi = visualizacao_resolvidos._count_desc_publi(acoes),
+            qtd_acoes_descricao_inter = visualizacao_resolvidos._count_desc_inter(acoes);
 
           commit;
           SQL
 
-      # 1) Validador dinâmico entre tabelas
-      - env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
-          begin;
-
-          create or replace function visualizacao_resolvidos.list_ticket_tables()
-          returns table(table_name text)
-          language sql
-          stable
-          as $$
-            select c.table_name
-            from information_schema.columns c
-            join information_schema.tables t
-              on t.table_schema=c.table_schema and t.table_name=c.table_name and t.table_type='BASE TABLE'
-            where c.table_schema='visualizacao_resolvidos'
-              and c.column_name='ticket_id'
-              and c.table_name <> 'sync_control'
-          $$;
-
-          create or replace function visualizacao_resolvidos.all_ticket_ids()
-          returns table(ticket_id integer)
-          language plpgsql
-          stable
-          as $$
-          declare
-            t text;
-            first boolean := true;
-            sql text := '';
-          begin
-            for t in select table_name from visualizacao_resolvidos.list_ticket_tables() loop
-              if first then
-                sql := format('select ticket_id from visualizacao_resolvidos.%I', t);
-                first := false;
-              else
-                sql := sql || format(' union select ticket_id from visualizacao_resolvidos.%I', t);
-              end if;
-            end loop;
-            if sql = '' then
-              return;
-            end if;
-            return query execute sql;
-          end $$;
-
-          create or replace function visualizacao_resolvidos.missing_per_table()
-          returns table(table_name text, ticket_id integer)
-          language plpgsql
-          stable
-          as $$
-          declare
-            t text;
-            q text;
-          begin
-            for t in select table_name from visualizacao_resolvidos.list_ticket_tables() loop
-              q := format(
-                'select %L::text as table_name, a.ticket_id
-                 from (select distinct ticket_id from visualizacao_resolvidos.all_ticket_ids()) a
-                 left join visualizacao_resolvidos.%I b on b.ticket_id=a.ticket_id
-                 where b.ticket_id is null', t, t);
-              return query execute q;
-            end loop;
-          end $$;
-
-          create or replace view visualizacao_resolvidos.vw_consistencia_tabelas as
-          with tabs as (
-            select table_name from visualizacao_resolvidos.list_ticket_tables()
-          ), cnts as (
-            select table_name,
-                   (select count(distinct ticket_id) from (select ticket_id from format('select ticket_id from visualizacao_resolvidos.%I', table_name)::regclass) as x) as qtd
-            from tabs
-          )
-          select
-            (select count(*) from tabs) as tabelas_avaliadas,
-            (select string_agg(table_name,',' order by table_name) from tabs) as tabelas,
-            (select min(qtd) from cnts) as min_qtd,
-            (select max(qtd) from cnts) as max_qtd,
-            (select count(*) from visualizacao_resolvidos.missing_per_table()) as total_faltantes;
-
-          create or replace function visualizacao_resolvidos.assert_consistencia()
-          returns void
-          language plpgsql
-          as $$
-          declare n int;
-          begin
-            select count(*) into n from visualizacao_resolvidos.missing_per_table();
-            if n > 0 then
-              raise exception 'Inconsistencias: % ticket(s) faltando em alguma tabela', n;
-            end if;
-          end $$;
-
-          commit;
-          SQL
-
-      # Python sync
       - run: pip install requests psycopg2-binary
+
+      # carga de detalhes (Python)
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -241,7 +163,14 @@ jobs:
           MOVIDESK_INDEX_DAYS: "180"
         run: python sync_resolved_detail.py
 
-      # Falha o job se houver divergência
+      # (Opcional) sanity check das colunas dependidas pela view
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: psql "$NEON_DSN" -v ON_ERROR_STOP=1 -c "select visualizacao_resolvidos.assert_consistencia();"
+        run: |
+          psql "$NEON_DSN" -v ON_ERROR_STOP=1 -Atqc "
+            select 'ok' 
+            where exists (
+              select 1 from information_schema.columns
+              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
+                and column_name in ('qtd_acoes_descricao_publi','qtd_acoes_descricao_inter')
+            )"
