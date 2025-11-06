@@ -12,6 +12,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -74,6 +75,7 @@ jobs:
           delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
           commit;
           SQL
+
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -84,38 +86,70 @@ jobs:
             ticket_id integer primary key,
             acoes jsonb not null
           );
-          alter table visualizacao_resolvidos.resolvidos_acoes
-            add column if not exists qtd_acoes_descricao_publi integer,
-            add column if not exists qtd_acoes_descricao_inter integer;
+
+          create or replace function visualizacao_resolvidos._cleanup_html(t text)
+          returns text
+          language sql
+          immutable
+          as $$
+            select nullif(
+              btrim(
+                regexp_replace(
+                  regexp_replace(
+                    regexp_replace(coalesce($1,''),'(?is)<script.*?</script>',' ','g'),
+                    '(?is)<style.*?</style>',' ','g'
+                  ),
+                  '(?is)<[^>]+>',' ','g'
+                )
+              ),
+              ''
+            )
+          $$;
+
+          create or replace function visualizacao_resolvidos._action_text(e jsonb)
+          returns text
+          language sql
+          immutable
+          as $$
+            select nullif(
+              btrim(
+                coalesce(
+                  nullif(e->>'description',''),
+                  visualizacao_resolvidos._cleanup_html(e->>'htmlDescription')
+                )
+              ),
+              ''
+            )
+          $$;
+
           create or replace function visualizacao_resolvidos.count_desc_by_type(j jsonb, t int)
           returns integer
           language sql
           immutable
           as $$
             select coalesce(count(*),0)
-            from jsonb_array_elements(coalesce($1, '[]'::jsonb)) as e(elem)
-            where length(btrim(coalesce(e.elem->>'description',''))) > 0
-              and coalesce(e.elem->>'isDeleted','false')::boolean = false
+            from jsonb_array_elements(coalesce($1,'[]'::jsonb)) e(elem)
+            where coalesce((e.elem->>'isDeleted')::boolean,false) = false
               and (e.elem->>'type') ~ '^\d+$'
               and (e.elem->>'type')::int = $2
+              and visualizacao_resolvidos._action_text(e.elem) is not null
           $$;
-          create or replace function visualizacao_resolvidos.trg_resolvidos_acoes_counts()
-          returns trigger
-          language plpgsql
-          as $$
-          begin
-            new.qtd_acoes_descricao_publi := visualizacao_resolvidos.count_desc_by_type(new.acoes, 2);
-            new.qtd_acoes_descricao_inter := visualizacao_resolvidos.count_desc_by_type(new.acoes, 1);
-            return new;
-          end $$;
+
           drop trigger if exists trg_resolvidos_acoes_counts on visualizacao_resolvidos.resolvidos_acoes;
-          create trigger trg_resolvidos_acoes_counts
-          before insert or update of acoes
-          on visualizacao_resolvidos.resolvidos_acoes
-          for each row execute function visualizacao_resolvidos.trg_resolvidos_acoes_counts();
-          update visualizacao_resolvidos.resolvidos_acoes set acoes = acoes;
+          drop function if exists visualizacao_resolvidos.trg_resolvidos_acoes_counts();
+
+          alter table visualizacao_resolvidos.resolvidos_acoes
+            drop column if exists qtd_acoes_descricao_publi,
+            drop column if exists qtd_acoes_descricao_inter;
+
+          alter table visualizacao_resolvidos.resolvidos_acoes
+            add column qtd_acoes_descricao_publi integer
+              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,2)) stored,
+            add column qtd_acoes_descricao_inter integer
+              generated always as (visualizacao_resolvidos.count_desc_by_type(acoes,1)) stored;
           commit;
           SQL
+
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -123,8 +157,9 @@ jobs:
           test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "14"
           test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")" = "YES"
           test "$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")" = "detail_control,tickets_resolvidos"
-          psql "$NEON_DSN" -Atqc "select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_publi'"
-          psql "$NEON_DSN" -Atqc "select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_inter'"
+          test "$(psql "$NEON_DSN" -Atqc "select is_generated from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_publi'")" = "ALWAYS"
+          test "$(psql "$NEON_DSN" -Atqc "select is_generated from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_inter'")" = "ALWAYS"
+
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
