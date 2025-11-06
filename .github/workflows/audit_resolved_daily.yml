@@ -1,4 +1,4 @@
-name: Auditoria resolvidos (janela 2d) + backfill
+name: Auditoria resolvidos e backfill
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -12,35 +12,26 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests psycopg2-binary
-
-      # 1) Executa a auditoria (apenas resolvedIn na janela; zera audit_recent_missing antes de gravar)
-      - name: Audit scan (resolvedIn only)
+      - name: Audit scan
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
         run: python audit_recent_resolved_scan.py
-
-      # 2) Reprocessa os ticket_ids faltantes para popular: detail_control, tickets_resolvidos, resolvidos_acoes
-      - name: Backfill missing tickets
+      - name: Backfill missing
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
         run: python reprocess_missing.py
-
-      # 3) Opcional: falhar se ainda existirem faltantes após o backfill
-      - name: Assert no missing after backfill
+      - name: Assert remaining missing
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           python - <<'PY'
           import os, psycopg2
-          dsn=os.environ["NEON_DSN"]
-          with psycopg2.connect(dsn) as c, c.cursor() as cur:
+          with psycopg2.connect(os.environ["NEON_DSN"]) as c, c.cursor() as cur:
             cur.execute("select count(*) from visualizacao_resolvidos.audit_recent_missing")
             n=cur.fetchone()[0]
-            print("missing_after_backfill:", n)
-            # não aborta o job; se quiser abortar, descomente:
-            # import sys; sys.exit(1 if n>0 else 0)
+            print("missing_after_backfill", n)
           PY
