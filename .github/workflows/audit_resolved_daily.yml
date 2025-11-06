@@ -12,13 +12,13 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - name: Audit scan
+      - name: Audit scan (resolvedIn only; mantém só última execução)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
         run: python audit_recent_resolved_scan.py
-      - name: Backfill missing
+      - name: Backfill missing tickets
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
