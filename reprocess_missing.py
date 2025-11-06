@@ -93,33 +93,20 @@ def map_ticket(t: dict):
 
 def fetch_full_ticket(ticket_id: int) -> dict:
     url = f"{API_BASE}/tickets/{ticket_id}"
-    # expandimos owner/clients/organization e actions
-    params = {
-        "token": API_TOKEN,
-        "$expand": "owner,clients($expand=organization),actions"
-    }
+    params = {"token": API_TOKEN, "$expand": "owner,clients($expand=organization),actions"}
     return _req(url, params) or {}
 
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-
     with psycopg2.connect(NEON_DSN) as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            select distinct m.ticket_id
-            from visualizacao_resolvidos.audit_recent_missing m
-            """)
+            cur.execute("select distinct m.ticket_id from visualizacao_resolvidos.audit_recent_missing m")
             ids = [r[0] for r in cur.fetchall()]
-
     if not ids:
-        print("Nada a reprocessar."); return
-
+        return
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
-    rows_ticket = []
-    rows_acoes  = []
-    rows_detail = []
-
+    rows_ticket, rows_acoes, rows_detail = [], [], []
     for tid in ids:
         t = fetch_full_ticket(tid)
         if not isinstance(t, dict) or not t:
@@ -130,7 +117,6 @@ def main():
         last_up = t.get("lastUpdate")
         rows_detail.append((tid, last_up))
         time.sleep(throttle)
-
     with psycopg2.connect(NEON_DSN) as conn:
         with conn.cursor() as cur:
             if rows_ticket:
@@ -140,8 +126,6 @@ def main():
             if rows_detail:
                 psycopg2.extras.execute_batch(cur, UPSERT_DETAIL_SQL, rows_detail, page_size=200)
         conn.commit()
-
-    print(f"Reprocessados: tickets={len(rows_ticket)} acoes={len(rows_acoes)} detail={len(rows_detail)}")
 
 if __name__ == "__main__":
     main()
