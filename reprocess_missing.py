@@ -9,14 +9,14 @@ http.headers.update({"Accept": "application/json"})
 
 def _req(url, params, timeout=90):
     while True:
-        r = http.get(url, params=params, timeout=timeout)
-        if r.status_code in (429, 503):
-            wait = int(r.headers.get("retry-after") or 60)
-            time.sleep(wait); continue
-        if r.status_code == 404:
-            return {}
-        r.raise_for_status()
-        return r.json() if r.text else {}
+      r = http.get(url, params=params, timeout=timeout)
+      if r.status_code in (429, 503):
+        wait = int(r.headers.get("retry-after") or 60)
+        time.sleep(wait); continue
+      if r.status_code == 404:
+        return {}
+      r.raise_for_status()
+      return r.json() if r.text else {}
 
 def _norm_ts(x):
     if not x: return None
@@ -101,7 +101,7 @@ def main():
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
     with psycopg2.connect(NEON_DSN) as conn:
         with conn.cursor() as cur:
-            cur.execute("select distinct m.ticket_id from visualizacao_resolvidos.audit_recent_missing m")
+            cur.execute("select distinct ticket_id from visualizacao_resolvidos.audit_recent_missing")
             ids = [r[0] for r in cur.fetchall()]
     if not ids:
         return
