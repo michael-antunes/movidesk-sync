@@ -1,4 +1,4 @@
-name: Auditoria resolvidos e backfill
+name: Auditoria resolvidos (resolvedIn) + backfill
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -12,19 +12,22 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - name: Audit scan
+
+      - name: Audit scan (resolvedIn only; mantém só última execução)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
         run: python audit_recent_resolved_scan.py
-      - name: Backfill missing
+
+      - name: Backfill missing tickets (detail_control, tickets_resolvidos, resolvidos_acoes)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
         run: python reprocess_missing.py
-      - name: Assert remaining missing
+
+      - name: Assert remaining missing (apenas log)
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -32,6 +35,6 @@ jobs:
           import os, psycopg2
           with psycopg2.connect(os.environ["NEON_DSN"]) as c, c.cursor() as cur:
             cur.execute("select count(*) from visualizacao_resolvidos.audit_recent_missing")
-            n=cur.fetchone()[0]
-            print("missing_after_backfill", n)
+            n = cur.fetchone()[0]
+            print("missing_after_backfill:", n)
           PY
