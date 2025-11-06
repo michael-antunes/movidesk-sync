@@ -77,10 +77,54 @@ jobs:
       - env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
+          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
+          begin;
+          create schema if not exists visualizacao_resolvidos;
+          create table if not exists visualizacao_resolvidos.resolvidos_acoes (
+            ticket_id integer primary key,
+            acoes jsonb not null
+          );
+          alter table visualizacao_resolvidos.resolvidos_acoes
+            add column if not exists qtd_acoes_descricao_publi integer,
+            add column if not exists qtd_acoes_descricao_inter integer;
+          create or replace function visualizacao_resolvidos.count_desc_by_type(j jsonb, t int)
+          returns integer
+          language sql
+          immutable
+          as $$
+            select coalesce(count(*),0)
+            from jsonb_array_elements(coalesce($1, '[]'::jsonb)) as e(elem)
+            where length(btrim(coalesce(e.elem->>'description',''))) > 0
+              and coalesce(e.elem->>'isDeleted','false')::boolean = false
+              and (e.elem->>'type') ~ '^\d+$'
+              and (e.elem->>'type')::int = $2
+          $$;
+          create or replace function visualizacao_resolvidos.trg_resolvidos_acoes_counts()
+          returns trigger
+          language plpgsql
+          as $$
+          begin
+            new.qtd_acoes_descricao_publi := visualizacao_resolvidos.count_desc_by_type(new.acoes, 2);
+            new.qtd_acoes_descricao_inter := visualizacao_resolvidos.count_desc_by_type(new.acoes, 1);
+            return new;
+          end $$;
+          drop trigger if exists trg_resolvidos_acoes_counts on visualizacao_resolvidos.resolvidos_acoes;
+          create trigger trg_resolvidos_acoes_counts
+          before insert or update of acoes
+          on visualizacao_resolvidos.resolvidos_acoes
+          for each row execute function visualizacao_resolvidos.trg_resolvidos_acoes_counts();
+          update visualizacao_resolvidos.resolvidos_acoes set acoes = acoes;
+          commit;
+          SQL
+      - env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
           set -e
           test "$(psql "$NEON_DSN" -Atqc "select count(*) from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos'")" = "14"
           test "$(psql "$NEON_DSN" -Atqc "select is_nullable from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='tickets_resolvidos' and column_name='last_resolved_at'")" = "YES"
           test "$(psql "$NEON_DSN" -Atqc "select string_agg(name,',' order by name) from visualizacao_resolvidos.sync_control")" = "detail_control,tickets_resolvidos"
+          psql "$NEON_DSN" -Atqc "select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_publi'"
+          psql "$NEON_DSN" -Atqc "select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes' and column_name='qtd_acoes_descricao_inter'"
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
