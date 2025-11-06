@@ -175,29 +175,49 @@ def fetch_custom_for_tickets(ticket_ids, custom_id):
         time.sleep(throttle)
     return out
 
+def ids_with_null_custom(conn, limit_ids):
+    open_ids = []
+    res_ids = []
+    with conn.cursor() as cur:
+        cur.execute("""
+            select id::int
+            from visualizacao_atual.movidesk_tickets_abertos
+            where adicional_137641_avaliado_csat is null
+            order by id desc
+            limit %s
+        """, (limit_ids,))
+        open_ids = [r[0] for r in cur.fetchall()]
+        cur.execute("""
+            select ticket_id::int
+            from visualizacao_resolvidos.tickets_resolvidos
+            where adicional_137641_avaliado_csat is null
+            order by ticket_id desc
+            limit %s
+        """, (limit_ids,))
+        res_ids = [r[0] for r in cur.fetchall()]
+    ids = set()
+    ids.update([i for i in open_ids if i is not None])
+    ids.update([i for i in res_ids if i is not None])
+    return sorted(ids)
+
 def update_custom_in_tables(conn, values_map):
     if not values_map:
         return 0, 0
-    open_rows = []
-    res_rows = []
-    for tid, val in values_map.items():
-        open_rows.append({"id": int(tid), "val": val if val not in ("", None) else None})
-        res_rows.append({"id": int(tid), "val": val if val not in ("", None) else None})
-    n1 = 0
-    n2 = 0
+    open_rows = [{"id": int(tid), "val": (val if val not in ("", None) else None)} for tid, val in values_map.items()]
+    res_rows  = [{"id": int(tid), "val": (val if val not in ("", None) else None)} for tid, val in values_map.items()]
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, """
             update visualizacao_atual.movidesk_tickets_abertos
             set adicional_137641_avaliado_csat = %(val)s
             where id = %(id)s
         """, open_rows, page_size=500)
-        n1 = cur.rowcount
+        n1 = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         psycopg2.extras.execute_batch(cur, """
             update visualizacao_resolvidos.tickets_resolvidos
             set adicional_137641_avaliado_csat = %(val)s
             where ticket_id = %(id)s
         """, res_rows, page_size=500)
-        n2 = cur.rowcount
+        n2 = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     conn.commit()
     return n1, n2
 
@@ -208,6 +228,8 @@ def main():
     overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
     force_backfill_days = os.getenv("FORCE_BACKFILL_DAYS")
     custom_id = int(os.getenv("MOVIDESK_CUSTOM_ID", "137641"))
+    limit_ids = int(os.getenv("MOVIDESK_LIMIT_IDS", "1500"))
+
     conn = psycopg2.connect(NEON_DSN)
     try:
         if force_backfill_days and force_backfill_days.isdigit():
@@ -215,16 +237,21 @@ def main():
         else:
             since_dt = get_since_from_db(conn, days_back, overlap_minutes)
         since_iso = to_iso_z(since_dt)
+
         resp = fetch_smiley_responses(since_iso)
         rows = [map_row(x) for x in resp if isinstance(x, dict)]
-        n = upsert_rows(conn, rows)
-        tids = sorted({r["ticket_id"] for r in rows if r.get("ticket_id") is not None})
-        if tids:
-            vals = fetch_custom_for_tickets(tids, custom_id)
-            n1, n2 = update_custom_in_tables(conn, vals)
-            print(f"DESDE {since_iso} | UPSERT: {n} respostas | AD137641 abertos atualizados: {n1} | resolvidos atualizados: {n2}")
-        else:
-            print(f"DESDE {since_iso} | UPSERT: {n} respostas | Nenhum ticket para atualizar AD137641")
+        n_resp = upsert_rows(conn, rows)
+
+        tids_from_resp = {r["ticket_id"] for r in rows if r.get("ticket_id") is not None}
+        backlog_ids = ids_with_null_custom(conn, limit_ids)
+        all_ids = sorted({int(x) for x in tids_from_resp.union(backlog_ids)})
+
+        n1 = n2 = 0
+        if all_ids:
+            values = fetch_custom_for_tickets(all_ids, custom_id)
+            n1, n2 = update_custom_in_tables(conn, values)
+
+        print(f"DESDE {since_iso} | UPSERT respostas: {n_resp} | Atualizado adicional 137641 -> abertos:{n1} resolvidos:{n2}")
     finally:
         conn.close()
 
