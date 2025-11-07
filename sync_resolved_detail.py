@@ -1,174 +1,193 @@
+#!/usr/bin/env python3
 import os
 import time
-import datetime
-import requests
+import logging
+import argparse
+from typing import Iterable, Dict, Any, List, Optional
+
 import psycopg2
 import psycopg2.extras
+import requests
 
-API_BASE = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-NEON_DSN = os.getenv("NEON_DSN")
+LOG = logging.getLogger("sync_resolved_detail")
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)7s  %(message)s",
+)
 
-http = requests.Session()
-http.headers.update({"Accept": "application/json"})
+MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+DSN = os.environ["NEON_DSN"]
+THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.25"))
 
-def _req(url, params, timeout=90):
-    while True:
-        r = http.get(url, params=params, timeout=timeout)
-        if r.status_code in (429, 503):
-            retry = r.headers.get("retry-after")
-            wait = int(retry) if str(retry).isdigit() else 60
-            time.sleep(wait)
-            continue
-        if r.status_code == 404:
-            return []
-        r.raise_for_status()
-        return r.json() if r.text else []
-
-def _utc_now():
-    return datetime.datetime.now(datetime.timezone.utc)
-
-def _as_utc(dt):
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(datetime.timezone.utc)
-
-def _iso_z(dt):
-    return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-
-def _get_since(conn, job_name):
-    with conn.cursor() as cur:
-        cur.execute("select last_update from visualizacao_resolvidos.sync_control where name=%s", (job_name,))
-        row = cur.fetchone()
-    base = _as_utc(row[0]) if row and row[0] else None
-    if not base:
-        days = int(os.getenv("MOVIDESK_INDEX_DAYS", "180"))
-        base = _utc_now() - datetime.timedelta(days=days)
-    since = base - datetime.timedelta(hours=4)
-    return since
-
-def iint(x):
-    try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
-    except Exception:
-        return None
-
-def norm_ts(x):
-    if not x:
-        return None
-    s = str(x).strip()
-    if not s or s.startswith("0001-01-01"):
-        return None
-    return s
-
-def fetch_details(since_iso):
-    url = f"{API_BASE}/tickets"
-    top = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
-    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-    skip = 0
-    select_fields = ",".join([
-        "id","status","baseStatus","resolvedIn","closedIn","lastUpdate",
-        "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
-    ])
-    expand = "owner,clients($expand=organization)"
-    filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge " + since_iso
-    items = []
-    while True:
-        page = _req(url, {
-            "token": API_TOKEN,
-            "$select": select_fields,
-            "$expand": expand,
-            "$filter": filtro,
-            "$orderby": "lastUpdate asc",
-            "$top": top,
-            "$skip": skip
-        }) or []
-        if not isinstance(page, list) or not page:
-            break
-        items.extend(page)
-        if len(page) < top:
-            break
-        skip += len(page)
-        time.sleep(throttle)
-    return items
-
-def map_row(t):
-    tid = t.get("id")
-    if isinstance(tid, str) and tid.isdigit():
-        tid = int(tid)
-    owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    c0 = clients[0] if isinstance(clients, list) and clients else {}
-    org = c0.get("organization") or {}
-    s1 = t.get("serviceFirstLevel")
-    s2 = t.get("serviceSecondLevel")
-    s3 = t.get("serviceThirdLevel")
-    return {
-        "ticket_id": tid,
-        "status": (t.get("baseStatus") or t.get("status") or None),
-        "last_resolved_at": norm_ts(t.get("resolvedIn")),
-        "last_closed_at": norm_ts(t.get("closedIn")),
-        "responsible_id": iint(owner.get("id")),
-        "responsible_name": owner.get("businessName"),
-        "organization_id": org.get("id"),
-        "organization_name": org.get("businessName"),
-        "origin": t.get("origin") or t.get("originName"),
-        "category": t.get("category"),
-        "urgency": t.get("urgency"),
-        "service_first_level": s3,
-        "service_second_level": s2,
-        "service_third_level": s1
-    }
+# Campos que iremos coletar no Movidesk
+SELECT_FIELDS = ",".join([
+    "id",
+    "status",
+    "resolvedIn",
+    "closedIn",
+    "canceledIn",              # <- importante!
+    "responsibleId",
+    "responsibleName",
+    "organizationId",
+    "organizationName",
+    "origin",
+    "category",
+    "urgency",
+    "serviceFirstLevel",
+    "serviceSecondLevel",
+    "serviceThirdLevel",
+])
 
 UPSERT_SQL = """
-insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name,origin,category,urgency,service_first_level,service_second_level,service_third_level)
-values
-(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s)
-on conflict (ticket_id) do update set
-  status = excluded.status,
-  last_resolved_at = excluded.last_resolved_at,
-  last_closed_at = excluded.last_closed_at,
-  responsible_id = excluded.responsible_id,
-  responsible_name = excluded.responsible_name,
-  organization_id = excluded.organization_id,
-  organization_name = excluded.organization_name,
-  origin = excluded.origin,
-  category = excluded.category,
-  urgency = excluded.urgency,
-  service_first_level = excluded.service_first_level,
-  service_second_level = excluded.service_second_level,
-  service_third_level = excluded.service_third_level
+INSERT INTO visualizacao_resolvidos.tickets_resolvidos (
+  ticket_id, status,
+  last_resolved_at, last_closed_at, last_cancelled_at,
+  responsible_id, responsible_name,
+  organization_id, organization_name,
+  origin, category, urgency,
+  service_first_level, service_second_level, service_third_level
+) VALUES (
+  %(ticket_id)s, %(status)s,
+  %(last_resolved_at)s, %(last_closed_at)s, %(last_cancelled_at)s,
+  %(responsible_id)s, %(responsible_name)s,
+  %(organization_id)s, %(organization_name)s,
+  %(origin)s, %(category)s, %(urgency)s,
+  %(service_first_level)s, %(service_second_level)s, %(service_third_level)s
+)
+ON CONFLICT (ticket_id) DO UPDATE SET
+  status               = EXCLUDED.status,
+  last_resolved_at     = EXCLUDED.last_resolved_at,
+  last_closed_at       = EXCLUDED.last_closed_at,
+  last_cancelled_at    = EXCLUDED.last_cancelled_at,
+  responsible_id       = EXCLUDED.responsible_id,
+  responsible_name     = EXCLUDED.responsible_name,
+  organization_id      = EXCLUDED.organization_id,
+  organization_name    = EXCLUDED.organization_name,
+  origin               = EXCLUDED.origin,
+  category             = EXCLUDED.category,
+  urgency              = EXCLUDED.urgency,
+  service_first_level  = EXCLUDED.service_first_level,
+  service_second_level = EXCLUDED.service_second_level,
+  service_third_level  = EXCLUDED.service_third_level
 """
 
-def upsert_details(conn, rows):
-    if not rows:
-        return 0
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=300)
-    conn.commit()
-    return len(rows)
+# ---------------------- Movidesk helpers ----------------------
 
-def mark_job_end(conn, job_name):
-    with conn.cursor() as cur:
-        cur.execute("update visualizacao_resolvidos.sync_control set last_update = now() where name=%s", (job_name,))
-        if cur.rowcount == 0:
-            cur.execute("insert into visualizacao_resolvidos.sync_control(name,last_update) values(%s, now())", (job_name,))
-    conn.commit()
+session = requests.Session()
+session.headers.update({"Content-Type": "application/json; charset=utf-8"})
+
+def md_get_ticket(ticket_id: int) -> Dict[str, Any]:
+    """
+    Busca um ticket por ID usando OData (1 request por ID -> mais robusto).
+    """
+    params = {
+        "token": TOKEN,
+        "$select": SELECT_FIELDS,
+        "$filter": f"id eq {ticket_id}",
+        "$top": 1,
+    }
+    # NÃO usar $take (Movidesk não suporta) e NÃO colocar aspas em valores datetimetz do filtro.
+    url = f"{MOVIDESK_BASE}/tickets"
+    r = session.get(url, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+    payload = r.json()
+    if not payload:
+        raise KeyError(f"Ticket {ticket_id} não retornou na API")
+    return payload[0]
+
+def norm_ts(v: Optional[str]) -> Optional[str]:
+    """
+    Normaliza campos datetime da API para None/ISO.
+    A API pode retornar null, string vazia ou '0001-01-01T00:00:00Z' para 'vazio'.
+    """
+    if not v or v == "0001-01-01T00:00:00Z":
+        return None
+    return v  # psycopg2 aceita ISO 8601 e grava como timestamptz
+
+def row_from_ticket(t: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ticket_id": int(t["id"]),
+        "status": t.get("status"),
+        "last_resolved_at":  norm_ts(t.get("resolvedIn")),
+        "last_closed_at":    norm_ts(t.get("closedIn")),
+        "last_cancelled_at": norm_ts(t.get("canceledIn")),  # <- aqui!
+        "responsible_id":    t.get("responsibleId"),
+        "responsible_name":  t.get("responsibleName"),
+        "organization_id":   t.get("organizationId"),
+        "organization_name": t.get("organizationName"),
+        "origin":            t.get("origin"),
+        "category":          t.get("category"),
+        "urgency":           t.get("urgency"),
+        "service_first_level":  t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level":  t.get("serviceThirdLevel"),
+    }
+
+# ---------------------- DB helpers ----------------------
+
+def get_ids_to_fill_cancelled(cur) -> List[int]:
+    """
+    Se nenhum ID for passado na linha de comando, o script preenche
+    todos os tickets CANCELADOS que ainda não têm last_cancelled_at.
+    """
+    cur.execute("""
+        SELECT ticket_id
+        FROM visualizacao_resolvidos.tickets_resolvidos
+        WHERE status ILIKE 'canc%'                -- Canceled/Cancelled
+          AND last_cancelled_at IS NULL
+        ORDER BY ticket_id
+        LIMIT 1000
+    """)
+    return [r[0] for r in cur.fetchall()]
+
+def upsert_ticket(cur, row: Dict[str, Any]) -> None:
+    cur.execute(UPSERT_SQL, row)
+
+# ---------------------- main ----------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Sync detail (tickets_resolvidos) incluindo last_cancelled_at")
+    p.add_argument("--ids", help="Lista de IDs separados por vírgula (opcional). Se não informar, busca no banco os cancelados sem data.")
+    return p.parse_args()
 
 def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-    with psycopg2.connect(NEON_DSN) as conn:
-        since_dt = _get_since(conn, "tickets_resolvidos")
-        since_iso = _iso_z(since_dt)
-        items = fetch_details(since_iso)
-        rows = [map_row(t) for t in items if isinstance(t, dict) and str(t.get("id","")).isdigit()]
-        upsert_details(conn, rows)
-        mark_job_end(conn, "tickets_resolvidos")
+    args = parse_args()
+
+    with psycopg2.connect(DSN) as conn:
+        conn.autocommit = False
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+
+            if args.ids:
+                ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
+            else:
+                ids = get_ids_to_fill_cancelled(cur)
+
+            if not ids:
+                LOG.info("Nenhum ID para processar.")
+                return
+
+            LOG.info("Processando %d ticket(s)...", len(ids))
+
+            processed = 0
+            for i, ticket_id in enumerate(ids, start=1):
+                try:
+                    t = md_get_ticket(ticket_id)
+                    row = row_from_ticket(t)
+                    upsert_ticket(cur, row)
+                    processed += 1
+                    if THROTTLE > 0:
+                        time.sleep(THROTTLE)
+                except Exception as e:
+                    LOG.error("Falha no ticket %s: %s", ticket_id, e, exc_info=False)
+
+                if i % 50 == 0:
+                    conn.commit()
+                    LOG.info("Checkpoint: %d/%d confirmados", i, len(ids))
+
+            conn.commit()
+            LOG.info("Finalizado. %d ticket(s) gravados/atualizados.", processed)
 
 if __name__ == "__main__":
     main()
