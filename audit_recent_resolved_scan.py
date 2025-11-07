@@ -1,209 +1,242 @@
+# audit_recent_resolved_scan.py
+# -*- coding: utf-8 -*-
+
 import os
 import time
-import datetime
+import math
+import json
+import datetime as dt
+from typing import Iterable, List, Dict, Any, Tuple
+
 import requests
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import execute_values
 
-API_BASE = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-NEON_DSN = os.getenv("NEON_DSN")
 
-http = requests.Session()
-http.headers.update({"Accept": "application/json"})
+API_URL = "https://api.movidesk.com/public/v1/tickets"
+# Campos mínimos: só precisamos dos IDs + carimbos para filtrar
+API_FIELDS = "id,baseStatus,resolvedIn,closedIn"
+PAGE_SIZE = 1000  # conforme pedido
+THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.25"))  # segundos entre chamadas
 
-def _req(url, params, timeout=90):
-    while True:
-        r = http.get(url, params=params, timeout=timeout)
-        if r.status_code in (429, 503):
-            wait = int(r.headers.get("retry-after") or 60)
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        return r.json() if r.text else []
 
-def _utc_now():
-    return datetime.datetime.now(datetime.timezone.utc)
+def _env(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        raise RuntimeError(f"Variável de ambiente obrigatória ausente: {name}")
+    return v
 
-def _iso_z(dt):
-    return dt.replace(microsecond=0).astimezone(datetime.timezone.utc) \
-             .isoformat().replace("+00:00", "Z")
 
-def fetch_ids_by_field(window_from, window_to, field_name, page_size, throttle):
-    """Retorna {ticket_id: (datetime_iso, 'resolved'|'closed')}"""
-    url = f"{API_BASE}/tickets"
-    skip = 0
-    out = {}
-    filtro = f"({field_name} ge {_iso_z(window_from)} and {field_name} le {_iso_z(window_to)})"
-    while True:
-        page = _req(url, {
-            "token": API_TOKEN,
-            "$select": f"id,{field_name}",
-            "$filter": filtro,
-            "$orderby": f"{field_name} asc",
-            "$top": page_size,
-            "$skip": skip,
-        }) or []
-        if not page:
-            break
-        for t in page:
-            tid = t.get("id")
-            if not str(tid).isdigit():
-                continue
-            when = t.get(field_name)
-            if not when:
-                continue
-            tid = int(tid)
-            tag = "resolved" if field_name == "resolvedIn" else "closed"
-            # resolved tem prioridade
-            if tag == "resolved" or tid not in out:
-                out[tid] = (when, tag)
-        if len(page) < page_size:
-            break
-        skip += len(page)
-        time.sleep(throttle)
-    return out
+def ensure_sql_objects(cur) -> None:
+    """
+    Garante as tabelas/índices/constraints exatamente como você tem hoje.
+    Também acerta DEFAULT 0 para missing_total (evita violar NOT NULL no insert do run).
+    """
+    cur.execute("""
+    create schema if not exists visualizacao_resolvidos;
 
-DDL = """
-begin;
-create schema if not exists visualizacao_resolvidos;
+    create table if not exists visualizacao_resolvidos.audit_recent_run (
+      id            bigserial primary key,
+      started_at    timestamptz not null default now(),
+      window_start  timestamptz not null,
+      window_end    timestamptz not null,
+      total_api     integer not null,
+      missing_total integer not null default 0
+    );
 
--- Tabela de runs com SEU layout:
-create table if not exists visualizacao_resolvidos.audit_recent_run (
-  id bigserial primary key,
-  started_at timestamptz not null default now(),
-  window_start timestamptz not null,
-  window_end   timestamptz not null,
-  total_api    integer     not null,
-  missing_total integer    not null default 0
-);
+    -- Garante DEFAULT 0 caso a tabela já exista sem default
+    alter table visualizacao_resolvidos.audit_recent_run
+      alter column missing_total set default 0;
 
--- Tabela de faltantes (mantemos run_id -> audit_recent_run.id)
-create table if not exists visualizacao_resolvidos.audit_recent_missing (
-  run_id    bigint not null,
-  table_name text  not null,
-  ticket_id integer not null
-);
+    create table if not exists visualizacao_resolvidos.audit_recent_missing (
+      run_id     bigint not null
+                 references visualizacao_resolvidos.audit_recent_run(id)
+                 on delete cascade,
+      table_name text   not null,
+      ticket_id  integer not null
+    );
 
--- Garantir colunas extras (caso já exista sem elas):
-do $$
-begin
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos'
-      and table_name='audit_recent_missing'
-      and column_name='event_in'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_missing add column event_in timestamptz';
-  end if;
+    -- Evita duplicar a mesma ausência na mesma execução
+    create unique index if not exists ux_audit_recent_missing
+      on visualizacao_resolvidos.audit_recent_missing(run_id, table_name, ticket_id);
+    """)
 
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos'
-      and table_name='audit_recent_missing'
-      and column_name='event_type'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_missing add column event_type text';
-  end if;
-end $$;
+    # Opcional: checa a existência das três tabelas de destino (apenas warning se não houver)
+    cur.execute("""
+      select n.nspname as schema, c.relname as table
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind = 'r'
+        and n.nspname = 'visualizacao_resolvidos'
+        and c.relname in ('tickets_resolvidos','resolvidos_acoes','detail_control')
+      order by c.relname;
+    """)
+    found = {row[1] for row in cur.fetchall()}
+    expected = {'tickets_resolvidos','resolvidos_acoes','detail_control'}
+    missing = expected - found
+    if missing:
+        print("[WARN] Tabelas não encontradas no schema visualizacao_resolvidos:", ", ".join(sorted(missing)))
 
--- manter somente a última execução
-truncate table visualizacao_resolvidos.audit_recent_missing;
 
-commit;
-"""
+def movidesk_get_tickets(token: str, date_from: dt.datetime, date_to: dt.datetime) -> List[int]:
+    """
+    Busca IDs de tickets que tenham resolvedIn OU closedIn dentro do intervalo [date_from, date_to].
+    """
+    ids: List[int] = []
 
-def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Configure MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+    # Movidesk aceita filtros com 'resolvedIn ge ... and resolvedIn le ...' etc.
+    # Se fechado ou resolvido na janela, queremos.
+    # Observação: API do Movidesk aceita pageSize e page (1-based). Usamos 1000 como você pediu.
+    df = date_from.isoformat()
+    dt_ = date_to.isoformat()
 
-    now = _utc_now()
-    window_to = now
-    window_from = now - datetime.timedelta(days=2)
+    # Dois filtros: resolvedIn e closedIn. Mesclamos resultados.
+    filters = [
+        f"(resolvedIn ge {json.dumps(df)} and resolvedIn le {json.dumps(dt_)})",
+        f"(closedIn   ge {json.dumps(df)} and closedIn   le {json.dumps(dt_)})"
+    ]
 
-    page_size = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
-    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json; charset=utf-8"})
 
-    # API: resolvedIn & closedIn
-    resolved_map = fetch_ids_by_field(window_from, window_to, "resolvedIn", page_size, throttle)
-    closed_map   = fetch_ids_by_field(window_from, window_to, "closedIn",   page_size, throttle)
-    api_map = dict(closed_map)
-    api_map.update(resolved_map)  # resolved tem prioridade
-    api_ids = set(api_map.keys())
+    for flt in filters:
+        page = 1
+        while True:
+            params = {
+                "token": token,
+                "$select": API_FIELDS,
+                "$filter": flt,
+                "pageSize": PAGE_SIZE,
+                "page": page
+            }
+            resp = session.get(API_URL, params=params, timeout=60)
+            if resp.status_code != 200:
+                raise RuntimeError(f"Movidesk HTTP {resp.status_code}: {resp.text}")
 
-    # DDL / garantias
-    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
-        cur.execute(DDL)
+            data = resp.json()
+            if not isinstance(data, list):
+                # Quando a API devolve objeto com 'message' etc.
+                raise RuntimeError(f"Resposta inesperada da API Movidesk: {data}")
+
+            if not data:
+                break
+
+            new_ids = [int(x["id"]) for x in data if "id" in x]
+            ids.extend(new_ids)
+
+            print(f"[Movidesk] filtro={flt} | page={page} | recebidos={len(new_ids)}")
+            if len(new_ids) < PAGE_SIZE:
+                break
+            page += 1
+            time.sleep(THROTTLE)
+
+    # remove duplicados (ticket pode aparecer nos dois filtros)
+    ids = sorted(set(ids))
+    print(f"[Movidesk] total único de IDs no período: {len(ids)}")
+    return ids
+
+
+def split_chunks(seq: List[int], size: int = 500) -> Iterable[List[int]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
+
+
+def find_missing(cur, table: str, ids: List[int]) -> List[Tuple[str, int]]:
+    """
+    Retorna pares (table, ticket_id) que estão faltando na tabela informada.
+    table ∈ {'tickets_resolvidos','resolvidos_acoes','detail_control'}
+    """
+    missing: List[Tuple[str, int]] = []
+    if not ids:
+        return missing
+
+    # Monta checagem em lotes para não estourar o limite de parâmetros
+    for chunk in split_chunks(ids, 5000):
+        q = f"""
+        with src(id) as (
+          select unnest(%s::int[])
+        )
+        select s.id
+        from src s
+        left join visualizacao_resolvidos.{table} t
+          on t.ticket_id = s.id
+        where t.ticket_id is null
+        """
+        cur.execute(q, (chunk,))
+        rows = cur.fetchall()
+        for (ticket_id,) in rows:
+            missing.append((table, int(ticket_id)))
+    return missing
+
+
+def main() -> None:
+    token = _env("MOVIDESK_TOKEN")
+    dsn = _env("NEON_DSN")
+
+    # Janela: últimos 2 dias (UTC). Ajuste se quiser timezone local.
+    now = dt.datetime.now(dt.timezone.utc)
+    window_end = now
+    window_start = now - dt.timedelta(days=2)
+
+    with psycopg2.connect(dsn) as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            # Garante estruturas
+            ensure_sql_objects(cur)
+            conn.commit()
+
+        # 1) Busca IDs na API (resolvidos ou fechados)
+        ids = movidesk_get_tickets(token, window_start, window_end)
+        total_api = len(ids)
+
+        with conn.cursor() as cur:
+            # 2) Abre um "run" com missing_total=0 (tem DEFAULT 0)
+            cur.execute("""
+                insert into visualizacao_resolvidos.audit_recent_run
+                  (window_start, window_end, total_api, missing_total)
+                values (%s, %s, %s, 0)
+                returning id
+            """, (window_start, window_end, total_api))
+            run_id = cur.fetchone()[0]
+            print(f"[RUN] id={run_id} total_api={total_api}")
+
+            # 3) Checa ausências nas três tabelas
+            missing_all: List[Tuple[str, int]] = []
+            for table in ("tickets_resolvidos", "resolvidos_acoes", "detail_control"):
+                miss = find_missing(cur, table, ids)
+                print(f"[MISSING] {table}: {len(miss)} ausentes")
+                missing_all.extend(miss)
+
+            # 4) Insere em audit_recent_missing (deduplicado pelo índice único)
+            if missing_all:
+                execute_values(
+                    cur,
+                    """
+                    insert into visualizacao_resolvidos.audit_recent_missing
+                      (run_id, table_name, ticket_id)
+                    values %s
+                    on conflict do nothing
+                    """,
+                    [(run_id, t, i) for (t, i) in missing_all],
+                    template="(%s,%s,%s)"
+                )
+
+            # 5) Atualiza o missing_total do run com o que foi parar em audit_recent_missing
+            cur.execute("""
+                update visualizacao_resolvidos.audit_recent_run r
+                   set missing_total = coalesce(m.cnt, 0)
+                from (
+                  select run_id, count(*)::int as cnt
+                  from visualizacao_resolvidos.audit_recent_missing
+                  where run_id = %s
+                  group by 1
+                ) m
+                where r.id = %s
+            """, (run_id, run_id))
+
         conn.commit()
+        print("[OK] Execução concluída.")
 
-    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
-        # conjuntos locais
-        cur.execute("select ticket_id from visualizacao_resolvidos.tickets_resolvidos")
-        local_tickets = {r[0] for r in cur.fetchall()}
-
-        cur.execute("select ticket_id from visualizacao_resolvidos.resolvidos_acoes")
-        local_acoes = {r[0] for r in cur.fetchall()}
-
-        cur.execute("select ticket_id from visualizacao_resolvidos.detail_control")
-        local_detail = {r[0] for r in cur.fetchall()}
-
-        # abre run no seu layout e pega id
-        cur.execute("""
-            insert into visualizacao_resolvidos.audit_recent_run
-              (window_start, window_end, total_api)
-            values (%s, %s, %s)
-            returning id
-        """, (window_from, window_to, len(api_ids)))
-        run_id = cur.fetchone()[0]
-
-        # popula missing por tabela
-        missing_rows = []
-        for tid in api_ids:
-            when, etype = api_map.get(tid)
-            if tid not in local_tickets:
-                missing_rows.append((run_id, "tickets_resolvidos", tid, when, etype))
-            if tid not in local_acoes:
-                missing_rows.append((run_id, "resolvidos_acoes", tid, when, etype))
-            if tid not in local_detail:
-                missing_rows.append((run_id, "detail_control", tid, when, etype))
-
-        if missing_rows:
-            psycopg2.extras.execute_batch(
-                cur,
-                """
-                insert into visualizacao_resolvidos.audit_recent_missing
-                  (run_id, table_name, ticket_id, event_in, event_type)
-                values (%s,%s,%s,%s,%s)
-                """,
-                missing_rows, page_size=1000
-            )
-
-        # atualiza somente missing_total (seu layout)
-        cur.execute("""
-            update visualizacao_resolvidos.audit_recent_run
-               set missing_total = %s
-             where id = %s
-        """, (len(missing_rows), run_id))
-
-        # índices úteis (idempotentes)
-        cur.execute("""
-        do $$
-        begin
-          if not exists (
-            select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
-            where c.relname='ix_audit_missing_run' and n.nspname='visualizacao_resolvidos'
-          ) then
-            execute 'create index ix_audit_missing_run on visualizacao_resolvidos.audit_recent_missing(run_id)';
-          end if;
-          if not exists (
-            select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
-            where c.relname='ix_audit_missing_ticket' and n.nspname='visualizacao_resolvidos'
-          ) then
-            execute 'create index ix_audit_missing_ticket on visualizacao_resolvidos.audit_recent_missing(ticket_id)';
-          end if;
-        end $$;
-        """)
-        conn.commit()
 
 if __name__ == "__main__":
     main()
