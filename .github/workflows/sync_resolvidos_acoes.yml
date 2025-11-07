@@ -11,72 +11,19 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
-          begin;
-          create schema if not exists visualizacao_resolvidos;
-          create table if not exists visualizacao_resolvidos.resolvidos_acoes (
-            ticket_id integer primary key,
-            acoes jsonb not null default '[]'::jsonb
-          );
-          do $$
-          begin
-            if not exists (
-              select 1 from information_schema.columns
-              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
-                and column_name='qtd_acoes_descricao_publi'
-            ) then
-              alter table visualizacao_resolvidos.resolvidos_acoes
-                add column qtd_acoes_descricao_publi integer;
-            end if;
-            if not exists (
-              select 1 from information_schema.columns
-              where table_schema='visualizacao_resolvidos' and table_name='resolvidos_acoes'
-                and column_name='qtd_acoes_descricao_inter'
-            ) then
-              alter table visualizacao_resolvidos.resolvidos_acoes
-                add column qtd_acoes_descricao_inter integer;
-            end if;
-          end $$;
-          create or replace function visualizacao_resolvidos._count_desc_publi(js jsonb)
-          returns integer language sql immutable as $$
-            select coalesce(sum(
-              case
-                when coalesce((a->>'type')::int,0) = 2
-                 and nullif(a->>'description','') is not null then 1 else 0 end
-            ),0)
-            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
-          $$;
-          create or replace function visualizacao_resolvidos._count_desc_inter(js jsonb)
-          returns integer language sql immutable as $$
-            select coalesce(sum(
-              case
-                when coalesce((a->>'type')::int,0) = 1
-                 and nullif(a->>'description','') is not null then 1 else 0 end
-            ),0)
-            from jsonb_array_elements(coalesce(js,'[]'::jsonb)) as a;
-          $$;
-          create or replace function visualizacao_resolvidos._resolvidos_acoes_fill_counts()
-          returns trigger language plpgsql as $$
-          begin
-            new.qtd_acoes_descricao_publi := visualizacao_resolvidos._count_desc_publi(new.acoes);
-            new.qtd_acoes_descricao_inter := visualizacao_resolvidos._count_desc_inter(new.acoes);
-            return new;
-          end $$;
-          do $$
-          begin
-            if exists (
-              select 1 from pg_trigger
-              where tgname='tr_resolvidos_acoes_fill_counts'
-                and tgrelid='visualizacao_resolvidos.resolvidos_acoes'::regclass
-            ) then
-              drop trigger tr_resolvidos_acoes_fill_counts on visualizacao_resolvidos.resolvidos_acoes;
-            end if;
-          end $$;
-          create trigger tr_resolvidos_acoes_fill_counts
-          before insert or update of acoes on visualizacao_resolvidos.resolvidos_acoes
-          for each row execute function visualizacao_resolvidos._resolvidos_acoes_fill_counts();
-          update visualizacao_resolvidos.resolvidos_acoes
-          set
-            qtd_acoes_descricao_publi = visualizacao_resolvidos._count_desc_publi(acoes),
-            qtd_acoes_descricao_inter = visualizacao_resolvidos._count_desc_inter(acoes);
-          commit;
+          BEGIN;
+
+          -- NADA de CREATE/ALTER/UPDATE nas colunas geradas.
+          -- Só limpamos artefatos antigos, se existirem:
+
+          -- Trigger antiga (não é mais usada com colunas GENERATED):
+          DROP TRIGGER IF EXISTS tr_resolvidos_acoes_fill_counts
+            ON visualizacao_resolvidos.resolvidos_acoes;
+
+          -- Funções antigas da trigger (opcional):
+          DROP FUNCTION IF EXISTS visualizacao_resolvidos._resolvidos_acoes_fill_counts();
+          DROP FUNCTION IF EXISTS visualizacao_resolvidos._count_desc_publi(jsonb);
+          DROP FUNCTION IF EXISTS visualizacao_resolvidos._count_desc_inter(jsonb);
+
+          COMMIT;
           SQL
