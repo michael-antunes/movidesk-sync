@@ -1,131 +1,221 @@
-import os, time, requests, datetime, psycopg2, psycopg2.extras
+#!/usr/bin/env python3
+import os, time, json, sys
+import requests
+import psycopg2
+from psycopg2.extras import execute_batch
 
-API_BASE  = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-NEON_DSN  = os.getenv("NEON_DSN")
+API_BASE = "https://api.movidesk.com/public/v1"
 
-http = requests.Session()
-http.headers.update({"Accept": "application/json"})
+def env(name, default=None, required=False):
+    val = os.getenv(name, default)
+    if required and not val:
+        print(f"Missing env {name}", file=sys.stderr); sys.exit(1)
+    return val
 
-def _req(url, params, timeout=90):
-    while True:
-      r = http.get(url, params=params, timeout=timeout)
-      if r.status_code in (429, 503):
-        wait = int(r.headers.get("retry-after") or 60)
-        time.sleep(wait); continue
-      if r.status_code == 404:
-        return {}
-      r.raise_for_status()
-      return r.json() if r.text else {}
+TOKEN   = env("MOVIDESK_TOKEN", required=True)
+DSN     = env("NEON_DSN", required=True)
+THROTTLE= float(env("MOVIDESK_THROTTLE", "0.25"))
+RUN_ID_OVERRIDE = os.getenv("AUDIT_RUN_ID")  # opcional: processar um run específico
 
-def _norm_ts(x):
-    if not x: return None
-    s = str(x).strip()
-    if not s or s.startswith("0001-01-01"):
-        return None
-    return s
+# ---------- Movidesk helpers ----------
 
-def _iint(x):
-    try:
-        s = str(x); return int(s) if s.isdigit() else None
-    except Exception:
-        return None
+def http_get(url):
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+    return r.json()
 
-UPSERT_TICKET_SQL = """
-insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,last_resolved_at,last_closed_at,responsible_id,responsible_name,organization_id,organization_name,origin,category,urgency,service_first_level,service_second_level,service_third_level)
-values
-(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s)
-on conflict (ticket_id) do update set
-  status = excluded.status,
-  last_resolved_at = excluded.last_resolved_at,
-  last_closed_at = excluded.last_closed_at,
-  responsible_id = excluded.responsible_id,
-  responsible_name = excluded.responsible_name,
-  organization_id = excluded.organization_id,
-  organization_name = excluded.organization_name,
-  origin = excluded.origin,
-  category = excluded.category,
-  urgency = excluded.urgency,
-  service_first_level = excluded.service_first_level,
-  service_second_level = excluded.service_second_level,
-  service_third_level = excluded.service_third_level
-"""
+def get_ticket_full(ticket_id):
+    """Tenta baixar o ticket (com actions). Variações do endpoint para garantir compatibilidade."""
+    candidates = [
+        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}&$expand=actions",
+        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}&include=actions",
+        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}",
+    ]
+    last_err = None
+    for url in candidates:
+        try:
+            return http_get(url)
+        except Exception as e:
+            last_err = e
+    raise last_err
 
-UPSERT_ACOES_SQL = """
-insert into visualizacao_resolvidos.resolvidos_acoes(ticket_id, acoes)
-values (%s, %s)
-on conflict (ticket_id) do update set acoes = excluded.acoes
-"""
+def pick(obj, *keys):
+    for k in keys:
+        v = obj.get(k)
+        if v not in (None, "", []):
+            return v
+    return None
 
-UPSERT_DETAIL_SQL = """
-insert into visualizacao_resolvidos.detail_control(ticket_id,last_update)
-values (%s,%s)
-on conflict (ticket_id) do update set last_update = greatest(excluded.last_update, visualizacao_resolvidos.detail_control.last_update)
-"""
+def normalize_ticket(t):
+    """Extrai campos usados nas tabelas de destino."""
+    # responsável
+    responsible_id = None
+    responsible_name = None
+    for k in ("owner", "responsible", "resolvedBy", "createdBy"):
+        if isinstance(t.get(k), dict):
+            responsible_id   = pick(t[k], "id", "personId", "agentId")
+            responsible_name = pick(t[k], "businessName", "name", "fullName")
+            if responsible_id or responsible_name:
+                break
 
-def map_ticket(t: dict):
-    owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    c0 = clients[0] if isinstance(clients, list) and clients else {}
-    org = (c0.get("organization") or {}) if isinstance(c0, dict) else {}
-    s1 = t.get("serviceFirstLevel")
-    s2 = t.get("serviceSecondLevel")
-    s3 = t.get("serviceThirdLevel")
-    tid = t.get("id")
-    if isinstance(tid,str) and tid.isdigit(): tid = int(tid)
+    origin = str(pick(t, "origin", "originId") or "")  # pode vir número
+    status = pick(t, "status", "baseStatus")
+    org_id = pick(t, "organizationId", "organization_id", "organizationIdOld")
+    org_nm = pick(t, "organization", "organizationName", "organization_name")
+
+    # ações (compactadas)
+    actions = []
+    for a in t.get("actions", []) or []:
+        actions.append({
+            "createdDate": a.get("createdDate") or a.get("createdAt"),
+            "isPublic":    a.get("isPublic"),
+            "type":        a.get("type"),
+            "description": a.get("description") or "",
+            "timeSpent":   a.get("timeSpent"),
+            "createdBy":   (a.get("createdBy") or {}).get("id")
+        })
+
     return {
-        "ticket_id": tid,
-        "status": (t.get("baseStatus") or t.get("status") or None),
-        "last_resolved_at": _norm_ts(t.get("resolvedIn")),
-        "last_closed_at":   _norm_ts(t.get("closedIn")),
-        "responsible_id": _iint(owner.get("id")),
-        "responsible_name": owner.get("businessName"),
-        "organization_id": (org.get("id") if isinstance(org, dict) else None),
-        "organization_name": (org.get("businessName") if isinstance(org, dict) else None),
-        "origin": t.get("origin") or t.get("originName"),
-        "category": t.get("category"),
-        "urgency": t.get("urgency"),
-        "service_first_level": s3,
-        "service_second_level": s2,
-        "service_third_level": s1
+        "ticket_id": int(t.get("id")),
+        "responsible_id": responsible_id,
+        "responsible_name": responsible_name,
+        "origin": origin,
+        "status": status,
+        "organization_id": org_id,
+        "organization_name": org_nm,
+        "actions_json": json.dumps(actions, ensure_ascii=False)
     }
 
-def fetch_full_ticket(ticket_id: int) -> dict:
-    url = f"{API_BASE}/tickets/{ticket_id}"
-    params = {"token": API_TOKEN, "$expand": "owner,clients($expand=organization),actions"}
-    return _req(url, params) or {}
+# ---------- DB work ----------
+
+SQL_LATEST_RUN = """
+    select max(id) from visualizacao_resolvidos.audit_recent_run
+"""
+
+SQL_MISSING_ROWS = """
+    select table_name, ticket_id
+      from visualizacao_resolvidos.audit_recent_missing
+     where run_id = %s
+"""
+
+UPSERT_TICKETS_RESOLVIDOS = """
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id, responsible_id, responsible_name, origin, status, organization_id, organization_name)
+values (%(ticket_id)s, %(responsible_id)s, %(responsible_name)s, %(origin)s, %(status)s, %(organization_id)s, %(organization_name)s)
+on conflict (ticket_id) do update set
+  responsible_id   = excluded.responsible_id,
+  responsible_name = excluded.responsible_name,
+  origin           = excluded.origin,
+  status           = excluded.status,
+  organization_id  = excluded.organization_id,
+  organization_name= excluded.organization_name
+"""
+
+UPSERT_RESOLVIDOS_ACOES = """
+insert into visualizacao_resolvidos.resolvidos_acoes
+(ticket_id, acoes)
+values (%(ticket_id)s, %(acoes_jsonb)s)
+on conflict (ticket_id) do update set
+  acoes = excluded.acoes
+"""
+
+UPSERT_DETAIL_CONTROL = """
+insert into visualizacao_resolvidos.detail_control
+(ticket_id, synced_at)
+values (%s, now())
+on conflict (ticket_id) do update set
+  synced_at = excluded.synced_at
+"""
 
 def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-    with psycopg2.connect(NEON_DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute("select distinct ticket_id from visualizacao_resolvidos.audit_recent_missing")
-            ids = [r[0] for r in cur.fetchall()]
-    if not ids:
-        return
-    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
-    rows_ticket, rows_acoes, rows_detail = [], [], []
-    for tid in ids:
-        t = fetch_full_ticket(tid)
-        if not isinstance(t, dict) or not t:
-            continue
-        rows_ticket.append(map_ticket(t))
-        acoes = t.get("actions") if isinstance(t.get("actions"), list) else []
-        rows_acoes.append((tid, psycopg2.extras.Json(acoes)))
-        last_up = t.get("lastUpdate")
-        rows_detail.append((tid, last_up))
-        time.sleep(throttle)
-    with psycopg2.connect(NEON_DSN) as conn:
-        with conn.cursor() as cur:
-            if rows_ticket:
-                psycopg2.extras.execute_batch(cur, UPSERT_TICKET_SQL, rows_ticket, page_size=200)
-            if rows_acoes:
-                psycopg2.extras.execute_batch(cur, UPSERT_ACOES_SQL, rows_acoes, page_size=200)
-            if rows_detail:
-                psycopg2.extras.execute_batch(cur, UPSERT_DETAIL_SQL, rows_detail, page_size=200)
-        conn.commit()
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        # 1) determine run
+        if RUN_ID_OVERRIDE:
+            run_id = int(RUN_ID_OVERRIDE)
+        else:
+            cur.execute(SQL_LATEST_RUN)
+            run_id = cur.fetchone()[0]
+        if not run_id:
+            print("Nenhum run encontrado em audit_recent_run.")
+            return
+        print("Processando run_id:", run_id)
+
+        # 2) rows missing
+        cur.execute(SQL_MISSING_ROWS, (run_id,))
+        rows = cur.fetchall()
+        if not rows:
+            print("Sem itens em audit_recent_missing para este run.")
+            return
+
+        need_tickets  = set()
+        need_actions  = set()
+        need_detail   = set()
+
+        for table_name, tid in rows:
+            if table_name == "tickets_resolvidos":
+                need_tickets.add(tid)
+            elif table_name == "resolvidos_acoes":
+                need_actions.add(tid)
+            elif table_name == "detail_control":
+                need_detail.add(tid)
+
+        all_ids = sorted(set().union(need_tickets, need_actions, need_detail))
+        print(f"tickets_resolvidos pendentes: {len(need_tickets)}")
+        print(f"resolvidos_acoes pendentes:   {len(need_actions)}")
+        print(f"detail_control pendentes:     {len(need_detail)}")
+        print(f"Total de tickets a consultar: {len(all_ids)}")
+
+        # 3) baixa e normaliza (cache)
+        norm_by_id = {}
+        for i, tid in enumerate(all_ids, 1):
+            try:
+                t = get_ticket_full(tid)
+                norm_by_id[tid] = normalize_ticket(t)
+            except Exception as e:
+                print(f"[WARN] ticket {tid}: {e}")
+            time.sleep(THROTTLE)
+            if i % 50 == 0:
+                print(f"  ..{i}/{len(all_ids)} baixados")
+
+        # 4) UPSERTS
+        # tickets_resolvidos
+        batch = []
+        for tid in need_tickets:
+            n = norm_by_id.get(tid)
+            if not n: continue
+            batch.append({
+                "ticket_id": n["ticket_id"],
+                "responsible_id": n["responsible_id"],
+                "responsible_name": n["responsible_name"],
+                "origin": n["origin"],
+                "status": n["status"],
+                "organization_id": n["organization_id"],
+                "organization_name": n["organization_name"],
+            })
+        if batch:
+            execute_batch(cur, UPSERT_TICKETS_RESOLVIDOS, batch, page_size=200)
+            print(f"UPSERT tickets_resolvidos: {len(batch)}")
+
+        # resolvidos_acoes
+        batch = []
+        for tid in need_actions:
+            n = norm_by_id.get(tid)
+            if not n: continue
+            batch.append({
+                "ticket_id": n["ticket_id"],
+                "acoes_jsonb": psycopg2.extras.Json(json.loads(n["actions_json"]))
+            })
+        if batch:
+            execute_batch(cur, UPSERT_RESOLVIDOS_ACOES, batch, page_size=200)
+            print(f"UPSERT resolvidos_acoes: {len(batch)}")
+
+        # detail_control
+        if need_detail:
+            execute_batch(cur, UPSERT_DETAIL_CONTROL, [(tid,) for tid in need_detail], page_size=500)
+            print(f"UPSERT detail_control: {len(need_detail)}")
+
+        print("Concluído com sucesso.")
 
 if __name__ == "__main__":
     main()
