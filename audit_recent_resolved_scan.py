@@ -16,12 +16,9 @@ def _req(url, params, timeout=90):
     while True:
         r = http.get(url, params=params, timeout=timeout)
         if r.status_code in (429, 503):
-            retry = r.headers.get("retry-after")
-            wait = int(retry) if str(retry).isdigit() else 60
+            wait = int(r.headers.get("retry-after") or 60)
             time.sleep(wait)
             continue
-        if r.status_code == 404:
-            return []
         r.raise_for_status()
         return r.json() if r.text else []
 
@@ -29,22 +26,23 @@ def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc)
 
 def _iso_z(dt):
-    return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return dt.replace(microsecond=0).astimezone(datetime.timezone.utc) \
+             .isoformat().replace("+00:00", "Z")
 
 def fetch_ids_by_field(window_from, window_to, field_name, page_size, throttle):
+    """Retorna {ticket_id: (datetime_iso, 'resolved'|'closed')}"""
     url = f"{API_BASE}/tickets"
     skip = 0
-    select_fields = f"id,{field_name}"
-    filtro = f"({field_name} ge {_iso_z(window_from)} and {field_name} le {_iso_z(window_to)})"
     out = {}
+    filtro = f"({field_name} ge {_iso_z(window_from)} and {field_name} le {_iso_z(window_to)})"
     while True:
         page = _req(url, {
             "token": API_TOKEN,
-            "$select": select_fields,
+            "$select": f"id,{field_name}",
             "$filter": filtro,
             "$orderby": f"{field_name} asc",
             "$top": page_size,
-            "$skip": skip
+            "$skip": skip,
         }) or []
         if not page:
             break
@@ -52,108 +50,64 @@ def fetch_ids_by_field(window_from, window_to, field_name, page_size, throttle):
             tid = t.get("id")
             if not str(tid).isdigit():
                 continue
-            dt = t.get(field_name)
-            if not dt:
+            when = t.get(field_name)
+            if not when:
                 continue
             tid = int(tid)
-            if field_name == "resolvedIn":
-                out[tid] = (dt, "resolved")
-            else:
-                if tid not in out:
-                    out[tid] = (dt, "closed")
+            tag = "resolved" if field_name == "resolvedIn" else "closed"
+            # resolved tem prioridade
+            if tag == "resolved" or tid not in out:
+                out[tid] = (when, tag)
         if len(page) < page_size:
             break
         skip += len(page)
         time.sleep(throttle)
     return out
 
-DDL_AUDIT = """
+DDL = """
 begin;
 create schema if not exists visualizacao_resolvidos;
 
--- cria as tabelas vazias (com PK) se ainda não existirem
+-- Tabela de runs com SEU layout:
 create table if not exists visualizacao_resolvidos.audit_recent_run (
-  run_id bigserial primary key
+  id bigserial primary key,
+  started_at timestamptz not null default now(),
+  window_start timestamptz not null,
+  window_end   timestamptz not null,
+  total_api    integer     not null,
+  missing_total integer    not null default 0
 );
 
+-- Tabela de faltantes (mantemos run_id -> audit_recent_run.id)
 create table if not exists visualizacao_resolvidos.audit_recent_missing (
-  run_id bigint not null,
-  table_name text not null,
+  run_id    bigint not null,
+  table_name text  not null,
   ticket_id integer not null
 );
 
--- migra/garante colunas da audit_recent_run
+-- Garantir colunas extras (caso já exista sem elas):
 do $$
 begin
   if not exists (
     select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='run_at'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column run_at timestamptz';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='window_from'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column window_from timestamptz';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='window_to'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column window_to timestamptz';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='total_api'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column total_api integer';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='total_local'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column total_local integer';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='missing_total'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column missing_total integer';
-  end if;
-
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_run' and column_name='notes'
-  ) then
-    execute 'alter table visualizacao_resolvidos.audit_recent_run add column notes text';
-  end if;
-end $$;
-
--- migra/garante colunas da audit_recent_missing
-do $$
-begin
-  if not exists (
-    select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_missing' and column_name='event_in'
+    where table_schema='visualizacao_resolvidos'
+      and table_name='audit_recent_missing'
+      and column_name='event_in'
   ) then
     execute 'alter table visualizacao_resolvidos.audit_recent_missing add column event_in timestamptz';
   end if;
 
   if not exists (
     select 1 from information_schema.columns
-    where table_schema='visualizacao_resolvidos' and table_name='audit_recent_missing' and column_name='event_type'
+    where table_schema='visualizacao_resolvidos'
+      and table_name='audit_recent_missing'
+      and column_name='event_type'
   ) then
     execute 'alter table visualizacao_resolvidos.audit_recent_missing add column event_type text';
   end if;
 end $$;
 
--- manter apenas a última execução
+-- manter somente a última execução
 truncate table visualizacao_resolvidos.audit_recent_missing;
 
 commit;
@@ -161,7 +115,7 @@ commit;
 
 def main():
     if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+        raise RuntimeError("Configure MOVIDESK_TOKEN e NEON_DSN nos secrets.")
 
     now = _utc_now()
     window_to = now
@@ -170,16 +124,16 @@ def main():
     page_size = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 
+    # API: resolvedIn & closedIn
     resolved_map = fetch_ids_by_field(window_from, window_to, "resolvedIn", page_size, throttle)
     closed_map   = fetch_ids_by_field(window_from, window_to, "closedIn",   page_size, throttle)
-
     api_map = dict(closed_map)
     api_map.update(resolved_map)  # resolved tem prioridade
     api_ids = set(api_map.keys())
 
+    # DDL / garantias
     with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
-        # DDL/migração idempotente
-        cur.execute(DDL_AUDIT)
+        cur.execute(DDL)
         conn.commit()
 
     with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
@@ -193,49 +147,45 @@ def main():
         cur.execute("select ticket_id from visualizacao_resolvidos.detail_control")
         local_detail = {r[0] for r in cur.fetchall()}
 
-        local_union = local_tickets | local_acoes | local_detail
-
-        # abre run e pega run_id
+        # abre run no seu layout e pega id
         cur.execute("""
             insert into visualizacao_resolvidos.audit_recent_run
-            (run_at, window_from, window_to, total_api, total_local, missing_total, notes)
-            values (now(), %s, %s, %s, 0, 0, null)
-            returning run_id
+              (window_start, window_end, total_api)
+            values (%s, %s, %s)
+            returning id
         """, (window_from, window_to, len(api_ids)))
         run_id = cur.fetchone()[0]
 
-        # cria linhas por tabela faltante
+        # popula missing por tabela
         missing_rows = []
         for tid in api_ids:
-            event_in, event_type = api_map.get(tid)
+            when, etype = api_map.get(tid)
             if tid not in local_tickets:
-                missing_rows.append((run_id, "tickets_resolvidos", tid, event_in, event_type))
+                missing_rows.append((run_id, "tickets_resolvidos", tid, when, etype))
             if tid not in local_acoes:
-                missing_rows.append((run_id, "resolvidos_acoes", tid, event_in, event_type))
+                missing_rows.append((run_id, "resolvidos_acoes", tid, when, etype))
             if tid not in local_detail:
-                missing_rows.append((run_id, "detail_control", tid, event_in, event_type))
+                missing_rows.append((run_id, "detail_control", tid, when, etype))
 
         if missing_rows:
             psycopg2.extras.execute_batch(
                 cur,
                 """
                 insert into visualizacao_resolvidos.audit_recent_missing
-                (run_id, table_name, ticket_id, event_in, event_type)
+                  (run_id, table_name, ticket_id, event_in, event_type)
                 values (%s,%s,%s,%s,%s)
                 """,
                 missing_rows, page_size=1000
             )
 
-        total_local = len(api_ids & local_union)
-        missing_total = len(missing_rows)
+        # atualiza somente missing_total (seu layout)
         cur.execute("""
             update visualizacao_resolvidos.audit_recent_run
-               set total_local   = %s,
-                   missing_total = %s
-             where run_id = %s
-        """, (total_local, missing_total, run_id))
+               set missing_total = %s
+             where id = %s
+        """, (len(missing_rows), run_id))
 
-        # índices idempotentes
+        # índices úteis (idempotentes)
         cur.execute("""
         do $$
         begin
@@ -245,7 +195,6 @@ def main():
           ) then
             execute 'create index ix_audit_missing_run on visualizacao_resolvidos.audit_recent_missing(run_id)';
           end if;
-
           if not exists (
             select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
             where c.relname='ix_audit_missing_ticket' and n.nspname='visualizacao_resolvidos'
