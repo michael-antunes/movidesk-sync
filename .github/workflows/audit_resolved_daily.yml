@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - name: Audit scan (resolvedIn only; mantém só última execução)
+      - name: Audit scan (resolvedIn only)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
