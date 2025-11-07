@@ -1,25 +1,52 @@
-name: Sync Movidesk -> Auditoria resolvidos (resolvedIn/closedIn)
+name: Sync Movidesk -> Auditoria resolvidos (resolvedIn + closedIn) + backfill
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 6 * * *"   # todos os dias 06:00
   workflow_dispatch: {}
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - run: pip install requests psycopg2-binary
-      - env:
+
+      # PASSO 1: varredura (preenche audit_recent_run e audit_recent_missing)
+      - name: Audit scan (resolvedIn + closedIn)
+        env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_PAGE_SIZE: "1000"   # << aumentar para 1000
+          NEON_DSN:       ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_PAGE_SIZE: "1000"
+          AUDIT_WINDOW_HOURS: "48"
         run: python audit_recent_resolved_scan.py
+
+      # PASSO 2: backfill do que ficou faltando (tabelas finais)
+      - name: Backfill missing tickets into final tables
+        env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN:       ${{ secrets.NEON_DSN }}
+          MOVIDESK_THROTTLE: "0.25"
+        run: python reprocess_missing.py
+
+      # PASSO 3: checagem simples
+      - name: Assert remaining missing (debug)
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
+          python - <<'PY'
+          import os, psycopg2
+          with psycopg2.connect(os.environ["NEON_DSN"]) as c, c.cursor() as cur:
+              cur.execute("select coalesce(max(id),0) from visualizacao_resolvidos.audit_recent_run")
+              run_id = cur.fetchone()[0]
+              cur.execute("""
+                  select count(*) from visualizacao_resolvidos.audit_recent_missing
+                   where run_id = %s
+              """, (run_id,))
+              print("missing_after_backfill:", cur.fetchone()[0], " (run_id=", run_id, ")")
+          PY
