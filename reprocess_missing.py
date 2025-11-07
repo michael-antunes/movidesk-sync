@@ -1,221 +1,370 @@
 #!/usr/bin/env python3
-import os, time, json, sys
-import requests
+# -*- coding: utf-8 -*-
+
+"""
+Reprocessa os tickets que ficaram faltando (audit_recent_missing) e
+preenche as tabelas de destino:
+  - visualizacao_resolvidos.tickets_resolvidos
+  - visualizacao_resolvidos.resolvidos_acoes      (coluna 'acoes' JSONB)
+  - visualizacao_resolvidos.detail_control
+
+Estratégia:
+  1) Lê o último run em visualizacao_resolvidos.audit_recent_run
+  2) Busca os ticket_ids em visualizacao_resolvidos.audit_recent_missing
+  3) Para cada tabela alvo, carrega da API e faz UPSERT dinâmico
+     (apenas colunas existentes na tabela são usadas)
+  4) Usa $expand=actions para buscar ações (evita 404)
+"""
+
+import os
+import time
+import json
+import math
+import logging
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
 import psycopg2
-from psycopg2.extras import execute_batch
+import psycopg2.extras
+import requests
+
 
 API_BASE = "https://api.movidesk.com/public/v1"
+SCHEMA = "visualizacao_resolvidos"
+TBL_RUN = f"{SCHEMA}.audit_recent_run"
+TBL_MISS = f"{SCHEMA}.audit_recent_missing"
 
-def env(name, default=None, required=False):
-    val = os.getenv(name, default)
-    if required and not val:
-        print(f"Missing env {name}", file=sys.stderr); sys.exit(1)
-    return val
+# Tabelas de destino
+TBL_TICKETS = f"{SCHEMA}.tickets_resolvidos"
+TBL_ACOES   = f"{SCHEMA}.resolvidos_acoes"
+TBL_DETAIL  = f"{SCHEMA}.detail_control"
 
-TOKEN   = env("MOVIDESK_TOKEN", required=True)
-DSN     = env("NEON_DSN", required=True)
-THROTTLE= float(env("MOVIDESK_THROTTLE", "0.25"))
-RUN_ID_OVERRIDE = os.getenv("AUDIT_RUN_ID")  # opcional: processar um run específico
+# Configuração básico de log
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-8s %(message)s"
+)
+log = logging.getLogger("reprocess_missing")
 
-# ---------- Movidesk helpers ----------
 
-def http_get(url):
-    r = requests.get(url, timeout=30)
+def env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    if not v and not default:
+        raise RuntimeError(f"Env var {name} não definida")
+    return v
+
+
+def db_conn() -> psycopg2.extensions.connection:
+    return psycopg2.connect(env("NEON_DSN"))
+
+
+def throttling():
+    try:
+        t = float(os.getenv("MOVIDESK_THROTTLE", "0"))
+        if t > 0:
+            time.sleep(t)
+    except Exception:
+        pass
+
+
+def chunks(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+# ---------- API MOVIDESK ----------
+
+def md_get(url: str, params: Dict[str, Any]) -> requests.Response:
+    throttling()
+    r = requests.get(url, params=params, timeout=60)
+    return r
+
+
+def fetch_tickets_raw(ids: List[int]) -> List[Dict[str, Any]]:
+    """
+    Busca tickets por lista de ids (até ~80 por chamada) usando $filter in.
+    Retorna a lista bruta (cada item é um ticket).
+    """
+    if not ids:
+        return []
+    url = f"{API_BASE}/tickets"
+    # IMPORTANTÍSSIMO: id é numérico -> sem aspas
+    filter_in = ",".join(str(i) for i in ids)
+    params = {
+        "token": env("MOVIDESK_TOKEN"),
+        "$filter": f"id in ({filter_in})",
+        # Campos amplos o suficiente para alimentar as tabelas destino
+        "$select": (
+            "id,subject,origin,baseStatus,status,owner,ownerId,ownerTeam,ownerTeamId,"
+            "organization,organizationId,organizationName,"
+            "resolvedIn,closedIn,lastActionDate,actionCount"
+        )
+    }
+    r = md_get(url, params)
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+    data = r.json() or []
+    return data
 
-def get_ticket_full(ticket_id):
-    """Tenta baixar o ticket (com actions). Variações do endpoint para garantir compatibilidade."""
-    candidates = [
-        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}&$expand=actions",
-        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}&include=actions",
-        f"{API_BASE}/tickets/{ticket_id}?token={TOKEN}",
-    ]
-    last_err = None
-    for url in candidates:
-        try:
-            return http_get(url)
-        except Exception as e:
-            last_err = e
-    raise last_err
 
-def pick(obj, *keys):
-    for k in keys:
-        v = obj.get(k)
-        if v not in (None, "", []):
-            return v
-    return None
+def fetch_ticket_actions(ticket_id: int) -> List[Dict[str, Any]]:
+    """
+    Busca ações do ticket usando $expand=actions.
+    Retorna a lista (pode ser vazia).
+    """
+    url = f"{API_BASE}/tickets"
+    params = {
+        "token": env("MOVIDESK_TOKEN"),
+        "$filter": f"id eq {ticket_id}",
+        "$select": "id",
+        "$expand": (
+            "actions("
+            "$select=id,origin,createdDate,baseStatus,description,isPublic,createdBy,createdByTeam"
+            ")"
+        ),
+    }
+    r = md_get(url, params)
+    if r.status_code != 200:
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+    data = r.json() or []
+    if not data:
+        return []
+    return data[0].get("actions") or []
 
-def normalize_ticket(t):
-    """Extrai campos usados nas tabelas de destino."""
-    # responsável
-    responsible_id = None
-    responsible_name = None
-    for k in ("owner", "responsible", "resolvedBy", "createdBy"):
-        if isinstance(t.get(k), dict):
-            responsible_id   = pick(t[k], "id", "personId", "agentId")
-            responsible_name = pick(t[k], "businessName", "name", "fullName")
-            if responsible_id or responsible_name:
-                break
 
-    origin = str(pick(t, "origin", "originId") or "")  # pode vir número
-    status = pick(t, "status", "baseStatus")
-    org_id = pick(t, "organizationId", "organization_id", "organizationIdOld")
-    org_nm = pick(t, "organization", "organizationName", "organization_name")
+# ---------- POSTGRES HELPERS ----------
 
-    # ações (compactadas)
-    actions = []
-    for a in t.get("actions", []) or []:
-        actions.append({
-            "createdDate": a.get("createdDate") or a.get("createdAt"),
-            "isPublic":    a.get("isPublic"),
-            "type":        a.get("type"),
-            "description": a.get("description") or "",
-            "timeSpent":   a.get("timeSpent"),
-            "createdBy":   (a.get("createdBy") or {}).get("id")
-        })
+def get_table_columns(cur, schema: str, table: str) -> List[str]:
+    cur.execute(
+        """
+        select column_name
+        from information_schema.columns
+        where table_schema = %s and table_name = %s
+        order by ordinal_position
+        """,
+        (schema, table),
+    )
+    return [r[0] for r in cur.fetchall()]
 
+
+def upsert_rows(
+    cur,
+    schema: str,
+    table: str,
+    rows: List[Dict[str, Any]],
+    conflict_cols: Sequence[str]
+):
+    """
+    UPSERT dinâmico: usa só colunas que realmente existem na tabela.
+    conflict_cols: chaves para ON CONFLICT.
+    """
+    if not rows:
+        return
+
+    table_cols = set(get_table_columns(cur, schema, table))
+    # União de todas as chaves que teremos *e* que existem na tabela
+    used_cols = []
+    for k in rows[0].keys():
+        if k in table_cols:
+            used_cols.append(k)
+
+    if not used_cols:
+        log.warning("Nenhuma coluna aplicável para %s.%s; ignorado", schema, table)
+        return
+
+    # Monta SQL com placeholders
+    cols_sql = ", ".join(used_cols)
+    vals_sql = ", ".join(["%s"] * len(used_cols))
+    conflict_sql = ", ".join(conflict_cols)
+
+    updates = [f'{c} = EXCLUDED.{c}' for c in used_cols if c not in conflict_cols]
+    set_sql = ", ".join(updates) if updates else ""
+
+    sql = f"INSERT INTO {schema}.{table} ({cols_sql}) VALUES ({vals_sql})"
+    if conflict_cols:
+        sql += f" ON CONFLICT ({conflict_sql}) DO "
+        sql += ("UPDATE SET " + set_sql) if set_sql else "NOTHING"
+
+    args = []
+    for r in rows:
+        values = [r.get(c) for c in used_cols]
+        args.append(values)
+
+    psycopg2.extras.execute_batch(cur, sql, args, page_size=200)
+    log.info("UPSERT %s.%s -> %d linhas", schema, table, len(rows))
+
+
+# ---------- TRANSFORMAÇÕES ----------
+
+def to_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mapeia um ticket bruto em colunas genéricas (o upsert só gravará as que existirem).
+    """
     return {
-        "ticket_id": int(t.get("id")),
-        "responsible_id": responsible_id,
-        "responsible_name": responsible_name,
-        "origin": origin,
-        "status": status,
-        "organization_id": org_id,
-        "organization_name": org_nm,
-        "actions_json": json.dumps(actions, ensure_ascii=False)
+        # chaves comuns
+        "ticket_id": t.get("id"),
+        # responsável
+        "responsible_id": t.get("ownerId"),
+        "responsible_name": t.get("owner"),
+        # origem/status
+        "origin": t.get("origin"),
+        "status": t.get("status"),
+        "base_status": t.get("baseStatus"),
+        # organização
+        "organization_id": t.get("organizationId"),
+        "organization_name": t.get("organizationName") or t.get("organization"),
+        # datas úteis
+        "resolved_in": t.get("resolvedIn"),
+        "closed_in": t.get("closedIn"),
+        "last_action_date": t.get("lastActionDate"),
+        # contagem
+        "tickets": 1,
+        "action_count": t.get("actionCount"),
+        # raw opcional
+        "raw": json.dumps(t),
     }
 
-# ---------- DB work ----------
 
-SQL_LATEST_RUN = """
-    select max(id) from visualizacao_resolvidos.audit_recent_run
-"""
+def to_detail_row(t: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ticket_id": t.get("id"),
+        "resolved_in": t.get("resolvedIn"),
+        "closed_in": t.get("closedIn"),
+        "last_action_date": t.get("lastActionDate"),
+        "action_count": t.get("actionCount"),
+        "synced_at": psycopg2.TimestampFromTicks(time.time()),
+    }
 
-SQL_MISSING_ROWS = """
-    select table_name, ticket_id
-      from visualizacao_resolvidos.audit_recent_missing
-     where run_id = %s
-"""
 
-UPSERT_TICKETS_RESOLVIDOS = """
-insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id, responsible_id, responsible_name, origin, status, organization_id, organization_name)
-values (%(ticket_id)s, %(responsible_id)s, %(responsible_name)s, %(origin)s, %(status)s, %(organization_id)s, %(organization_name)s)
-on conflict (ticket_id) do update set
-  responsible_id   = excluded.responsible_id,
-  responsible_name = excluded.responsible_name,
-  origin           = excluded.origin,
-  status           = excluded.status,
-  organization_id  = excluded.organization_id,
-  organization_name= excluded.organization_name
-"""
+def to_acoes_row(ticket_id: int, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Grava as ações em JSONB (coluna 'acoes'). Colunas geradas (qtd_*) na tabela
+    serão recalculadas automaticamente e não são tocadas aqui.
+    """
+    # Limpa só o necessário
+    acoes_slim = []
+    for a in actions or []:
+        acoes_slim.append({
+            "id": a.get("id"),
+            "origin": a.get("origin"),
+            "createdDate": a.get("createdDate"),
+            "baseStatus": a.get("baseStatus"),
+            "description": a.get("description"),
+            "isPublic": a.get("isPublic"),
+            "createdBy": a.get("createdBy"),
+            "createdByTeam": a.get("createdByTeam"),
+        })
+    return {
+        "ticket_id": ticket_id,
+        "acoes": json.dumps(acoes_slim, ensure_ascii=False),
+        "synced_at": psycopg2.TimestampFromTicks(time.time()),
+    }
 
-UPSERT_RESOLVIDOS_ACOES = """
-insert into visualizacao_resolvidos.resolvidos_acoes
-(ticket_id, acoes)
-values (%(ticket_id)s, %(acoes_jsonb)s)
-on conflict (ticket_id) do update set
-  acoes = excluded.acoes
-"""
 
-UPSERT_DETAIL_CONTROL = """
-insert into visualizacao_resolvidos.detail_control
-(ticket_id, synced_at)
-values (%s, now())
-on conflict (ticket_id) do update set
-  synced_at = excluded.synced_at
-"""
+# ---------- PIPELINE ----------
+
+def resolve_run_id(cur) -> int:
+    forced = os.getenv("RUN_ID")
+    if forced:
+        cur.execute(f"select id from {TBL_RUN} where id = %s", (int(forced),))
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"RUN_ID={forced} não existe em {TBL_RUN}")
+        return int(forced)
+    cur.execute(f"select id from {TBL_RUN} order by id desc limit 1")
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"Nenhum run em {TBL_RUN}")
+    return int(row[0])
+
+
+def load_missing(cur, run_id: int) -> Dict[str, List[int]]:
+    cur.execute(
+        f"""
+        select table_name, ticket_id
+        from {TBL_MISS}
+        where run_id = %s
+        order by table_name, ticket_id
+        """,
+        (run_id,),
+    )
+    groups: Dict[str, List[int]] = {}
+    for tbl, tid in cur.fetchall():
+        groups.setdefault(tbl, []).append(int(tid))
+    return groups
+
+
+def process_tickets(cur, ids: List[int]):
+    """
+    Preenche tickets_resolvidos (e, de quebra, detail_control) para o conjunto de ids informado.
+    """
+    if not ids:
+        return
+    log.info("Buscando %d tickets (em lotes)...", len(ids))
+    all_tickets: List[Dict[str, Any]] = []
+    for batch in chunks(ids, 80):
+        data = fetch_tickets_raw(batch)
+        all_tickets.extend(data)
+
+    # UPSERT tickets_resolvidos
+    rows_tickets = [to_ticket_row(t) for t in all_tickets]
+    upsert_rows(cur, SCHEMA, "tickets_resolvidos", rows_tickets, conflict_cols=["ticket_id"])
+
+    # UPSERT detail_control (aproveita a mesma carga)
+    rows_detail = [to_detail_row(t) for t in all_tickets]
+    upsert_rows(cur, SCHEMA, "detail_control", rows_detail, conflict_cols=["ticket_id"])
+
+
+def process_acoes(cur, ids: List[int]):
+    """
+    Preenche resolvidos_acoes (coluna 'acoes' JSONB) para os ids.
+    """
+    if not ids:
+        return
+    log.info("Buscando ações de %d tickets (1 a 1 com $expand=actions)...", len(ids))
+    rows: List[Dict[str, Any]] = []
+    for tid in ids:
+        try:
+            acts = fetch_ticket_actions(tid)
+        except Exception as e:
+            log.warning("Falha ao buscar ações do ticket %s: %s", tid, e)
+            acts = []
+        rows.append(to_acoes_row(tid, acts))
+
+    upsert_rows(cur, SCHEMA, "resolvidos_acoes", rows, conflict_cols=["ticket_id"])
+
 
 def main():
-    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
-        # 1) determine run
-        if RUN_ID_OVERRIDE:
-            run_id = int(RUN_ID_OVERRIDE)
-        else:
-            cur.execute(SQL_LATEST_RUN)
-            run_id = cur.fetchone()[0]
-        if not run_id:
-            print("Nenhum run encontrado em audit_recent_run.")
-            return
-        print("Processando run_id:", run_id)
+    token = env("MOVIDESK_TOKEN")
+    del token  # só para forçar validação; usamos via env() nas funções
 
-        # 2) rows missing
-        cur.execute(SQL_MISSING_ROWS, (run_id,))
-        rows = cur.fetchall()
-        if not rows:
-            print("Sem itens em audit_recent_missing para este run.")
-            return
+    with db_conn() as conn:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            run_id = resolve_run_id(cur)
+            log.info("RUN_ID alvo: %s", run_id)
 
-        need_tickets  = set()
-        need_actions  = set()
-        need_detail   = set()
+            groups = load_missing(cur, run_id)
+            log.info("Pendências por tabela: %s", {k: len(v) for k, v in groups.items()})
 
-        for table_name, tid in rows:
-            if table_name == "tickets_resolvidos":
-                need_tickets.add(tid)
-            elif table_name == "resolvidos_acoes":
-                need_actions.add(tid)
-            elif table_name == "detail_control":
-                need_detail.add(tid)
+            # tickets_resolvidos
+            ids_tk = groups.get("tickets_resolvidos", [])
+            if ids_tk:
+                process_tickets(cur, ids_tk)
 
-        all_ids = sorted(set().union(need_tickets, need_actions, need_detail))
-        print(f"tickets_resolvidos pendentes: {len(need_tickets)}")
-        print(f"resolvidos_acoes pendentes:   {len(need_actions)}")
-        print(f"detail_control pendentes:     {len(need_detail)}")
-        print(f"Total de tickets a consultar: {len(all_ids)}")
+            # detail_control (se houver ids isolados só para ela)
+            ids_dc = groups.get("detail_control", [])
+            if ids_dc:
+                # reaproveita a mesma rotina de tickets (pega do endpoint de tickets)
+                process_tickets(cur, ids_dc)
 
-        # 3) baixa e normaliza (cache)
-        norm_by_id = {}
-        for i, tid in enumerate(all_ids, 1):
-            try:
-                t = get_ticket_full(tid)
-                norm_by_id[tid] = normalize_ticket(t)
-            except Exception as e:
-                print(f"[WARN] ticket {tid}: {e}")
-            time.sleep(THROTTLE)
-            if i % 50 == 0:
-                print(f"  ..{i}/{len(all_ids)} baixados")
+            # resolvidos_acoes
+            ids_ac = groups.get("resolvidos_acoes", [])
+            if ids_ac:
+                process_acoes(cur, ids_ac)
 
-        # 4) UPSERTS
-        # tickets_resolvidos
-        batch = []
-        for tid in need_tickets:
-            n = norm_by_id.get(tid)
-            if not n: continue
-            batch.append({
-                "ticket_id": n["ticket_id"],
-                "responsible_id": n["responsible_id"],
-                "responsible_name": n["responsible_name"],
-                "origin": n["origin"],
-                "status": n["status"],
-                "organization_id": n["organization_id"],
-                "organization_name": n["organization_name"],
-            })
-        if batch:
-            execute_batch(cur, UPSERT_TICKETS_RESOLVIDOS, batch, page_size=200)
-            print(f"UPSERT tickets_resolvidos: {len(batch)}")
+        conn.commit()
+    log.info("Reprocesso finalizado com sucesso.")
 
-        # resolvidos_acoes
-        batch = []
-        for tid in need_actions:
-            n = norm_by_id.get(tid)
-            if not n: continue
-            batch.append({
-                "ticket_id": n["ticket_id"],
-                "acoes_jsonb": psycopg2.extras.Json(json.loads(n["actions_json"]))
-            })
-        if batch:
-            execute_batch(cur, UPSERT_RESOLVIDOS_ACOES, batch, page_size=200)
-            print(f"UPSERT resolvidos_acoes: {len(batch)}")
-
-        # detail_control
-        if need_detail:
-            execute_batch(cur, UPSERT_DETAIL_CONTROL, [(tid,) for tid in need_detail], page_size=500)
-            print(f"UPSERT detail_control: {len(need_detail)}")
-
-        print("Concluído com sucesso.")
 
 if __name__ == "__main__":
     main()
