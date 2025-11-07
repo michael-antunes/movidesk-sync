@@ -1,242 +1,219 @@
 # audit_recent_resolved_scan.py
-# -*- coding: utf-8 -*-
-
 import os
 import time
-import math
-import json
-import datetime as dt
-from typing import Iterable, List, Dict, Any, Tuple
-
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+NEON_DSN  = os.getenv("NEON_DSN")
 
-API_URL = "https://api.movidesk.com/public/v1/tickets"
-# Campos mínimos: só precisamos dos IDs + carimbos para filtrar
-API_FIELDS = "id,baseStatus,resolvedIn,closedIn"
-PAGE_SIZE = 1000  # conforme pedido
-THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.25"))  # segundos entre chamadas
+PAGE_TOP   = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))   # pedido: 1000
+THROTTLE   = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+WINDOW_HRS = int(os.getenv("AUDIT_WINDOW_HOURS", "48"))     # 48h por padrão
 
+SCHEMA = "visualizacao_resolvidos"
+TABLE_RUN     = f"{SCHEMA}.audit_recent_run"
+TABLE_MISSING = f"{SCHEMA}.audit_recent_missing"
 
-def _env(name: str) -> str:
-    v = os.environ.get(name)
-    if not v:
-        raise RuntimeError(f"Variável de ambiente obrigatória ausente: {name}")
-    return v
+TABLES_TO_CHECK = [
+    f"{SCHEMA}.tickets_resolvidos",
+    f"{SCHEMA}.resolvidos_acoes",
+    f"{SCHEMA}.detail_control",
+]
 
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
-def ensure_sql_objects(cur) -> None:
-    """
-    Garante as tabelas/índices/constraints exatamente como você tem hoje.
-    Também acerta DEFAULT 0 para missing_total (evita violar NOT NULL no insert do run).
-    """
-    cur.execute("""
-    create schema if not exists visualizacao_resolvidos;
+def iso_z(dt):
+    # Sempre sem aspas e com 'Z' no fim
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    create table if not exists visualizacao_resolvidos.audit_recent_run (
-      id            bigserial primary key,
-      started_at    timestamptz not null default now(),
-      window_start  timestamptz not null,
-      window_end    timestamptz not null,
-      total_api     integer not null,
-      missing_total integer not null default 0
-    );
+def now_utc():
+    import datetime as _dt
+    return _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
 
-    -- Garante DEFAULT 0 caso a tabela já exista sem default
-    alter table visualizacao_resolvidos.audit_recent_run
-      alter column missing_total set default 0;
+def movidesk_get_tickets(token, dt_from, dt_to):
+    """Retorna lista de IDs de tickets com resolvedIn OU closedIn dentro do intervalo."""
+    url = f"{API_BASE}/tickets"
+    ids = []
+    skip = 0
 
-    create table if not exists visualizacao_resolvidos.audit_recent_missing (
-      run_id     bigint not null
-                 references visualizacao_resolvidos.audit_recent_run(id)
-                 on delete cascade,
-      table_name text   not null,
-      ticket_id  integer not null
-    );
+    ts_from = iso_z(dt_from)
+    ts_to   = iso_z(dt_to)
 
-    -- Evita duplicar a mesma ausência na mesma execução
-    create unique index if not exists ux_audit_recent_missing
-      on visualizacao_resolvidos.audit_recent_missing(run_id, table_name, ticket_id);
-    """)
+    # Filtro alvo (sem aspas) – o que a API aceita
+    filter_noquotes = (
+        f"((resolvedIn ge {ts_from} and resolvedIn le {ts_to}) "
+        f"or (closedIn ge {ts_from} and closedIn le {ts_to}))"
+    )
+    # fallback com aspas simples (caso alguma instância aceite esse formato)
+    filter_singlequotes = (
+        f"((resolvedIn ge '{ts_from}' and resolvedIn le '{ts_to}') "
+        f"or (closedIn ge '{ts_from}' and closedIn le '{ts_to}'))"
+    )
 
-    # Opcional: checa a existência das três tabelas de destino (apenas warning se não houver)
-    cur.execute("""
-      select n.nspname as schema, c.relname as table
-      from pg_class c
-      join pg_namespace n on n.oid = c.relnamespace
-      where c.relkind = 'r'
-        and n.nspname = 'visualizacao_resolvidos'
-        and c.relname in ('tickets_resolvidos','resolvidos_acoes','detail_control')
-      order by c.relname;
-    """)
-    found = {row[1] for row in cur.fetchall()}
-    expected = {'tickets_resolvidos','resolvidos_acoes','detail_control'}
-    missing = expected - found
-    if missing:
-        print("[WARN] Tabelas não encontradas no schema visualizacao_resolvidos:", ", ".join(sorted(missing)))
+    def fetch_page(the_filter, _skip):
+        params = {
+            "token": token,
+            "$select": "id,resolvedIn,closedIn,lastUpdate",
+            "$filter": the_filter,
+            "$top": PAGE_TOP,
+            "$skip": _skip,
+        }
+        r = http.get(url, params=params, timeout=120)
+        return r
 
+    # Primeira tentativa: sem aspas
+    filter_in_use = filter_noquotes
+    tried_fallback = False
 
-def movidesk_get_tickets(token: str, date_from: dt.datetime, date_to: dt.datetime) -> List[int]:
-    """
-    Busca IDs de tickets que tenham resolvedIn OU closedIn dentro do intervalo [date_from, date_to].
-    """
-    ids: List[int] = []
+    while True:
+        r = fetch_page(filter_in_use, skip)
 
-    # Movidesk aceita filtros com 'resolvedIn ge ... and resolvedIn le ...' etc.
-    # Se fechado ou resolvido na janela, queremos.
-    # Observação: API do Movidesk aceita pageSize e page (1-based). Usamos 1000 como você pediu.
-    df = date_from.isoformat()
-    dt_ = date_to.isoformat()
+        if r.status_code in (429, 503):
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
+            time.sleep(wait)
+            continue
 
-    # Dois filtros: resolvedIn e closedIn. Mesclamos resultados.
-    filters = [
-        f"(resolvedIn ge {json.dumps(df)} and resolvedIn le {json.dumps(dt_)})",
-        f"(closedIn   ge {json.dumps(df)} and closedIn   le {json.dumps(dt_)})"
-    ]
+        if r.status_code == 400 and not tried_fallback:
+            # Tenta com aspas simples se vier erro de sintaxe
+            tried_fallback = True
+            filter_in_use = filter_singlequotes
+            continue
 
-    session = requests.Session()
-    session.headers.update({"Content-Type": "application/json; charset=utf-8"})
+        r.raise_for_status()
+        page = r.json() if r.text else []
+        if not isinstance(page, list) or not page:
+            break
 
-    for flt in filters:
-        page = 1
-        while True:
-            params = {
-                "token": token,
-                "$select": API_FIELDS,
-                "$filter": flt,
-                "pageSize": PAGE_SIZE,
-                "page": page
-            }
-            resp = session.get(API_URL, params=params, timeout=60)
-            if resp.status_code != 200:
-                raise RuntimeError(f"Movidesk HTTP {resp.status_code}: {resp.text}")
+        for t in page:
+            tid = t.get("id")
+            if isinstance(tid, str) and tid.isdigit():
+                tid = int(tid)
+            ids.append(tid)
 
-            data = resp.json()
-            if not isinstance(data, list):
-                # Quando a API devolve objeto com 'message' etc.
-                raise RuntimeError(f"Resposta inesperada da API Movidesk: {data}")
+        if len(page) < PAGE_TOP:
+            break
 
-            if not data:
-                break
+        skip += len(page)
+        time.sleep(THROTTLE)
 
-            new_ids = [int(x["id"]) for x in data if "id" in x]
-            ids.extend(new_ids)
-
-            print(f"[Movidesk] filtro={flt} | page={page} | recebidos={len(new_ids)}")
-            if len(new_ids) < PAGE_SIZE:
-                break
-            page += 1
-            time.sleep(THROTTLE)
-
-    # remove duplicados (ticket pode aparecer nos dois filtros)
-    ids = sorted(set(ids))
-    print(f"[Movidesk] total único de IDs no período: {len(ids)}")
+    # Dedup
+    ids = sorted({i for i in ids if isinstance(i, int)})
     return ids
 
-
-def split_chunks(seq: List[int], size: int = 500) -> Iterable[List[int]]:
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
-
-
-def find_missing(cur, table: str, ids: List[int]) -> List[Tuple[str, int]]:
-    """
-    Retorna pares (table, ticket_id) que estão faltando na tabela informada.
-    table ∈ {'tickets_resolvidos','resolvidos_acoes','detail_control'}
-    """
-    missing: List[Tuple[str, int]] = []
-    if not ids:
-        return missing
-
-    # Monta checagem em lotes para não estourar o limite de parâmetros
-    for chunk in split_chunks(ids, 5000):
-        q = f"""
-        with src(id) as (
-          select unnest(%s::int[])
-        )
-        select s.id
-        from src s
-        left join visualizacao_resolvidos.{table} t
-          on t.ticket_id = s.id
-        where t.ticket_id is null
+def get_ticket_id_column(cur, full_table_name):
+    """Descobre se a tabela usa 'ticket_id' ou 'id'."""
+    schema, table = full_table_name.split(".", 1)
+    cur.execute(
         """
-        cur.execute(q, (chunk,))
+        select column_name
+        from information_schema.columns
+        where table_schema = %s and table_name = %s
+          and column_name in ('ticket_id','id')
+        order by case column_name when 'ticket_id' then 0 else 1 end
+        limit 1
+        """,
+        (schema, table),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"Tabela {full_table_name} não tem coluna 'ticket_id' ou 'id'.")
+    return row[0]
+
+def compute_missing_for_table(conn, full_table_name, ids):
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        col = get_ticket_id_column(cur, full_table_name)
+        # Usa UNNEST para comparar com o conjunto de IDs da API
+        sql = f"""
+            with api_ids as (
+                select unnest(%s::int[]) as tid
+            )
+            select a.tid
+            from api_ids a
+            left join {full_table_name} t
+              on t.{col} = a.tid
+            where t.{col} is null
+        """
+        cur.execute(sql, (ids,))
         rows = cur.fetchall()
-        for (ticket_id,) in rows:
-            missing.append((table, int(ticket_id)))
-    return missing
+        return [r[0] for r in rows]
 
+def main():
+    assert API_TOKEN, "Defina MOVIDESK_TOKEN no ambiente."
+    assert NEON_DSN,  "Defina NEON_DSN no ambiente."
 
-def main() -> None:
-    token = _env("MOVIDESK_TOKEN")
-    dsn = _env("NEON_DSN")
+    # Janela dos últimos WINDOW_HRS
+    end = now_utc()
+    start = end - __import__("datetime").timedelta(hours=WINDOW_HRS)
 
-    # Janela: últimos 2 dias (UTC). Ajuste se quiser timezone local.
-    now = dt.datetime.now(dt.timezone.utc)
-    window_end = now
-    window_start = now - dt.timedelta(days=2)
-
-    with psycopg2.connect(dsn) as conn:
+    with psycopg2.connect(NEON_DSN) as conn:
         conn.autocommit = False
         with conn.cursor() as cur:
-            # Garante estruturas
-            ensure_sql_objects(cur)
-            conn.commit()
+            # Mantém apenas a ÚLTIMA execução em audit_recent_missing
+            cur.execute(f"truncate table {TABLE_MISSING}")
 
-        # 1) Busca IDs na API (resolvidos ou fechados)
-        ids = movidesk_get_tickets(token, window_start, window_end)
+            # Cria o run (missing_total inicia em 0)
+            cur.execute(
+                f"""
+                insert into {TABLE_RUN}
+                    (started_at, window_start, window_end, total_api, missing_total)
+                values (now(), %s, %s, 0, 0)
+                returning id
+                """,
+                (start, end),
+            )
+            run_id = cur.fetchone()[0]
+        conn.commit()
+
+        # Busca IDs na API
+        ids = movidesk_get_tickets(API_TOKEN, start, end)
         total_api = len(ids)
 
+        # Atualiza total_api
         with conn.cursor() as cur:
-            # 2) Abre um "run" com missing_total=0 (tem DEFAULT 0)
-            cur.execute("""
-                insert into visualizacao_resolvidos.audit_recent_run
-                  (window_start, window_end, total_api, missing_total)
-                values (%s, %s, %s, 0)
-                returning id
-            """, (window_start, window_end, total_api))
-            run_id = cur.fetchone()[0]
-            print(f"[RUN] id={run_id} total_api={total_api}")
+            cur.execute(
+                f"update {TABLE_RUN} set total_api = %s where id = %s",
+                (total_api, run_id),
+            )
+        conn.commit()
 
-            # 3) Checa ausências nas três tabelas
-            missing_all: List[Tuple[str, int]] = []
-            for table in ("tickets_resolvidos", "resolvidos_acoes", "detail_control"):
-                miss = find_missing(cur, table, ids)
-                print(f"[MISSING] {table}: {len(miss)} ausentes")
-                missing_all.extend(miss)
-
-            # 4) Insere em audit_recent_missing (deduplicado pelo índice único)
-            if missing_all:
+        # Compara com as tabelas-alvo e popula missing
+        total_missing = 0
+        with conn.cursor() as cur:
+            for table in TABLES_TO_CHECK:
+                missing = compute_missing_for_table(conn, table, ids)
+                if not missing:
+                    continue
+                rows = [(run_id, table.split(".",1)[1], t) for t in missing]
                 execute_values(
                     cur,
-                    """
-                    insert into visualizacao_resolvidos.audit_recent_missing
-                      (run_id, table_name, ticket_id)
-                    values %s
-                    on conflict do nothing
-                    """,
-                    [(run_id, t, i) for (t, i) in missing_all],
-                    template="(%s,%s,%s)"
+                    f"insert into {TABLE_MISSING} (run_id, table_name, ticket_id) values %s",
+                    rows,
+                    page_size=1000,
                 )
+                total_missing += len(missing)
 
-            # 5) Atualiza o missing_total do run com o que foi parar em audit_recent_missing
-            cur.execute("""
-                update visualizacao_resolvidos.audit_recent_run r
-                   set missing_total = coalesce(m.cnt, 0)
-                from (
-                  select run_id, count(*)::int as cnt
-                  from visualizacao_resolvidos.audit_recent_missing
-                  where run_id = %s
-                  group by 1
-                ) m
-                where r.id = %s
-            """, (run_id, run_id))
-
+        # Atualiza missing_total do run
+        with conn.cursor() as cur:
+            cur.execute(
+                f"update {TABLE_RUN} set missing_total = %s where id = %s",
+                (total_missing, run_id),
+            )
         conn.commit()
-        print("[OK] Execução concluída.")
 
+        print({
+            "run_id": run_id,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "total_api": total_api,
+            "missing_total": total_missing,
+        })
 
 if __name__ == "__main__":
     main()
