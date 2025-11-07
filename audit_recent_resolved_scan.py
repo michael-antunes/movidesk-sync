@@ -19,7 +19,7 @@ PAGE_SIZE    = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
 WINDOW_HOURS = int(os.getenv("AUDIT_WINDOW_HOURS", "48"))
 
 def od_get(path: str, params: dict):
-    """Chamada OData usando params= (deixa o requests fazer a querystring)."""
+    """Chamada OData usando params= (requests monta a querystring)."""
     url = f"{BASE}/{path}"
     r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
@@ -48,27 +48,30 @@ def page_iter(filter_expr: str, select_fields: str):
         skip += top
         time.sleep(THROTTLE)
 
+def iso_odata_z(d: dt.datetime) -> str:
+    """DateTimeOffset em UTC sem aspas, no formato aceito pelo OData: YYYY-MM-DDTHH:MM:SSZ."""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    d = d.astimezone(dt.timezone.utc).replace(microsecond=0)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     win_end = now
     win_start = now - dt.timedelta(hours=WINDOW_HOURS)
 
-    def iso_z(d: dt.datetime) -> str:
-        # sem micros + timezone explícito
-        return d.replace(microsecond=0).isoformat()
+    f_start = iso_odata_z(win_start)
+    f_end   = iso_odata_z(win_end)
 
-    f_start = iso_z(win_start)
-    f_end   = iso_z(win_end)
-
-    # datas em ASPAS SIMPLES no filtro OData
-    resolved = f"(resolvedIn ge '{f_start}' and resolvedIn le '{f_end}')"
-    closed   = f"(closedIn  ge '{f_start}' and closedIn  le '{f_end}')"
+    # IMPORTANTe: SEM aspas – DateTimeOffset literal
+    resolved = f"(resolvedIn ge {f_start} and resolvedIn le {f_end})"
+    closed   = f"(closedIn  ge {f_start} and closedIn  le {f_end})"
     odata_filter = f"({resolved} or {closed})"
     select_fields = "id,baseStatus,resolvedIn,closedIn"
 
     logging.info("Janela: %s -> %s", f_start, f_end)
 
-    # 1) coleto os IDs únicos na janela
+    # 1) IDs únicos no período
     ids = set()
     for page in page_iter(odata_filter, select_fields):
         for row in page:
@@ -79,9 +82,8 @@ def main():
 
     logging.info("Total API (únicos): %d", len(ids))
 
-    # 2) registro o RUN e aponto pendências
+    # 2) Abre RUN e registra pendências
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
-        # abre RUN
         cur.execute("""
             insert into visualizacao_resolvidos.audit_recent_run
               (window_start, window_end, total_api, missing_total, run_at, window_from, window_to,
@@ -96,7 +98,7 @@ def main():
 
         missing_total = 0
 
-        # pendência em tickets_resolvidos (pela janela)
+        # pendências em tickets_resolvidos dentro da janela
         cur.execute("""
             select ticket_id
               from visualizacao_resolvidos.tickets_resolvidos
@@ -113,7 +115,7 @@ def main():
             """, [(run_id, "tickets_resolvidos", i) for i in miss_tk])
             missing_total += len(miss_tk)
 
-        # pendência em resolvidos_acoes (para qualquer id da janela)
+        # pendências em resolvidos_acoes para os IDs encontrados
         if ids:
             cur.execute("""
                 select ticket_id
