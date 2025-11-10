@@ -16,37 +16,34 @@ def req(url, params, timeout=90):
         if r.status_code in (429,503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
-            time.sleep(wait)
-            continue
-        if r.status_code == 404:
-            return []
+            time.sleep(wait); continue
+        if r.status_code == 404: return []
         r.raise_for_status()
         return r.json() if r.text else []
 
 def ensure_ctl(conn):
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
+        cur.execute("create table if not exists visualizacao_resolvidos.detail_control(ticket_id integer primary key)")
         cur.execute("""
-        create table if not exists visualizacao_resolvidos.detail_control(
-          ticket_id integer primary key,
-          status text not null,
-          last_resolved_at timestamptz,
-          last_closed_at timestamptz,
-          last_cancelled_at timestamptz,
-          last_update timestamptz,
-          need_detail boolean not null default true,
-          detail_last_run_at timestamptz,
-          tries integer not null default 0
-        )
+        alter table visualizacao_resolvidos.detail_control
+          add column if not exists status text,
+          add column if not exists last_resolved_at timestamptz,
+          add column if not exists last_closed_at timestamptz,
+          add column if not exists last_cancelled_at timestamptz,
+          add column if not exists last_update timestamptz,
+          add column if not exists need_detail boolean default true,
+          add column if not exists detail_last_run_at timestamptz,
+          add column if not exists tries integer default 0
         """)
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
           name text primary key default 'default',
-          last_update timestamptz not null default now(),
-          last_index_run_at timestamptz,
-          last_detail_run_at timestamptz
+          last_update timestamptz not null default now()
         )
         """)
+        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_index_run_at timestamptz")
+        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_detail_run_at timestamptz")
         cur.execute("create index if not exists ix_dc_need on visualizacao_resolvidos.detail_control(need_detail,last_update)")
     conn.commit()
 
@@ -68,20 +65,11 @@ def fetch_index(since_iso):
     select_fields = "id,status,resolvedIn,closedIn,canceledIn,lastUpdate"
     items = []
     while True:
-        page = req(url, {
-            "token": API_TOKEN,
-            "$select": select_fields,
-            "$filter": filtro,
-            "$top": top,
-            "$skip": skip
-        }) or []
-        if not page:
-            break
+        page = req(url, {"token":API_TOKEN,"$select":select_fields,"$filter":filtro,"$top":top,"$skip":skip}) or []
+        if not page: break
         items.extend(page)
-        if len(page) < top:
-            break
-        skip += len(page)
-        time.sleep(throttle)
+        if len(page) < top: break
+        skip += len(page); time.sleep(throttle)
     return items
 
 UPSERT = """
@@ -114,16 +102,13 @@ def map_row(t):
 
 def upsert(conn, rows):
     rows = [r for r in rows if r["ticket_id"] is not None]
-    if not rows:
-        return 0
+    if not rows: return 0
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=500)
-    conn.commit()
-    return len(rows)
+    conn.commit(); return len(rows)
 
 def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
+    if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
     conn = psycopg2.connect(NEON_DSN)
     try:
         ensure_ctl(conn)
