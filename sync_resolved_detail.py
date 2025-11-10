@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 import os
 import time
-import math
-import json
 import logging
-from typing import Iterable, List, Dict
+from typing import List, Dict, Iterable
 
 import requests
 import psycopg2
 import psycopg2.extras
 
 API_BASE = "https://api.movidesk.com/public/v1"
-BATCH = 100  # tamanho do lote para o OData "id in (...)"
+BATCH = int(os.getenv("DETAIL_BATCH", "50"))  # lotes menores para evitar URL grande
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.20"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -25,41 +24,39 @@ def env(name: str) -> str:
     return v
 
 def fetch_missing_ids(conn) -> List[int]:
+    """IDs pendentes para preencher em tickets_resolvidos."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT DISTINCT ticket_id
             FROM visualizacao_resolvidos.audit_recent_missing
             WHERE table_name = 'tickets_resolvidos'
             ORDER BY ticket_id
-            LIMIT 1000
+            LIMIT 2000
         """)
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
+        return [r[0] for r in cur.fetchall()]
 
-def chunks(ids: List[int], size: int) -> Iterable[List[int]]:
-    for i in range(0, len(ids), size):
-        yield ids[i:i+size]
+def chunks(xs: List[int], n: int) -> Iterable[List[int]]:
+    for i in range(0, len(xs), n):
+        yield xs[i:i+n]
 
 def movidesk_get_basic(ids: List[int], token: str) -> List[Dict]:
     """
-    Busca campos básicos: id, status, resolvedIn, closedIn, canceledIn
-    Observação: em Movidesk o campo é 'canceledIn' (uma letra 'l'),
-    e o status retornado para cancelados é 'Canceled'.
+    Busca campos básicos para os tickets informados.
+    IMPORTANTE: O Movidesk não aceita 'in (...)'; use 'id eq A or id eq B ...'
     """
     if not ids:
         return []
 
-    q = f"id in ({','.join(str(i) for i in ids)})"
+    filter_expr = " or ".join([f"id eq {i}" for i in ids])
     params = {
         "token": token,
         "$select": "id,status,resolvedIn,closedIn,canceledIn",
-        "$filter": q
+        "$filter": filter_expr
     }
     r = requests.get(f"{API_BASE}/tickets", params=params, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
     data = r.json()
-    # Normaliza as chaves e garante ausência vira None
     out = []
     for t in data:
         out.append({
@@ -67,14 +64,13 @@ def movidesk_get_basic(ids: List[int], token: str) -> List[Dict]:
             "status": t.get("status"),
             "resolvedIn": t.get("resolvedIn"),
             "closedIn": t.get("closedIn"),
-            "canceledIn": t.get("canceledIn"),
+            "canceledIn": t.get("canceledIn"),  # será gravado em last_cancelled_at
         })
     return out
 
 def upsert_tickets(conn, rows: List[Dict]) -> int:
     if not rows:
         return 0
-    # upsert minimalista — só status e 3 timestamps
     sql = """
     INSERT INTO visualizacao_resolvidos.tickets_resolvidos
         (ticket_id, status, last_resolved_at, last_closed_at, last_cancelled_at)
@@ -108,31 +104,32 @@ def delete_from_missing(conn, ids: List[int]):
              WHERE table_name = 'tickets_resolvidos'
                AND ticket_id = ANY(%s)
         """, (ids,))
-    logging.info("audit_recent_missing: limpos %d ids para table_name=tickets_resolvidos", len(ids))
+    logging.info("audit_recent_missing: removidos %d ids (tickets_resolvidos)", len(ids))
 
 def main():
     token = env("MOVIDESK_TOKEN")
-    dsn   = env("NEON_DSN")
+    dsn = env("NEON_DSN")
 
     with psycopg2.connect(dsn) as conn:
         conn.autocommit = False
 
         ids = fetch_missing_ids(conn)
         if not ids:
-            logging.info("Nenhum ticket pendente em audit_recent_missing (tickets_resolvidos). Nada a fazer.")
+            logging.info("Sem pendências em audit_recent_missing para tickets_resolvidos.")
             return
 
-        total_upsert = 0
-        for group in chunks(ids, BATCH):
-            data = movidesk_get_basic(group, token)
-            # segurança: garante que só upsertamos IDs que pedimos
-            data = [d for d in data if d.get("id") in group]
-            total_upsert += upsert_tickets(conn, data)
-            delete_from_missing(conn, group)
+        total = 0
+        for grp in chunks(ids, BATCH):
+            data = movidesk_get_basic(grp, token)
+            # Garante que só upsertamos o que pedimos
+            allowed = {i for i in grp}
+            data = [d for d in data if d.get("id") in allowed]
+            total += upsert_tickets(conn, data)
+            delete_from_missing(conn, grp)
             conn.commit()
-            time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.20")))  # gentil com a API
+            time.sleep(THROTTLE)
 
-        logging.info("Upserts em tickets_resolvidos concluídos. Registros aplicados: %d", total_upsert)
+        logging.info("Upsert concluído: %d registros aplicados em tickets_resolvidos.", total)
 
 if __name__ == "__main__":
     main()
