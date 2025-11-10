@@ -25,7 +25,29 @@ def req(url, params, timeout=90):
 
 def ensure_ctl(conn):
     with conn.cursor() as cur:
-        cur.execute(open("sql/01_resolvidos_schema.sql","r",encoding="utf-8").read())
+        cur.execute("create schema if not exists visualizacao_resolvidos")
+        cur.execute("""
+        create table if not exists visualizacao_resolvidos.detail_control(
+          ticket_id integer primary key,
+          status text not null,
+          last_resolved_at timestamptz,
+          last_closed_at timestamptz,
+          last_cancelled_at timestamptz,
+          last_update timestamptz,
+          need_detail boolean not null default true,
+          detail_last_run_at timestamptz,
+          tries integer not null default 0
+        )
+        """)
+        cur.execute("""
+        create table if not exists visualizacao_resolvidos.sync_control(
+          name text primary key default 'default',
+          last_update timestamptz not null default now(),
+          last_index_run_at timestamptz,
+          last_detail_run_at timestamptz
+        )
+        """)
+        cur.execute("create index if not exists ix_dc_need on visualizacao_resolvidos.detail_control(need_detail,last_update)")
     conn.commit()
 
 def get_since(conn):
@@ -43,7 +65,7 @@ def fetch_index(since_iso):
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
     skip = 0
     filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso}"
-    select_fields = ",".join(["id","status","resolvedIn","closedIn","canceledIn","lastUpdate"])
+    select_fields = "id,status,resolvedIn,closedIn,canceledIn,lastUpdate"
     items = []
     while True:
         page = req(url, {
@@ -80,8 +102,9 @@ on conflict (ticket_id) do update set
 """
 
 def map_row(t):
+    tid = str(t.get("id"))
     return {
-        "ticket_id": int(str(t.get("id"))) if str(t.get("id")).isdigit() else None,
+        "ticket_id": int(tid) if tid.isdigit() else None,
         "status": t.get("status"),
         "last_resolved_at": t.get("resolvedIn"),
         "last_closed_at": t.get("closedIn"),
@@ -90,6 +113,7 @@ def map_row(t):
     }
 
 def upsert(conn, rows):
+    rows = [r for r in rows if r["ticket_id"] is not None]
     if not rows:
         return 0
     with conn.cursor() as cur:
@@ -106,8 +130,7 @@ def main():
         since_dt = get_since(conn)
         items = fetch_index(iso_z(since_dt))
         rows = [map_row(t) for t in items if isinstance(t, dict)]
-        rows = [r for r in rows if r["ticket_id"] is not None]
-        upsert(conn, rows)
+        n = upsert(conn, rows)
         with conn.cursor() as cur:
             cur.execute("""
               insert into visualizacao_resolvidos.sync_control(name,last_update,last_index_run_at)
@@ -115,7 +138,7 @@ def main():
               on conflict (name) do update set last_update=excluded.last_update,last_index_run_at=excluded.last_index_run_at
             """)
         conn.commit()
-        print(f"rows={len(rows)}")
+        print(f"rows={n}")
     finally:
         conn.close()
 
