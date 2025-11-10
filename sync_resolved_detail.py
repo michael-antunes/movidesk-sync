@@ -9,7 +9,9 @@ import psycopg2
 import psycopg2.extras
 
 API_BASE = "https://api.movidesk.com/public/v1"
-BATCH = int(os.getenv("DETAIL_BATCH", "50"))  # lotes menores para evitar URL grande
+
+# Lote “macro” (o código divide sozinho se a API reclamar do limite de nós)
+BATCH = int(os.getenv("DETAIL_BATCH", "60"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.20"))
 
 logging.basicConfig(
@@ -35,27 +37,45 @@ def fetch_missing_ids(conn) -> List[int]:
         """)
         return [r[0] for r in cur.fetchall()]
 
-def chunks(xs: List[int], n: int) -> Iterable[List[int]]:
+def chunks(xs: List[int], n: int):
     for i in range(0, len(xs), n):
         yield xs[i:i+n]
 
-def movidesk_get_basic(ids: List[int], token: str) -> List[Dict]:
-    """
-    Busca campos básicos para os tickets informados.
-    IMPORTANTE: O Movidesk não aceita 'in (...)'; use 'id eq A or id eq B ...'
-    """
+def _request_tickets_by_ids(ids: List[int], token: str) -> List[Dict]:
+    """Faz 1 request ao Movidesk para um conjunto de IDs (usando OR)."""
     if not ids:
         return []
-
+    # Monta filtro no formato aceito pelo OData do Movidesk
     filter_expr = " or ".join([f"id eq {i}" for i in ids])
     params = {
         "token": token,
         "$select": "id,status,resolvedIn,closedIn,canceledIn",
         "$filter": filter_expr
     }
+    time.sleep(THROTTLE)  # respeita rate-limit
     r = requests.get(f"{API_BASE}/tickets", params=params, timeout=60)
+    return r
+
+def movidesk_get_basic(ids: List[int], token: str) -> List[Dict]:
+    """
+    Busca campos básicos para os tickets informados.
+    Se a API devolver o erro do 'node count limit', divide o lote e tenta novamente.
+    """
+    if not ids:
+        return []
+
+    r = _request_tickets_by_ids(ids, token)
+
+    # Tenta dividir automaticamente se estourar o limite de nós do OData
+    if r.status_code == 400 and "node count limit" in r.text.lower() and len(ids) > 1:
+        mid = len(ids) // 2
+        left  = movidesk_get_basic(ids[:mid], token)
+        right = movidesk_get_basic(ids[mid:], token)
+        return left + right
+
     if r.status_code != 200:
         raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+
     data = r.json()
     out = []
     for t in data:
@@ -64,7 +84,7 @@ def movidesk_get_basic(ids: List[int], token: str) -> List[Dict]:
             "status": t.get("status"),
             "resolvedIn": t.get("resolvedIn"),
             "closedIn": t.get("closedIn"),
-            "canceledIn": t.get("canceledIn"),  # será gravado em last_cancelled_at
+            "canceledIn": t.get("canceledIn"),  # mapeado para last_cancelled_at
         })
     return out
 
@@ -121,13 +141,12 @@ def main():
         total = 0
         for grp in chunks(ids, BATCH):
             data = movidesk_get_basic(grp, token)
-            # Garante que só upsertamos o que pedimos
-            allowed = {i for i in grp}
+            # Garante que só upsertamos IDs requisitados
+            allowed = set(grp)
             data = [d for d in data if d.get("id") in allowed]
             total += upsert_tickets(conn, data)
             delete_from_missing(conn, grp)
             conn.commit()
-            time.sleep(THROTTLE)
 
         logging.info("Upsert concluído: %d registros aplicados em tickets_resolvidos.", total)
 
