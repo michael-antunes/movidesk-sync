@@ -7,9 +7,6 @@ NEON_DSN = os.getenv("NEON_DSN")
 http = requests.Session()
 http.headers.update({"Accept":"application/json"})
 
-def iso_z(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
 def req(url, params, timeout=90):
     while True:
         r = http.get(url, params=params, timeout=timeout)
@@ -23,76 +20,20 @@ def req(url, params, timeout=90):
         r.raise_for_status()
         return r.json() if r.text else []
 
-def ensure_ddl(conn):
+def ensure_schema(conn):
     with conn.cursor() as cur:
-        cur.execute("create schema if not exists visualizacao_resolvidos")
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.tickets_resolvidos(
-          ticket_id integer primary key,
-          status text not null,
-          last_resolved_at timestamptz,
-          last_closed_at timestamptz,
-          last_cancelled_at timestamptz,
-          last_update timestamptz default now(),
-          responsible_id bigint,
-          responsible_name text,
-          organization_id text,
-          organization_name text,
-          origin text,
-          category text,
-          urgency text,
-          service_first_level text,
-          service_second_level text,
-          service_third_level text,
-          adicional_137641_avaliado_csat text
-        )
-        """)
-        cur.execute("""
-        alter table visualizacao_resolvidos.tickets_resolvidos
-          add column if not exists last_resolved_date_br_date date generated always as (((last_resolved_at at time zone 'America/Sao_Paulo')::date)) stored,
-          add column if not exists last_resolved_date_br_str  text generated always as (to_char((last_resolved_at at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored,
-          add column if not exists last_closed_date_br_date   date generated always as (((last_closed_at  at time zone 'America/Sao_Paulo')::date)) stored,
-          add column if not exists last_closed_date_br_str    text generated always as (to_char((last_closed_at  at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored,
-          add column if not exists last_cancelled_date_br_date date generated always as (((last_cancelled_at at time zone 'America/Sao_Paulo')::date)) stored,
-          add column if not exists last_cancelled_date_br_str  text generated always as (to_char((last_cancelled_at at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored
-        """)
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.sync_control(
-          name text primary key default 'default',
-          last_update timestamptz not null default now(),
-          last_index_run_at timestamptz,
-          last_detail_run_at timestamptz
-        )
-        """)
+        cur.execute(open("sql/01_resolvidos_schema.sql","r",encoding="utf-8").read())
     conn.commit()
 
-def get_since(conn):
-    days = int(os.getenv("MOVIDESK_DETAIL_DAYS","180"))
-    with conn.cursor() as cur:
-        cur.execute("select last_detail_run_at from visualizacao_resolvidos.sync_control where name='default'")
-        row = cur.fetchone()
-    if row and row[0]:
-        return row[0] - datetime.timedelta(minutes=int(os.getenv("MOVIDESK_OVERLAP_MIN","60")))
-    return datetime.datetime.utcnow() - datetime.timedelta(days=days)
-
-def pick_ids(conn, since_dt, limit):
+def pick_ids(conn, limit):
     with conn.cursor() as cur:
         cur.execute("""
         select ticket_id
-        from visualizacao_resolvidos.tickets_resolvidos
-        where last_update >= %s
-           or origin is null
-           or category is null
-           or urgency is null
-           or service_first_level is null
-           or service_second_level is null
-           or service_third_level is null
-           or responsible_id is null
-           or organization_id is null
-           or adicional_137641_avaliado_csat is null
-        order by ticket_id
+        from visualizacao_resolvidos.detail_control
+        where need_detail = true or detail_last_run_at is null
+        order by coalesce(last_update, now()) desc
         limit %s
-        """, (since_dt, limit))
+        """, (limit,))
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
@@ -142,7 +83,7 @@ def fetch_detail(ticket_id):
     }) or []
     return data[0] if data else {}
 
-UPSERT_SQL = """
+UPSERT_TK = """
 insert into visualizacao_resolvidos.tickets_resolvidos
 (ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,
  responsible_id,responsible_name,organization_id,organization_name,origin,category,urgency,
@@ -194,30 +135,43 @@ def map_row(t):
         "adicional_137641_avaliado_csat": cfs.get("adicional_137641_avaliado_csat"),
     }
 
-def upsert(conn, rows):
+def upsert_detail(conn, rows):
     if not rows:
         return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
+        psycopg2.extras.execute_batch(cur, UPSERT_TK, rows, page_size=200)
     conn.commit()
     return len(rows)
+
+def mark_done(conn, ids):
+    if not ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute("""
+        update visualizacao_resolvidos.detail_control
+           set need_detail=false, detail_last_run_at=now(), tries=0
+         where ticket_id = any(%s)
+        """, (ids,))
+    conn.commit()
 
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
     conn = psycopg2.connect(NEON_DSN)
     try:
-        ensure_ddl(conn)
-        since_dt = get_since(conn)
+        ensure_schema(conn)
         limit = int(os.getenv("MOVIDESK_DETAIL_LIMIT","2000"))
-        ids = pick_ids(conn, since_dt, limit)
-        rows = []
+        throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
+        ids = pick_ids(conn, limit)
+        rows, done = [], []
         for tid in ids:
             t = fetch_detail(tid)
             if t:
                 rows.append(map_row(t))
-            time.sleep(float(os.getenv("MOVIDESK_THROTTLE","0.25")))
-        upsert(conn, rows)
+                done.append(tid)
+            time.sleep(throttle)
+        upsert_detail(conn, rows)
+        mark_done(conn, done)
         with conn.cursor() as cur:
             cur.execute("""
               insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
@@ -225,7 +179,7 @@ def main():
               on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
             """)
         conn.commit()
-        print(f"rows={len(rows)}")
+        print(f"rows={len(rows)} done={len(done)}")
     finally:
         conn.close()
 
