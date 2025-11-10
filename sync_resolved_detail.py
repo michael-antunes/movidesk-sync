@@ -1,215 +1,173 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 import time
+import math
 import json
-import argparse
-from typing import Any, Dict, List, Optional
+import logging
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode
 
-import psycopg2
-import psycopg2.extras
 import requests
+import psycopg2
+from psycopg2.extras import execute_values
 
-MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
+LOG = logging.getLogger("sync_resolved_detail")
+logging.basicConfig(
+    level=os.getenv("LOGLEVEL", "INFO"),
+    format="%(asctime)s %(levelname)5s  %(message)s",
+)
 
-TOKEN = os.environ.get("MOVIDESK_TOKEN", "")
-DSN   = os.environ.get("NEON_DSN", "")
-THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.20"))  # segundos entre chamadas
+BASE = "https://api.movidesk.com/public/v1"
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+NEON_DSN = os.environ["NEON_DSN"]
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))  # segundos
 
-session = requests.Session()
-session.headers.update({"Accept": "application/json"})
+# ---- Helpers ---------------------------------------------------------------
 
-CANCEL_WORDS = {"canceled", "cancelled", "cancelado", "cancelada"}
+def utc_now():
+    return datetime.now(timezone.utc)
 
-# --------------------------- util ---------------------------
-
-def norm_ts(v: Optional[str]) -> Optional[str]:
+def odata_ts(dt: datetime) -> str:
     """
-    Movidesk normalmente devolve ISO-8601 com offset (+00:00).
-    Para o DB (timestamptz) podemos mandar a string ISO direto.
+    Movidesk aceita DateTimeOffset sem aspas; use 'Z' para UTC.
+    Ex: 2016-09-01T00:00:00.00Z  (vide docs de exemplos de OData).
     """
-    if not v:
-        return None
-    s = str(v).strip()
-    return s or None
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.00Z")
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-# --------------------------- Movidesk ---------------------------
-
-def md_get_ticket_with_history(ticket_id: int) -> Dict[str, Any]:
-    """
-    Busca 1 ticket por id com campos principais + histories resumido.
-    """
-    params = {
-        "token": TOKEN,
-        "$filter": f"id eq {ticket_id}",
-        "$top": 1,
-        "$select": ",".join([
-            "id","status",
-            "resolvedIn","closedIn","canceledIn","cancelledIn",
-            "responsibleId","responsibleName",
-            "organizationId","organizationName",
-            "origin","category","urgency",
-            "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-        ]),
-        "$expand": "histories($select=createdDate,field,oldValue,newValue,description)"
-    }
-    url = f"{MOVIDESK_BASE}/tickets"
-    r = session.get(url, params=params, timeout=60)
+def od_get(path: str, params: dict):
+    # usa $top/$skip; NÃO use $take/$count (não suportados)
+    q = {"token": TOKEN}
+    q.update(params or {})
+    url = f"{BASE}/{path}?{urlencode(q, safe=\"(),$:+-:TZ \")}"
+    r = requests.get(url, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
-    data = r.json()
-    if not data:
-        raise KeyError(f"Ticket {ticket_id} não encontrado")
-    return data[0]
+    return r.json()
 
-def derive_cancelled_from_history(t: Dict[str, Any]) -> Optional[str]:
-    """
-    Quando o campo cancelado não vem direto, inferimos pelo histórico.
-    """
-    hist = t.get("histories") or []
-    for h in hist:
-        field = (h.get("field") or "").strip().lower()
-        newv  = (h.get("newValue") or "").strip().lower()
-        desc  = (h.get("description") or "").strip().lower()
+def page_iter(odata_filter: str, select_fields: str, page=1000):
+    skip = 0
+    while True:
+        params = {
+            "$select": select_fields,
+            "$filter": odata_filter,
+            "$orderby": "id desc",
+            "$top": page,
+            "$skip": skip,
+        }
+        data = od_get("tickets", params)
+        if not data:
+            break
+        yield data
+        skip += page
+        time.sleep(THROTTLE)
 
-        # troca de status / situação para cancelado
-        if field in {"status", "situation", "situação"} and newv in CANCEL_WORDS:
-            return norm_ts(h.get("createdDate"))
+# ---- DB --------------------------------------------------------------------
 
-        # alguns ambientes só deixam a palavra no description
-        if any(w in desc for w in CANCEL_WORDS):
-            return norm_ts(h.get("createdDate"))
+UPSERT_SQL = """
+INSERT INTO visualizacao_resolvidos.tickets_resolvidos
+  (ticket_id, status, last_resolved_at, last_closed_at, last_cancelled_at)
+VALUES %s
+ON CONFLICT (ticket_id) DO UPDATE SET
+  status = EXCLUDED.status,
+  last_resolved_at = COALESCE(EXCLUDED.last_resolved_at,
+                              visualizacao_resolvidos.tickets_resolvidos.last_resolved_at),
+  last_closed_at   = COALESCE(EXCLUDED.last_closed_at,
+                              visualizacao_resolvidos.tickets_resolvidos.last_closed_at),
+  last_cancelled_at= COALESCE(EXCLUDED.last_cancelled_at,
+                              visualizacao_resolvidos.tickets_resolvidos.last_cancelled_at)
+"""
 
-    return None
+SYNC_READ_SQL = """
+SELECT last_update
+  FROM visualizacao_resolvidos.sync_control
+ WHERE name = 'tickets_resolvidos'
+"""
 
-def extract_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
-    resolved  = norm_ts(t.get("resolvedIn"))
-    closed    = norm_ts(t.get("closedIn"))
-    cancelled = norm_ts(t.get("canceledIn")) or norm_ts(t.get("cancelledIn"))
-    if not cancelled:
-        cancelled = derive_cancelled_from_history(t)
+SYNC_WRITE_SQL = """
+INSERT INTO visualizacao_resolvidos.sync_control (name, last_update)
+VALUES ('tickets_resolvidos', %s)
+ON CONFLICT (name) DO UPDATE SET last_update = EXCLUDED.last_update
+"""
 
-    return {
-        "ticket_id": int(t["id"]),
-        "status": t.get("status"),
-
-        "last_resolved_at": resolved,
-        "last_closed_at":   closed,
-        "last_cancelled_at": cancelled,
-
-        "responsible_id":   t.get("responsibleId"),
-        "responsible_name": t.get("responsibleName"),
-        "organization_id":  t.get("organizationId"),
-        "organization_name": t.get("organizationName"),
-        "origin": t.get("origin"),
-        "category": t.get("category"),
-        "urgency": t.get("urgency"),
-        "service_first_level":  t.get("serviceFirstLevel"),
-        "service_second_level": t.get("serviceSecondLevel"),
-        "service_third_level":  t.get("serviceThirdLevel"),
-    }
-
-# --------------------------- DB ---------------------------
-
-def get_conn():
-    if not DSN:
-        raise RuntimeError("NEON_DSN não informado")
-    return psycopg2.connect(DSN)
-
-def ensure_schema(cur) -> None:
-    """
-    Garante colunas essenciais (não mexe nas geradas).
-    """
-    cur.execute("""
-        CREATE SCHEMA IF NOT EXISTS visualizacao_resolvidos;
-        ALTER TABLE visualizacao_resolvidos.tickets_resolvidos
-            ADD COLUMN IF NOT EXISTS last_cancelled_at timestamptz;
-    """)
-
-def ids_pendentes_cancelled(cur, limit: int) -> List[int]:
-    cur.execute(f"""
-        SELECT ticket_id
-        FROM visualizacao_resolvidos.tickets_resolvidos
-        WHERE last_cancelled_at IS NULL
-          AND lower(status) IN ('canceled','cancelled','cancelado','cancelada')
-        ORDER BY ticket_id
-        LIMIT {int(limit)};
-    """)
-    return [r[0] for r in cur.fetchall()]
-
-def upsert_ticket(cur, row: Dict[str, Any]) -> None:
-    """
-    Atualiza campos de datas. Não sobrescreve com NULL.
-    """
-    cur.execute("""
-        UPDATE visualizacao_resolvidos.tickets_resolvidos
-           SET last_resolved_at  = COALESCE(%s, last_resolved_at),
-               last_closed_at    = COALESCE(%s, last_closed_at),
-               last_cancelled_at = COALESCE(%s, last_cancelled_at)
-         WHERE ticket_id = %s
-    """, (
-        row["last_resolved_at"],
-        row["last_closed_at"],
-        row["last_cancelled_at"],
-        row["ticket_id"],
-    ))
-
-# --------------------------- CLI / main ---------------------------
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Preenche last_cancelled_at (e datas) em tickets_resolvidos")
-    p.add_argument("--ids", help="lista de IDs separados por vírgula (pula a seleção por status)", default="")
-    p.add_argument("--limit", type=int, default=1000, help="limite de pendentes por execução")
-    p.add_argument("--throttle", type=float, default=THROTTLE, help="intervalo entre chamadas à API em segundos")
-    return p.parse_args()
+# ---- Main ------------------------------------------------------------------
 
 def main():
-    if not TOKEN:
-        print("MOVIDESK_TOKEN não informado", file=sys.stderr)
-        sys.exit(1)
+    # 1) Janela de coleta (a partir do controle; senão, 60 dias)
+    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+        cur.execute(SYNC_READ_SQL)
+        row = cur.fetchone()
+    if row and row[0]:
+        window_from = row[0].astimezone(timezone.utc)
+    else:
+        window_from = utc_now() - timedelta(days=60)
 
-    args = parse_args()
-    throttle = max(0.0, float(args.throttle))
+    window_to = utc_now()
+    LOG.info("Janela: %s -> %s", window_from.isoformat(), window_to.isoformat())
 
-    with get_conn() as conn:
-        conn.autocommit = False
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            ensure_schema(cur)
+    # 2) OData filter: resolvedIn / closedIn / canceledIn na janela
+    #    IMPORTANTÍSSIMO: datetimes SEM aspas para não virar string em OData!
+    f_from = odata_ts(window_from)
+    f_to   = odata_ts(window_to)
 
-            if args.ids:
-                ids = [int(x) for x in args.ids.split(",") if x.strip()]
-            else:
-                ids = ids_pendentes_cancelled(cur, args.limit)
+    odata_filter = (
+        f"(resolvedIn ge {f_from} and resolvedIn le {f_to})"
+        f" or (closedIn ge {f_from} and closedIn le {f_to})"
+        f" or (canceledIn ge {f_from} and canceledIn le {f_to})"
+    )
 
-            if not ids:
-                log("Nada pendente para preencher.")
-                return
+    # 3) Campos que realmente precisamos (inclui canceledIn!)
+    select_fields = ",".join([
+        "id","status","resolvedIn","closedIn","canceledIn"
+    ])
 
-            log(f"Processando {len(ids)} tickets...")
-            ok = 0
-            miss = 0
+    # 4) Coleta
+    rows = []
+    for page in page_iter(odata_filter, select_fields, page=1000):
+        for t in page:
+            tid = t.get("id")
+            if not isinstance(tid, int):
+                continue
+            status = t.get("status")
+            r_in   = t.get("resolvedIn")
+            c_in   = t.get("closedIn")
+            x_in   = t.get("canceledIn")  # <- **a data de cancelamento**
 
-            for i, tid in enumerate(ids, 1):
-                try:
-                    t = md_get_ticket_with_history(tid)
-                    row = extract_ticket_row(t)
-                    upsert_ticket(cur, row)
-                    ok += 1
+            # Converte para timezone-aware UTC (psycopg2 aceita string ISO)
+            def to_dt(x):
+                if not x:
+                    return None
+                # Movidesk devolve DateTimeOffset; manter como texto ISO
+                return x
 
-                except Exception as e:
-                    miss += 1
-                    log(f"[WARN] ticket {tid}: {e}")
+            rows.append((
+                tid,
+                status,
+                to_dt(r_in),
+                to_dt(c_in),
+                to_dt(x_in),
+            ))
 
-                if throttle > 0:
-                    time.sleep(throttle)
-
+    if not rows:
+        LOG.info("Sem alterações para aplicar.")
+        # Mesmo sem linhas, atualiza o controle para não repetir a janela toda
+        with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+            cur.execute(SYNC_WRITE_SQL, (window_to,))
             conn.commit()
-            log(f"Concluído. Atualizados: {ok} | Falhas: {miss}")
+        return
+
+    # 5) Upsert em lote
+    with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
+        execute_values(cur, UPSERT_SQL, rows, page_size=1000)
+        cur.execute(SYNC_WRITE_SQL, (window_to,))
+        conn.commit()
+
+    LOG.info("Upsert concluído. Total de tickets: %d", len(rows))
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        LOG.exception("Falhou")
+        sys.exit(1)
