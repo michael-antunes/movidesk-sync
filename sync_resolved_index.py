@@ -39,11 +39,11 @@ def ensure_ctl(conn):
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
           name text primary key default 'default',
-          last_update timestamptz not null default now()
+          last_update timestamptz not null default now(),
+          last_index_run_at timestamptz,
+          last_detail_run_at timestamptz
         )
         """)
-        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_index_run_at timestamptz")
-        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_detail_run_at timestamptz")
         cur.execute("create index if not exists ix_dc_need on visualizacao_resolvidos.detail_control(need_detail,last_update)")
     conn.commit()
 
