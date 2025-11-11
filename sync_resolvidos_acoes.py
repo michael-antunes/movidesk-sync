@@ -35,10 +35,60 @@ def ensure_schema(conn):
         cur.execute("""
         create table if not exists visualizacao_resolvidos.resolvidos_acoes(
           ticket_id integer primary key,
-          acoes jsonb,
-          qtd_acoes_descricao_publi integer,
-          qtd_acoes_descricao_inter integer
+          acoes jsonb
         )
+        """)
+        cur.execute("""
+        do $$
+        begin
+          if not exists(
+            select 1 from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_publi'
+              and is_generated='ALWAYS'
+          ) then
+            begin
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                drop column if exists qtd_acoes_descricao_publi;
+            exception when undefined_column then null;
+            end;
+            alter table visualizacao_resolvidos.resolvidos_acoes
+              add column qtd_acoes_descricao_publi integer
+              generated always as (
+                jsonb_array_length(
+                  jsonb_path_query_array(
+                    acoes,
+                    '$[*] ? (@.description != "" && ((@.isPublic == true) || (@.isPublic == "true")))'
+                  )
+                )
+              ) stored;
+          end if;
+
+          if not exists(
+            select 1 from information_schema.columns
+            where table_schema='visualizacao_resolvidos'
+              and table_name='resolvidos_acoes'
+              and column_name='qtd_acoes_descricao_inter'
+              and is_generated='ALWAYS'
+          ) then
+            begin
+              alter table visualizacao_resolvidos.resolvidos_acoes
+                drop column if exists qtd_acoes_descricao_inter;
+            exception when undefined_column then null;
+            end;
+            alter table visualizacao_resolvidos.resolvidos_acoes
+              add column qtd_acoes_descricao_inter integer
+              generated always as (
+                jsonb_array_length(
+                  jsonb_path_query_array(
+                    acoes,
+                    '$[*] ? (@.description != "" && ((@.isPublic == false) || (@.isPublic == "false")))'
+                  )
+                )
+              ) stored;
+          end if;
+        end$$;
         """)
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
@@ -62,8 +112,7 @@ def get_since(conn):
         base = r2[0]
     else:
         base = datetime.now(timezone.utc) - timedelta(days=int(os.getenv("MOVIDESK_ACOES_DAYS","7")))
-    overlap_min = int(os.getenv("MOVIDESK_OVERLAP_MIN","15"))
-    return base - timedelta(minutes=overlap_min)
+    return base - timedelta(minutes=int(os.getenv("MOVIDESK_OVERLAP_MIN","15")))
 
 def list_ids(conn, since_dt, limit):
     with conn.cursor() as cur:
@@ -116,25 +165,12 @@ def simplify_actions(actions):
         })
     return out
 
-def count_descriptions(actions):
-    pub = 0
-    inter = 0
-    for a in actions:
-        desc = a.get("description")
-        is_pub = bool(a.get("isPublic"))
-        if isinstance(desc, str) and desc.strip():
-            if is_pub: pub += 1
-            else: inter += 1
-    return pub, inter
-
 UPSERT = """
 insert into visualizacao_resolvidos.resolvidos_acoes
-(ticket_id,acoes,qtd_acoes_descricao_publi,qtd_acoes_descricao_inter)
-values (%(ticket_id)s,%(acoes)s,%(pub)s,%(inter)s)
+(ticket_id,acoes)
+values (%(ticket_id)s,%(acoes)s)
 on conflict (ticket_id) do update set
-  acoes = excluded.acoes,
-  qtd_acoes_descricao_publi = excluded.qtd_acoes_descricao_publi,
-  qtd_acoes_descricao_inter = excluded.qtd_acoes_descricao_inter
+  acoes = excluded.acoes
 """
 
 def flush_rows(conn, rows):
@@ -153,6 +189,7 @@ def heartbeat(conn):
     conn.commit()
 
 def main():
+    if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
     c0 = get_conn()
     try:
         ensure_schema(c0)
@@ -162,15 +199,14 @@ def main():
     limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","5000"))
     chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","150"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.2"))
-    conn_ids = get_conn()
-    ids = list_ids(conn_ids, since_dt, limit)
-    conn_ids.close()
+    c1 = get_conn()
+    ids = list_ids(c1, since_dt, limit)
+    c1.close()
     rows = []
     for tid in ids:
         acts = fetch_actions(tid)
         simp = simplify_actions(acts)
-        pub, inter = count_descriptions(simp)
-        rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp), "pub": pub, "inter": inter})
+        rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp)})
         if len(rows) >= chunk:
             c = get_conn(); flush_rows(c, rows); heartbeat(c); c.close(); rows = []
         time.sleep(throttle)
