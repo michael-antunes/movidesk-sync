@@ -114,15 +114,27 @@ def get_since(conn):
         base = datetime.now(timezone.utc) - timedelta(days=int(os.getenv("MOVIDESK_ACOES_DAYS","7")))
     return base - timedelta(minutes=int(os.getenv("MOVIDESK_OVERLAP_MIN","15")))
 
-def list_ids(conn, since_dt, limit):
+def list_ids(conn, since_dt, limit, repair_days):
     with conn.cursor() as cur:
         cur.execute("""
+        with delta as (
+          select ticket_id, last_update
+            from visualizacao_resolvidos.tickets_resolvidos
+           where last_update >= %s
+        ),
+        missing as (
+          select tr.ticket_id, tr.last_update
+            from visualizacao_resolvidos.tickets_resolvidos tr
+            left join visualizacao_resolvidos.resolvidos_acoes ra
+              on ra.ticket_id = tr.ticket_id
+           where (ra.ticket_id is null or ra.acoes is null or jsonb_array_length(coalesce(ra.acoes,'[]'::jsonb))=0)
+             and tr.last_update >= now() - (%s || ' days')::interval
+        )
         select ticket_id
-          from visualizacao_resolvidos.tickets_resolvidos
-         where last_update >= %s
+          from (select * from delta union all select * from missing) q
          order by last_update desc
          limit %s
-        """, (since_dt, limit))
+        """, (since_dt, repair_days, limit))
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
@@ -151,6 +163,12 @@ def fetch_actions(ticket_id):
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 400: continue
             raise
+    url3 = f"{API_BASE}/tickets/{ticket_id}/actions"
+    try:
+        acts = req(url3, {"token":API_TOKEN, "$select":"id,isPublic,description,createdDate,origin"})
+        if isinstance(acts, list): return acts
+    except:
+        pass
     return []
 
 def simplify_actions(actions):
@@ -173,11 +191,11 @@ on conflict (ticket_id) do update set
   acoes = excluded.acoes
 """
 
-def flush_rows(conn, rows):
-    if not rows: return
+def flush_rows(conn, rows, page):
+    if not rows: return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=int(os.getenv("MOVIDESK_PG_PAGESIZE","200")))
-    conn.commit()
+        psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=page)
+    conn.commit(); return len(rows)
 
 def heartbeat(conn):
     with conn.cursor() as cur:
@@ -199,8 +217,9 @@ def main():
     limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","5000"))
     chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","150"))
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.2"))
+    repair_days = os.getenv("MOVIDESK_ACOES_REPAIR_DAYS","30")
     c1 = get_conn()
-    ids = list_ids(c1, since_dt, limit)
+    ids = list_ids(c1, since_dt, limit, repair_days)
     c1.close()
     rows = []
     for tid in ids:
@@ -208,10 +227,10 @@ def main():
         simp = simplify_actions(acts)
         rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp)})
         if len(rows) >= chunk:
-            c = get_conn(); flush_rows(c, rows); heartbeat(c); c.close(); rows = []
+            c = get_conn(); flush_rows(c, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","200"))); heartbeat(c); c.close(); rows = []
         time.sleep(throttle)
     if rows:
-        c = get_conn(); flush_rows(c, rows); heartbeat(c); c.close()
+        c = get_conn(); flush_rows(c, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","200"))); heartbeat(c); c.close()
     print("ok")
 
 if __name__ == "__main__":
