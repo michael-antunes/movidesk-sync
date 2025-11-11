@@ -224,38 +224,28 @@ def up_sync_rows(conn):
           values('default',now(),now())
           on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
         """)
-        cur.execute("""
-          insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
-          values('detail_control',now(),now())
-          on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
-        """)
-        cur.execute("""
-          insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
-          values('tickets_resolvidos',now(),now())
-          on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
-        """)
     conn.commit()
 
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-    conn = get_conn()
+    c = get_conn()
     try:
-        ensure_schema(conn)
-        since = get_since(conn)
+        ensure_schema(c)
+        since = get_since(c)
     finally:
-        conn.close()
+        c.close()
     since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     data = fetch_pages(since_iso)
     rows = [map_row(t) for t in data if isinstance(t, dict)]
     rows = [r for r in rows if r["ticket_id"]]
     ids = [r["ticket_id"] for r in rows]
-    conn = get_conn()
+    c = get_conn()
     try:
-        upsert_rows(conn, rows)
-        mark_done(conn, ids)
-        up_sync_rows(conn)
+        upsert_rows(c, rows)
+        mark_done(c, ids)
+        up_sync_rows(c)
     finally:
-        conn.close()
+        c.close()
     print(f"pages_upsert={len(rows)} since={since_iso}")
 
 if __name__ == "__main__":
