@@ -102,4 +102,161 @@ def get_since(conn):
 
 def iint(x):
     try:
-        s = str(x); return int(s)
+        s = str(x); return int(s) if s.isdigit() else None
+    except: return None
+
+def pick_org(clients):
+    if not isinstance(clients, list) or not clients: return None, None
+    c0 = clients[0] or {}; org = c0.get("organization") or {}
+    return org.get("id"), org.get("businessName")
+
+def extract_csat(cfs):
+    if not isinstance(cfs, list): return None
+    for cf in cfs:
+        if str(cf.get("id")) == "137641":
+            return cf.get("value")
+    return None
+
+def fetch_pages(since_iso):
+    url = f"{API_BASE}/tickets"
+    top = int(os.getenv("MOVIDESK_PAGE_SIZE","200"))
+    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.8"))
+    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso}"
+    select_fields = ",".join([
+        "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
+        "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
+    ])
+    expand_options = [
+        "owner,clients($expand=organization),customFields",
+        "owner,clients($expand=organization)",
+        "owner,clients",
+        ""
+    ]
+    items, skip, exp_idx = [], 0, 0
+    while True:
+        try:
+            params = {"token":API_TOKEN,"$select":select_fields,"$filter":filtro,"$top":top,"$skip":skip}
+            if expand_options[exp_idx]: params["$expand"]=expand_options[exp_idx]
+            page = req(url, params) or []
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400 and exp_idx < len(expand_options)-1:
+                exp_idx += 1; continue
+            raise
+        if not isinstance(page, list) or not page: break
+        items.extend(page)
+        if len(page) < top: break
+        skip += len(page)
+        time.sleep(throttle)
+    return items
+
+UPSERT = """
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,
+ responsible_id,responsible_name,organization_id,organization_name,origin,category,urgency,
+ service_first_level,service_second_level,service_third_level,adicional_137641_avaliado_csat)
+values
+(%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(last_cancelled_at)s,%(last_update)s,
+ %(responsible_id)s,%(responsible_name)s,%(organization_id)s,%(organization_name)s,%(origin)s,%(category)s,%(urgency)s,
+ %(service_first_level)s,%(service_second_level)s,%(service_third_level)s,%(adicional_137641_avaliado_csat)s)
+on conflict (ticket_id) do update set
+  status=excluded.status,
+  last_resolved_at=excluded.last_resolved_at,
+  last_closed_at=excluded.last_closed_at,
+  last_cancelled_at=excluded.last_cancelled_at,
+  last_update=excluded.last_update,
+  responsible_id=excluded.responsible_id,
+  responsible_name=excluded.responsible_name,
+  organization_id=excluded.organization_id,
+  organization_name=excluded.organization_name,
+  origin=excluded.origin,
+  category=excluded.category,
+  urgency=excluded.urgency,
+  service_first_level=excluded.service_first_level,
+  service_second_level=excluded.service_second_level,
+  service_third_level=excluded.service_third_level,
+  adicional_137641_avaliado_csat=excluded.adicional_137641_avaliado_csat
+"""
+
+def map_row(t):
+    owner = t.get("owner") or {}
+    org_id, org_name = pick_org(t.get("clients") or [])
+    csat = extract_csat(t.get("customFields") or [])
+    return {
+        "ticket_id": iint(t.get("id")),
+        "status": t.get("status"),
+        "last_resolved_at": t.get("resolvedIn"),
+        "last_closed_at": t.get("closedIn"),
+        "last_cancelled_at": t.get("canceledIn"),
+        "last_update": t.get("lastUpdate"),
+        "responsible_id": iint(owner.get("id")),
+        "responsible_name": owner.get("businessName"),
+        "organization_id": org_id,
+        "organization_name": org_name,
+        "origin": "" if t.get("origin") is None else str(t.get("origin")),
+        "category": t.get("category"),
+        "urgency": t.get("urgency"),
+        "service_first_level": t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level": t.get("serviceThirdLevel"),
+        "adicional_137641_avaliado_csat": csat,
+    }
+
+def upsert_rows(conn, rows):
+    if not rows: return 0
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=int(os.getenv("MOVIDESK_PG_PAGESIZE","300")))
+    conn.commit(); return len(rows)
+
+def mark_done(conn, ids):
+    if not ids: return
+    with conn.cursor() as cur:
+        cur.execute("""
+        update visualizacao_resolvidos.detail_control
+           set need_detail=false, detail_last_run_at=now(), tries=0
+         where ticket_id = any(%s)
+        """, (ids,))
+    conn.commit()
+
+def up_sync_rows(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+          insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
+          values('default',now(),now())
+          on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
+        """)
+        cur.execute("""
+          insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
+          values('detail_control',now(),now())
+          on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
+        """)
+        cur.execute("""
+          insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
+          values('tickets_resolvidos',now(),now())
+          on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
+        """)
+    conn.commit()
+
+def main():
+    if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
+    conn = get_conn()
+    try:
+        ensure_schema(conn)
+        since = get_since(conn)
+    finally:
+        conn.close()
+    since_iso = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    data = fetch_pages(since_iso)
+    rows = [map_row(t) for t in data if isinstance(t, dict)]
+    rows = [r for r in rows if r["ticket_id"]]
+    ids = [r["ticket_id"] for r in rows]
+    conn = get_conn()
+    try:
+        upsert_rows(conn, rows)
+        mark_done(conn, ids)
+        up_sync_rows(conn)
+    finally:
+        conn.close()
+    print(f"pages_upsert={len(rows)} since={since_iso}")
+
+if __name__ == "__main__":
+    main()
