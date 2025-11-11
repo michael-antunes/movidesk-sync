@@ -2,7 +2,9 @@ name: Movidesk • Ações dos tickets resolvidos
 
 on:
   workflow_run:
-    workflows: ["Movidesk • Tickets resolvidos (detail + cancelled)"]
+    workflows:
+      - "Movidesk - Tickets resolvidos (detail + cancelled)"
+      - "Movidesk • Tickets resolvidos (detail + cancelled)"
     types: [completed]
   schedule:
     - cron: "0 * * * *"
