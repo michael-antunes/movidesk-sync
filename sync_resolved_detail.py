@@ -1,4 +1,4 @@
-import os, time, datetime, requests, psycopg2, psycopg2.extras
+import os, time, requests, psycopg2, psycopg2.extras
 
 API_BASE = "https://api.movidesk.com/public/v1"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
@@ -14,7 +14,8 @@ def req(url, params, timeout=90):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
             time.sleep(wait); continue
-        if r.status_code == 404: return []
+        if r.status_code == 404:
+            return []
         r.raise_for_status()
         return r.json() if r.text else []
 
@@ -110,15 +111,37 @@ def extract_custom(cfs):
     return out
 
 def fetch_detail(ticket_id):
-    url = f"{API_BASE}/tickets"
     select_fields = ",".join([
         "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
         "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
     ])
-    expand = "owner,clients($expand=organization),customFields"
-    filtro = f"id eq {ticket_id}"
-    data = req(url, {"token":API_TOKEN,"$select":select_fields,"$expand":expand,"$filter":filtro,"$top":1}) or []
-    return data[0] if data else {}
+    expand_opts = [
+        "owner,clients($expand=organization),customFields",
+        "owner,clients($expand=organization)",
+        "owner,clients",
+        ""
+    ]
+    url_id = f"{API_BASE}/tickets/{ticket_id}"
+    for exp in expand_opts:
+        params = {"token":API_TOKEN, "$select":select_fields}
+        if exp: params["$expand"] = exp
+        try:
+            data = req(url_id, params) or {}
+            if isinstance(data, dict) and data.get("id"): return data
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400: continue
+            raise
+    url_list = f"{API_BASE}/tickets"
+    for exp in expand_opts:
+        params = {"token":API_TOKEN, "$select":select_fields, "$filter": f"id eq {ticket_id}", "$top": 1}
+        if exp: params["$expand"] = exp
+        try:
+            data = req(url_list, params) or []
+            if isinstance(data, list) and data: return data[0]
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400: continue
+            raise
+    return {}
 
 UPSERT_TK = """
 insert into visualizacao_resolvidos.tickets_resolvidos
@@ -163,7 +186,7 @@ def map_row(t):
         "responsible_name": owner.get("businessName"),
         "organization_id": org_id,
         "organization_name": org_name,
-        "origin": str(t.get("origin") if t.get("origin") is not None else ""),
+        "origin": "" if t.get("origin") is None else str(t.get("origin")),
         "category": t.get("category"),
         "urgency": t.get("urgency"),
         "service_first_level": t.get("serviceFirstLevel"),
@@ -193,7 +216,7 @@ def main():
     conn = psycopg2.connect(NEON_DSN)
     try:
         ensure_schema(conn)
-        limit = int(os.getenv("MOVIDESK_DETAIL_LIMIT","2000"))
+        limit = int(os.getenv("MOVIDESK_DETAIL_LIMIT","500"))
         throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
         ids = pick_ids(conn, limit)
         rows, done = [], []
