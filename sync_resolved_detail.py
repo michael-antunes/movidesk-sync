@@ -13,42 +13,87 @@ def req(url, params, timeout=90):
         if r.status_code in (429,503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
-            time.sleep(wait)
-            continue
-        if r.status_code == 404:
-            return []
+            time.sleep(wait); continue
+        if r.status_code == 404: return []
         r.raise_for_status()
         return r.json() if r.text else []
 
 def ensure_schema(conn):
     with conn.cursor() as cur:
-        cur.execute(open("sql/01_resolvidos_schema.sql","r",encoding="utf-8").read())
+        cur.execute("create schema if not exists visualizacao_resolvidos")
+        cur.execute("create table if not exists visualizacao_resolvidos.tickets_resolvidos(ticket_id integer primary key)")
+        cur.execute("""
+        alter table visualizacao_resolvidos.tickets_resolvidos
+          add column if not exists status text,
+          add column if not exists last_resolved_at timestamptz,
+          add column if not exists last_closed_at timestamptz,
+          add column if not exists last_cancelled_at timestamptz,
+          add column if not exists last_update timestamptz,
+          add column if not exists responsible_id bigint,
+          add column if not exists responsible_name text,
+          add column if not exists organization_id text,
+          add column if not exists organization_name text,
+          add column if not exists origin text,
+          add column if not exists category text,
+          add column if not exists urgency text,
+          add column if not exists service_first_level text,
+          add column if not exists service_second_level text,
+          add column if not exists service_third_level text,
+          add column if not exists adicional_137641_avaliado_csat text
+        """)
+        cur.execute("""
+        alter table visualizacao_resolvidos.tickets_resolvidos
+          add column if not exists last_resolved_date_br_date date generated always as (((last_resolved_at at time zone 'America/Sao_Paulo')::date)) stored,
+          add column if not exists last_resolved_date_br_str  text generated always as (to_char((last_resolved_at at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored,
+          add column if not exists last_closed_date_br_date   date generated always as (((last_closed_at  at time zone 'America/Sao_Paulo')::date)) stored,
+          add column if not exists last_closed_date_br_str    text generated always as (to_char((last_closed_at  at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored,
+          add column if not exists last_cancelled_date_br_date date generated always as (((last_cancelled_at at time zone 'America/Sao_Paulo')::date)) stored,
+          add column if not exists last_cancelled_date_br_str  text generated always as (to_char((last_cancelled_at at time zone 'America/Sao_Paulo'),'DD/MM/YYYY')) stored
+        """)
+        cur.execute("create table if not exists visualizacao_resolvidos.detail_control(ticket_id integer primary key)")
+        cur.execute("""
+        alter table visualizacao_resolvidos.detail_control
+          add column if not exists status text,
+          add column if not exists last_resolved_at timestamptz,
+          add column if not exists last_closed_at timestamptz,
+          add column if not exists last_cancelled_at timestamptz,
+          add column if not exists last_update timestamptz,
+          add column if not exists need_detail boolean default true,
+          add column if not exists detail_last_run_at timestamptz,
+          add column if not exists tries integer default 0
+        """)
+        cur.execute("""
+        create table if not exists visualizacao_resolvidos.sync_control(
+          name text primary key default 'default',
+          last_update timestamptz not null default now()
+        )
+        """)
+        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_index_run_at timestamptz")
+        cur.execute("alter table visualizacao_resolvidos.sync_control add column if not exists last_detail_run_at timestamptz")
+        cur.execute("create index if not exists ix_dc_need on visualizacao_resolvidos.detail_control(need_detail,last_update)")
+        cur.execute("create index if not exists ix_tr_status on visualizacao_resolvidos.tickets_resolvidos(status)")
     conn.commit()
 
 def pick_ids(conn, limit):
     with conn.cursor() as cur:
         cur.execute("""
         select ticket_id
-        from visualizacao_resolvidos.detail_control
-        where need_detail = true or detail_last_run_at is null
-        order by coalesce(last_update, now()) desc
-        limit %s
+          from visualizacao_resolvidos.detail_control
+         where need_detail = true or detail_last_run_at is null
+         order by coalesce(last_update, now()) desc
+         limit %s
         """, (limit,))
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
 def iint(x):
     try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
-    except Exception:
-        return None
+        s = str(x); return int(s) if s.isdigit() else None
+    except: return None
 
 def pick_org(clients):
-    if not isinstance(clients, list) or not clients:
-        return None, None
-    c0 = clients[0] or {}
-    org = c0.get("organization") or {}
+    if not isinstance(clients, list) or not clients: return None, None
+    c0 = clients[0] or {}; org = c0.get("organization") or {}
     return org.get("id"), org.get("businessName")
 
 def slug(s):
@@ -59,11 +104,9 @@ def extract_custom(cfs):
     out = {}
     if isinstance(cfs, list):
         for cf in cfs:
-            fid = cf.get("id")
-            name = cf.get("name")
+            fid = cf.get("id"); name = cf.get("name")
             key = f"adicional_{fid}_{slug(name)}" if fid else None
-            if key:
-                out[key] = cf.get("value")
+            if key: out[key] = cf.get("value")
     return out
 
 def fetch_detail(ticket_id):
@@ -74,13 +117,7 @@ def fetch_detail(ticket_id):
     ])
     expand = "owner,clients($expand=organization),customFields"
     filtro = f"id eq {ticket_id}"
-    data = req(url, {
-        "token": API_TOKEN,
-        "$select": select_fields,
-        "$expand": expand,
-        "$filter": filtro,
-        "$top": 1
-    }) or []
+    data = req(url, {"token":API_TOKEN,"$select":select_fields,"$expand":expand,"$filter":filtro,"$top":1}) or []
     return data[0] if data else {}
 
 UPSERT_TK = """
@@ -136,16 +173,13 @@ def map_row(t):
     }
 
 def upsert_detail(conn, rows):
-    if not rows:
-        return 0
+    if not rows: return 0
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, UPSERT_TK, rows, page_size=200)
-    conn.commit()
-    return len(rows)
+    conn.commit(); return len(rows)
 
 def mark_done(conn, ids):
-    if not ids:
-        return
+    if not ids: return
     with conn.cursor() as cur:
         cur.execute("""
         update visualizacao_resolvidos.detail_control
@@ -155,8 +189,7 @@ def mark_done(conn, ids):
     conn.commit()
 
 def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
+    if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
     conn = psycopg2.connect(NEON_DSN)
     try:
         ensure_schema(conn)
@@ -167,8 +200,7 @@ def main():
         for tid in ids:
             t = fetch_detail(tid)
             if t:
-                rows.append(map_row(t))
-                done.append(tid)
+                rows.append(map_row(t)); done.append(tid)
             time.sleep(throttle)
         upsert_detail(conn, rows)
         mark_done(conn, done)
