@@ -4,6 +4,16 @@ API_BASE = "https://api.movidesk.com/public/v1"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
+def get_conn():
+    return psycopg2.connect(
+        NEON_DSN,
+        sslmode="require",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+
 http = requests.Session()
 http.headers.update({"Accept":"application/json"})
 
@@ -14,8 +24,7 @@ def req(url, params, timeout=90):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
             time.sleep(wait); continue
-        if r.status_code == 404:
-            return []
+        if r.status_code == 404: return []
         r.raise_for_status()
         return r.json() if r.text else []
 
@@ -75,17 +84,21 @@ def ensure_schema(conn):
         cur.execute("create index if not exists ix_tr_status on visualizacao_resolvidos.tickets_resolvidos(status)")
     conn.commit()
 
-def pick_ids(conn, limit):
-    with conn.cursor() as cur:
-        cur.execute("""
-        select ticket_id
-          from visualizacao_resolvidos.detail_control
-         where need_detail = true or detail_last_run_at is null
-         order by coalesce(last_update, now()) desc
-         limit %s
-        """, (limit,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
+def pick_ids(limit):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            select ticket_id
+              from visualizacao_resolvidos.detail_control
+             where need_detail = true or detail_last_run_at is null
+             order by coalesce(last_update, now()) desc
+             limit %s
+            """, (limit,))
+            rows = cur.fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
 
 def iint(x):
     try:
@@ -198,7 +211,7 @@ def map_row(t):
 def upsert_detail(conn, rows):
     if not rows: return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_TK, rows, page_size=200)
+        psycopg2.extras.execute_batch(cur, UPSERT_TK, rows, page_size=int(os.getenv("MOVIDESK_PG_PAGESIZE","100")))
     conn.commit(); return len(rows)
 
 def mark_done(conn, ids):
@@ -211,32 +224,56 @@ def mark_done(conn, ids):
         """, (ids,))
     conn.commit()
 
+def safe_flush(rows, done):
+    if not rows: return
+    for attempt in (1,2):
+        conn = None
+        try:
+            conn = get_conn()
+            upsert_detail(conn, rows)
+            mark_done(conn, done)
+            with conn.cursor() as cur:
+                cur.execute("""
+                  insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
+                  values('default',now(),now())
+                  on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
+                """)
+            conn.commit()
+            return
+        except psycopg2.OperationalError:
+            if conn:
+                try: conn.close()
+                except: pass
+            if attempt == 2: raise
+            time.sleep(3)
+        finally:
+            if conn:
+                try: conn.close()
+                except: pass
+
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-    conn = psycopg2.connect(NEON_DSN)
+    first = get_conn()
     try:
-        ensure_schema(conn)
-        limit = int(os.getenv("MOVIDESK_DETAIL_LIMIT","500"))
-        throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
-        ids = pick_ids(conn, limit)
-        rows, done = [], []
-        for tid in ids:
-            t = fetch_detail(tid)
-            if t:
-                rows.append(map_row(t)); done.append(tid)
-            time.sleep(throttle)
-        upsert_detail(conn, rows)
-        mark_done(conn, done)
-        with conn.cursor() as cur:
-            cur.execute("""
-              insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
-              values('default',now(),now())
-              on conflict (name) do update set last_update=excluded.last_update,last_detail_run_at=excluded.last_detail_run_at
-            """)
-        conn.commit()
-        print(f"rows={len(rows)} done={len(done)}")
+        ensure_schema(first)
     finally:
-        conn.close()
+        first.close()
+    limit = int(os.getenv("MOVIDESK_DETAIL_LIMIT","3000"))
+    chunk = int(os.getenv("MOVIDESK_DETAIL_CHUNK","250"))
+    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.20"))
+    ids = pick_ids(limit)
+    rows, done = [], []
+    for tid in ids:
+        t = fetch_detail(tid)
+        if t:
+            rows.append(map_row(t)); done.append(tid)
+        if len(rows) >= chunk:
+            safe_flush(rows, done)
+            rows, done = [], []
+        time.sleep(throttle)
+    if rows:
+        safe_flush(rows, done)
+    print("ok")
 
 if __name__ == "__main__":
     main()
