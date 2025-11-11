@@ -1,20 +1,13 @@
 name: Movidesk • Tickets resolvidos (detail + cancelled)
-
 on:
   schedule:
     - cron: "7-59/15 * * * *"
   workflow_dispatch: {}
-
 concurrency:
   group: movidesk-detail
   cancel-in-progress: true
-
-permissions:
-  contents: read
-  actions: write
-
 jobs:
-  run:
+  detail:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,14 +24,7 @@ jobs:
           MOVIDESK_OVERLAP_MIN: "15"
           MOVIDESK_PG_PAGESIZE: "300"
         run: python sync_resolved_detail.py
-      - name: Disparar workflow das ações
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'sync_resolvidos_acoes.yml',
-              ref: process.env.GITHUB_REF_NAME || context.ref.replace(/^refs\/(heads|tags)\//,'')
-            })
+  acoes:
+    needs: detail
+    uses: ./.github/workflows/sync_resolvidos_acoes.yml
+    secrets: inherit
