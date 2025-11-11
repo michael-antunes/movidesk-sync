@@ -1,20 +1,26 @@
-# .github/workflows/sync_resolved_detail.yml
-name: Movidesk - Tickets resolvidos (detail + cancelled)
+name: Movidesk • Tickets resolvidos (detail + cancelled)
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7-59/15 * * * *"
+  workflow_dispatch: {}
+concurrency:
+  group: movidesk-detail
+  cancel-in-progress: true
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - name: Sync resolved/closed/cancelled detail
-        env:
+      - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_PAGE_SIZE: "200"
+          MOVIDESK_THROTTLE: "0.8"
+          MOVIDESK_DETAIL_DAYS: "7"
+          MOVIDESK_OVERLAP_MIN: "15"
+          MOVIDESK_PG_PAGESIZE: "300"
         run: python sync_resolved_detail.py
