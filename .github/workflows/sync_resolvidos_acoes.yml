@@ -22,7 +22,9 @@ jobs:
           MOVIDESK_OVERLAP_MIN: "15"
           MOVIDESK_ACOES_DAYS: "7"
           MOVIDESK_ACOES_REPAIR_DAYS: "30"
-          MOVIDESK_ACOES_TOP: "100"
+          MOVIDESK_ACOES_LIMIT: "4000"
+          MOVIDESK_ACOES_CHUNK: "120"
           MOVIDESK_PG_PAGESIZE: "200"
-          MOVIDESK_THROTTLE: "0.3"
+          MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_ACOES_TOP: "200"
         run: python sync_resolvidos_acoes.py
