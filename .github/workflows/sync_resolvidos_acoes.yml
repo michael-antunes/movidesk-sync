@@ -1,22 +1,13 @@
 name: Movidesk • Ações dos tickets resolvidos
-
 on:
-  workflow_run:
-    workflows:
-      - "Movidesk - Tickets resolvidos (detail + cancelled)"
-      - "Movidesk • Tickets resolvidos (detail + cancelled)"
-    types: [completed]
+  workflow_dispatch: {}
   schedule:
     - cron: "0 * * * *"
-  workflow_dispatch: {}
-
 concurrency:
   group: movidesk-acoes
   cancel-in-progress: true
-
 jobs:
   run:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +20,7 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_OVERLAP_MIN: "15"
           MOVIDESK_ACOES_DAYS: "7"
+          MOVIDESK_ACOES_REPAIR_DAYS: "30"
           MOVIDESK_ACOES_LIMIT: "5000"
           MOVIDESK_ACOES_CHUNK: "150"
           MOVIDESK_PG_PAGESIZE: "200"
