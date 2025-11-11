@@ -25,9 +25,9 @@ def req(url, params, timeout=90):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
             time.sleep(wait); continue
-        if r.status_code == 404: return {}
+        if r.status_code == 404: return []
         r.raise_for_status()
-        return r.json() if r.text else {}
+        return r.json() if r.text else []
 
 def ensure_schema(conn):
     with conn.cursor() as cur:
@@ -138,37 +138,35 @@ def list_ids(conn, since_dt, limit, repair_days):
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
-def fetch_actions(ticket_id):
+def fetch_actions_paginated(ticket_id):
+    top = int(os.getenv("MOVIDESK_ACOES_TOP","200"))
+    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.2"))
+    url = f"{API_BASE}/tickets/{ticket_id}/actions"
+    skip = 0
+    all_items = []
+    while True:
+        page = req(url, {"token":API_TOKEN, "$select":"id,isPublic,description,createdDate,origin", "$top":top, "$skip":skip}) or []
+        if not isinstance(page, list) or not page:
+            break
+        all_items.extend(page)
+        if len(page) < top:
+            break
+        skip += len(page)
+        time.sleep(throttle)
+    if all_items:
+        return all_items
     select_fields = "id,status,lastUpdate"
-    expand_opts = [
-        "actions($select=id,isPublic,description,createdDate,origin)",
-        "actions($select=id,isPublic,description,createdDate)"
-    ]
-    url = f"{API_BASE}/tickets/{ticket_id}"
-    for exp in expand_opts:
+    for exp in ["actions($select=id,isPublic,description,createdDate,origin)","actions($select=id,isPublic,description,createdDate)","actions"]:
         try:
-            data = req(url, {"token":API_TOKEN, "$select":select_fields, "$expand":exp}) or {}
+            data = req(f"{API_BASE}/tickets/{ticket_id}", {"token":API_TOKEN, "$select":select_fields, "$expand":exp}) or {}
             acts = data.get("actions") or []
             if isinstance(acts, list): return acts
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 400: continue
-            raise
-    url2 = f"{API_BASE}/tickets"
-    for exp in expand_opts:
-        try:
-            data = req(url2, {"token":API_TOKEN, "$select":select_fields, "$filter":f"id eq {ticket_id}", "$expand":exp, "$top":1}) or {}
-            if isinstance(data, list) and data:
-                acts = data[0].get("actions") or []
-                if isinstance(acts, list): return acts
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 400: continue
-            raise
-    url3 = f"{API_BASE}/tickets/{ticket_id}/actions"
-    try:
-        acts = req(url3, {"token":API_TOKEN, "$select":"id,isPublic,description,createdDate,origin"})
+        except:
+            pass
+    data = req(f"{API_BASE}/tickets", {"token":API_TOKEN, "$select":select_fields, "$filter":f"id eq {ticket_id}", "$expand":"actions($select=id,isPublic,description,createdDate,origin)", "$top":1}) or []
+    if isinstance(data, list) and data:
+        acts = data[0].get("actions") or []
         if isinstance(acts, list): return acts
-    except:
-        pass
     return []
 
 def simplify_actions(actions):
@@ -223,7 +221,7 @@ def main():
     c1.close()
     rows = []
     for tid in ids:
-        acts = fetch_actions(tid)
+        acts = fetch_actions_paginated(tid)
         simp = simplify_actions(acts)
         rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp)})
         if len(rows) >= chunk:
