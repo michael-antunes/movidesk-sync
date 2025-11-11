@@ -17,7 +17,8 @@ def req(url, params, timeout=90):
             ra = r.headers.get("retry-after")
             wait = int(ra) if str(ra).isdigit() else 60
             time.sleep(wait); continue
-        if r.status_code == 404: return []
+        if r.status_code == 404:
+            return []
         r.raise_for_status()
         return r.json() if r.text else []
 
@@ -38,7 +39,7 @@ def ensure_ctl(conn):
         """)
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
-          name text primary key default 'default',
+          name text primary key,
           last_update timestamptz not null default now(),
           last_index_run_at timestamptz,
           last_detail_run_at timestamptz
@@ -107,23 +108,26 @@ def upsert(conn, rows):
         psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=500)
     conn.commit(); return len(rows)
 
+def up_sync_rows(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+          insert into visualizacao_resolvidos.sync_control(name,last_update,last_index_run_at)
+          values('default',now(),now())
+          on conflict (name) do update set last_update=excluded.last_update,last_index_run_at=excluded.last_index_run_at
+        """)
+    conn.commit()
+
 def main():
     if not API_TOKEN or not NEON_DSN: raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-    conn = psycopg2.connect(NEON_DSN)
+    conn = psycopg2.connect(NEON_DSN, sslmode="require", keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
     try:
         ensure_ctl(conn)
         since_dt = get_since(conn)
         items = fetch_index(iso_z(since_dt))
         rows = [map_row(t) for t in items if isinstance(t, dict)]
-        n = upsert(conn, rows)
-        with conn.cursor() as cur:
-            cur.execute("""
-              insert into visualizacao_resolvidos.sync_control(name,last_update,last_index_run_at)
-              values('default',now(),now())
-              on conflict (name) do update set last_update=excluded.last_update,last_index_run_at=excluded.last_index_run_at
-            """)
-        conn.commit()
-        print(f"rows={n}")
+        _ = upsert(conn, rows)
+        up_sync_rows(conn)
+        print("ok")
     finally:
         conn.close()
 
