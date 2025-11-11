@@ -1,8 +1,11 @@
-name: Sync Movidesk -> Index resolvidos
+name: Movidesk • Resolved Index
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
+concurrency:
+  group: movidesk-index
+  cancel-in-progress: true
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -11,33 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          psql "$NEON_DSN" -v ON_ERROR_STOP=1 <<'SQL'
-          begin;
-          create schema if not exists visualizacao_resolvidos;
-          alter table if exists visualizacao_resolvidos.detail_control drop column if exists synced_at;
-          do $$
-          begin
-            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_index_run_at') then
-              execute 'alter table visualizacao_resolvidos.sync_control drop column last_index_run_at';
-            end if;
-            if exists (select 1 from information_schema.columns where table_schema='visualizacao_resolvidos' and table_name='sync_control' and column_name='last_detail_run_at') then
-              execute 'alter table visualizacao_resolvidos.sync_control drop column last_detail_run_at';
-            end if;
-          end $$;
-          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('detail_control', now() - interval '180 days') on conflict (name) do nothing;
-          insert into visualizacao_resolvidos.sync_control(name,last_update) values ('tickets_resolvidos', now() - interval '180 days') on conflict (name) do nothing;
-          delete from visualizacao_resolvidos.sync_control where name not in ('detail_control','tickets_resolvidos');
-          commit;
-          SQL
       - run: pip install requests psycopg2-binary
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_PAGE_SIZE: "500"
           MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_OVERLAP_MIN: "60"
           MOVIDESK_INDEX_DAYS: "180"
         run: python sync_resolved_index.py
