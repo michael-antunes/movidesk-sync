@@ -6,6 +6,9 @@ on:
 concurrency:
   group: movidesk-detail
   cancel-in-progress: true
+permissions:
+  contents: read
+  actions: write
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -24,3 +27,8 @@ jobs:
           MOVIDESK_OVERLAP_MIN: "15"
           MOVIDESK_PG_PAGESIZE: "300"
         run: python sync_resolved_detail.py
+      - name: Disparar ações após detail
+        uses: peter-evans/workflow-dispatch@v1
+        with:
+          workflow: sync_resolvidos_acoes.yml
+          ref: ${{ github.ref }}
