@@ -2,13 +2,13 @@ name: Movidesk • Tickets resolvidos (ações)
 
 on:
   workflow_run:
-    workflows: ["Movidesk • Tickets resolvidos (detail + cancelled)"]  # <- o nome exato do outro workflow
+    workflows: ["Movidesk • Tickets resolvidos (detail + cancelled)"]
     types: [completed]
   workflow_dispatch: {}
 
 concurrency:
   group: movidesk-acoes
-  cancel-in-progress: false   # evita cancelamentos quando a fila acumula
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -20,12 +20,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Dependências
-        run: pip install requests psycopg2-binary
+      - run: pip install requests psycopg2-binary
       - name: Executa ações (10 por vez a partir do tickets_resolvidos)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_THROTTLE: "0.25"
-          MOVIDESK_TOP: "10"           # <- exatamente 10 por execução
+          MOVIDESK_TOP: "10"
         run: python sync_resolvidos_acoes.py
