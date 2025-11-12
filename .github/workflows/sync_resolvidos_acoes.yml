@@ -1,9 +1,7 @@
-name: Movidesk - Ações (10 por vez a partir de tickets_resolvidos)
+name: Movidesk - Ações (depende do detail via dispatch)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
 
 concurrency:
   group: movidesk-acoes-${{ github.ref }}
@@ -22,13 +20,10 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests psycopg2-binary
-      - name: Executa ações
+      - name: Executa ações (10 por vez)
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          # Mesmo segredo; o script aceita os dois nomes
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          # lote de 10, conforme solicitado
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           ACTIONS_BATCH_SIZE: "10"
-          # respiro nas chamadas (ajuste se quiser)
           ACTIONS_THROTTLE_SEC: "0.7"
         run: python sync_resolvidos_acoes.py
