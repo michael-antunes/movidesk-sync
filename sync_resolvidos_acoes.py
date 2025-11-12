@@ -1,156 +1,144 @@
-import os, time, json, requests, psycopg2, psycopg2.extras
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, time, json, math
+import requests
+import psycopg2, psycopg2.extras
+from datetime import datetime, timezone
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-NEON_DSN = os.getenv("NEON_DSN")
-if not API_TOKEN or not NEON_DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
+NEON_DSN  = os.getenv("NEON_DSN")
 
-BATCH = int(os.getenv("ACTIONS_BATCH_SIZE","10"))
-THROTTLE = float(os.getenv("ACTIONS_THROTTLE_SEC","0.7"))
+# parâmetros ajustáveis por env
+BATCH_SIZE          = int(os.getenv("ACTIONS_BATCH_SIZE", "10"))   # 10 tickets por vez
+THROTTLE_SEC        = float(os.getenv("ACTIONS_THROTTLE_SEC", "0.4"))
+PAGE_SIZE_ACTIONS   = 100  # paginação da API de ações
 
-def conn():
+BASE_URL = "https://api.movidesk.com/public/v1"
+
+def http_get(url, params):
+    # evita None no token
+    if not API_TOKEN:
+        raise RuntimeError("Defina MOVIDESK_TOKEN (ou MOVIDESK_API_TOKEN)")
+    q = dict(params or {})
+    q["token"] = API_TOKEN
+    r = requests.get(url, params=q, timeout=90)
+    r.raise_for_status()
+    return r.json()
+
+def get_conn():
+    if not NEON_DSN:
+        raise RuntimeError("Defina NEON_DSN")
     return psycopg2.connect(NEON_DSN)
 
-def ensure_schema():
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute("create schema if not exists visualizacao_resolvidos")
-            cur.execute("""
-            create table if not exists visualizacao_resolvidos.resolvidos_acoes(
-              ticket_id integer primary key,
-              acoes jsonb,
-              updated_at timestamptz default now()
-            )
-            """)
-            cur.execute("""
-            create table if not exists visualizacao_resolvidos.sync_control(
-              name text primary key,
-              last_update timestamptz default now(),
-              last_index_run_at timestamptz,
-              last_detail_run_at timestamptz
-            )
-            """)
-    return True
+def select_next_ticket_ids(conn, limit=BATCH_SIZE):
+    """
+    Seleciona até 'limit' tickets que precisam atualizar ações:
+      - não existem na resolvidos_acoes, OU
+      - tickets_resolvidos.last_update > resolvidos_acoes.updated_at
+    """
+    sql = """
+        with tr as (
+            select id, last_update
+            from visualizacao_resolvidos.tickets_resolvidos
+        )
+        select tr.id
+        from tr
+        left join visualizacao_resolvidos.resolvidos_acoes ra
+               on ra.ticket_id = tr.id
+        where ra.ticket_id is null
+           or tr.last_update > coalesce(ra.updated_at, '1970-01-01'::timestamptz)
+        order by tr.last_update desc nulls last, tr.id desc
+        limit %s;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (limit,))
+        return [row[0] for row in cur.fetchall()]
 
-UPSERT = """
-insert into visualizacao_resolvidos.resolvidos_acoes
-(ticket_id, acoes, updated_at)
-values (%s, %s::jsonb, now())
-on conflict (ticket_id) do update set
- acoes=excluded.acoes,
- updated_at=now()
-"""
+def fetch_actions_for_ticket(ticket_id):
+    """
+    Busca ações pela rota /ticketActions paginando, incluindo:
+      - description (HTML)
+      - isPublic, createdDate, origin
+      - attachments (id, fileName, link)
+      - timeAppointments (id, startDate, endDate, workTime)
+    """
+    url = f"{BASE_URL}/ticketActions"
+    all_actions = []
+    skip = 0
+    while True:
+        params = {
+            "$filter": f"ticket/id eq {ticket_id} and isDeleted eq false",
+            "$select": "id,isPublic,description,createdDate,origin",
+            "$expand": "attachments($select=id,fileName,link),timeAppointments($select=id,startDate,endDate,workTime)",
+            "$top": PAGE_SIZE_ACTIONS,
+            "$skip": skip
+        }
+        data = http_get(url, params)
+        if not isinstance(data, list):
+            # proteção caso a API venha como objeto
+            page = data or []
+        else:
+            page = data
 
-PICK = """
-with uniq as (
-  select tr.*,
-         row_number() over (
-           partition by tr.ticket_id
-           order by coalesce(tr.last_update, tr.last_resolved_at, tr.last_closed_at, tr.last_cancelled_at) desc,
-                    tr.ticket_id desc
-         ) rn
-  from visualizacao_resolvidos.tickets_resolvidos tr
-),
-latest as (
-  select * from uniq where rn = 1
-)
-select l.ticket_id
-from latest l
-left join visualizacao_resolvidos.resolvidos_acoes ra on ra.ticket_id = l.ticket_id
-where ra.ticket_id is null
-   or coalesce(jsonb_array_length(ra.acoes),0)=0
-order by coalesce(l.last_update, l.last_resolved_at, l.last_closed_at, l.last_cancelled_at) desc nulls last,
-         l.ticket_id desc
-limit %s
-"""
+        all_actions.extend(page)
+        if len(page) < PAGE_SIZE_ACTIONS:
+            break
+        skip += PAGE_SIZE_ACTIONS
+        time.sleep(THROTTLE_SEC)  # bem leve
 
-def req(url, params, retries=4):
-    for i in range(retries):
-        r = requests.get(url, params=params, timeout=60)
-        if r.status_code == 200:
-            return r.json()
-        if r.status_code in (429,500,502,503,504):
-            time.sleep(1.5*(i+1))
-            continue
-        r.raise_for_status()
-    r.raise_for_status()
+    return all_actions
 
-def fetch_actions_json(ticket_id):
-    url = "https://api.movidesk.com/public/v1/tickets"
-    params = {
-        "token": API_TOKEN,
-        "$select": "id",
-        "$expand": "actions($select=id,isPublic,description,createdDate,origin;$expand=attachments,timeAppointments)",
-        "$filter": f"id eq {ticket_id}",
-        "$top": 1
-    }
-    data = req(url, params) or []
-    if not data:
-        return []
-    actions = data[0].get("actions") or []
-    return actions
-
-def fetch_html_for_action(ticket_id, action_id):
-    try:
-        o = req("https://api.movidesk.com/public/v1/tickets/htmldescription",
-                {"token": API_TOKEN, "id": str(ticket_id), "actionId": str(action_id)})
-        if isinstance(o, dict):
-            return o.get("description")
-    except:
-        return None
-    return None
-
-def enrich_with_html(ticket_id, actions):
-    out = []
-    for a in actions:
-        obj = dict(a)
-        if obj.get("id") is not None:
-            try:
-                time.sleep(THROTTLE)
-                html = fetch_html_for_action(ticket_id, obj.get("id"))
-                if html:
-                    obj["html"] = html
-            except:
-                pass
-        out.append(obj)
-    return out
+def upsert_actions(conn, rows):
+    """
+    rows: lista de tuplas (ticket_id, acoes_json_text)
+    """
+    sql = """
+        insert into visualizacao_resolvidos.resolvidos_acoes
+            (ticket_id, acoes, updated_at)
+        values (%s, %s::jsonb, now())
+        on conflict (ticket_id)
+        do update set
+            acoes = excluded.acoes,
+            updated_at = now();
+    """
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, sql, rows, page_size=100)
+    conn.commit()
 
 def main():
-    ensure_schema()
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute(PICK, (BATCH,))
-            ids = [r[0] for r in cur.fetchall()]
-    if not ids:
-        with conn() as c:
-            with c.cursor() as cur:
-                cur.execute("""
-                insert into visualizacao_resolvidos.sync_control(name,last_update)
-                values('default', now())
-                on conflict (name) do update set last_update=excluded.last_update
-                """)
-        return
-    rows = []
-    for tid in ids:
-        try:
-            acts = fetch_actions_json(tid)
-            acts = enrich_with_html(tid, acts)
-            rows.append((tid, json.dumps(acts, ensure_ascii=False)))
-        except Exception:
-            time.sleep(THROTTLE)
-            continue
-        time.sleep(THROTTLE)
-    if rows:
-        with conn() as c:
-            with c.cursor() as cur:
-                psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=50)
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute("""
-            insert into visualizacao_resolvidos.sync_control(name,last_update)
-            values('default', now())
-            on conflict (name) do update set last_update=excluded.last_update
-            """)
+    if not API_TOKEN or not NEON_DSN:
+        raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
+
+    conn = get_conn()
+    try:
+        while True:
+            ids = select_next_ticket_ids(conn, BATCH_SIZE)
+            if not ids:
+                # nada para fazer agora
+                break
+
+            out_rows = []
+            for tid in ids:
+                try:
+                    actions = fetch_actions_for_ticket(tid)
+                    # guardamos exatamente como veio (lista de objetos)
+                    acoes_json = json.dumps(actions, ensure_ascii=False)
+                    out_rows.append((tid, acoes_json))
+                except requests.HTTPError as e:
+                    # HTTP 404 / 400 etc — armazena vazio mas não quebra lote
+                    out_rows.append((tid, "[]"))
+                except Exception:
+                    out_rows.append((tid, "[]"))
+                finally:
+                    time.sleep(THROTTLE_SEC)
+
+            if out_rows:
+                upsert_actions(conn, out_rows)
+
+            # loop continua até esvaziar a fila (ids vazios)
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
