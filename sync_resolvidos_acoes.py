@@ -1,5 +1,4 @@
 import os, time, json, requests, psycopg2, psycopg2.extras
-from datetime import datetime, timezone
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
@@ -19,15 +18,26 @@ on conflict (ticket_id) do update set
 """
 
 PICK = """
-with tgt as (
-  select tr.ticket_id
+with uniq as (
+  select tr.*,
+         row_number() over (
+           partition by tr.ticket_id
+           order by coalesce(tr.last_update, tr.last_resolved_at, tr.last_closed_at, tr.last_cancelled_at) desc,
+                    tr.ticket_id desc
+         ) rn
   from visualizacao_resolvidos.tickets_resolvidos tr
-  left join visualizacao_resolvidos.resolvidos_acoes ra on ra.ticket_id = tr.ticket_id
-  where ra.acoes is null or jsonb_typeof(ra.acoes) is null or (jsonb_typeof(ra.acoes)='array' and jsonb_array_length(ra.acoes)=0)
-  order by coalesce(tr.last_update, tr.last_resolved_at, tr.last_closed_at, tr.last_cancelled_at) asc nulls last
-  limit %s
+),
+latest as (
+  select * from uniq where rn = 1
 )
-select ticket_id from tgt
+select l.ticket_id
+from latest l
+left join visualizacao_resolvidos.resolvidos_acoes ra on ra.ticket_id = l.ticket_id
+where ra.ticket_id is null
+   or coalesce(jsonb_array_length(ra.acoes),0)=0
+order by coalesce(l.last_update, l.last_resolved_at, l.last_closed_at, l.last_cancelled_at) desc nulls last,
+         l.ticket_id desc
+limit %s
 """
 
 def conn():
@@ -44,18 +54,7 @@ def req(url, params, retries=4):
         r.raise_for_status()
     r.raise_for_status()
 
-def compact_action(a):
-    return {
-        "id": a.get("id"),
-        "isPublic": a.get("isPublic"),
-        "description": a.get("description"),
-        "createdDate": a.get("createdDate"),
-        "origin": a.get("origin"),
-        "attachments": a.get("attachments") or [],
-        "timeAppointments": a.get("timeAppointments") or []
-    }
-
-def fetch_actions(ticket_id):
+def fetch_actions_json(ticket_id):
     url = "https://api.movidesk.com/public/v1/tickets"
     params = {
         "token": API_TOKEN,
@@ -68,57 +67,54 @@ def fetch_actions(ticket_id):
     if not data:
         return []
     actions = data[0].get("actions") or []
-    return [compact_action(a) for a in actions]
+    return actions
 
-def cleanup_unique():
-    sql = """
-    do $$
-    begin
-      begin
-        alter table visualizacao_resolvidos.resolvidos_acoes
-        add constraint uq_resolvidos_acoes_ticket unique (ticket_id);
-      exception when duplicate_table then
-        null;
-      end;
-    end $$;
-    """
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql)
+def fetch_html_for_action(ticket_id, action_id):
+    try:
+        o = req("https://api.movidesk.com/public/v1/tickets/htmldescription",
+                {"token": API_TOKEN, "id": str(ticket_id), "actionId": str(action_id)})
+        if isinstance(o, dict):
+            return o.get("description")
+    except:
+        return None
+    return None
 
-def heartbeat():
-    sql = """
-    insert into visualizacao_resolvidos.sync_control(name,last_update)
-    values('default', now())
-    on conflict (name) do update set last_update=now()
-    """
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute(sql)
+def enrich_with_html(ticket_id, actions):
+    out = []
+    for a in actions:
+        obj = dict(a)
+        if obj.get("description"):
+            try:
+                time.sleep(THROTTLE)
+                html = fetch_html_for_action(ticket_id, obj.get("id"))
+                if html:
+                    obj["html"] = html
+            except:
+                pass
+        out.append(obj)
+    return out
 
 def main():
-    cleanup_unique()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(PICK, (BATCH,))
             ids = [r[0] for r in cur.fetchall()]
     if not ids:
-        heartbeat()
         return
-    up_rows = []
+    rows = []
     for tid in ids:
         try:
-            acts = fetch_actions(tid)
+            acts = fetch_actions_json(tid)
+            acts = enrich_with_html(tid, acts)
+            rows.append((tid, json.dumps(acts, ensure_ascii=False)))
         except Exception:
             time.sleep(THROTTLE)
             continue
-        up_rows.append((tid, json.dumps(acts)))
         time.sleep(THROTTLE)
-    if up_rows:
+    if rows:
         with conn() as c:
             with c.cursor() as cur:
-                psycopg2.extras.execute_batch(cur, UPSERT, up_rows, page_size=50)
-    heartbeat()
+                psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=50)
 
 if __name__ == "__main__":
     main()
