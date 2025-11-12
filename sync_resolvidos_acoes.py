@@ -40,8 +40,8 @@ def get_conn():
 
 def select_next_ticket_ids(conn, limit: int) -> t.List[int]:
     """
-    Pega tickets que nunca foram gravados em resolvidos_acoes
-    ou que tiveram 'last_activity' posterior ao updated_at das ações.
+    Pega tickets nunca gravados em resolvidos_acoes
+    ou com atividade posterior ao updated_at das ações.
     """
     sql = f"""
     with cand as (
@@ -74,7 +74,6 @@ def movidesk_request(params: dict, max_retries: int = 3, backoff_s: float = 1.5)
     for i in range(max_retries):
         r = requests.get(API_URL, params=params, timeout=60)
         if r.status_code >= 400:
-            # guarda corpo pro diagnóstico
             try:
                 last_err_txt = r.text[:500]
             except Exception:
@@ -83,41 +82,36 @@ def movidesk_request(params: dict, max_retries: int = 3, backoff_s: float = 1.5)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError:
-            # Retentativas apenas para erros temporários
             if r.status_code in (429, 500, 502, 503, 504) and i < max_retries - 1:
                 time.sleep(backoff_s * (i + 1))
                 continue
-            # Anexa corpo à exceção pra facilitar debug
             raise requests.HTTPError(f"{r.status_code} {r.reason} - body: {last_err_txt}", response=r)
 
 
 def fetch_actions_for_ids(ids: t.List[int]) -> t.Dict[int, t.List[dict]]:
     """
-    Busca ações dos tickets informados.
-    - NÃO usa descriptionHtml (causa 400).
-    - Evita pôr 'actions' no $select de tickets (alguns ambientes retornam 400).
-    - Faz fallback: com attachments+timeAppointments → só attachments → apenas ações.
+    Busca ações dos tickets (sem $select em actions para evitar 400 quando o campo não existe).
+    Fallback de expansions:
+      1) attachments + timeAppointments
+      2) apenas attachments
+      3) sem expand (só ações básicas)
     """
     if not ids:
         return {}
 
     filter_expr = " or ".join([f"id eq {i}" for i in ids])
 
-    # Ordem de tentativas (da mais completa para a mais simples):
     expands = [
-        # Completa
-        "actions($select=id,isPublic,origin,createdDate,description;$expand=attachments,timeAppointments)",
-        # Sem timeAppointments
-        "actions($select=id,isPublic,origin,createdDate,description;$expand=attachments)",
-        # Só ações
-        "actions($select=id,isPublic,origin,createdDate,description)"
+        "actions($expand=attachments,timeAppointments)",
+        "actions($expand=attachments)",
+        "actions"
     ]
 
     last_err = None
     for exp in expands:
         params = {
             "token": API_TOKEN,
-            "$select": "id,lastUpdate",  # << NÃO inclui 'actions' aqui
+            "$select": "id,lastUpdate",   # NÃO inclui 'actions' aqui
             "$expand": exp,
             "$filter": filter_expr,
             "$top": 100
@@ -132,12 +126,10 @@ def fetch_actions_for_ids(ids: t.List[int]) -> t.Dict[int, t.List[dict]]:
             print(f"Expand OK: {exp}")
             return out
         except requests.HTTPError as e:
-            # guarda e tenta a próxima forma
             last_err = e
             print(f"Tentativa falhou com expand='{exp}': {e}")
             continue
 
-    # Se nenhuma forma funcionou, propaga o último erro
     if last_err:
         raise last_err
     return {}
