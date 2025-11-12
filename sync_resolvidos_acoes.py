@@ -216,12 +216,12 @@ def heartbeat(conn):
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
-    base_conn = get_conn()
+    base = get_conn()
     try:
-        ensure_schema(base_conn)
-        since_dt = get_since(base_conn)
+        ensure_schema(base)
+        since_dt = get_since(base)
     finally:
-        base_conn.close()
+        base.close()
 
     limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","4000"))
     chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","120"))
