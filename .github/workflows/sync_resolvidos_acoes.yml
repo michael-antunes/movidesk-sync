@@ -1,7 +1,6 @@
 name: Movidesk - Ações (depende do detail via dispatch)
 
 on:
-  # chamado pelo workflow de "tickets_resolvidos (detail)" via github-script/dispatch
   workflow_dispatch:
     inputs:
       batch:
@@ -9,7 +8,6 @@ on:
         required: false
         default: "10"
         type: string
-  # opcional: roda sozinho a cada 5min se quiser
   schedule:
     - cron: "*/5 * * * *"
 
@@ -19,11 +17,9 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -38,5 +34,4 @@ jobs:
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           BATCH_SIZE: ${{ github.event.inputs.batch || '10' }}
-        run: |
-          python sync_resolvidos_acoes.py
+        run: python sync_resolvidos_acoes.py
