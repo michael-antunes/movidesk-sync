@@ -1,284 +1,231 @@
-import os, time, requests, psycopg2, psycopg2.extras
-from datetime import datetime, timedelta, timezone
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Sincroniza ações dos tickets resolvidos/fechados/cancelados.
+- Processa 10 tickets por execução, olhando a fila em visualizacao_resolvidos.tickets_resolvidos
+- Remove duplicatas antigas em tickets_resolvidos
+- Busca ações por ticket (endpoint por ID) e faz UPSERT em visualizacao_resolvidos.resolvidos_acoes
+Requisitos de ambiente:
+  MOVIDESK_TOKEN   -> token da API Movidesk
+  NEON_DSN         -> DSN Postgres (ex: postgres://user:pass@host/db)
+Variáveis opcionais:
+  MOVIDESK_THROTTLE -> sleep entre chamadas (default 0.25s)
+  MOVIDESK_TOP      -> qtd de tickets por execução (default 10)
+  HTTP_TIMEOUT      -> timeout requests (seg) (default 30)
+"""
+import os, time, json, sys
+import psycopg2, psycopg2.extras
+import requests
 
 API_BASE = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-NEON_DSN = os.getenv("NEON_DSN")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN", "")
+NEON_DSN  = os.getenv("NEON_DSN", "")
+THROTTLE  = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+TOP       = int(os.getenv("MOVIDESK_TOP", "10"))
+TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "30"))
 
-def get_conn():
-    return psycopg2.connect(
-        NEON_DSN,
-        sslmode="require",
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-    )
-
-http = requests.Session()
-http.headers.update({"Accept":"application/json"})
-
-def req(url, params, timeout=120):
-    while True:
-        r = http.get(url, params=params, timeout=timeout)
-        if r.status_code in (429,503):
-            ra = r.headers.get("retry-after")
-            wait = int(ra) if str(ra).isdigit() else 60
-            time.sleep(wait); continue
-        if r.status_code == 404:
-            return []
+# ---------- HTTP helper ----------
+def req(url, params=None):
+    """GET com retry simples e throttle."""
+    if params is None:
+        params = {}
+    params = {k: v for k, v in params.items() if v is not None}
+    for attempt in range(4):
+        r = requests.get(url, params=params, timeout=TIMEOUT)
+        if r.status_code >= 500:
+            # backoff leve
+            time.sleep(0.5 * (attempt + 1))
+            continue
         r.raise_for_status()
-        return r.json() if r.text else []
+        time.sleep(THROTTLE)
+        return r.json()
+    r.raise_for_status()
 
-def ensure_schema(conn):
-    with conn.cursor() as cur:
-        cur.execute("create schema if not exists visualizacao_resolvidos")
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.resolvidos_acoes(
-          ticket_id integer primary key,
-          acoes jsonb
-        )
-        """)
-        cur.execute("""
-        do $$
-        begin
-          if not exists(
-            select 1 from information_schema.columns
-            where table_schema='visualizacao_resolvidos'
-              and table_name='resolvidos_acoes'
-              and column_name='qtd_acoes_descricao_publi'
-              and is_generated='ALWAYS'
-          ) then
-            begin
-              alter table visualizacao_resolvidos.resolvidos_acoes drop column if exists qtd_acoes_descricao_publi;
-            exception when undefined_column then null;
-            end;
-            alter table visualizacao_resolvidos.resolvidos_acoes add column qtd_acoes_descricao_publi integer
-              generated always as (
-                jsonb_array_length(
-                  jsonb_path_query_array(
-                    acoes,'$[*] ? (@.description != "" && ((@.isPublic == true) || (@.isPublic == "true")))'
-                  )
-                )
-              ) stored;
-          end if;
+# ---------- DB helpers ----------
+def conn():
+    return psycopg2.connect(NEON_DSN)
 
-          if not exists(
-            select 1 from information_schema.columns
-            where table_schema='visualizacao_resolvidos'
-              and table_name='resolvidos_acoes'
-              and column_name='qtd_acoes_descricao_inter'
-              and is_generated='ALWAYS'
-          ) then
-            begin
-              alter table visualizacao_resolvidos.resolvidos_acoes drop column if exists qtd_acoes_descricao_inter;
-            exception when undefined_column then null;
-            end;
-            alter table visualizacao_resolvidos.resolvidos_acoes add column qtd_acoes_descricao_inter integer
-              generated always as (
-                jsonb_array_length(
-                  jsonb_path_query_array(
-                    acoes,'$[*] ? (@.description != "" && ((@.isPublic == false) || (@.isPublic == "false")))'
-                  )
-                )
-              ) stored;
-          end if;
-        end$$;
-        """)
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.sync_control(
-          name text primary key,
-          last_update timestamptz not null default now(),
-          last_index_run_at timestamptz,
-          last_detail_run_at timestamptz
-        )
-        """)
-    conn.commit()
+def cleanup_dupes(c):
+    """
+    Remove duplicatas em visualizacao_resolvidos.tickets_resolvidos,
+    mantendo somente o registro MAIS RECENTE por ticket_id
+    (ordena por last_update desc; se não existir, cai no id desc).
+    """
+    sql = """
+    with ranked as (
+      select ctid,
+             row_number() over(
+               partition by ticket_id
+               order by coalesce(last_update, resolvedin, closedin, canceledin) desc,
+                        id desc
+             ) rn
+      from visualizacao_resolvidos.tickets_resolvidos
+    )
+    delete from visualizacao_resolvidos.tickets_resolvidos t
+    using ranked r
+    where t.ctid = r.ctid and r.rn > 1;
+    """
+    with c.cursor() as cur:
+        cur.execute(sql)
+    c.commit()
 
-def get_since(conn):
-    with conn.cursor() as cur:
-        cur.execute("select last_detail_run_at from visualizacao_resolvidos.sync_control where name='default'")
-        r1 = cur.fetchone()
-        cur.execute("select last_index_run_at from visualizacao_resolvidos.sync_control where name='default'")
-        r2 = cur.fetchone()
-    if r1 and r1[0]:
-        base = r1[0]
-    elif r2 and r2[0]:
-        base = r2[0]
-    else:
-        base = datetime.now(timezone.utc) - timedelta(days=int(os.getenv("MOVIDESK_ACOES_DAYS","7")))
-    return base - timedelta(minutes=int(os.getenv("MOVIDESK_OVERLAP_MIN","15")))
+def next_ticket_ids(c, limit=10):
+    """
+    Seleciona até `limit` ticket_ids que precisam ter ações buscadas:
+    - pega apenas a LINHA MAIS NOVA por ticket_id em tickets_resolvidos
+    - filtra aqueles que ainda não existem em resolvidos_acoes
+      ou que estão vazios (array json []).
+    """
+    sql = """
+    with latest as (
+      select *
+      from (
+        select tr.*,
+               row_number() over(
+                 partition by ticket_id
+                 order by coalesce(last_update, resolvedin, closedin, canceledin) desc,
+                          id desc
+               ) rn
+        from visualizacao_resolvidos.tickets_resolvidos tr
+      ) x
+      where x.rn = 1
+    )
+    select l.ticket_id
+    from latest l
+    left join visualizacao_resolvidos.resolvidos_acoes ra
+           on ra.ticket_id = l.ticket_id
+    where ra.ticket_id is null
+       or coalesce(jsonb_array_length(ra.acoes), 0) = 0
+    order by coalesce(l.last_update, l.resolvedin, l.closedin, l.canceledin) desc
+    limit %s;
+    """
+    with c.cursor() as cur:
+        cur.execute(sql, (limit,))
+        return [row[0] for row in cur.fetchall()]
 
-def list_ids(conn, since_dt, limit, repair_days):
-    with conn.cursor() as cur:
-        cur.execute("""
-        with delta as (
-          select ticket_id, last_update
-            from visualizacao_resolvidos.tickets_resolvidos
-           where last_update >= %s
-        ),
-        missing as (
-          select tr.ticket_id, tr.last_update
-            from visualizacao_resolvidos.tickets_resolvidos tr
-            left join visualizacao_resolvidos.resolvidos_acoes ra
-              on ra.ticket_id = tr.ticket_id
-           where (ra.ticket_id is null or ra.acoes is null or jsonb_array_length(coalesce(ra.acoes,'[]'::jsonb))=0)
-             and tr.last_update >= now() - (%s || ' days')::interval
-        )
-        select ticket_id
-          from (select * from delta union all select * from missing) q
-         order by last_update desc
-         limit %s
-        """, (since_dt, repair_days, limit))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
+def upsert_acoes(c, rows):
+    """
+    rows: lista de tuplas (ticket_id, acoes_json)
+    A tabela resolvidos_acoes tem UNIQUE(ticket_id).
+    As colunas geradas (qtd_*) não são informadas no INSERT.
+    """
+    if not rows:
+        return
+    sql = """
+    insert into visualizacao_resolvidos.resolvidos_acoes (ticket_id, acoes)
+    values (%s, %s)
+    on conflict (ticket_id) do update
+      set acoes = excluded.acoes;
+    """
+    with c.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
+    c.commit()
 
-def prefilter_has_actions(ids, top, throttle, chunk_size):
-    if not ids:
-        return set()
-    ids = list(dict.fromkeys(ids))
-    out = set()
-    url = f"{API_BASE}/tickets"
-    select_fields = "id"
-    expand = "actions($select=id)"
-    for i in range(0, len(ids), chunk_size):
-        chunk = ids[i:i+chunk_size]
-        filtro = " or ".join([f"(id eq {int(x)})" for x in chunk])
-        try:
-            page = req(url, {
-                "token": API_TOKEN,
-                "$select": select_fields,
-                "$expand": expand,
-                "$filter": filtro,
-                "$top": chunk_size,
-            }) or []
-        except Exception:
-            return set(ids)
-        for t in page:
-            acts = t.get("actions") or []
-            if isinstance(acts, list) and len(acts) > 0:
-                out.add(int(str(t.get("id"))))
-        time.sleep(throttle)
-    return out
+def heartbeat(c):
+    """Atualiza o relógio no sync_control.default (opcional/diagnóstico)."""
+    sql = """
+      insert into visualizacao_resolvidos.sync_control(name,last_update)
+      values ('default', now())
+      on conflict (name) do update set last_update = excluded.last_update
+    """
+    with c.cursor() as cur:
+        cur.execute(sql)
+    c.commit()
 
-def fetch_actions_for_ticket(ticket_id, top, throttle):
-    url = f"{API_BASE}/tickets/{ticket_id}/actions"
-    skip = 0
-    all_items = []
-    while True:
-        page = req(url, {
-            "token": API_TOKEN,
-            "$select": "id,isPublic,description,createdDate,origin,attachments,timeAppointments",
-            "$expand": "attachments,timeAppointments",
-            "$top": top,
-            "$skip": skip
-        }) or []
-        if not isinstance(page, list) or not page:
-            break
-        all_items.extend(page)
-        if len(page) < top:
-            break
-        skip += len(page)
-        time.sleep(throttle)
-    if all_items:
-        return all_items
-    try:
-        data = req(f"{API_BASE}/tickets", {
-            "token": API_TOKEN,
-            "$select": "id",
-            "$filter": f"id eq {ticket_id}",
-            "$expand": "actions($select=id,isPublic,description,createdDate,origin)"
-        }) or []
-        if isinstance(data, list) and data:
-            acts = data[0].get("actions") or []
-            if isinstance(acts, list):
-                return acts
-    except:
-        pass
-    return []
+# ---------- Movidesk ----------
+def fetch_actions_for_ticket(ticket_id: int):
+    """
+    Busca ações do ticket por ID.
+    Estratégia:
+      1) /tickets/{id}?$expand=actions(...): retorna 'description' (texto) e,
+         de acordo com a base de conhecimento, pode retornar htmlDescription
+         quando a consulta é por ID. Se vier, ótimo.
+      2) Se html não vier, tentamos complementar via /tickets/htmldescription (best-effort).
+    Campos salvos: id, isPublic, description, htmlDescription, createdDate, origin,
+                   attachments (id,fileName), timeAppointments (id,workingTime)
+    """
+    # 1) por ID com expand das ações
+    expand = "actions($expand=attachments,timeAppointments;$select=id,isPublic,description,createdDate,origin,attachments,timeAppointments)"
+    data = req(f"{API_BASE}/tickets/{ticket_id}",
+               {"token": API_TOKEN, "$select": "actions", "$expand": expand}) or {}
+    actions = data.get("actions") or []
 
-def simplify(actions):
-    out = []
+    # normaliza payload, pegando apenas campos úteis
+    norm = []
     for a in actions:
-        atts = a.get("attachments") or []
-        tapps = a.get("timeAppointments") or []
-        out.append({
+        norm.append({
             "id": a.get("id"),
             "isPublic": a.get("isPublic"),
             "description": a.get("description"),
+            "htmlDescription": a.get("htmlDescription"),  # pode vir quando busca é por ID
             "createdDate": a.get("createdDate"),
             "origin": a.get("origin"),
             "attachments": [
-                {"id":x.get("id"),"fileName":x.get("fileName"),"link":x.get("link"),"size":x.get("size"),"type":x.get("type")}
-                for x in atts if isinstance(x,dict)
+                {"id": att.get("id"), "fileName": att.get("fileName")}
+                for att in (a.get("attachments") or [])
             ],
             "timeAppointments": [
-                {"id":x.get("id"),"workTime":x.get("workTime"),"createdDate":x.get("createdDate"),"time":"%s"%x.get("time")}
-                for x in tapps if isinstance(x,dict)
+                {"id": t.get("id"), "workingTime": t.get("workingTime")}
+                for t in (a.get("timeAppointments") or [])
             ]
         })
-    return out
 
-UPSERT = """
-insert into visualizacao_resolvidos.resolvidos_acoes(ticket_id,acoes)
-values (%(ticket_id)s,%(acoes)s)
-on conflict (ticket_id) do update set acoes=excluded.acoes
-"""
+    # 2) best-effort para HTML das ações (só se faltou):
+    # documentação: htmlDescription só sai por ID ou pelo endpoint /tickets/htmldescription
+    if any(x.get("htmlDescription") is None for x in norm):
+        try:
+            # tentamos os dois formatos comuns que já encontrei na prática:
+            # a) /tickets/htmldescription/{id}
+            html_payload = None
+            try:
+                html_payload = req(f"{API_BASE}/tickets/htmldescription/{ticket_id}",
+                                   {"token": API_TOKEN})
+            except requests.HTTPError:
+                # b) /tickets/htmldescription?ticketId={id}
+                html_payload = req(f"{API_BASE}/tickets/htmldescription",
+                                   {"token": API_TOKEN, "ticketId": ticket_id})
+            # se a resposta trouxer lista de ações com htmlDescription, fazemos o merge por id
+            if isinstance(html_payload, dict) and "actions" in html_payload:
+                html_actions = {a.get("id"): a.get("htmlDescription") for a in html_payload["actions"]}
+                for item in norm:
+                    if item.get("htmlDescription") is None and item.get("id") in html_actions:
+                        item["htmlDescription"] = html_actions[item["id"]]
+        except Exception:
+            # se der qualquer erro aqui, seguimos apenas com description (texto)
+            pass
 
-def upsert(conn, rows, page_size):
-    if not rows: return 0
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=page_size)
-    conn.commit()
-    return len(rows)
+    return norm
 
-def heartbeat(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-        insert into visualizacao_resolvidos.sync_control(name,last_update)
-        values('default',now())
-        on conflict (name) do update set last_update=excluded.last_update
-        """)
-    conn.commit()
-
+# ---------- Main ----------
 def main():
     if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
+        print("ERRO: defina MOVIDESK_TOKEN e NEON_DSN no ambiente.", file=sys.stderr)
+        sys.exit(1)
 
-    base = get_conn()
+    c = conn()
     try:
-        ensure_schema(base)
-        since_dt = get_since(base)
-    finally:
-        base.close()
+        cleanup_dupes(c)
+        ids = next_ticket_ids(c, TOP)
+        if not ids:
+            heartbeat(c)
+            print("Nada para fazer.")
+            return
 
-    limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","2000"))
-    chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","250"))
-    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.10"))
-    top = int(os.getenv("MOVIDESK_ACOES_TOP","200"))
-    repair_days = os.getenv("MOVIDESK_ACOES_REPAIR_DAYS","7")
-    pre_chunk = int(os.getenv("MOVIDESK_PREFILTER_CHUNK","15"))
+        rows = []
+        for tid in ids:
+            try:
+                acoes = fetch_actions_for_ticket(tid)
+            except requests.HTTPError as e:
+                # registra vazio para não travar; na próxima execução tentamos novamente
+                print(f"ticket {tid}: HTTP {e}", file=sys.stderr)
+                acoes = []
+            rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
 
-    c = get_conn()
-    try:
-        ids = list_ids(c, since_dt, limit, repair_days)
+        upsert_acoes(c, rows)
+        heartbeat(c)
+        print(f"Processados {len(rows)} tickets: {ids}")
     finally:
         c.close()
-
-    cand = prefilter_has_actions(ids, top, throttle, pre_chunk)
-    ids = [i for i in ids if i in cand] if cand else ids
-
-    rows, sent = [], 0
-    for tid in ids:
-        acts = fetch_actions_for_ticket(tid, top, throttle)
-        simp = simplify(acts)
-        rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp)})
-        if len(rows) >= chunk:
-            cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","500"))); heartbeat(cx); cx.close(); rows = []
-        time.sleep(throttle)
-    if rows:
-        cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","500"))); heartbeat(cx); cx.close()
-    print(f"ok ids_total={len(ids)} upserts={sent} since={since_dt.isoformat()}")
 
 if __name__ == "__main__":
     main()
