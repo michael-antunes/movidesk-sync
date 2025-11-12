@@ -1,31 +1,31 @@
-name: Movidesk • Ações dos tickets resolvidos
+name: Movidesk • Tickets resolvidos (ações)
+
 on:
+  workflow_run:
+    workflows: ["Movidesk • Tickets resolvidos (detail + cancelled)"]  # <- o nome exato do outro workflow
+    types: [completed]
   workflow_dispatch: {}
+
 concurrency:
-  group: movidesk-acoes-${{ github.run_id }}
-  cancel-in-progress: true
+  group: movidesk-acoes
+  cancel-in-progress: false   # evita cancelamentos quando a fila acumula
+
 jobs:
   run:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
-      - run: pip install -r requirements.txt
-      - env:
+      - name: Dependências
+        run: pip install requests psycopg2-binary
+      - name: Executa ações (10 por vez a partir do tickets_resolvidos)
+        env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_OVERLAP_MIN: "10"
-          MOVIDESK_ACOES_DAYS: "3"
-          MOVIDESK_ACOES_REPAIR_DAYS: "7"
-          MOVIDESK_ACOES_LIMIT: "2000"
-          MOVIDESK_ACOES_CHUNK: "250"
-          MOVIDESK_PG_PAGESIZE: "500"
-          MOVIDESK_THROTTLE: "0.10"
-          MOVIDESK_ACOES_TOP: "200"
-          MOVIDESK_PREFILTER_CHUNK: "15"
+          MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_TOP: "10"           # <- exatamente 10 por execução
         run: python sync_resolvidos_acoes.py
