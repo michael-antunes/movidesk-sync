@@ -133,6 +133,31 @@ def list_ids(conn, since_dt, limit, repair_days):
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
+def prefilter_has_actions(ids, since_dt, top, throttle):
+    if not ids:
+        return set()
+    ids = list(dict.fromkeys(ids))
+    id_chunks = [ids[i:i+100] for i in range(0, len(ids), 100)]
+    out = set()
+    url = f"{API_BASE}/tickets"
+    select_fields = "id"
+    expand = "actions($select=id;$top=1)"
+    for chunk in id_chunks:
+        filtro = " or ".join([f"id eq {i}" for i in chunk])
+        page = req(url, {
+            "token": API_TOKEN,
+            "$select": select_fields,
+            "$expand": expand,
+            "$filter": filtro,
+            "$top": 100
+        }) or []
+        for t in page:
+            acts = t.get("actions") or []
+            if isinstance(acts, list) and len(acts) > 0:
+                out.add(int(str(t.get("id"))))
+        time.sleep(throttle)
+    return out
+
 def fetch_actions_for_ticket(ticket_id, top, throttle):
     url = f"{API_BASE}/tickets/{ticket_id}/actions"
     skip = 0
@@ -216,6 +241,7 @@ def heartbeat(conn):
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN")
+
     base = get_conn()
     try:
         ensure_schema(base)
@@ -223,15 +249,20 @@ def main():
     finally:
         base.close()
 
-    limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","4000"))
-    chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","120"))
-    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.25"))
+    limit = int(os.getenv("MOVIDESK_ACOES_LIMIT","2000"))
+    chunk = int(os.getenv("MOVIDESK_ACOES_CHUNK","250"))
+    throttle = float(os.getenv("MOVIDESK_THROTTLE","0.10"))
     top = int(os.getenv("MOVIDESK_ACOES_TOP","200"))
-    repair_days = os.getenv("MOVIDESK_ACOES_REPAIR_DAYS","30")
+    repair_days = os.getenv("MOVIDESK_ACOES_REPAIR_DAYS","7")
 
     c = get_conn()
-    ids = list_ids(c, since_dt, limit, repair_days)
-    c.close()
+    try:
+        ids = list_ids(c, since_dt, limit, repair_days)
+    finally:
+        c.close()
+
+    cand = prefilter_has_actions(ids, since_dt, top, throttle)
+    ids = [i for i in ids if i in cand]
 
     rows, sent = [], 0
     for tid in ids:
@@ -239,11 +270,11 @@ def main():
         simp = simplify(acts)
         rows.append({"ticket_id": tid, "acoes": psycopg2.extras.Json(simp)})
         if len(rows) >= chunk:
-            cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","200"))); heartbeat(cx); cx.close(); rows = []
+            cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","500"))); heartbeat(cx); cx.close(); rows = []
         time.sleep(throttle)
     if rows:
-        cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","200"))); heartbeat(cx); cx.close()
-    print(f"ok ids={len(ids)} rows={sent} since={since_dt.isoformat()}")
+        cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","500"))); heartbeat(cx); cx.close()
+    print(f"ok ids_prefilter={len(cand)} upserts={sent} since={since_dt.isoformat()}")
 
 if __name__ == "__main__":
     main()
