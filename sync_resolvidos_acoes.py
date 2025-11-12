@@ -133,24 +133,27 @@ def list_ids(conn, since_dt, limit, repair_days):
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
-def prefilter_has_actions(ids, since_dt, top, throttle):
+def prefilter_has_actions(ids, top, throttle, chunk_size):
     if not ids:
         return set()
     ids = list(dict.fromkeys(ids))
-    id_chunks = [ids[i:i+100] for i in range(0, len(ids), 100)]
     out = set()
     url = f"{API_BASE}/tickets"
     select_fields = "id"
-    expand = "actions($select=id;$top=1)"
-    for chunk in id_chunks:
-        filtro = " or ".join([f"id eq {i}" for i in chunk])
-        page = req(url, {
-            "token": API_TOKEN,
-            "$select": select_fields,
-            "$expand": expand,
-            "$filter": filtro,
-            "$top": 100
-        }) or []
+    expand = "actions($select=id)"
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i+chunk_size]
+        filtro = " or ".join([f"(id eq {int(x)})" for x in chunk])
+        try:
+            page = req(url, {
+                "token": API_TOKEN,
+                "$select": select_fields,
+                "$expand": expand,
+                "$filter": filtro,
+                "$top": chunk_size,
+            }) or []
+        except Exception:
+            return set(ids)
         for t in page:
             acts = t.get("actions") or []
             if isinstance(acts, list) and len(acts) > 0:
@@ -254,6 +257,7 @@ def main():
     throttle = float(os.getenv("MOVIDESK_THROTTLE","0.10"))
     top = int(os.getenv("MOVIDESK_ACOES_TOP","200"))
     repair_days = os.getenv("MOVIDESK_ACOES_REPAIR_DAYS","7")
+    pre_chunk = int(os.getenv("MOVIDESK_PREFILTER_CHUNK","15"))
 
     c = get_conn()
     try:
@@ -261,8 +265,8 @@ def main():
     finally:
         c.close()
 
-    cand = prefilter_has_actions(ids, since_dt, top, throttle)
-    ids = [i for i in ids if i in cand]
+    cand = prefilter_has_actions(ids, top, throttle, pre_chunk)
+    ids = [i for i in ids if i in cand] if cand else ids
 
     rows, sent = [], 0
     for tid in ids:
@@ -274,7 +278,7 @@ def main():
         time.sleep(throttle)
     if rows:
         cx = get_conn(); sent += upsert(cx, rows, int(os.getenv("MOVIDESK_PG_PAGESIZE","500"))); heartbeat(cx); cx.close()
-    print(f"ok ids_prefilter={len(cand)} upserts={sent} since={since_dt.isoformat()}")
+    print(f"ok ids_total={len(ids)} upserts={sent} since={since_dt.isoformat()}")
 
 if __name__ == "__main__":
     main()
