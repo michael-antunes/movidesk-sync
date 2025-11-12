@@ -1,30 +1,62 @@
 name: Movidesk - Ações (depende do detail via dispatch)
 
 on:
-  workflow_dispatch:
-
-concurrency:
-  group: movidesk-acoes-${{ github.ref }}
-  cancel-in-progress: false
+  # Permite ser chamado pelo detail.yml via dispatch e rodar manualmente
+  workflow_dispatch: {}
+  # Fallback opcional para rodar sozinho (mantém em sincronia caso um dispatch falhe)
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: movidesk-acoes
+  cancel-in-progress: true
+
 jobs:
   run:
+    name: Executa ações (10 por vez)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
-      - name: Executa ações (10 por vez)
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests psycopg2-binary
+          fi
+
+      - name: Run sync_resolvidos_acoes.py
         env:
+          # Secrets necessários
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          # Compatibilidade com var alternativa, se você usa MOVIDESK_API_TOKEN
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          ACTIONS_BATCH_SIZE: "10"
-          ACTIONS_THROTTLE_SEC: "0.7"
+
+          # Parâmetros de execução
+          PYTHONUNBUFFERED: "1"
+          MOVIDESK_PAGE_SIZE: "10"          # 10 tickets por rodada
+          MOVIDESK_THROTTLE: "0.2"          # intervalo entre chamadas
+          UPSERT_PAGESIZE: "200"            # batch no INSERT
+          # Nomes das tabelas/esquemas usados pelo script
+          ACTIONS_SCHEMA: "visualizacao_resolvidos"
+          ACTIONS_TABLE: "resolvidos_acoes"
+          TICKETS_SCHEMA: "visualizacao_resolvidos"
+          TICKETS_TABLE: "tickets_resolvidos"
+          CONTROL_SCHEMA: "visualizacao_resolvidos"
+          CONTROL_TABLE: "sync_control"
+          # Nome lógico deste processo no sync_control
+          SYNC_NAME: "acoes"
         run: python sync_resolvidos_acoes.py
