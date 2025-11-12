@@ -1,181 +1,214 @@
 #!/usr/bin/env python3
-import os, time, json, sys, requests, psycopg2, psycopg2.extras
+# -*- coding: utf-8 -*-
 
-API_BASE = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN", "")
-NEON_DSN  = os.getenv("NEON_DSN", "")
-THROTTLE  = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-TOP       = int(os.getenv("MOVIDESK_TOP", "10"))
-TIMEOUT   = int(os.getenv("HTTP_TIMEOUT", "30"))
+import os, time, json, sys, math
+import requests
+import psycopg2, psycopg2.extras
+from datetime import datetime, timezone, timedelta
 
-def req(url, params=None):
-    if params is None:
-        params = {}
-    params = {k: v for k, v in params.items() if v is not None}
-    for attempt in range(4):
-        r = requests.get(url, params=params, timeout=TIMEOUT)
-        if r.status_code >= 500:
-            time.sleep(0.5 * (attempt + 1))
+API_TOKEN = os.getenv("MOVIDESK_API_TOKEN") or os.getenv("MOVIDESK_TOKEN")
+BASE_URL  = "https://api.movidesk.com/public/v1"
+DSN       = os.getenv("NEON_DSN")
+
+BATCH_SIZE   = int(os.getenv("ACTIONS_BATCH_SIZE", "10"))
+THROTTLE_SEC = float(os.getenv("ACTIONS_THROTTLE_SEC", "0.7"))  # respiro entre requisições
+HARD_RETRY   = int(os.getenv("ACTIONS_RETRY", "3"))
+
+# ---------- HTTP helper com backoff e tratamento de 429 ----------
+def req(path, params, retry=HARD_RETRY):
+    params = dict(params or {})
+    params["token"] = API_TOKEN
+    url = f"{BASE_URL}{path}"
+    for attempt in range(retry+1):
+        r = requests.get(url, params=params, timeout=60)
+        # 2xx
+        if 200 <= r.status_code < 300:
+            if not r.text:
+                return None
+            try:
+                return r.json()
+            except Exception:
+                return None
+        # 429 (limite)
+        if r.status_code == 429:
+            wait = int(r.headers.get("retry-after", "60"))
+            time.sleep(max(wait, 5))
+            continue
+        # outros 4xx/5xx: pequena pausa + retry
+        if attempt < retry:
+            time.sleep(2*(attempt+1))
             continue
         r.raise_for_status()
-        time.sleep(THROTTLE)
-        return r.json()
-    r.raise_for_status()
 
-def conn():
-    return psycopg2.connect(NEON_DSN)
+# ---------- DB ----------
+def get_conn():
+    return psycopg2.connect(DSN)
 
-def cleanup_dupes(c):
-    sql = """
-    with ranked as (
-      select ctid,
-             row_number() over(
-               partition by tr.ticket_id
-               order by greatest(
-                        coalesce(tr.last_update,        '-infinity'::timestamptz),
-                        coalesce(tr.last_resolved_at,   '-infinity'::timestamptz),
-                        coalesce(tr.last_closed_at,     '-infinity'::timestamptz),
-                        coalesce(tr.last_cancelled_at,  '-infinity'::timestamptz)
-                      ) desc,
-                      tr.ticket_id desc
-             ) rn
-      from visualizacao_resolvidos.tickets_resolvidos tr
-    )
-    delete from visualizacao_resolvidos.tickets_resolvidos t
-    using ranked r
-    where t.ctid = r.ctid and r.rn > 1;
-    """
-    with c.cursor() as cur:
-        cur.execute(sql)
-    c.commit()
+UPSERT = """
+INSERT INTO visualizacao_resolvidos.resolvidos_acoes (ticket_id, acoes, updated_at)
+VALUES (%s, %s::jsonb, now())
+ON CONFLICT (ticket_id) DO UPDATE
+   SET acoes = EXCLUDED.acoes,
+       updated_at = now();
+"""
 
-def next_ticket_ids(c, limit=10):
-    sql = """
-    with latest as (
-      select *
-      from (
-        select tr.*,
-               row_number() over(
-                 partition by tr.ticket_id
-                 order by greatest(
-                          coalesce(tr.last_update,        '-infinity'::timestamptz),
-                          coalesce(tr.last_resolved_at,   '-infinity'::timestamptz),
-                          coalesce(tr.last_closed_at,     '-infinity'::timestamptz),
-                          coalesce(tr.last_cancelled_at,  '-infinity'::timestamptz)
-                        ) desc,
-                        tr.ticket_id desc
-               ) rn
-        from visualizacao_resolvidos.tickets_resolvidos tr
-      ) x
-      where x.rn = 1
-    )
-    select l.ticket_id
-    from latest l
-    left join visualizacao_resolvidos.resolvidos_acoes ra
-           on ra.ticket_id = l.ticket_id
-    where ra.ticket_id is null
-       or coalesce(jsonb_array_length(ra.acoes), 0) = 0
-    order by greatest(
-             coalesce(l.last_update,        '-infinity'::timestamptz),
-             coalesce(l.last_resolved_at,   '-infinity'::timestamptz),
-             coalesce(l.last_closed_at,     '-infinity'::timestamptz),
-             coalesce(l.last_cancelled_at,  '-infinity'::timestamptz)
-           ) desc,
-           l.ticket_id desc
-    limit %s;
-    """
-    with c.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+AUDIT_HIT = """
+INSERT INTO visualizacao_resolvidos.audit_recent_run (table_name, ticket_id, audit_recent_run)
+VALUES ('resolvidos_acoes', %s, now())
+ON CONFLICT DO NOTHING;
+"""
 
-def upsert_acoes(c, rows):
-    if not rows:
-        return
-    sql = """
-    insert into visualizacao_resolvidos.resolvidos_acoes (ticket_id, acoes)
-    values (%s, %s)
-    on conflict (ticket_id) do update
-      set acoes = excluded.acoes;
-    """
-    with c.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
-    c.commit()
+AUDIT_MISS = """
+INSERT INTO visualizacao_resolvidos.audit_recent_missing (table_name, ticket_id, audit_recent_missing)
+VALUES ('resolvidos_acoes', %s, now())
+ON CONFLICT DO NOTHING;
+"""
 
-def heartbeat(c):
-    sql = """
-      insert into visualizacao_resolvidos.sync_control(name,last_update)
-      values ('default', now())
-      on conflict (name) do update set last_update = excluded.last_update
-    """
-    with c.cursor() as cur:
-        cur.execute(sql)
-    c.commit()
+def upsert_rows(conn, rows):
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=50)
+    conn.commit()
 
-def fetch_actions_for_ticket(ticket_id: int):
-    expand = "actions($expand=attachments,timeAppointments;$select=id,isPublic,description,createdDate,origin,attachments,timeAppointments)"
-    data = req(f"{API_BASE}/tickets/{ticket_id}",
-               {"token": API_TOKEN, "$select": "actions", "$expand": expand}) or {}
-    actions = data.get("actions") or []
-    norm = []
-    for a in actions:
-        norm.append({
-            "id": a.get("id"),
-            "isPublic": a.get("isPublic"),
-            "description": a.get("description"),
-            "htmlDescription": a.get("htmlDescription"),
-            "createdDate": a.get("createdDate"),
-            "origin": a.get("origin"),
-            "attachments": [
-                {"id": att.get("id"), "fileName": att.get("fileName")}
-                for att in (a.get("attachments") or [])
-            ],
-            "timeAppointments": [
-                {"id": t.get("id"), "workingTime": t.get("workingTime")}
-                for t in (a.get("timeAppointments") or [])
-            ]
-        })
-    if any(x.get("htmlDescription") is None for x in norm):
-        try:
-            html_payload = None
-            try:
-                html_payload = req(f"{API_BASE}/tickets/htmldescription/{ticket_id}",
-                                   {"token": API_TOKEN})
-            except requests.HTTPError:
-                html_payload = req(f"{API_BASE}/tickets/htmldescription",
-                                   {"token": API_TOKEN, "ticketId": ticket_id})
-            if isinstance(html_payload, dict) and "actions" in html_payload:
-                html_actions = {a.get("id"): a.get("htmlDescription") for a in html_payload["actions"]}
-                for item in norm:
-                    if item.get("htmlDescription") is None and item.get("id") in html_actions:
-                        item["htmlDescription"] = html_actions[item["id"]]
-        except Exception:
-            pass
-    return norm
-
-def main():
-    if not API_TOKEN or not NEON_DSN:
-        print("ERRO_ENV", file=sys.stderr)
-        sys.exit(1)
-    c = conn()
+def audit_hit(conn, tid):
     try:
-        cleanup_dupes(c)
-        ids = next_ticket_ids(c, TOP)
-        if not ids:
-            heartbeat(c)
-            print("OK 0")
-            return
-        rows = []
-        for tid in ids:
-            try:
-                acoes = fetch_actions_for_ticket(tid)
-            except requests.HTTPError as e:
-                acoes = []
-            rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
-        upsert_acoes(c, rows)
-        heartbeat(c)
-        print(f"OK {len(rows)} {ids}")
-    finally:
-        c.close()
+        with conn.cursor() as cur:
+            cur.execute(AUDIT_HIT, (tid,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+def audit_miss(conn, tid):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(AUDIT_MISS, (tid,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+# ---------- seleção de 10 tickets a partir de tickets_resolvidos ----------
+CANDIDATES_SQL = """
+WITH base AS (
+  SELECT t.ticket_id
+  FROM visualizacao_resolvidos.tickets_resolvidos t
+  LEFT JOIN visualizacao_resolvidos.resolvidos_acoes a
+         ON a.ticket_id = t.ticket_id
+  WHERE a.ticket_id IS NULL     -- ainda não tem ações salvas
+  ORDER BY t.ticket_id DESC     -- fallback robusto (colunas de data variam)
+  LIMIT %s
+)
+SELECT ticket_id FROM base ORDER BY ticket_id DESC;
+"""
+
+def pick_candidates(conn, limit=BATCH_SIZE):
+    with conn.cursor() as cur:
+        cur.execute(CANDIDATES_SQL, (limit,))
+        return [r[0] for r in cur.fetchall()]
+
+# ---------- coleta de ações JSON + HTML ----------
+def fetch_actions_for_ticket(ticket_id: int):
+    """
+    Busca o ticket com as ações (JSON). Para HTML das ações,
+    usa o endpoint /tickets/htmldescription por actionId.
+    """
+    # 1) lista de ações (JSON) – atenção: htmlDescription NÃO vem na listagem.
+    select_fields = "id,lastUpdate,actionCount"
+    expand = (
+        "actions("
+        "$select=id,isPublic,description,createdDate,origin;"
+        "$expand=timeAppointments($select=id,activity,date,periodStart,periodEnd,workTime,accountedTime,workTypeName,createdBy,createdByTeam),"
+        "attachments($select=fileName,path,createdDate)"
+        ")"
+    )
+
+    data = req(
+        "/tickets",
+        {
+            "$select": select_fields,
+            "$expand": expand,
+            "id": str(ticket_id),
+            "includeDeletedItems": "true",
+        },
+    )
+
+    if not data:
+        return None  # não encontrado
+
+    # a API devolve {} quando usa id=...; normalizamos para um dict
+    if isinstance(data, list) and data:
+        item = data[0]
+    elif isinstance(data, dict):
+        item = data
+    else:
+        return {"ticket_id": ticket_id, "actions": []}
+
+    actions = item.get("actions") or []
+
+    # 2) HTML das ações (campo "description" em HTML)
+    # Doc: /tickets/htmldescription?id=<ticket>&actionId=<id>  -> {"id":1,"description":"<html>..."}
+    rich = []
+    for a in actions:
+        action_id = a.get("id")
+        html = None
+        try:
+            # evitar estourar limite
+            time.sleep(THROTTLE_SEC)
+            html_obj = req("/tickets/htmldescription", {"id": str(ticket_id), "actionId": str(action_id)})
+            if isinstance(html_obj, dict):
+                html = html_obj.get("description")
+        except Exception:
+            html = None
+
+        a2 = dict(a)
+        if html is not None:
+            a2["html"] = html  # adiciona o HTML ao JSON da ação
+        rich.append(a2)
+
+    return {
+        "ticket_id": ticket_id,
+        "actions": rich,
+        "lastUpdate": item.get("lastUpdate"),
+        "actionCount": item.get("actionCount", len(rich)),
+    }
+
+# ---------- main ----------
+def main():
+    if not API_TOKEN:
+        print("MOVIDESK_API_TOKEN não configurado", file=sys.stderr)
+        sys.exit(2)
+    conn = get_conn()
+
+    # pega 10 candidatos da tabela tickets_resolvidos
+    candidates = pick_candidates(conn, BATCH_SIZE)
+    if not candidates:
+        print("Nenhum ticket pendente em tickets_resolvidos.")
+        return
+
+    rows = []
+    for tid in candidates:
+        try:
+            # respiro entre tickets para respeitar rate limit
+            time.sleep(THROTTLE_SEC)
+            obj = fetch_actions_for_ticket(tid)
+            if not obj:
+                audit_miss(conn, tid)
+                continue
+
+            acoes_json = json.dumps(obj["actions"], ensure_ascii=False)
+            rows.append((tid, acoes_json))
+            audit_hit(conn, tid)
+
+        except requests.HTTPError as e:
+            # se der 404/400 marcamos como miss para investigação
+            audit_miss(conn, tid)
+            print(f"[WARN] ticket {tid} => HTTP {e}", file=sys.stderr)
+        except Exception as e:
+            audit_miss(conn, tid)
+            print(f"[WARN] ticket {tid} => {e}", file=sys.stderr)
+
+    if rows:
+        upsert_rows(conn, rows)
+
+    conn.close()
 
 if __name__ == "__main__":
     main()
