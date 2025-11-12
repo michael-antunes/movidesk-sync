@@ -1,30 +1,29 @@
-name: Movidesk • Tickets resolvidos (ações)
+name: Movidesk - Ações (10 por vez a partir de tickets_resolvidos)
 
 on:
   workflow_run:
-    workflows: ["Movidesk • Tickets resolvidos (detail + cancelled)"]
+    workflows: ["Movidesk - Tickets resolvidos (detail + cancelled)"]
     types: [completed]
-  workflow_dispatch: {}
-
-concurrency:
-  group: movidesk-acoes
-  cancel-in-progress: false
 
 jobs:
   run:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
+
+      - name: Install deps
+        run: pip install requests psycopg2-binary
+
       - name: Executa ações (10 por vez a partir do tickets_resolvidos)
         env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_THROTTLE: "0.25"
-          MOVIDESK_TOP: "10"
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          ACTIONS_BATCH_SIZE: "10"
+          ACTIONS_THROTTLE_SEC: "0.7"
         run: python sync_resolvidos_acoes.py
