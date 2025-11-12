@@ -8,6 +8,30 @@ if not API_TOKEN or not NEON_DSN:
 BATCH = int(os.getenv("ACTIONS_BATCH_SIZE","10"))
 THROTTLE = float(os.getenv("ACTIONS_THROTTLE_SEC","0.7"))
 
+def conn():
+    return psycopg2.connect(NEON_DSN)
+
+def ensure_schema():
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("create schema if not exists visualizacao_resolvidos")
+            cur.execute("""
+            create table if not exists visualizacao_resolvidos.resolvidos_acoes(
+              ticket_id integer primary key,
+              acoes jsonb,
+              updated_at timestamptz default now()
+            )
+            """)
+            cur.execute("""
+            create table if not exists visualizacao_resolvidos.sync_control(
+              name text primary key,
+              last_update timestamptz default now(),
+              last_index_run_at timestamptz,
+              last_detail_run_at timestamptz
+            )
+            """)
+    return True
+
 UPSERT = """
 insert into visualizacao_resolvidos.resolvidos_acoes
 (ticket_id, acoes, updated_at)
@@ -39,9 +63,6 @@ order by coalesce(l.last_update, l.last_resolved_at, l.last_closed_at, l.last_ca
          l.ticket_id desc
 limit %s
 """
-
-def conn():
-    return psycopg2.connect(NEON_DSN)
 
 def req(url, params, retries=4):
     for i in range(retries):
@@ -83,7 +104,7 @@ def enrich_with_html(ticket_id, actions):
     out = []
     for a in actions:
         obj = dict(a)
-        if obj.get("description"):
+        if obj.get("id") is not None:
             try:
                 time.sleep(THROTTLE)
                 html = fetch_html_for_action(ticket_id, obj.get("id"))
@@ -95,11 +116,19 @@ def enrich_with_html(ticket_id, actions):
     return out
 
 def main():
+    ensure_schema()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(PICK, (BATCH,))
             ids = [r[0] for r in cur.fetchall()]
     if not ids:
+        with conn() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                insert into visualizacao_resolvidos.sync_control(name,last_update)
+                values('default', now())
+                on conflict (name) do update set last_update=excluded.last_update
+                """)
         return
     rows = []
     for tid in ids:
@@ -115,6 +144,13 @@ def main():
         with conn() as c:
             with c.cursor() as cur:
                 psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=50)
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("""
+            insert into visualizacao_resolvidos.sync_control(name,last_update)
+            values('default', now())
+            on conflict (name) do update set last_update=excluded.last_update
+            """)
 
 if __name__ == "__main__":
     main()
