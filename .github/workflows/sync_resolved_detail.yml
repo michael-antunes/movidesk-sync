@@ -24,15 +24,14 @@ jobs:
       - name: Sync resolved/closed/cancelled detail
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           PAGES_UPSERT: "7"
-        run: python sync_resolved_detail.py
+        run: python env_compat_detail.py
 
   dispatch-acoes:
     needs: detail
     if: ${{ needs.detail.result == 'success' }}
     runs-on: ubuntu-latest
-    # precisa de permissão actions:write para disparar outro workflow
     permissions:
       actions: write
       contents: read
