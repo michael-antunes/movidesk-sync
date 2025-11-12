@@ -1,4 +1,4 @@
-import os, time, json, requests, psycopg2, psycopg2.extras
+import os, time, requests, psycopg2, psycopg2.extras
 from datetime import datetime, timedelta, timezone
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
@@ -9,10 +9,76 @@ if not API_TOKEN or not NEON_DSN:
 TOP = int(os.getenv("PAGES_UPSERT", "7")) * 100
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.5"))
 
+def conn():
+    return psycopg2.connect(NEON_DSN)
+
+def ensure_schema():
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute("create schema if not exists visualizacao_resolvidos")
+            cur.execute("""
+            create table if not exists visualizacao_resolvidos.tickets_resolvidos(
+              ticket_id integer primary key,
+              status text,
+              last_resolved_at timestamptz,
+              last_closed_at timestamptz,
+              last_cancelled_at timestamptz,
+              last_update timestamptz,
+              origin text,
+              category text,
+              urgency text,
+              service_first_level text,
+              service_second_level text,
+              service_third_level text,
+              owner_id text,
+              owner_name text,
+              organization_id text,
+              organization_name text
+            )
+            """)
+            cur.execute("""
+            do $$
+            begin
+              if not exists(select 1 from information_schema.columns
+                            where table_schema='visualizacao_resolvidos'
+                              and table_name='tickets_resolvidos'
+                              and column_name='owner_id') then
+                alter table visualizacao_resolvidos.tickets_resolvidos add column owner_id text;
+              end if;
+              if not exists(select 1 from information_schema.columns
+                            where table_schema='visualizacao_resolvidos'
+                              and table_name='tickets_resolvidos'
+                              and column_name='owner_name') then
+                alter table visualizacao_resolvidos.tickets_resolvidos add column owner_name text;
+              end if;
+              if not exists(select 1 from information_schema.columns
+                            where table_schema='visualizacao_resolvidos'
+                              and table_name='tickets_resolvidos'
+                              and column_name='organization_id') then
+                alter table visualizacao_resolvidos.tickets_resolvidos add column organization_id text;
+              end if;
+              if not exists(select 1 from information_schema.columns
+                            where table_schema='visualizacao_resolvidos'
+                              and table_name='tickets_resolvidos'
+                              and column_name='organization_name') then
+                alter table visualizacao_resolvidos.tickets_resolvidos add column organization_name text;
+              end if;
+            end$$
+            """)
+            cur.execute("""
+            create table if not exists visualizacao_resolvidos.sync_control(
+              name text primary key,
+              last_update timestamptz default now(),
+              last_index_run_at timestamptz,
+              last_detail_run_at timestamptz
+            )
+            """)
+    return True
+
 UPSERT = """
 insert into visualizacao_resolvidos.tickets_resolvidos
 (ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,origin,category,urgency,service_first_level,service_second_level,service_third_level,owner_id,owner_name,organization_id,organization_name)
-values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+values (%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(last_cancelled_at)s,%(last_update)s,%(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,%(owner_id)s,%(owner_name)s,%(organization_id)s,%(organization_name)s)
 on conflict (ticket_id) do update set
  status=excluded.status,
  last_resolved_at=excluded.last_resolved_at,
@@ -39,9 +105,6 @@ on conflict (name) do update set last_update=now(), last_detail_run_at=now()
 
 GET_LASTRUN = "select coalesce(max(last_detail_run_at), timestamp 'epoch') from visualizacao_resolvidos.sync_control where name='default'"
 
-def conn():
-    return psycopg2.connect(NEON_DSN)
-
 def req(url, params, retries=4):
     for i in range(retries):
         r = requests.get(url, params=params, timeout=60)
@@ -53,7 +116,7 @@ def req(url, params, retries=4):
         r.raise_for_status()
     r.raise_for_status()
 
-def iso(dt):
+def to_utc(dt):
     if not dt:
         return None
     try:
@@ -91,45 +154,38 @@ def fetch_pages(since_iso):
             break
         time.sleep(THROTTLE)
 
-def row_from_ticket(t):
-    owner_id = None
-    owner_name = None
-    try:
-        o = t.get("owner") or {}
-        owner_id = o.get("id")
-        owner_name = o.get("businessName") or o.get("fullName")
-    except:
-        pass
+def map_row(t):
+    owner = (t.get("owner") or {})
+    owner_id = owner.get("id")
+    owner_name = owner.get("businessName") or owner.get("fullName")
     org_id = None
     org_name = None
-    try:
-        cl = (t.get("clients") or [])
-        if cl:
-            org = (cl[0].get("organization") or {})
-            org_id = org.get("id")
-            org_name = org.get("businessName") or org.get("fullName")
-    except:
-        pass
-    return (
-        t.get("id"),
-        t.get("status"),
-        iso(t.get("resolvedIn")),
-        iso(t.get("closedIn")),
-        iso(t.get("canceledIn")),
-        iso(t.get("lastUpdate")),
-        t.get("origin"),
-        t.get("category"),
-        t.get("urgency"),
-        t.get("serviceFirstLevel"),
-        t.get("serviceSecondLevel"),
-        t.get("serviceThirdLevel"),
-        owner_id,
-        owner_name,
-        org_id,
-        org_name
-    )
+    clients = t.get("clients") or []
+    if clients:
+        org = clients[0].get("organization") or {}
+        org_id = org.get("id")
+        org_name = org.get("businessName") or org.get("fullName")
+    return {
+        "ticket_id": t.get("id"),
+        "status": t.get("status"),
+        "last_resolved_at": to_utc(t.get("resolvedIn")),
+        "last_closed_at": to_utc(t.get("closedIn")),
+        "last_cancelled_at": to_utc(t.get("canceledIn")),
+        "last_update": to_utc(t.get("lastUpdate")),
+        "origin": t.get("origin"),
+        "category": t.get("category"),
+        "urgency": t.get("urgency"),
+        "service_first_level": t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level": t.get("serviceThirdLevel"),
+        "owner_id": owner_id,
+        "owner_name": owner_name,
+        "organization_id": org_id,
+        "organization_name": org_name
+    }
 
 def main():
+    ensure_schema()
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(GET_LASTRUN)
@@ -140,7 +196,7 @@ def main():
     rows = []
     for page in fetch_pages(since_iso):
         for t in page:
-            rows.append(row_from_ticket(t))
+            rows.append(map_row(t))
     if rows:
         with conn() as c:
             with c.cursor() as cur:
