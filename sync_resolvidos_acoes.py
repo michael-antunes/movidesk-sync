@@ -70,50 +70,77 @@ def select_next_ticket_ids(conn, limit: int) -> t.List[int]:
 
 
 def movidesk_request(params: dict, max_retries: int = 3, backoff_s: float = 1.5):
+    last_err_txt = ""
     for i in range(max_retries):
         r = requests.get(API_URL, params=params, timeout=60)
+        if r.status_code >= 400:
+            # guarda corpo pro diagnóstico
+            try:
+                last_err_txt = r.text[:500]
+            except Exception:
+                last_err_txt = ""
         try:
             r.raise_for_status()
             return r.json()
         except requests.HTTPError:
+            # Retentativas apenas para erros temporários
             if r.status_code in (429, 500, 502, 503, 504) and i < max_retries - 1:
                 time.sleep(backoff_s * (i + 1))
                 continue
-            raise
+            # Anexa corpo à exceção pra facilitar debug
+            raise requests.HTTPError(f"{r.status_code} {r.reason} - body: {last_err_txt}", response=r)
 
 
 def fetch_actions_for_ids(ids: t.List[int]) -> t.Dict[int, t.List[dict]]:
     """
-    Busca ações dos tickets informados. Inclui descriptionHtml, attachments,
-    e timeAppointments conforme a KB do Movidesk.
+    Busca ações dos tickets informados.
+    - NÃO usa descriptionHtml (causa 400).
+    - Evita pôr 'actions' no $select de tickets (alguns ambientes retornam 400).
+    - Faz fallback: com attachments+timeAppointments → só attachments → apenas ações.
     """
     if not ids:
         return {}
 
     filter_expr = " or ".join([f"id eq {i}" for i in ids])
 
-    expand_inner = (
-        "actions("
-        "$select=id,isPublic,origin,createdDate,description,descriptionHtml,attachments,timeAppointments;"
-        "$expand=attachments,timeAppointments"
-        ")"
-    )
+    # Ordem de tentativas (da mais completa para a mais simples):
+    expands = [
+        # Completa
+        "actions($select=id,isPublic,origin,createdDate,description;$expand=attachments,timeAppointments)",
+        # Sem timeAppointments
+        "actions($select=id,isPublic,origin,createdDate,description;$expand=attachments)",
+        # Só ações
+        "actions($select=id,isPublic,origin,createdDate,description)"
+    ]
 
-    params = {
-        "token": API_TOKEN,
-        "$select": "id,lastUpdate,actions",
-        "$expand": expand_inner,
-        "$filter": filter_expr,
-        "$top": 100
-    }
+    last_err = None
+    for exp in expands:
+        params = {
+            "token": API_TOKEN,
+            "$select": "id,lastUpdate",  # << NÃO inclui 'actions' aqui
+            "$expand": exp,
+            "$filter": filter_expr,
+            "$top": 100
+        }
+        try:
+            data = movidesk_request(params) or []
+            out: t.Dict[int, t.List[dict]] = {}
+            for item in data:
+                tid = int(item.get("id"))
+                acts = item.get("actions") or []
+                out[tid] = acts
+            print(f"Expand OK: {exp}")
+            return out
+        except requests.HTTPError as e:
+            # guarda e tenta a próxima forma
+            last_err = e
+            print(f"Tentativa falhou com expand='{exp}': {e}")
+            continue
 
-    data = movidesk_request(params) or []
-    out: t.Dict[int, t.List[dict]] = {}
-    for item in data:
-        tid = int(item.get("id"))
-        acts = item.get("actions") or []
-        out[tid] = acts
-    return out
+    # Se nenhuma forma funcionou, propaga o último erro
+    if last_err:
+        raise last_err
+    return {}
 
 
 def upsert_actions(conn, rows: t.List[t.Tuple[int, list]]):
