@@ -32,21 +32,21 @@ jobs:
           MOVIDESK_PG_PAGESIZE: "300"
         run: python sync_resolved_detail.py
 
-  dispatch-acoes:
+    dispatch-acoes:
     needs: detail
+    if: ${{ needs.detail.result == 'success' }}
     runs-on: ubuntu-latest
-    if: ${{ success() }}
+    permissions:
+      actions: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/github-script@v7
-        env:
-          TARGET_REF: ${{ github.ref_name }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'sync_resolvidos_acoes.yml',
-              ref: process.env.TARGET_REF
+              ref: 'main'
             })
+
