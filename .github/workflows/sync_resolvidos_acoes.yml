@@ -23,7 +23,8 @@ jobs:
       - name: Executa ações (10 por vez)
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           ACTIONS_BATCH_SIZE: "10"
           ACTIONS_THROTTLE_SEC: "0.7"
         run: python sync_resolvidos_acoes.py
