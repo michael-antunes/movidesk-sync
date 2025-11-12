@@ -1,11 +1,9 @@
 name: Movidesk • Ações dos tickets resolvidos
 on:
   workflow_dispatch: {}
-
 concurrency:
   group: movidesk-acoes-${{ github.run_id }}
   cancel-in-progress: true
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -15,16 +13,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
       - env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_OVERLAP_MIN: "15"
-          MOVIDESK_ACOES_DAYS: "7"
-          MOVIDESK_ACOES_REPAIR_DAYS: "30"
-          MOVIDESK_ACOES_LIMIT: "4000"
-          MOVIDESK_ACOES_CHUNK: "120"
-          MOVIDESK_PG_PAGESIZE: "200"
-          MOVIDESK_THROTTLE: "0.25"
+          MOVIDESK_OVERLAP_MIN: "10"
+          MOVIDESK_ACOES_DAYS: "3"
+          MOVIDESK_ACOES_REPAIR_DAYS: "7"
+          MOVIDESK_ACOES_LIMIT: "2000"
+          MOVIDESK_ACOES_CHUNK: "250"
+          MOVIDESK_PG_PAGESIZE: "500"
+          MOVIDESK_THROTTLE: "0.10"
           MOVIDESK_ACOES_TOP: "200"
+          MOVIDESK_PREFILTER_CHUNK: "15"
         run: python sync_resolvidos_acoes.py
