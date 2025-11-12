@@ -1,14 +1,11 @@
 name: Movidesk - Ações (depende do detail via dispatch)
 
 on:
-  # Permite ser chamado pelo detail.yml via dispatch e rodar manualmente
-  workflow_dispatch: {}
-  # Fallback opcional para rodar sozinho (mantém em sincronia caso um dispatch falhe)
+  # para ser chamado pelo workflow do detail
+  workflow_dispatch:
+  # opcional: roda sozinho também, a cada 5 minutos
   schedule:
     - cron: "*/5 * * * *"
-
-permissions:
-  contents: read
 
 concurrency:
   group: movidesk-acoes
@@ -16,7 +13,6 @@ concurrency:
 
 jobs:
   run:
-    name: Executa ações (10 por vez)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -29,34 +25,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests psycopg2-binary
-          fi
+      - name: Install deps
+        run: pip install requests psycopg2-binary
 
-      - name: Run sync_resolvidos_acoes.py
+      - name: Executa ações (10 por vez)
         env:
-          # Secrets necessários
-          NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          # Compatibilidade com var alternativa, se você usa MOVIDESK_API_TOKEN
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-
-          # Parâmetros de execução
-          PYTHONUNBUFFERED: "1"
-          MOVIDESK_PAGE_SIZE: "10"          # 10 tickets por rodada
-          MOVIDESK_THROTTLE: "0.2"          # intervalo entre chamadas
-          UPSERT_PAGESIZE: "200"            # batch no INSERT
-          # Nomes das tabelas/esquemas usados pelo script
-          ACTIONS_SCHEMA: "visualizacao_resolvidos"
-          ACTIONS_TABLE: "resolvidos_acoes"
-          TICKETS_SCHEMA: "visualizacao_resolvidos"
-          TICKETS_TABLE: "tickets_resolvidos"
-          CONTROL_SCHEMA: "visualizacao_resolvidos"
-          CONTROL_TABLE: "sync_control"
-          # Nome lógico deste processo no sync_control
-          SYNC_NAME: "acoes"
-        run: python sync_resolvidos_acoes.py
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          # ajustes finos (opcionais)
+          MOVIDESK_BATCH_SIZE: "10"
+          MOVIDESK_THROTTLE: "7"
+        run: |
+          python sync_resolvidos_acoes.py
