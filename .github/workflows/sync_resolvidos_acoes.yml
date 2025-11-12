@@ -1,19 +1,17 @@
 name: Movidesk - Ações (depende do detail via dispatch)
 
 on:
+  # chamado pelo workflow de "tickets_resolvidos (detail)" via github-script/dispatch
   workflow_dispatch:
     inputs:
-      motivo:
-        description: "Obs (opcional)"
+      batch:
+        description: "Qtd de tickets por execução"
         required: false
-        default: ""
-
-permissions:
-  contents: read
-
-concurrency:
-  group: movidesk-acoes
-  cancel-in-progress: true
+        default: "10"
+        type: string
+  # opcional: roda sozinho a cada 5min se quiser
+  schedule:
+    - cron: "*/5 * * * *"
 
 jobs:
   run:
@@ -27,19 +25,18 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir requests psycopg2-binary
+          pip install requests psycopg2-binary
 
       - name: Executa ações (10 por vez)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_BATCH: "10"
-          MOVIDESK_PG_PAGESIZE: "200"
+          BATCH_SIZE: ${{ github.event.inputs.batch || '10' }}
         run: |
           python sync_resolvidos_acoes.py
