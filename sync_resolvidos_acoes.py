@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, json, math
+import os, time, json
+from datetime import datetime, timezone, timedelta
+
 import requests
-import psycopg2, psycopg2.extras
-from datetime import datetime, timezone
+import psycopg2
+import psycopg2.extras
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN  = os.getenv("NEON_DSN")
 
-# parâmetros ajustáveis por env
-BATCH_SIZE          = int(os.getenv("ACTIONS_BATCH_SIZE", "10"))   # 10 tickets por vez
-THROTTLE_SEC        = float(os.getenv("ACTIONS_THROTTLE_SEC", "0.4"))
-PAGE_SIZE_ACTIONS   = 100  # paginação da API de ações
+# Parâmetros
+BATCH_SIZE        = int(os.getenv("ACTIONS_BATCH_SIZE", "10"))     # tickets por vez
+THROTTLE_SEC      = float(os.getenv("ACTIONS_THROTTLE_SEC", "0.4")) # intervalo entre chamadas
+PAGE_SIZE_ACTIONS = int(os.getenv("ACTIONS_PAGE_SIZE", "100"))
+BACKFILL_DAYS     = int(os.getenv("ACTIONS_BACKFILL_DAYS", "30"))   # fallback se não houver last_run
 
 BASE_URL = "https://api.movidesk.com/public/v1"
 
+# ---------- util ----------
 def http_get(url, params):
-    # evita None no token
     if not API_TOKEN:
         raise RuntimeError("Defina MOVIDESK_TOKEN (ou MOVIDESK_API_TOKEN)")
     q = dict(params or {})
@@ -26,43 +29,34 @@ def http_get(url, params):
     r.raise_for_status()
     return r.json()
 
+def qident(name: str) -> str:
+    # quote de identificador postgres
+    return '"' + name.replace('"','""') + '"'
+
 def get_conn():
     if not NEON_DSN:
         raise RuntimeError("Defina NEON_DSN")
     return psycopg2.connect(NEON_DSN)
 
-def select_next_ticket_ids(conn, limit=BATCH_SIZE):
-    """
-    Seleciona até 'limit' tickets que precisam atualizar ações:
-      - não existem na resolvidos_acoes, OU
-      - tickets_resolvidos.last_update > resolvidos_acoes.updated_at
-    """
+def list_columns(conn, schema: str, table: str):
     sql = """
-        with tr as (
-            select id, last_update
-            from visualizacao_resolvidos.tickets_resolvidos
-        )
-        select tr.id
-        from tr
-        left join visualizacao_resolvidos.resolvidos_acoes ra
-               on ra.ticket_id = tr.id
-        where ra.ticket_id is null
-           or tr.last_update > coalesce(ra.updated_at, '1970-01-01'::timestamptz)
-        order by tr.last_update desc nulls last, tr.id desc
-        limit %s;
+      select column_name
+      from information_schema.columns
+      where table_schema=%s and table_name=%s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+        cur.execute(sql, (schema, table))
+        return {row[0] for row in cur.fetchall()}
 
-def fetch_actions_for_ticket(ticket_id):
-    """
-    Busca ações pela rota /ticketActions paginando, incluindo:
-      - description (HTML)
-      - isPublic, createdDate, origin
-      - attachments (id, fileName, link)
-      - timeAppointments (id, startDate, endDate, workTime)
-    """
+def pick_column(available: set, candidates: list[str]) -> str | None:
+    # devolve o primeiro candidato existente (case-sensitive)
+    for c in candidates:
+        if c in available:
+            return c
+    return None
+
+# ---------- API Movidesk ----------
+def fetch_actions_for_ticket(ticket_id: int):
     url = f"{BASE_URL}/ticketActions"
     all_actions = []
     skip = 0
@@ -75,23 +69,113 @@ def fetch_actions_for_ticket(ticket_id):
             "$skip": skip
         }
         data = http_get(url, params)
-        if not isinstance(data, list):
-            # proteção caso a API venha como objeto
-            page = data or []
-        else:
-            page = data
-
+        page = data if isinstance(data, list) else (data or [])
         all_actions.extend(page)
         if len(page) < PAGE_SIZE_ACTIONS:
             break
         skip += PAGE_SIZE_ACTIONS
-        time.sleep(THROTTLE_SEC)  # bem leve
-
+        time.sleep(THROTTLE_SEC)
     return all_actions
+
+# ---------- DB ----------
+def get_last_run(conn) -> datetime:
+    """
+    Usa sync_control(name='acoes').last_update.
+    Se não existir, volta BACKFILL_DAYS atrás.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            select last_update
+            from visualizacao_resolvidos.sync_control
+            where name='acoes'
+            order by last_update desc
+            limit 1
+        """)
+        row = cur.fetchone()
+    if row and row[0]:
+        return row[0]
+    # fallback
+    return datetime.now(timezone.utc) - timedelta(days=BACKFILL_DAYS)
+
+def heartbeat(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            insert into visualizacao_resolvidos.sync_control(name, last_update)
+            values ('acoes', now())
+            on conflict (name) do update set last_update = excluded.last_update
+        """)
+    conn.commit()
+
+def select_next_ticket_ids(conn, limit: int):
+    """
+    Seleciona até 'limit' tickets com base:
+     - data de resolução >= última execução do 'acoes' (com margem de 1 dia)
+     - OU ausentes na resolvidos_acoes
+     - ordena por resolução desc
+    Esquema agnóstico (id ou ticket_id; camelCase / snake_case para datas).
+    """
+    cols = list_columns(conn, "visualizacao_resolvidos", "tickets_resolvidos")
+
+    pk = pick_column(cols, ["id", "ticket_id"])
+    if not pk:
+        raise RuntimeError("Não encontrei a PK em visualizacao_resolvidos.tickets_resolvidos (id ou ticket_id).")
+
+    # datas possíveis
+    resolved_candidates  = ["resolvedIn", "resolvedin", "resolved_in"]
+    closed_candidates    = ["closedIn", "closedin", "closed_in"]
+    canceled_candidates  = ["canceledIn", "canceledin", "canceled_in"]
+    lastupd_candidates   = ["lastUpdate", "lastupdate", "last_update"]
+
+    resolved_col = pick_column(cols, resolved_candidates)
+    closed_col   = pick_column(cols, closed_candidates)
+    canceled_col = pick_column(cols, canceled_candidates)
+    lastupd_col  = pick_column(cols, lastupd_candidates)
+
+    # expressão de data de resolução
+    date_expr_parts = []
+    if resolved_col: date_expr_parts.append(qident(resolved_col))
+    if closed_col:   date_expr_parts.append(qident(closed_col))
+    if canceled_col: date_expr_parts.append(qident(canceled_col))
+
+    if date_expr_parts:
+        resolved_expr = "GREATEST(" + ",".join(date_expr_parts) + ")"
+    elif lastupd_col:
+        resolved_expr = qident(lastupd_col)  # fallback
+    else:
+        # último fallback: usa 'now()' para não quebrar
+        resolved_expr = "now()"
+
+    last_run = get_last_run(conn)
+
+    sql = f"""
+        with ctl as (
+          select %s::timestamptz as last_run
+        ),
+        src as (
+          select {qident(pk)} as ticket_id,
+                 {resolved_expr} as resolved_at
+          from visualizacao_resolvidos.tickets_resolvidos
+        )
+        select s.ticket_id
+        from src s, ctl c
+        left join visualizacao_resolvidos.resolvidos_acoes ra
+               on ra.ticket_id = s.ticket_id
+        where
+          -- não existe em ações
+          ra.ticket_id is null
+          -- ou foi resolvido após última execução (com margem de 1 dia)
+          or (s.resolved_at is not null and s.resolved_at >= c.last_run - interval '1 day')
+        order by s.resolved_at desc nulls last, s.ticket_id desc
+        limit %s
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, (last_run, limit))
+        return [r[0] for r in cur.fetchall()]
 
 def upsert_actions(conn, rows):
     """
-    rows: lista de tuplas (ticket_id, acoes_json_text)
+    rows: [(ticket_id, acoes_json_text), ...]
     """
     sql = """
         insert into visualizacao_resolvidos.resolvidos_acoes
@@ -100,12 +184,13 @@ def upsert_actions(conn, rows):
         on conflict (ticket_id)
         do update set
             acoes = excluded.acoes,
-            updated_at = now();
+            updated_at = now()
     """
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=100)
     conn.commit()
 
+# ---------- MAIN ----------
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
@@ -115,28 +200,23 @@ def main():
         while True:
             ids = select_next_ticket_ids(conn, BATCH_SIZE)
             if not ids:
-                # nada para fazer agora
                 break
 
-            out_rows = []
+            payload = []
             for tid in ids:
                 try:
                     actions = fetch_actions_for_ticket(tid)
-                    # guardamos exatamente como veio (lista de objetos)
-                    acoes_json = json.dumps(actions, ensure_ascii=False)
-                    out_rows.append((tid, acoes_json))
-                except requests.HTTPError as e:
-                    # HTTP 404 / 400 etc — armazena vazio mas não quebra lote
-                    out_rows.append((tid, "[]"))
+                    payload.append((tid, json.dumps(actions, ensure_ascii=False)))
                 except Exception:
-                    out_rows.append((tid, "[]"))
+                    # Falha na API? Não trava o lote; grava vazio para não loopar
+                    payload.append((tid, "[]"))
                 finally:
                     time.sleep(THROTTLE_SEC)
 
-            if out_rows:
-                upsert_actions(conn, out_rows)
+            if payload:
+                upsert_actions(conn, payload)
 
-            # loop continua até esvaziar a fila (ids vazios)
+            heartbeat(conn)  # marca última execução bem-sucedida
     finally:
         conn.close()
 
