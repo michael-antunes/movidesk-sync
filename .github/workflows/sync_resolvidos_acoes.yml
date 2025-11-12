@@ -1,7 +1,5 @@
 name: Movidesk • Ações dos tickets resolvidos
-
 on:
-  workflow_call: {}
   workflow_dispatch: {}
 
 concurrency:
