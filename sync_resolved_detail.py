@@ -1,12 +1,18 @@
-# sync_resolved_detail.py
 # -*- coding: utf-8 -*-
-import os, time, logging
+import os
+import time
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Dict, Any
-import requests, psycopg2
-from psycopg2.extras import execute_values
+from typing import Dict, Any, List, Iterable
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
+import requests
+import psycopg2
+import psycopg2.extras
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)7s  %(message)s"
+)
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN  = os.getenv("NEON_DSN")
@@ -15,23 +21,123 @@ if not API_TOKEN or not NEON_DSN:
 
 BASE_URL = "https://api.movidesk.com/public/v1/tickets"
 
-# Controle/segurança
-THROTTLE_SEC       = float(os.getenv("THROTTLE_SEC", "0.4"))
-PAGES_UPSERT       = int(os.getenv("PAGES_UPSERT", "7"))          # páginas no modo incremental
-OdataGroupMaxIDs   = int(os.getenv("ODATA_GROUP_MAX_IDS", "15"))  # grupo seguro p/ $filter (limite de 'node count 100')
+# ------------ parâmetros de execução ------------
+THROTTLE_SEC        = float(os.getenv("THROTTLE_SEC", "0.35"))
+PAGES_UPSERT        = int(os.getenv("PAGES_UPSERT", "7"))   # só para o fallback por janela temporal
+FILTER_GROUP_SIZE   = int(os.getenv("FILTER_GROUP_SIZE", "25"))  # ids por chamada OData (<=25 fica bem abaixo do node-limit 100)
+MAX_AUDIT_IDS       = int(os.getenv("MAX_AUDIT_IDS", "600"))     # máximo de ids vindos do audit por execução
+FALLBACK_DAYS       = int(os.getenv("FALLBACK_DAYS", "7"))       # janela temporal caso o audit esteja vazio
 
-def db():
+# ------------ seleção / expand para a API ------------
+SELECT_FIELDS = ",".join([
+    "id",
+    "status",
+    "resolvedIn",
+    "closedIn",
+    "canceledIn",
+    "lastUpdate",
+    "origin",
+    "category",
+    "urgency",
+    "serviceFirstLevel",
+    "serviceSecondLevel",
+    "serviceThirdLevel",
+    "subject",          # assunto
+    "ownerTeam"         # nome da equipe (string simples)
+])
+
+# IMPORTANTE: sem fullName; apenas businessName (algumas contas expõem 'name', tratamos no fallback do map)
+EXPAND = "owner($select=id,businessName),clients($expand=organization($select=id,businessName))"
+
+# ------------ SQL ------------
+UPSERT_SQL = """
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,
+ origin,category,urgency,service_first_level,service_second_level,service_third_level,
+ subject, owner_id, owner_name, owner_team_name, organization_id, organization_name)
+values (%(ticket_id)s,%(status)s,%(last_resolved_at)s,%(last_closed_at)s,%(last_cancelled_at)s,%(last_update)s,
+        %(origin)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,
+        %(subject)s, %(owner_id)s, %(owner_name)s, %(owner_team_name)s, %(organization_id)s, %(organization_name)s)
+on conflict (ticket_id) do update set
+ status               = excluded.status,
+ last_resolved_at     = excluded.last_resolved_at,
+ last_closed_at       = excluded.last_closed_at,
+ last_cancelled_at    = excluded.last_cancelled_at,
+ last_update          = excluded.last_update,
+ origin               = excluded.origin,
+ category             = excluded.category,
+ urgency              = excluded.urgency,
+ service_first_level  = excluded.service_first_level,
+ service_second_level = excluded.service_second_level,
+ service_third_level  = excluded.service_third_level,
+ subject              = excluded.subject,
+ owner_id             = excluded.owner_id,
+ owner_name           = excluded.owner_name,
+ owner_team_name      = excluded.owner_team_name,
+ organization_id      = excluded.organization_id,
+ organization_name    = excluded.organization_name
+"""
+
+# coluna adicional_nome (código 29077) — guardamos num UPDATE para não poluir o upsert acima
+UPSERT_ADICIONAL_NOME = """
+update visualizacao_resolvidos.tickets_resolvidos
+   set adicional_nome = %s
+ where ticket_id = %s
+"""
+
+SET_LASTRUN = """
+insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
+values ('default', now(), now())
+on conflict (name) do update set last_update = now(), last_detail_run_at = now()
+"""
+
+GET_LASTRUN = """
+select coalesce(max(last_detail_run_at), timestamp 'epoch')
+  from visualizacao_resolvidos.sync_control
+ where name = 'default'
+"""
+
+# ------------ util ------------
+def conn():
     return psycopg2.connect(NEON_DSN)
 
+def z(dt_str: Any):
+    """Converte string ISO da API para UTC (timestamptz) ou None."""
+    if not dt_str:
+        return None
+    try:
+        s = str(dt_str).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def req(url: str, params: dict):
+    # monta com token sem escapar os símbolos do OData (para $filter grande)
+    from urllib.parse import urlencode
+    q = {"token": API_TOKEN, **params}
+    full = f"{url}?{urlencode(q, safe='(),$= :')}"
+    r = requests.get(full, timeout=60)
+    if r.status_code == 200:
+        try:
+            return r.json()
+        except Exception:
+            return []
+    # mensagens claras pra log
+    raise requests.HTTPError(
+        f"{r.status_code} {r.reason} - url: {full} - body: {r.text}",
+        response=r
+    )
+
+# ------------ schema ------------
 def ensure_schema():
-    with db() as c, c.cursor() as cur:
+    with conn() as c, c.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
         cur.execute("""
         create table if not exists visualizacao_resolvidos.tickets_resolvidos(
           ticket_id integer primary key,
-          status text not null,
+          status text,
           last_resolved_at timestamptz,
-          last_closed_at  timestamptz,
+          last_closed_at timestamptz,
           last_cancelled_at timestamptz,
           last_update timestamptz,
           origin text,
@@ -40,162 +146,80 @@ def ensure_schema():
           service_first_level text,
           service_second_level text,
           service_third_level text,
-          owner_id   text,
+          subject text,
+          owner_id text,
           owner_name text,
-          organization_id   text,
+          owner_team_name text,
+          organization_id text,
           organization_name text,
-          owner_team_name   text
-        )""")
-        # Tabelas auxiliares já existentes no seu ambiente (mantemos):
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.sync_control(
-          name text primary key,
-          last_update timestamptz default now(),
-          last_index_run_at timestamptz,
-          last_detail_run_at timestamptz
+          adicional_nome text
         )
         """)
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.audit_recent_run(
-          id bigserial primary key,
-          window_start timestamptz,
-          window_end   timestamptz,
-          total_api    integer,
-          missing_total integer,
-          run_at timestamptz,
-          window_from timestamptz,
-          window_to   timestamptz,
-          total_local integer,
-          notes text
-        )
-        """)
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.audit_recent_missing(
-          run_id bigint not null references visualizacao_resolvidos.audit_recent_run(id) on delete cascade,
-          table_name text not null,
-          ticket_id integer not null,
-          constraint ux_audit_recent_missing unique (run_id, table_name, ticket_id)
-        )
-        """)
-        cur.execute("""
-        create table if not exists visualizacao_resolvidos.audit_ticket_watch(
-          ticket_id integer primary key,
-          hit_count integer not null default 1,
-          last_reason text,
-          last_seen_at timestamptz default now()
-        )
-        """)
-    return True
+        # adiciona colunas que porventura não existam ainda (sem dropar nada)
+        for col, ddl in [
+            ("subject",              "alter table visualizacao_resolvidos.tickets_resolvidos add column subject text"),
+            ("owner_id",             "alter table visualizacao_resolvidos.tickets_resolvidos add column owner_id text"),
+            ("owner_name",           "alter table visualizacao_resolvidos.tickets_resolvidos add column owner_name text"),
+            ("owner_team_name",      "alter table visualizacao_resolvidos.tickets_resolvidos add column owner_team_name text"),
+            ("organization_id",      "alter table visualizacao_resolvidos.tickets_resolvidos add column organization_id text"),
+            ("organization_name",    "alter table visualizacao_resolvidos.tickets_resolvidos add column organization_name text"),
+            ("adicional_nome",       "alter table visualizacao_resolvidos.tickets_resolvidos add column adicional_nome text"),
+        ]:
+            cur.execute("""
+                do $$
+                begin
+                  if not exists(
+                    select 1 from information_schema.columns
+                     where table_schema='visualizacao_resolvidos'
+                       and table_name='tickets_resolvidos'
+                       and column_name=%s
+                  ) then execute %s; end if;
+                end$$
+            """, (col, ddl))
 
-UPSERT_SQL = """
-insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,
- origin,category,urgency,service_first_level,service_second_level,service_third_level,
- owner_id,owner_name,organization_id,organization_name,owner_team_name)
-values %s
-on conflict (ticket_id) do update set
- status=excluded.status,
- last_resolved_at=excluded.last_resolved_at,
- last_closed_at=excluded.last_closed_at,
- last_cancelled_at=excluded.last_cancelled_at,
- last_update=excluded.last_update,
- origin=excluded.origin,
- category=excluded.category,
- urgency=excluded.urgency,
- service_first_level=excluded.service_first_level,
- service_second_level=excluded.service_second_level,
- service_third_level=excluded.service_third_level,
- owner_id=excluded.owner_id,
- owner_name=excluded.owner_name,
- organization_id=excluded.organization_id,
- organization_name=excluded.organization_name,
- owner_team_name=excluded.owner_team_name
-"""
+# ------------ mapeamento dos campos ------------
+def extract_owner_name(owner: Dict[str, Any]) -> str:
+    # API vária entre 'businessName' e 'name'
+    return owner.get("businessName") or owner.get("name")
 
-SET_LASTRUN = """
-insert into visualizacao_resolvidos.sync_control(name,last_update,last_detail_run_at)
-values('detail',now(),now())
-on conflict (name) do update set last_update=now(), last_detail_run_at=now()
-"""
+def extract_org_name(org: Dict[str, Any]) -> str:
+    return org.get("businessName") or org.get("name")
 
-GET_LASTRUN = """
-select coalesce(max(last_detail_run_at), timestamp 'epoch')
-from visualizacao_resolvidos.sync_control
-where name='detail'
-"""
-
-def req(url: str, params: dict) -> Any:
-    p = {"token": API_TOKEN, **params}
-    r = requests.get(url, params=p, timeout=60)
-    if r.status_code == 200:
-        return r.json()
-    raise requests.HTTPError(
-        f"{r.status_code} {r.reason} - url: {r.url} - body: {r.text}",
-        response=r
-    )
-
-def z(dtstr: str):
-    if not dtstr:
-        return None
-    try:
-        return datetime.fromisoformat(dtstr.replace("Z","+00:00")).astimezone(timezone.utc)
-    except Exception:
+def extract_adicional_nome(custom_fields: Any) -> Any:
+    """
+    Campo adicional 'nome' (código 29077).
+    Considera diferentes formatos possíveis vindos da API.
+    """
+    if not custom_fields:
         return None
 
-def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
+    for cf in custom_fields:
+        cid = cf.get("id")
+        ccustom = cf.get("customFieldId")
+        label = (cf.get("label") or cf.get("name") or "").strip().lower()
+        # identifica pelo código
+        if str(ccustom or cid) == "29077" or "29077" in str(cid):
+            val = cf.get("value")
+            if isinstance(val, dict):
+                return val.get("name") or val.get("value")
+            if isinstance(val, list):
+                return ", ".join(map(str, val))
+            return val
+        # fallback por label/descrição
+        if "nome" in label:
+            val = cf.get("value")
+            if isinstance(val, dict):
+                return val.get("name") or val.get("value")
+            if isinstance(val, list):
+                return ", ".join(map(str, val))
+            return val
 
-# ---------- FETCHERS ----------
-
-SELECT_FIELDS = ",".join([
-    "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
-    "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-    "ownerTeam"  # Nome da equipe; API não expõe ownerTeamId
-])
-EXPAND = "owner($select=id,businessName,fullName),clients($expand=organization($select=id,businessName,fullName))"
-
-def fetch_incremental_pages(since_iso: str):
-    total = 0
-    skip = 0
-    while True:
-        page = req(BASE_URL, {
-            "$select": SELECT_FIELDS,
-            "$expand": EXPAND,
-            "$filter": "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge %s" % since_iso,
-            "$orderby": "lastUpdate asc",
-            "$top": 100,
-            "$skip": skip
-        }) or []
-        if not page: break
-        yield page
-        got = len(page)
-        total += got
-        skip += got
-        if got < 100 or total >= (PAGES_UPSERT * 100):
-            break
-        time.sleep(THROTTLE_SEC)
-
-def fetch_group_by_ids(ids: List[int]):
-    # Quebra em grupos para não estourar node-count 100
-    for group in chunked(ids, OdataGroupMaxIDs):
-        filt = " or ".join([f"id eq {i}" for i in group])
-        data = req(BASE_URL, {
-            "$select": SELECT_FIELDS,
-            "$expand": EXPAND,
-            "$filter": filt,
-            "$top": 100
-        }) or []
-        yield data
-        time.sleep(THROTTLE_SEC)
-
-# ---------- MAP ----------
+    return None
 
 def map_row(t: Dict[str, Any]) -> Dict[str, Any]:
     owner = t.get("owner") or {}
-    # id de pessoa vem como string; normalizamos para texto
-    owner_id   = (owner.get("id") or None)
-    owner_name = (owner.get("businessName") or owner.get("fullName") or owner.get("name"))
+    owner_id   = owner.get("id")
+    owner_name = extract_owner_name(owner)
 
     org_id = None
     org_nm = None
@@ -203,7 +227,10 @@ def map_row(t: Dict[str, Any]) -> Dict[str, Any]:
     if clients:
         org = clients[0].get("organization") or {}
         org_id = org.get("id")
-        org_nm = org.get("businessName") or org.get("fullName") or org.get("name")
+        org_nm = extract_org_name(org)
+
+    # adicional nome (código 29077) — retorna string/None
+    adicional_nome = extract_adicional_nome(t.get("customFields"))
 
     return {
         "ticket_id": int(t.get("id")),
@@ -218,84 +245,153 @@ def map_row(t: Dict[str, Any]) -> Dict[str, Any]:
         "service_first_level":  t.get("serviceFirstLevel"),
         "service_second_level": t.get("serviceSecondLevel"),
         "service_third_level":  t.get("serviceThirdLevel"),
+        "subject": t.get("subject"),
         "owner_id": owner_id,
         "owner_name": owner_name,
+        "owner_team_name": t.get("ownerTeam"),
         "organization_id": org_id,
         "organization_name": org_nm,
-        "owner_team_name": t.get("ownerTeam")  # string ou None
+        "adicional_nome": adicional_nome,
     }
 
-# ---------- MAIN ----------
+# ------------ busca por IDs (audit) ------------
+def chunk(iterable: Iterable[int], size: int) -> Iterable[List[int]]:
+    bucket = []
+    for x in iterable:
+        bucket.append(x)
+        if len(bucket) >= size:
+            yield bucket
+            bucket = []
+    if bucket:
+        yield bucket
 
-def upsert_rows(rows: List[Dict[str, Any]]):
-    if not rows: return 0
-    with db() as c, c.cursor() as cur:
-        execute_values(cur, UPSERT_SQL, [(
-            r["ticket_id"], r["status"], r["last_resolved_at"], r["last_closed_at"], r["last_cancelled_at"], r["last_update"],
-            r["origin"], r["category"], r["urgency"], r["service_first_level"], r["service_second_level"], r["service_third_level"],
-            r["owner_id"], r["owner_name"], r["organization_id"], r["organization_name"], r["owner_team_name"]
-        ) for r in rows], page_size=200)
-    return len(rows)
+def fetch_group_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
+    """
+    Busca 1 página por grupo de ids (ids já vem limitados em FILTER_GROUP_SIZE).
+    """
+    filt = " or ".join([f"id eq {i}" for i in ids])
+    params = {
+        "$select": SELECT_FIELDS,
+        "$expand": EXPAND,
+        "$filter": filt,
+        "$top": 100  # não interfere pois filtro é por ids
+    }
+    data = req(BASE_URL, params) or []
+    time.sleep(THROTTLE_SEC)
+    return data
 
-def purge_audit_missing(processed_ids: List[int], table_name: str):
-    if not processed_ids: return
-    with db() as c, c.cursor() as cur:
-        # apaga do último RUN (ou de todos) as pendências resolvidas
-        cur.execute("select coalesce(max(id),0) from visualizacao_resolvidos.audit_recent_run")
-        run_id = cur.fetchone()[0]
-        cur.execute("""
-            delete from visualizacao_resolvidos.audit_recent_missing
-             where table_name = %s
-               and run_id = %s
-               and ticket_id = any(%s)
-        """, (table_name, run_id, processed_ids))
+def fetch_by_ids(all_ids: List[int]) -> Iterable[List[Dict[str, Any]]]:
+    """
+    Itera em grupos pequenos para não estourar o node-limit do OData.
+    """
+    for group in chunk(all_ids, FILTER_GROUP_SIZE):
+        yield fetch_group_by_ids(group)
 
-def main():
-    ensure_schema()
+# ------------ fallback por janela temporal ------------
+def fetch_by_window(since_iso: str) -> Iterable[List[Dict[str, Any]]]:
+    """
+    Varredura por lastUpdate (fallback quando não há itens no audit).
+    """
+    got = 0
+    skip = 0
+    top_total = PAGES_UPSERT * 100  # respeita a mesma lógica antiga (100 por página)
+    filtro = f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge {since_iso}"
+    while True:
+        params = {
+            "$select": SELECT_FIELDS,
+            "$expand": EXPAND,
+            "$filter": filtro,
+            "$orderby": "lastUpdate asc",
+            "$top": min(100, top_total - got),
+            "$skip": skip
+        }
+        data = req(BASE_URL, params) or []
+        if not data:
+            break
+        yield data
+        got += len(data)
+        skip += len(data)
+        if got >= top_total or len(data) < 100:
+            break
+        time.sleep(THROTTLE_SEC)
 
-    # 1) IDs pendentes no audit (tabela 'tickets_resolvidos')
-    with db() as c, c.cursor() as cur:
+# ------------ leitura do audit ------------
+def load_audit_ids() -> List[int]:
+    with conn() as c, c.cursor() as cur:
+        # pega os ids pendentes mais recentes (independente de run)
         cur.execute("""
             select ticket_id
               from visualizacao_resolvidos.audit_recent_missing
              where table_name = 'tickets_resolvidos'
-             order by ticket_id
-             limit 600
-        """)
-        audit_ids = [r[0] for r in cur.fetchall()]
+             order by run_id desc, ticket_id desc
+             limit %s
+        """, (MAX_AUDIT_IDS,))
+        rows = cur.fetchall() or []
+    ids = [int(r[0]) for r in rows]
+    logging.info("Audit pendentes: %d", len(ids))
+    return ids
 
-    logging.info("Audit pendentes: %d", len(audit_ids))
+def remove_from_audit(success_ids: List[int]):
+    if not success_ids:
+        return
+    with conn() as c, c.cursor() as cur:
+        psycopg2.extras.execute_values(cur, """
+            delete from visualizacao_resolvidos.audit_recent_missing a
+             where a.table_name = 'tickets_resolvidos'
+               and a.ticket_id = any(%s)
+        """, (success_ids,))
+        # não é necessário COMMIT explícito (context manager faz)
 
-    processed_ids: List[int] = []
+# ------------ persistência ------------
+def upsert_rows(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with conn() as c, c.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
+        # adicional_nome num update à parte (só quando houver)
+        ad_vals = [(r["adicional_nome"], r["ticket_id"])
+                   for r in rows if r.get("adicional_nome") is not None]
+        if ad_vals:
+            psycopg2.extras.execute_batch(cur, UPSERT_ADICIONAL_NOME, ad_vals, page_size=200)
 
-    # 2) Reprocessa pendentes por grupos
+# ------------ main ------------
+def main():
+    ensure_schema()
+
+    # 1) tenta pelo audit
+    audit_ids = load_audit_ids()
+
+    success_ids: List[int] = []
+    total_upserts = 0
+
     if audit_ids:
-        for page in fetch_group_by_ids(audit_ids):
-            rows = [map_row(t) for t in page if t.get("id")]
-            if not rows: 
-                continue
-            upsert_rows(rows)
-            processed_ids.extend([r["ticket_id"] for r in rows])
+        for page in fetch_by_ids(audit_ids):
+            mapped = [map_row(t) for t in page]
+            upsert_rows(mapped)
+            total_upserts += len(mapped)
+            success_ids.extend([m["ticket_id"] for m in mapped])
 
-        purge_audit_missing(processed_ids, "tickets_resolvidos")
+        remove_from_audit(success_ids)
+        logging.info("Upserts (audit): %d | removidos do audit: %d", total_upserts, len(success_ids))
 
-    # 3) Incremental “desde o último run”
-    with db() as c, c.cursor() as cur:
-        cur.execute(GET_LASTRUN)
-        since = cur.fetchone()[0]
-    if since == datetime(1970,1,1,tzinfo=timezone.utc):
-        since = datetime.now(timezone.utc) - timedelta(days=7)
-    since_iso = since.replace(microsecond=0).isoformat().replace("+00:00","Z")
+    # 2) fallback por janela (se não havia audit)
+    if not audit_ids:
+        with conn() as c, c.cursor() as cur:
+            cur.execute(GET_LASTRUN)
+            since = cur.fetchone()[0]
+        if since == datetime(1970,1,1,tzinfo=timezone.utc):
+            since = datetime.now(timezone.utc) - timedelta(days=FALLBACK_DAYS)
+        since_iso = since.replace(microsecond=0).isoformat().replace("+00:00","Z")
 
-    inc_rows: List[Dict[str,Any]] = []
-    for page in fetch_incremental_pages(since_iso):
-        for t in page:
-            inc_rows.append(map_row(t))
-    if inc_rows:
-        upsert_rows(inc_rows)
+        total_upserts = 0
+        for page in fetch_by_window(since_iso):
+            mapped = [map_row(t) for t in page]
+            upsert_rows(mapped)
+            total_upserts += len(mapped)
+        logging.info("Upserts (fallback janela): %d", total_upserts)
 
-    # 4) Marca last run
-    with db() as c, c.cursor() as cur:
+    # 3) marca o last run sempre que rodar
+    with conn() as c, c.cursor() as cur:
         cur.execute(SET_LASTRUN)
 
 if __name__ == "__main__":
