@@ -3,10 +3,12 @@
 
 import os
 import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List
+
 import requests
 import psycopg2
 import psycopg2.extras
-from datetime import datetime, timedelta, timezone
 
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
@@ -16,40 +18,45 @@ if not API_TOKEN or not NEON_DSN:
 TOP = int(os.getenv("PAGES_UPSERT", "7")) * 100
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.5"))
 
+BASE = "https://api.movidesk.com/public/v1"
+
+
 def conn():
     return psycopg2.connect(NEON_DSN)
+
 
 def ensure_schema():
     with conn() as c:
         with c.cursor() as cur:
             cur.execute("create schema if not exists visualizacao_resolvidos")
 
-            # tabela base
-            cur.execute("""
-            create table if not exists visualizacao_resolvidos.tickets_resolvidos(
-              ticket_id integer primary key,
-              status text,
-              last_resolved_at timestamptz,
-              last_closed_at timestamptz,
-              last_cancelled_at timestamptz,
-              last_update timestamptz,
-              origin text,
-              category text,
-              urgency text,
-              service_first_level text,
-              service_second_level text,
-              service_third_level text,
-              owner_id text,
-              owner_name text,
-              owner_team_id text,
-              owner_team_name text,
-              organization_id text,
-              organization_name text
+            cur.execute(
+                """
+                create table if not exists visualizacao_resolvidos.tickets_resolvidos(
+                  ticket_id integer primary key,
+                  status text,
+                  last_resolved_at timestamptz,
+                  last_closed_at timestamptz,
+                  last_cancelled_at timestamptz,
+                  last_update timestamptz,
+                  origin text,
+                  category text,
+                  urgency text,
+                  service_first_level text,
+                  service_second_level text,
+                  service_third_level text,
+                  owner_id text,
+                  owner_name text,
+                  owner_team_id text,
+                  owner_team_name text,
+                  organization_id text,
+                  organization_name text
+                )
+                """
             )
-            """)
 
-            # garante colunas novas sem derrubar nada
-            for col_sql in [
+            # garante colunas novas sem dropar nada
+            for col, typ in [
                 ("owner_id", "text"),
                 ("owner_name", "text"),
                 ("owner_team_id", "text"),
@@ -57,29 +64,35 @@ def ensure_schema():
                 ("organization_id", "text"),
                 ("organization_name", "text"),
             ]:
-                cur.execute(f"""
-                do $$
-                begin
-                  if not exists(
-                    select 1 from information_schema.columns
-                     where table_schema='visualizacao_resolvidos'
-                       and table_name='tickets_resolvidos'
-                       and column_name=%s
-                  ) then
-                    execute 'alter table visualizacao_resolvidos.tickets_resolvidos add column {col_sql[0]} {col_sql[1]}';
-                  end if;
-                end$$
-                """, (col_sql[0],))
+                cur.execute(
+                    """
+                    do $$
+                    begin
+                      if not exists(
+                        select 1 from information_schema.columns
+                         where table_schema='visualizacao_resolvidos'
+                           and table_name='tickets_resolvidos'
+                           and column_name=%s
+                      ) then
+                        execute format('alter table visualizacao_resolvidos.tickets_resolvidos add column %I %s',
+                                       %s, %s);
+                      end if;
+                    end$$
+                    """,
+                    (col, col, typ),
+                )
 
-            # controle de execução
-            cur.execute("""
-            create table if not exists visualizacao_resolvidos.sync_control(
-              name text primary key,
-              last_update timestamptz default now(),
-              last_index_run_at timestamptz,
-              last_detail_run_at timestamptz
+            cur.execute(
+                """
+                create table if not exists visualizacao_resolvidos.sync_control(
+                  name text primary key,
+                  last_update timestamptz default now(),
+                  last_index_run_at timestamptz,
+                  last_detail_run_at timestamptz
+                )
+                """
             )
-            """)
+
 
 UPSERT = """
 insert into visualizacao_resolvidos.tickets_resolvidos
@@ -121,6 +134,7 @@ from visualizacao_resolvidos.sync_control
 where name='default'
 """
 
+
 def req(url, params, retries=4):
     for i in range(retries):
         r = requests.get(url, params=params, timeout=60)
@@ -129,43 +143,69 @@ def req(url, params, retries=4):
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (i + 1))
             continue
-        r.raise_for_status()
-    r.raise_for_status()
+        # expõe o corpo para facilitar debug
+        try:
+            body = r.text
+        except Exception:
+            body = ""
+        raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {r.url} - body: {body}", response=r)
+    raise requests.HTTPError("Falhou após retries")
 
-def to_utc(dt):
-    if not dt:
+
+def to_utc(dt_str):
+    if not dt_str:
         return None
     try:
-        return datetime.fromisoformat(dt.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
 
+
 def fetch_pages(since_iso):
-    url = "https://api.movidesk.com/public/v1/tickets"
+    url = f"{BASE}/tickets"
 
-    # campos simples (não incluir ownerTeam aqui!)
-    select_fields = ",".join([
-        "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
-        "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
-    ])
+    # campos simples (inclui ownerTeamId aqui!)
+    select_fields = ",".join(
+        [
+            "id",
+            "status",
+            "resolvedIn",
+            "closedIn",
+            "canceledIn",
+            "lastUpdate",
+            "origin",
+            "category",
+            "urgency",
+            "serviceFirstLevel",
+            "serviceSecondLevel",
+            "serviceThirdLevel",
+            "ownerTeamId",
+        ]
+    )
 
-    # navegações corretas
-    expand = "owner,ownerTeam($select=id,name),clients($expand=organization)"
+    # navegações válidas
+    expand = "owner,clients($expand=organization)"
 
-    filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge %s" % since_iso
+    filtro = (
+        "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') "
+        f"and lastUpdate ge {since_iso}"
+    )
+
     skip = 0
     total = 0
-
     while True:
-        page = req(url, {
-            "token": API_TOKEN,
-            "$select": select_fields,
-            "$expand": expand,
-            "$filter": filtro,
-            "$orderby": "lastUpdate asc",
-            "$top": min(100, TOP - total),
-            "$skip": skip
-        }) or []
+        page = req(
+            url,
+            {
+                "token": API_TOKEN,
+                "$select": select_fields,
+                "$expand": expand,
+                "$filter": filtro,
+                "$orderby": "lastUpdate asc",
+                "$top": min(100, TOP - total),
+                "$skip": skip,
+            },
+        ) or []
         if not page:
             break
         yield page
@@ -176,18 +216,54 @@ def fetch_pages(since_iso):
             break
         time.sleep(THROTTLE)
 
-def map_row(t):
+
+def fetch_teams_names(team_ids: List[int]) -> Dict[str, str]:
+    """
+    Resolve nomes das equipes via /teams.
+    Retorna { str(id): name }.
+    """
+    out: Dict[str, str] = {}
+    if not team_ids:
+        return out
+
+    # chunks para evitar URL gigante
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i : i + n]
+
+    for chunk in chunks(sorted(set([int(x) for x in team_ids if x is not None])), 50):
+        try:
+            f = " or ".join([f"id eq {i}" for i in chunk])
+            data = req(
+                f"{BASE}/teams",
+                {
+                    "token": API_TOKEN,
+                    "$select": "id,name",
+                    "$filter": f,
+                    "$top": len(chunk),
+                },
+            ) or []
+            for t in data:
+                if "id" in t:
+                    out[str(t["id"])] = t.get("name") or ""
+        except Exception:
+            # se der 400 aqui por qualquer motivo, seguimos sem o nome
+            pass
+        time.sleep(THROTTLE)
+    return out
+
+
+def map_row(t, team_names: Dict[str, str]):
     owner = (t.get("owner") or {})
     owner_id = owner.get("id")
     owner_name = owner.get("businessName") or owner.get("fullName") or owner.get("name")
 
-    team = (t.get("ownerTeam") or {})
-    team_id = team.get("id")
-    team_name = team.get("name")
+    team_id = t.get("ownerTeamId")
+    team_id_str = str(team_id) if team_id is not None else None
+    team_name = team_names.get(team_id_str) if team_id_str else None
 
     org_id = None
     org_name = None
-    # clients[0].organization costuma estar presente
     clients = t.get("clients") or []
     if clients:
         org = (clients[0].get("organization") or {})
@@ -209,11 +285,12 @@ def map_row(t):
         "service_third_level": t.get("serviceThirdLevel"),
         "owner_id": owner_id,
         "owner_name": owner_name,
-        "owner_team_id": team_id,
+        "owner_team_id": team_id_str,
         "owner_team_name": team_name,
         "organization_id": org_id,
-        "organization_name": org_name
+        "organization_name": org_name,
     }
+
 
 def main():
     ensure_schema()
@@ -228,10 +305,24 @@ def main():
 
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    rows = []
+    # 1) carrega páginas e coleta teamIds
+    raw_pages: List[dict] = []
+    team_ids: List[int] = []
     for page in fetch_pages(since_iso):
+        raw_pages.extend(page)
         for t in page:
-            rows.append(map_row(t))
+            tid = t.get("ownerTeamId")
+            if tid is not None:
+                try:
+                    team_ids.append(int(tid))
+                except Exception:
+                    pass
+
+    # 2) resolve nomes das equipes
+    team_names = fetch_teams_names(team_ids)
+
+    # 3) mapeia e upserta
+    rows = [map_row(t, team_names) for t in raw_pages]
 
     if rows:
         with conn() as c:
@@ -241,6 +332,7 @@ def main():
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(SET_LASTRUN)
+
 
 if __name__ == "__main__":
     main()
