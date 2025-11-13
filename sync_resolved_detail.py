@@ -22,11 +22,10 @@ if not API_TOKEN or not NEON_DSN:
 BASE_URL = "https://api.movidesk.com/public/v1/tickets"
 
 THROTTLE_SEC       = float(os.getenv("THROTTLE_SEC", "0.4"))
-PAGES_UPSERT       = int(os.getenv("PAGES_UPSERT", "7"))      # 7 * 100 = até 700 tickets por execução incremental
-FILTER_GROUP_SIZE  = int(os.getenv("FILTER_GROUP_SIZE", "10"))  # tamanho do grupo de IDs por requisição
-MAX_IDS_PER_RUN    = int(os.getenv("MAX_IDS_PER_RUN", "1200"))  # sanidade para evitar execuções gigantes
+PAGES_UPSERT       = int(os.getenv("PAGES_UPSERT", "7"))        # 7*100 = até 700 no incremental
+FILTER_GROUP_SIZE  = int(os.getenv("FILTER_GROUP_SIZE", "10"))  # ORs por requisição
+MAX_IDS_PER_RUN    = int(os.getenv("MAX_IDS_PER_RUN", "1200"))
 
-# Campos do ticket
 SELECT_FIELDS = ",".join([
     "id",
     "status",
@@ -41,11 +40,11 @@ SELECT_FIELDS = ",".join([
     "serviceSecondLevel",
     "serviceThirdLevel",
     "subject",
-    "ownerTeam",     # nome da equipe (string)
-    "customFields"   # para pegar adicional 29077
+    "ownerTeam",    # nome da equipe
+    "customFields"  # para achar o adicional 29077
 ])
 
-# Expand aninhado. Atenção: **sem fullName** para evitar 400 (TicketPersonApiDto não tem).
+# Sem fullName para não quebrar; organization idem.
 EXPAND = "owner($select=id,businessName),clients($expand=organization($select=id,businessName))"
 
 # ------------------------------------------------------------------------------
@@ -55,11 +54,10 @@ def conn():
     return psycopg2.connect(NEON_DSN)
 
 def ensure_schema() -> None:
-    """Cria schema e tabela se não existirem; adiciona colunas novas se faltarem."""
+    """Cria schema/tabela e adiciona colunas novas se faltarem (sem DROPs)."""
     with conn() as c, c.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
 
-        # tabela principal (não derruba nada; apenas cria se não existir)
         cur.execute("""
         create table if not exists visualizacao_resolvidos.tickets_resolvidos(
           ticket_id integer primary key,
@@ -84,22 +82,23 @@ def ensure_schema() -> None:
         )
         """)
 
-        # adiciona colunas novas sem afetar as existentes
         def addcol(col: str, typ: str):
-            cur.execute("""
-                do $$
-                begin
-                  if not exists(
-                      select 1 from information_schema.columns
-                       where table_schema='visualizacao_resolvidos'
-                         and table_name='tickets_resolvidos'
-                         and column_name=%s
-                  ) then
-                    execute format('alter table visualizacao_resolvidos.tickets_resolvidos add column %I %s', %s, %s);
-                  end if;
-                end$$
-            """, (col, col, typ))
+            # Usa EXECUTE format no lado do servidor (sem parâmetros do psycopg2).
+            cur.execute(f"""
+            do $$
+            begin
+              if not exists(
+                select 1 from information_schema.columns
+                 where table_schema='visualizacao_resolvidos'
+                   and table_name='tickets_resolvidos'
+                   and column_name='{col}'
+              ) then
+                execute format('alter table visualizacao_resolvidos.tickets_resolvidos add column %I {typ}', '{col}');
+              end if;
+            end$$
+            """)
 
+        # Garante colunas novas (idempotente)
         addcol("owner_team_name", "text")
         addcol("subject", "text")
         addcol("adicional_29077_nome", "text")
@@ -163,25 +162,19 @@ on conflict (name) do update set last_update=now(), last_detail_run_at=now()
 # HTTP helpers
 # ------------------------------------------------------------------------------
 def req(url: str, params: Dict[str, Any], retries: int = 3) -> Any:
-    """GET robusto com mensagens de erro legíveis e throttling."""
     for i in range(retries):
         r = requests.get(url, params={"token": API_TOKEN, **params}, timeout=60)
         if r.status_code == 200:
             return r.json()
-        # backoffs básicos nos 5xx/429
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.2 * (i + 1))
             continue
-        # Erros 4xx – sobe com corpo para facilitar debug
+        body = ""
         try:
             body = r.text
         except Exception:
-            body = ""
-        raise requests.HTTPError(
-            f"{r.status_code} {r.reason} - url: {r.url} - body: {body}",
-            response=r
-        )
-    # se sair do loop, última resposta
+            pass
+        raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {r.url} - body: {body}", response=r)
     r.raise_for_status()
 
 # ------------------------------------------------------------------------------
@@ -192,7 +185,6 @@ def chunk(seq: List[int], size: int) -> Iterable[List[int]]:
         yield seq[i:i+size]
 
 def _fetch_ids_once(ids: List[int]) -> List[Dict[str, Any]]:
-    """Uma chamada com filtro OR; o chamador trata 'node count limit'."""
     filt = " or ".join([f"id eq {i}" for i in ids])
     params = {
         "$select": SELECT_FIELDS,
@@ -204,7 +196,6 @@ def _fetch_ids_once(ids: List[int]) -> List[Dict[str, Any]]:
     return data
 
 def fetch_group_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
-    """Divide recursivamente ao detectar 'node count limit'."""
     try:
         return _fetch_ids_once(ids)
     except requests.HTTPError as e:
@@ -217,12 +208,10 @@ def fetch_group_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
         raise
 
 def fetch_by_ids(all_ids: List[int]) -> Iterable[List[Dict[str, Any]]]:
-    """Itera em grupos; cada grupo é protegido contra 'node count limit'."""
     for group in chunk(all_ids, FILTER_GROUP_SIZE):
         yield fetch_group_by_ids(group)
 
 def fetch_pages(since_iso: str) -> Iterable[List[Dict[str, Any]]]:
-    """Fallback incremental: varre por lastUpdate asc a partir de since_iso."""
     top_total = PAGES_UPSERT * 100
     got_total = 0
     skip = 0
@@ -258,31 +247,22 @@ def to_utc(dt_str: Optional[str]) -> Optional[datetime]:
         return None
 
 def extract_org(t: Dict[str, Any]) -> (Optional[str], Optional[str]):
-    """Pega a primeira organization de clients, se houver."""
     clients = t.get("clients") or []
     if not clients:
         return None, None
     org = (clients[0].get("organization") or {})
-    org_id = org.get("id")
-    org_name = org.get("businessName") or org.get("fullName")  # se vier
-    return org_id, org_name
+    return org.get("id"), (org.get("businessName") or org.get("fullName"))
 
 def extract_owner(t: Dict[str, Any]) -> (Optional[str], Optional[str]):
-    """owner.id e owner.businessName (sem fullName para evitar 400)."""
     owner = t.get("owner") or {}
     return owner.get("id"), (owner.get("businessName") or owner.get("fullName"))
 
 def extract_cf_nome_29077(t: Dict[str, Any]) -> Optional[str]:
-    """
-    Procura o 'adicional nome' (código 29077) no array customFields.
-    Como o identificador varia por instância, aceitaremos qualquer id que
-    contenha '29077' e 'nome' (case-insensitive), ex.: 'adicional_29077_nome'.
-    """
+    # tenta "29077" e "nome" no id; se não achar, apenas "29077"
     for cf in (t.get("customFields") or []):
         cid = (cf.get("id") or "")
         if "29077" in cid and "nome" in cid.lower():
             return cf.get("value")
-    # fallback: tenta achar 'adicional_29077'
     for cf in (t.get("customFields") or []):
         cid = (cf.get("id") or "")
         if "29077" in cid:
@@ -318,7 +298,6 @@ def map_row(t: Dict[str, Any]) -> Dict[str, Any]:
 # Audit helpers
 # ------------------------------------------------------------------------------
 def load_audit_ids(limit: int = MAX_IDS_PER_RUN) -> List[int]:
-    """Lê o último run da audit e retorna os ticket_ids faltantes para tickets_resolvidos."""
     with conn() as c, c.cursor() as cur:
         cur.execute("select coalesce(max(id),0) from visualizacao_resolvidos.audit_recent_run")
         run_id = cur.fetchone()[0]
@@ -344,12 +323,12 @@ def clear_audit_for(ids: List[int]) -> None:
         run_id = cur.fetchone()[0]
         if not run_id:
             return
-        psycopg2.extras.execute_values(cur, """
-            delete from visualizacao_resolvidos.audit_recent_missing m
-             where m.run_id = %s
-               and m.table_name = 'tickets_resolvidos'
-               and m.ticket_id = any(%s)
-        """, [(run_id, ids)])
+        cur.execute("""
+            delete from visualizacao_resolvidos.audit_recent_missing
+             where run_id = %s
+               and table_name = 'tickets_resolvidos'
+               and ticket_id = any(%s)
+        """, (run_id, ids))
 
 # ------------------------------------------------------------------------------
 # Main
@@ -357,7 +336,7 @@ def clear_audit_for(ids: List[int]) -> None:
 def main():
     ensure_schema()
 
-    # 1) Primeiro tenta resolver IDs pendentes do audit
+    # 1) Prioriza o audit
     audit_ids = load_audit_ids()
     processed_any = False
 
@@ -376,7 +355,7 @@ def main():
             processed_any = True
             logging.info("Upsert (audit): %d", len(rows))
 
-    # 2) Fallback incremental por lastUpdate se nada foi processado do audit
+    # 2) Fallback incremental
     if not processed_any:
         with conn() as c, c.cursor() as cur:
             cur.execute(GET_LASTRUN_SQL)
