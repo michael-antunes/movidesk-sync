@@ -3,14 +3,15 @@
 sync_resolved_detail.py
 -----------------------
 - Preenche visualizacao_resolvidos.tickets_resolvidos com tickets Resolved/Closed/Canceled.
-- Busca:
-    (1) IDs da tabela visualizacao_resolvidos.audit_recent_missing (último run, table=tickets_resolvidos)
-    (2) Incremental por lastUpdate >= last_detail_run_at
-- Campos de responsável/equipe:
-    - owner_id        -> owner.id (via $expand=owner)
-    - owner_name      -> owner.businessName | owner.fullName | owner.name
-    - owner_team_name -> ownerTeam (string, no $select)
-- NÃO toca nas colunas que foram removidas no Neon (responsible_*, datas_Br*, owner_team_id, etc.)
+- Fluxo:
+  (1) Reprocessa IDs em audit_recent_missing (último run, table=tickets_resolvidos)
+  (2) Incremental por lastUpdate >= last_detail_run_at
+- Campos:
+  - owner_id        -> owner.id (via $expand=owner)
+  - owner_name      -> owner.businessName | owner.fullName | owner.name
+  - owner_team_name -> ownerTeam (string, via $select)
+- Não altera esquema (sem DROP/ALTER nas colunas removidas no Neon).
+- Robustez: divisão recursiva do lote de IDs se a API devolver 400 por “node count limit” / URI grande.
 """
 
 import os
@@ -33,11 +34,12 @@ NEON_DSN  = os.getenv("NEON_DSN")
 if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-# paginação/limites
-TOP_LIMIT  = 100  # Movidesk tickets aceita até 100 por página
+TOP_LIMIT  = 100
 THROTTLE   = float(os.getenv("THROTTLE_SEC", "0.4"))
-# Para filtro por lista de IDs (cadeia 'id eq X or id eq Y'), manter baixo para evitar 400
-IDS_BATCH  = int(os.getenv("IDS_BATCH", "45"))
+# tamanho de lote inicial (será dividido automaticamente se estourar limite de nós do OData)
+IDS_BATCH  = int(os.getenv("IDS_BATCH", "30"))
+
+BASE_URL = "https://api.movidesk.com/public/v1"
 
 # ------------------------------------------------------------------------------
 # DB helpers
@@ -46,59 +48,45 @@ def conn():
     return psycopg2.connect(NEON_DSN)
 
 def ensure_schema() -> None:
-    """
-    Cria schema/tabelas base somente se não existirem.
-    NÃO dropa/renomeia nada.
-    Garante colunas necessárias caso estejam faltando.
-    """
+    """Cria objetos mínimos, nunca derruba nada."""
     with conn() as c, c.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
-
-        # tabela destino (mínimo necessário hoje)
         cur.execute("""
         create table if not exists visualizacao_resolvidos.tickets_resolvidos(
-            ticket_id           integer primary key,
-            status              text,
-            last_resolved_at    timestamptz,
-            last_closed_at      timestamptz,
-            last_cancelled_at   timestamptz,
-            last_update         timestamptz,
-            origin              text,
-            category            text,
-            urgency             text,
+            ticket_id            integer primary key,
+            status               text,
+            last_resolved_at     timestamptz,
+            last_closed_at       timestamptz,
+            last_cancelled_at    timestamptz,
+            last_update          timestamptz,
+            origin               text,
+            category             text,
+            urgency              text,
             service_first_level  text,
             service_second_level text,
             service_third_level  text,
-            owner_id           text,
-            owner_name         text,
-            owner_team_name    text,
-            organization_id    text,
-            organization_name  text
+            owner_id             text,
+            owner_name           text,
+            owner_team_name      text,
+            organization_id      text,
+            organization_name    text
         )
         """)
-
-        # garante colunas novas se por acaso faltarem
+        # garante colunas novas (idempotente)
         def ensure_col(table: str, col: str, ddl_type: str):
             cur.execute("""
-                select 1
-                  from information_schema.columns
-                 where table_schema='visualizacao_resolvidos'
-                   and table_name=%s
-                   and column_name=%s
+                select 1 from information_schema.columns
+                where table_schema='visualizacao_resolvidos'
+                  and table_name=%s and column_name=%s
             """, (table, col))
             if cur.fetchone() is None:
                 cur.execute(f"alter table visualizacao_resolvidos.{table} add column {col} {ddl_type}")
-
         for col, typ in [
-            ("owner_id", "text"),
-            ("owner_name", "text"),
-            ("owner_team_name", "text"),
-            ("organization_id", "text"),
-            ("organization_name", "text"),
+            ("owner_id","text"),("owner_name","text"),("owner_team_name","text"),
+            ("organization_id","text"),("organization_name","text")
         ]:
             ensure_col("tickets_resolvidos", col, typ)
 
-        # controle simples
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
           name text primary key,
@@ -109,35 +97,27 @@ def ensure_schema() -> None:
         """)
 
 # ------------------------------------------------------------------------------
-# OData helpers
+# HTTP / OData helpers
 # ------------------------------------------------------------------------------
-BASE_URL = "https://api.movidesk.com/public/v1"
-
 def req(url: str, params: Dict[str, Any], retries: int = 4) -> Any:
-    """
-    GET com tratamento básico de erros/429 e mensagens claras.
-    """
     for i in range(retries):
         r = requests.get(url, params=params, timeout=60)
         if r.status_code == 200:
             return r.json()
-        # backoff simples em casos transitórios
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (i + 1))
             continue
-        # erro definitivo
         raise requests.HTTPError(
             f"{r.status_code} {r.reason} - url: {r.url} - body: {r.text}",
             response=r
         )
-    # se saiu do loop sem 200, levanta a última
     r.raise_for_status()
 
 def to_utc(dt_str: Any):
     if not dt_str:
         return None
     try:
-        return datetime.fromisoformat(str(dt_str).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(str(dt_str).replace("Z","+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -148,27 +128,23 @@ SELECT_FIELDS = ",".join([
     "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
     "origin","category","urgency",
     "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-    "ownerTeam"  # string com o nome da equipe
+    "ownerTeam"  # string
 ])
 EXPAND = "owner,clients($expand=organization)"
 
 def fetch_pages_since(since_iso: str) -> Iterable[List[Dict[str, Any]]]:
-    """
-    Paginado por lastUpdate >= since_iso.
-    """
     url = f"{BASE_URL}/tickets"
     filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')" \
              f" and lastUpdate ge {since_iso}"
     skip = 0
     while True:
-        top = TOP_LIMIT
         params = {
             "token": API_TOKEN,
             "$select": SELECT_FIELDS,
             "$expand": EXPAND,
             "$filter": filtro,
             "$orderby": "lastUpdate asc",
-            "$top": top,
+            "$top": TOP_LIMIT,
             "$skip": skip
         }
         page = req(url, params) or []
@@ -176,32 +152,56 @@ def fetch_pages_since(since_iso: str) -> Iterable[List[Dict[str, Any]]]:
             break
         yield page
         got = len(page)
-        if got < top:
+        if got < TOP_LIMIT:
             break
         skip += got
         time.sleep(THROTTLE)
 
-def chunk(lst: List[int], size: int) -> Iterable[List[int]]:
-    for i in range(0, len(lst), size):
-        yield lst[i:i+size]
-
-def fetch_by_ids(ids: List[int]) -> Iterable[List[Dict[str, Any]]]:
+def _fetch_group_ids(group: List[int]) -> Iterable[List[Dict[str, Any]]]:
     """
-    Busca por grupos de IDs (lotes pequenos para não explodir o tamanho do $filter).
+    Busca recursiva segura: se a API retornar 400 (node count / URI),
+    divide o grupo ao meio e tenta novamente até funcionar.
     """
     base = f"{BASE_URL}/tickets"
-    for group in chunk(sorted(ids), IDS_BATCH):
-        filt = " or ".join([f"id eq {i}" for i in group])
-        params = {
-            "token": API_TOKEN,
-            "$select": SELECT_FIELDS,
-            "$expand": EXPAND,
-            "$filter": filt,
-            "$top": TOP_LIMIT
-        }
+    if not group:
+        return
+    filt = " or ".join([f"id eq {i}" for i in group])
+    params = {
+        "token": API_TOKEN,
+        "$select": SELECT_FIELDS,
+        "$expand": EXPAND,
+        "$filter": filt,
+        "$top": TOP_LIMIT
+    }
+    try:
         page = req(base, params) or []
         yield page
         time.sleep(THROTTLE)
+    except requests.HTTPError as e:
+        msg = (str(e) or "").lower()
+        status = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
+        # limite de nós (400) ou URI longa (414) → divide
+        if status in (400, 414) and ("node count limit" in msg or "uri" in msg or "$filter" in msg):
+            if len(group) == 1:
+                raise
+            mid = max(1, len(group)//2)
+            left, right = group[:mid], group[mid:]
+            for page in _fetch_group_ids(left):
+                yield page
+            for page in _fetch_group_ids(right):
+                yield page
+        else:
+            raise
+
+def fetch_by_ids(ids: List[int]) -> Iterable[List[Dict[str, Any]]]:
+    if not ids:
+        return
+    ids = sorted(set(int(x) for x in ids))
+    # tenta em lotes iniciais; se algum lote for grande demais, _fetch_group_ids divide
+    for i in range(0, len(ids), IDS_BATCH):
+        group = ids[i:i+IDS_BATCH]
+        for page in _fetch_group_ids(group):
+            yield page
 
 # ------------------------------------------------------------------------------
 # Mapping + UPSERT
@@ -269,9 +269,6 @@ on conflict (ticket_id) do update set
 """
 
 def upsert_rows(rows: List[Dict[str, Any]]) -> List[int]:
-    """
-    Executa o upsert e retorna os ticket_ids gravados.
-    """
     if not rows:
         return []
     with conn() as c, c.cursor() as cur:
@@ -279,7 +276,7 @@ def upsert_rows(rows: List[Dict[str, Any]]) -> List[int]:
     return [r["ticket_id"] for r in rows]
 
 # ------------------------------------------------------------------------------
-# Audit helpers (read & cleanup)
+# Audit helpers
 # ------------------------------------------------------------------------------
 def get_last_detail_run_at() -> datetime:
     with conn() as c, c.cursor() as cur:
@@ -287,6 +284,8 @@ def get_last_detail_run_at() -> datetime:
         val = cur.fetchone()[0]
     if val is None or val == datetime(1970,1,1):
         return datetime.now(timezone.utc) - timedelta(days=7)
+    if val.tzinfo is None:
+        return val.replace(tzinfo=timezone.utc)
     return val
 
 def set_last_detail_run_now() -> None:
@@ -298,10 +297,6 @@ def set_last_detail_run_now() -> None:
         """)
 
 def get_audit_ids_latest_run() -> Tuple[int, List[int]]:
-    """
-    Retorna (run_id, [ticket_ids]) para table_name='tickets_resolvidos' no último run.
-    Se não houver run, retorna (0, []).
-    """
     with conn() as c, c.cursor() as cur:
         cur.execute("select coalesce(max(id),0) from visualizacao_resolvidos.audit_recent_run")
         run_id = cur.fetchone()[0] or 0
@@ -317,14 +312,9 @@ def get_audit_ids_latest_run() -> Tuple[int, List[int]]:
     return run_id, ids
 
 def cleanup_audit_if_persisted(run_id: int, processed_ids: List[int]) -> None:
-    """
-    Remove do audit apenas os IDs que ficaram presentes em tickets_resolvidos.
-    Se uma trigger excluiu a linha (por NULL em owner/equipe), o ID continuará no audit.
-    """
     if run_id <= 0 or not processed_ids:
         return
     with conn() as c, c.cursor() as cur:
-        # quais desses tickets estão presentes na tabela final?
         cur.execute("""
             select ticket_id
               from visualizacao_resolvidos.tickets_resolvidos
@@ -339,7 +329,7 @@ def cleanup_audit_if_persisted(run_id: int, processed_ids: List[int]) -> None:
         """, (run_id, present))
 
 # ------------------------------------------------------------------------------
-# Main
+# Execução principal
 # ------------------------------------------------------------------------------
 def process_pages(pages_iter: Iterable[List[Dict[str, Any]]], label: str) -> int:
     total = 0
@@ -359,7 +349,6 @@ def main():
     run_id, audit_ids = get_audit_ids_latest_run()
     if audit_ids:
         logging.info("Audit pendentes (run_id=%s): %d", run_id, len(audit_ids))
-        total_processed = 0
         processed_ids: List[int] = []
         for page in fetch_by_ids(audit_ids):
             rows = [map_row(t) for t in page if t.get("id")]
@@ -367,18 +356,15 @@ def main():
                 continue
             ids = upsert_rows(rows)
             processed_ids.extend(ids)
-            total_processed += len(ids)
-        logging.info("Audit: upsert %d", total_processed)
-        # limpa do audit os que ficaram gravados
+        logging.info("Audit: upsert %d", len(processed_ids))
         cleanup_audit_if_persisted(run_id, processed_ids)
 
     # 2) Incremental por lastUpdate
     since = get_last_detail_run_at()
-    since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    since_iso = since.replace(microsecond=0).isoformat().replace("+00:00","Z")
     logging.info("Incremental desde: %s", since_iso)
-    _ = process_pages(fetch_pages_since(since_iso), "Incremental")
+    process_pages(fetch_pages_since(since_iso), "Incremental")
 
-    # Marca run do detail
     set_last_detail_run_now()
 
 if __name__ == "__main__":
