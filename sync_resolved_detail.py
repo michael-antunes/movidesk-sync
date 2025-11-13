@@ -26,72 +26,51 @@ def conn():
 
 
 def ensure_schema():
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute("create schema if not exists visualizacao_resolvidos")
+    with conn() as c, c.cursor() as cur:
+        # schema
+        cur.execute("create schema if not exists visualizacao_resolvidos")
 
-            cur.execute(
-                """
-                create table if not exists visualizacao_resolvidos.tickets_resolvidos(
-                  ticket_id integer primary key,
-                  status text,
-                  last_resolved_at timestamptz,
-                  last_closed_at timestamptz,
-                  last_cancelled_at timestamptz,
-                  last_update timestamptz,
-                  origin text,
-                  category text,
-                  urgency text,
-                  service_first_level text,
-                  service_second_level text,
-                  service_third_level text,
-                  owner_id text,
-                  owner_name text,
-                  owner_team_id text,
-                  owner_team_name text,
-                  organization_id text,
-                  organization_name text
-                )
-                """
+        # tabela base
+        cur.execute("""
+            create table if not exists visualizacao_resolvidos.tickets_resolvidos(
+              ticket_id integer primary key,
+              status text,
+              last_resolved_at timestamptz,
+              last_closed_at timestamptz,
+              last_cancelled_at timestamptz,
+              last_update timestamptz,
+              origin text,
+              category text,
+              urgency text,
+              service_first_level text,
+              service_second_level text,
+              service_third_level text,
+              owner_id text,
+              owner_name text,
+              owner_team_id text,
+              owner_team_name text,
+              organization_id text,
+              organization_name text
             )
+        """)
 
-            # garante colunas novas sem dropar nada
-            for col, typ in [
-                ("owner_id", "text"),
-                ("owner_name", "text"),
-                ("owner_team_id", "text"),
-                ("owner_team_name", "text"),
-                ("organization_id", "text"),
-                ("organization_name", "text"),
-            ]:
-                cur.execute(
-                    """
-                    do $$
-                    begin
-                      if not exists(
-                        select 1 from information_schema.columns
-                         where table_schema='visualizacao_resolvidos'
-                           and table_name='tickets_resolvidos'
-                           and column_name=%s
-                      ) then
-                        execute format('alter table visualizacao_resolvidos.tickets_resolvidos add column %I %s',
-                                       %s, %s);
-                      end if;
-                    end$$
-                    """,
-                    (col, col, typ),
-                )
+        # garante colunas (sem DO/format e sem placeholders)
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_id text")
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_name text")
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_team_id text")
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_team_name text")
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists organization_id text")
+        cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists organization_name text")
 
-            cur.execute(
-                """
-                create table if not exists visualizacao_resolvidos.sync_control(
-                  name text primary key,
-                  last_update timestamptz default now(),
-                  last_index_run_at timestamptz,
-                  last_detail_run_at timestamptz
-                )
-                """
+        # controle
+        cur.execute("""
+            create table if not exists visualizacao_resolvidos.sync_control(
+              name text primary key,
+              last_update timestamptz default now(),
+              last_index_run_at timestamptz,
+              last_detail_run_at timestamptz
             )
+        """)
 
 
 UPSERT = """
@@ -143,13 +122,9 @@ def req(url, params, retries=4):
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (i + 1))
             continue
-        # expõe o corpo para facilitar debug
-        try:
-            body = r.text
-        except Exception:
-            body = ""
-        raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {r.url} - body: {body}", response=r)
-    raise requests.HTTPError("Falhou após retries")
+        # expõe o corpo p/ debug
+        raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {r.url} - body: {r.text}", response=r)
+    raise requests.HTTPError("Falhou após tentativas")
 
 
 def to_utc(dt_str):
@@ -164,48 +139,32 @@ def to_utc(dt_str):
 def fetch_pages(since_iso):
     url = f"{BASE}/tickets"
 
-    # campos simples (inclui ownerTeamId aqui!)
-    select_fields = ",".join(
-        [
-            "id",
-            "status",
-            "resolvedIn",
-            "closedIn",
-            "canceledIn",
-            "lastUpdate",
-            "origin",
-            "category",
-            "urgency",
-            "serviceFirstLevel",
-            "serviceSecondLevel",
-            "serviceThirdLevel",
-            "ownerTeamId",
-        ]
-    )
+    # incluir ownerTeamId no select (sem expand ownerTeam)
+    select_fields = ",".join([
+        "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
+        "origin","category","urgency",
+        "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
+        "ownerTeamId"
+    ])
 
     # navegações válidas
     expand = "owner,clients($expand=organization)"
 
-    filtro = (
-        "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') "
-        f"and lastUpdate ge {since_iso}"
-    )
+    filtro = ("(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') "
+              f"and lastUpdate ge {since_iso}")
 
     skip = 0
     total = 0
     while True:
-        page = req(
-            url,
-            {
-                "token": API_TOKEN,
-                "$select": select_fields,
-                "$expand": expand,
-                "$filter": filtro,
-                "$orderby": "lastUpdate asc",
-                "$top": min(100, TOP - total),
-                "$skip": skip,
-            },
-        ) or []
+        page = req(url, {
+            "token": API_TOKEN,
+            "$select": select_fields,
+            "$expand": expand,
+            "$filter": filtro,
+            "$orderby": "lastUpdate asc",
+            "$top": min(100, TOP - total),
+            "$skip": skip
+        }) or []
         if not page:
             break
         yield page
@@ -218,36 +177,28 @@ def fetch_pages(since_iso):
 
 
 def fetch_teams_names(team_ids: List[int]) -> Dict[str, str]:
-    """
-    Resolve nomes das equipes via /teams.
-    Retorna { str(id): name }.
-    """
+    """Resolve nomes das equipes via /teams -> {str(id): name}."""
     out: Dict[str, str] = {}
     if not team_ids:
         return out
 
-    # chunks para evitar URL gigante
     def chunks(lst, n):
         for i in range(0, len(lst), n):
-            yield lst[i : i + n]
+            yield lst[i:i+n]
 
-    for chunk in chunks(sorted(set([int(x) for x in team_ids if x is not None])), 50):
+    uniq = sorted({int(x) for x in team_ids if x is not None})
+    for ck in chunks(uniq, 50):
         try:
-            f = " or ".join([f"id eq {i}" for i in chunk])
-            data = req(
-                f"{BASE}/teams",
-                {
-                    "token": API_TOKEN,
-                    "$select": "id,name",
-                    "$filter": f,
-                    "$top": len(chunk),
-                },
-            ) or []
+            f = " or ".join([f"id eq {i}" for i in ck])
+            data = req(f"{BASE}/teams", {
+                "token": API_TOKEN,
+                "$select": "id,name",
+                "$filter": f,
+                "$top": len(ck)
+            }) or []
             for t in data:
-                if "id" in t:
-                    out[str(t["id"])] = t.get("name") or ""
+                out[str(t.get("id"))] = t.get("name") or ""
         except Exception:
-            # se der 400 aqui por qualquer motivo, seguimos sem o nome
             pass
         time.sleep(THROTTLE)
     return out
@@ -288,26 +239,25 @@ def map_row(t, team_names: Dict[str, str]):
         "owner_team_id": team_id_str,
         "owner_team_name": team_name,
         "organization_id": org_id,
-        "organization_name": org_name,
+        "organization_name": org_name
     }
 
 
 def main():
     ensure_schema()
 
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute(GET_LASTRUN)
-            since = cur.fetchone()[0]
+    with conn() as c, c.cursor() as cur:
+        cur.execute(GET_LASTRUN)
+        since = cur.fetchone()[0]
 
     if since == datetime(1970, 1, 1, tzinfo=timezone.utc):
         since = datetime.now(timezone.utc) - timedelta(days=7)
 
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    # 1) carrega páginas e coleta teamIds
     raw_pages: List[dict] = []
     team_ids: List[int] = []
+
     for page in fetch_pages(since_iso):
         raw_pages.extend(page)
         for t in page:
@@ -318,20 +268,15 @@ def main():
                 except Exception:
                     pass
 
-    # 2) resolve nomes das equipes
     team_names = fetch_teams_names(team_ids)
-
-    # 3) mapeia e upserta
     rows = [map_row(t, team_names) for t in raw_pages]
 
     if rows:
-        with conn() as c:
-            with c.cursor() as cur:
-                psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=200)
+        with conn() as c, c.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=200)
 
-    with conn() as c:
-        with c.cursor() as cur:
-            cur.execute(SET_LASTRUN)
+    with conn() as c, c.cursor() as cur:
+        cur.execute(SET_LASTRUN)
 
 
 if __name__ == "__main__":
