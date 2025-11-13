@@ -1,17 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 sync_resolved_detail.py
------------------------
-- Preenche visualizacao_resolvidos.tickets_resolvidos com tickets Resolved/Closed/Canceled.
-- Fluxo:
-  (1) Reprocessa IDs em audit_recent_missing (último run, table=tickets_resolvidos)
-  (2) Incremental por lastUpdate >= last_detail_run_at
-- Campos:
-  - owner_id        -> owner.id (via $expand=owner)
-  - owner_name      -> owner.businessName | owner.fullName | owner.name
-  - owner_team_name -> ownerTeam (string, via $select)
-- Não altera esquema (sem DROP/ALTER nas colunas removidas no Neon).
-- Robustez: divisão recursiva do lote de IDs se a API devolver 400 por “node count limit” / URI grande.
+
+- Reprocessa IDs de visualizacao_resolvidos.audit_recent_missing (table_name='tickets_resolvidos')
+  do último run e grava/atualiza em visualizacao_resolvidos.tickets_resolvidos.
+- Depois faz incremental por lastUpdate a partir de sync_control.last_detail_run_at.
+- Campos de responsável:
+    owner_id        -> owner.id
+    owner_name      -> owner.businessName | owner.fullName | owner.name
+    owner_team_name -> ownerTeam (string)
+- Lotes pequenos para evitar "node count limit" do OData.
 """
 
 import os
@@ -34,10 +32,10 @@ NEON_DSN  = os.getenv("NEON_DSN")
 if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-TOP_LIMIT  = 100
-THROTTLE   = float(os.getenv("THROTTLE_SEC", "0.4"))
-# tamanho de lote inicial (será dividido automaticamente se estourar limite de nós do OData)
-IDS_BATCH  = int(os.getenv("IDS_BATCH", "30"))
+THROTTLE      = float(os.getenv("THROTTLE_SEC", "0.4"))
+TOP_LIMIT     = 100
+# Força lote bem pequeno; ainda existe fallback recursivo quando necessário.
+IDS_PER_CALL  = int(os.getenv("IDS_PER_CALL", "8"))
 
 BASE_URL = "https://api.movidesk.com/public/v1"
 
@@ -48,7 +46,7 @@ def conn():
     return psycopg2.connect(NEON_DSN)
 
 def ensure_schema() -> None:
-    """Cria objetos mínimos, nunca derruba nada."""
+    """Cria objetos mínimos; não derruba nada."""
     with conn() as c, c.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
         cur.execute("""
@@ -72,21 +70,6 @@ def ensure_schema() -> None:
             organization_name    text
         )
         """)
-        # garante colunas novas (idempotente)
-        def ensure_col(table: str, col: str, ddl_type: str):
-            cur.execute("""
-                select 1 from information_schema.columns
-                where table_schema='visualizacao_resolvidos'
-                  and table_name=%s and column_name=%s
-            """, (table, col))
-            if cur.fetchone() is None:
-                cur.execute(f"alter table visualizacao_resolvidos.{table} add column {col} {ddl_type}")
-        for col, typ in [
-            ("owner_id","text"),("owner_name","text"),("owner_team_name","text"),
-            ("organization_id","text"),("organization_name","text")
-        ]:
-            ensure_col("tickets_resolvidos", col, typ)
-
         cur.execute("""
         create table if not exists visualizacao_resolvidos.sync_control(
           name text primary key,
@@ -128,7 +111,7 @@ SELECT_FIELDS = ",".join([
     "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
     "origin","category","urgency",
     "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-    "ownerTeam"  # string
+    "ownerTeam"  # string com o nome da equipe
 ])
 EXPAND = "owner,clients($expand=organization)"
 
@@ -151,16 +134,15 @@ def fetch_pages_since(since_iso: str) -> Iterable[List[Dict[str, Any]]]:
         if not page:
             break
         yield page
-        got = len(page)
-        if got < TOP_LIMIT:
+        if len(page) < TOP_LIMIT:
             break
-        skip += got
+        skip += len(page)
         time.sleep(THROTTLE)
 
 def _fetch_group_ids(group: List[int]) -> Iterable[List[Dict[str, Any]]]:
     """
-    Busca recursiva segura: se a API retornar 400 (node count / URI),
-    divide o grupo ao meio e tenta novamente até funcionar.
+    Busca segura: se a API retornar 400/414 (node count/URI grande),
+    divide o grupo ao meio e tenta novamente.
     """
     base = f"{BASE_URL}/tickets"
     if not group:
@@ -178,14 +160,15 @@ def _fetch_group_ids(group: List[int]) -> Iterable[List[Dict[str, Any]]]:
         yield page
         time.sleep(THROTTLE)
     except requests.HTTPError as e:
-        msg = (str(e) or "").lower()
         status = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
-        # limite de nós (400) ou URI longa (414) → divide
-        if status in (400, 414) and ("node count limit" in msg or "uri" in msg or "$filter" in msg):
+        msg = (str(e) or "").lower()
+        # quando o OData reclama do tamanho do filtro/quantidade de nós
+        if status in (400, 414) and ("node count" in msg or "uri" in msg or "$filter" in msg):
             if len(group) == 1:
                 raise
             mid = max(1, len(group)//2)
             left, right = group[:mid], group[mid:]
+            logging.info("Dividindo lote por limite OData: %s -> %s + %s", len(group), len(left), len(right))
             for page in _fetch_group_ids(left):
                 yield page
             for page in _fetch_group_ids(right):
@@ -197,9 +180,9 @@ def fetch_by_ids(ids: List[int]) -> Iterable[List[Dict[str, Any]]]:
     if not ids:
         return
     ids = sorted(set(int(x) for x in ids))
-    # tenta em lotes iniciais; se algum lote for grande demais, _fetch_group_ids divide
-    for i in range(0, len(ids), IDS_BATCH):
-        group = ids[i:i+IDS_BATCH]
+    # Força lotes pequenos para já evitar 400; _fetch_group_ids ainda divide se necessário.
+    for i in range(0, len(ids), IDS_PER_CALL):
+        group = ids[i:i+IDS_PER_CALL]
         for page in _fetch_group_ids(group):
             yield page
 
@@ -337,8 +320,8 @@ def process_pages(pages_iter: Iterable[List[Dict[str, Any]]], label: str) -> int
         rows = [map_row(t) for t in page if t.get("id")]
         if not rows:
             continue
-        ids = upsert_rows(rows)
-        total += len(ids)
+        upsert_rows(rows)
+        total += len(rows)
     logging.info("%s: upsert %d", label, total)
     return total
 
@@ -349,15 +332,15 @@ def main():
     run_id, audit_ids = get_audit_ids_latest_run()
     if audit_ids:
         logging.info("Audit pendentes (run_id=%s): %d", run_id, len(audit_ids))
-        processed_ids: List[int] = []
+        processed: List[int] = []
         for page in fetch_by_ids(audit_ids):
             rows = [map_row(t) for t in page if t.get("id")]
             if not rows:
                 continue
             ids = upsert_rows(rows)
-            processed_ids.extend(ids)
-        logging.info("Audit: upsert %d", len(processed_ids))
-        cleanup_audit_if_persisted(run_id, processed_ids)
+            processed.extend(ids)
+        logging.info("Audit: upsert %d", len(processed))
+        cleanup_audit_if_persisted(run_id, processed)
 
     # 2) Incremental por lastUpdate
     since = get_last_detail_run_at()
