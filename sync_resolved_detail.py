@@ -2,22 +2,20 @@
 """
 Sync resolved/closed/cancelled detail (Movidesk -> visualizacao_resolvidos.tickets_resolvidos)
 
+Fluxo:
 - Lê IDs em visualizacao_resolvidos.audit_recent_missing (table_name='tickets_resolvidos')
 - Busca detalhes no /tickets (OData) em grupos pequenos (evita MaxNodeCount)
 - Upsert em visualizacao_resolvidos.tickets_resolvidos
-- Acrescenta/atualiza:
-    * subject
-    * adicional_nome (código 29077)
-    * adicional_29077_nome (espelho)
-- NÃO usa ownerTeamId; somente ownerTeam (texto).
+- Campos novos: subject, adicional_nome (código 29077), adicional_29077_nome (espelho)
+- NÃO usa ownerTeamId; somente ownerTeam (texto)
 - Se a API rejeitar customFieldValues no $expand, refaz a chamada sem isso.
 
 ENV:
 - MOVIDESK_TOKEN
 - NEON_DSN
-- MOVIDESK_THROTTLE        (default 0.25)
-- AUDIT_LIMIT_IDS          (default 600)
-- AUDIT_GROUP_SIZE         (default 20)
+- MOVIDESK_THROTTLE  (default 0.25)
+- AUDIT_LIMIT_IDS    (default 600)
+- AUDIT_GROUP_SIZE   (default 20)
 """
 
 import os
@@ -53,15 +51,15 @@ SELECT_FIELDS = ",".join([
     "serviceFirstLevel",
     "serviceSecondLevel",
     "serviceThirdLevel",
-    "subject",       # assunto
-    "ownerTeam"      # nome da equipe
+    "subject",      # assunto
+    "ownerTeam"     # nome da equipe
 ])
 
-# Tenta com customFieldValues; se 400, refaz sem
+# Usar customFieldValues sem $select (o DTO não tem 'id', e alguns ambientes variam).
 EXPAND_WITH_CF = (
     "owner($select=id,businessName),"
     "clients($expand=organization($select=id,businessName)),"
-    "customFieldValues($select=id,value)"
+    "customFieldValues"
 )
 EXPAND_NO_CF = (
     "owner($select=id,businessName),"
@@ -109,9 +107,13 @@ def req(url: str, params: Dict[str, Any], allow_cf: bool = True) -> List[Dict[st
     if r.status_code == 200:
         return r.json() or []
 
-    body = r.text or ""
-    if r.status_code == 400 and allow_cf and "customFieldValues" in body:
-        # refaz sem customFieldValues
+    body = (r.text or "")
+    # Se deu 400 relacionado a custom fields, refaz sem customFieldValues
+    if r.status_code == 400 and allow_cf and (
+        "customFieldValues" in body
+        or "CustomFieldValue" in body
+        or "CustomField" in body
+    ):
         new_params = dict(params)
         new_params["$expand"] = EXPAND_NO_CF
         qs2 = urlencode({**base_params, **new_params}, safe="(),$= ")
@@ -164,12 +166,12 @@ def _pick_org_from_clients(t: Dict[str, Any]) -> Tuple[Any, Any]:
 
 
 def _pick_custom_29077(t: Dict[str, Any]) -> str | None:
-    # tenta várias estruturas possíveis
+    # Estruturas possíveis: customFieldValues (oficial), mas mantemos fallback.
     for arr in [t.get("customFieldValues"), t.get("customFields"), t.get("customFieldItems")]:
         if not arr:
             continue
         for item in arr:
-            iid = item.get("id") or item.get("customFieldId") or item.get("name")
+            iid = item.get("customFieldId") or item.get("id") or item.get("name")
             if iid in CUSTOM_FIELD_ID_NOME or str(iid) in CUSTOM_FIELD_ID_NOME:
                 val = item.get("value")
                 if isinstance(val, (str, int, float)):
@@ -188,7 +190,6 @@ def _pick_custom_29077(t: Dict[str, Any]) -> str | None:
 def map_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
     owner = t.get("owner") or {}
     org_id, org_name = _pick_org_from_clients(t)
-
     add_nome = _pick_custom_29077(t)
 
     return {
@@ -314,7 +315,7 @@ def mark_sync(conn, ticket_ids: List[int]) -> None:
 def delete_from_audit_only_if_ok(conn, ids: List[int]) -> None:
     """
     Remove do audit_recent_missing APENAS tickets que ficaram gravados com
-    owner_name e owner_team_name preenchidos (respeitando a trigger que reenvia).
+    owner_name e owner_team_name preenchidos (respeitando a trigger).
     """
     if not ids:
         return
@@ -384,7 +385,6 @@ def main():
             processed_ids.extend(ids)
             total_upserts += len(rows)
 
-        # Limpa do audit apenas o que ficou "ok" na tabela final
         if processed_ids:
             delete_from_audit_only_if_ok(conn, processed_ids)
 
