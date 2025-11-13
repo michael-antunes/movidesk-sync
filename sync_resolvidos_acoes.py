@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import os, time, json, requests, psycopg2, psycopg2.extras
 
-API_BASE   = "https://api.movidesk.com/public/v1/tickets"
-API_TOKEN  = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-NEON_DSN   = os.getenv("NEON_DSN")
+API_BASE = "https://api.movidesk.com/public/v1/tickets"
+API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+NEON_DSN = os.getenv("NEON_DSN")
+
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+ACTIONS_CHUNK = int(os.getenv("ACTIONS_CHUNK", "10"))
 AUDIT_LIMIT = int(os.getenv("AUDIT_LIMIT", "300"))
+THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.5"))
 
 SCHEMA = "visualizacao_resolvidos"
 T_TICKETS = f"{SCHEMA}.tickets_resolvidos"
@@ -27,18 +30,13 @@ def cleanup_incomplete_rows(conn):
     where r.acoes is null
        or jsonb_typeof(r.acoes) <> 'array'
        or jsonb_array_length(r.acoes) = 0
-       or not exists (
-           select 1 from jsonb_array_elements(r.acoes) a(el) where (a.el ? 'id')
-       )
+       or not exists (select 1 from jsonb_array_elements(r.acoes) a(el) where a.el ? 'id')
     """
     with conn.cursor() as cur:
         cur.execute(sql)
-        n = cur.rowcount
     conn.commit()
-    if n:
-        print(f"Limpeza: {n} linha(s) incompleta(s) removida(s) de resolvidos_acoes.")
 
-def get_audit_ids(conn, limit=AUDIT_LIMIT):
+def get_audit_ids(conn, limit_):
     sql = f"""
       select distinct ticket_id
       from {T_AUDIT}
@@ -47,7 +45,7 @@ def get_audit_ids(conn, limit=AUDIT_LIMIT):
       limit %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
+        cur.execute(sql, (limit_,))
         rows = cur.fetchall()
     return [r[0] for r in rows]
 
@@ -63,7 +61,7 @@ def clear_audit_ids(conn, ids):
         cur.execute(sql, (ids,))
     conn.commit()
 
-def select_next_ticket_ids(conn, limit:int, exclude_ids):
+def select_next_ticket_ids(conn, limit_, exclude_ids):
     sql = f"""
     with base as (
         select t.ticket_id, coalesce(t.last_update, t.last_resolved_at, t.last_closed_at) as ref_dt
@@ -71,86 +69,93 @@ def select_next_ticket_ids(conn, limit:int, exclude_ids):
     )
     select b.ticket_id
     from base b
-    left join {T_ACOES} ra
-      on ra.ticket_id = b.ticket_id
+    left join {T_ACOES} ra on ra.ticket_id = b.ticket_id
     where (ra.ticket_id is null or ra.updated_at is null or (b.ref_dt is not null and ra.updated_at < b.ref_dt))
       and not (b.ticket_id = any(%s::int[]))
     order by b.ref_dt desc nulls last, b.ticket_id desc
     limit %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (exclude_ids or [], limit))
+        cur.execute(sql, (exclude_ids or [], limit_))
         return [r[0] for r in cur.fetchall()]
 
-def _sleep_from_retry_after(r):
+def _sleep_retry_after(r):
     try:
         ra = r.headers.get("retry-after")
-        if ra is None:
-            return False
-        secs = int(str(ra).strip())
-        time.sleep(max(1, secs))
+        if not ra: return False
+        time.sleep(max(1, int(str(ra).strip())))
         return True
     except Exception:
         return False
 
 def movidesk_request(params, max_retries=4):
-    params = dict(params or {})
-    params["token"] = API_TOKEN
-    for attempt in range(max_retries):
-        r = SESS.get(API_BASE, params=params, timeout=60)
+    p = dict(params or {})
+    p["token"] = API_TOKEN
+    for i in range(max_retries):
+        r = SESS.get(API_BASE, params=p, timeout=60)
         if r.status_code == 200:
             return r.json()
-        if r.status_code in (429, 500, 502, 503, 504):
-            if _sleep_from_retry_after(r):
+        if r.status_code in (429,500,502,503,504):
+            if _sleep_retry_after(r): 
                 continue
-            time.sleep(1 + attempt * 2)
+            time.sleep(1 + 2*i)
             continue
-        body = None
-        try:
-            body = r.text
-        except Exception:
-            pass
         r.raise_for_status()
-    raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
+    r.raise_for_status()
 
 def build_expand_param():
-    a_select = "actions($select=id,type,origin,description,status,justification,createdDate,createdBy,isDeleted,tags)"
-    a_expand = "actions($expand=timeAppointments($select=id,activity,date,periodStart,periodEnd,workTime,accountedTime,workTypeName,createdBy,createdByTeam),attachments($select=fileName,path,createdBy,createdDate))"
-    return f"{a_select},{a_expand}"
+    a1 = "actions($select=id,type,origin,description,status,justification,createdDate,createdBy,isDeleted,tags)"
+    a2 = "actions($expand=timeAppointments($select=id,activity,date,periodStart,periodEnd,workTime,accountedTime,workTypeName,createdBy,createdByTeam),attachments($select=fileName,path,createdBy,createdDate))"
+    return f"{a1},{a2}"
 
-def fetch_actions_for_ids(ticket_ids):
-    if not ticket_ids:
-        return {}
-    id_filter = " or ".join([f"id eq {int(i)}" for i in ticket_ids])
+def fetch_actions_chunk(ids_chunk):
+    if not ids_chunk:
+        return []
+    filtro = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
     params = {
         "$select": "id,lastUpdate",
-        "$filter": id_filter,
+        "$filter": filtro,
         "$expand": build_expand_param(),
         "$top": 100,
         "includeDeletedItems": "true",
     }
-    data = movidesk_request(params) or []
+    return movidesk_request(params) or []
+
+def fetch_actions_for_ids(ids):
     out = {}
-    for item in data:
-        tid = int(item.get("id"))
-        actions = item.get("actions") or []
-        cleaned = []
-        for a in actions:
-            cleaned.append({
-                "id": a.get("id"),
-                "type": a.get("type"),
-                "origin": a.get("origin"),
-                "description": a.get("description"),
-                "status": a.get("status"),
-                "justification": a.get("justification"),
-                "createdDate": a.get("createdDate"),
-                "createdBy": a.get("createdBy"),
-                "isDeleted": a.get("isDeleted"),
-                "timeAppointments": a.get("timeAppointments"),
-                "attachments": a.get("attachments"),
-                "tags": a.get("tags"),
-            })
-        out[tid] = cleaned
+    chunk = max(1, ACTIONS_CHUNK)
+    i = 0
+    ids = list(dict.fromkeys(ids))
+    while i < len(ids):
+        part = ids[i:i+chunk]
+        try:
+            data = fetch_actions_chunk(part)
+            for item in data:
+                tid = int(item.get("id"))
+                actions = item.get("actions") or []
+                cleaned = []
+                for a in actions:
+                    cleaned.append({
+                        "id": a.get("id"),
+                        "type": a.get("type"),
+                        "origin": a.get("origin"),
+                        "description": a.get("description"),
+                        "status": a.get("status"),
+                        "justification": a.get("justification"),
+                        "createdDate": a.get("createdDate"),
+                        "createdBy": a.get("createdBy"),
+                        "isDeleted": a.get("isDeleted"),
+                        "timeAppointments": a.get("timeAppointments"),
+                        "attachments": a.get("attachments"),
+                        "tags": a.get("tags"),
+                    })
+                out[tid] = cleaned
+            i += len(part)
+            time.sleep(THROTTLE_SEC)
+        except requests.HTTPError:
+            if chunk == 1:
+                raise
+            chunk = max(1, chunk // 2)
     return out
 
 def upsert_actions(conn, rows):
@@ -168,28 +173,28 @@ def upsert_actions(conn, rows):
 def main():
     with get_conn() as conn:
         cleanup_incomplete_rows(conn)
-        audit_ids = get_audit_ids(conn, AUDIT_LIMIT)
-        ids = list(audit_ids)
+        audit_pick = get_audit_ids(conn, min(AUDIT_LIMIT, BATCH_SIZE))
+        ids = list(audit_pick)[:BATCH_SIZE]
         if len(ids) < BATCH_SIZE:
             fill = select_next_ticket_ids(conn, BATCH_SIZE - len(ids), ids)
             ids.extend(fill)
+        ids = ids[:BATCH_SIZE]
         if not ids:
             print("Nenhum ticket pendente para ações.")
             return
         print(f"Processando {len(ids)} ticket(s): {ids}")
         actions_map = fetch_actions_for_ids(ids)
-        rows = []
-        processed_ids = []
+        rows, processed = [], []
         for tid in ids:
             acoes = actions_map.get(tid, [])
             rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
             if tid in actions_map:
-                processed_ids.append(tid)
+                processed.append(tid)
         if rows:
             upsert_actions(conn, rows)
-        if processed_ids:
-            clear_audit_ids(conn, processed_ids)
-        print(f"Gravado/atualizado ações para {len(rows)} ticket(s). Limpou {len(processed_ids)} da audit.")
+        if processed:
+            clear_audit_ids(conn, processed)
+        print(f"Gravou {len(rows)} ticket(s). Limpou {len(processed)} da audit.")
 
 if __name__ == "__main__":
     main()
