@@ -15,23 +15,20 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
-
       - name: Executa ações (10 por vez)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           BATCH_SIZE: ${{ github.event.inputs.batch || '10' }}
+          AUDIT_LIMIT: "300"
         run: python sync_resolvidos_acoes.py
