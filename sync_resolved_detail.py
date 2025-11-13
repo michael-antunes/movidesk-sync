@@ -139,14 +139,17 @@ def req(url, params, retries=4):
             return r.json()
         if r.status_code in (429,500,502,503,504):
             sleep_s = float(r.headers.get("Retry-After") or 0) or (1.5 * (i + 1))
-            time.sleep(sleep_s)
-            continue
+            time.sleep(sleep_s); continue
+        try:
+            msg = r.text[:300]
+            print(f"[HTTP {r.status_code}] {msg}")
+        except Exception:
+            pass
         r.raise_for_status()
     r.raise_for_status()
 
 def to_utc(dt):
-    if not dt:
-        return None
+    if not dt: return None
     try:
         return datetime.fromisoformat(str(dt).replace("Z","+00:00")).astimezone(timezone.utc)
     except Exception:
@@ -164,13 +167,13 @@ SELECT_FIELDS = ",".join([
     "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
     "ownerTeam","ownerTeamId"
 ])
-EXPAND_FIELDS = "owner,clients($expand=organization)"
+# sem expand do owner (causava 400). Mantém org:
+EXPAND_FIELDS = "clients($expand=organization)"
 
 def fetch_pages_since(since_iso):
     url = "https://api.movidesk.com/public/v1/tickets"
     filtro = "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') and lastUpdate ge %s" % since_iso
-    skip = 0
-    total = 0
+    skip = 0; total = 0
     while True:
         page = req(url, {
             "token": API_TOKEN,
@@ -181,14 +184,10 @@ def fetch_pages_since(since_iso):
             "$top": min(100, TOP - total),
             "$skip": skip
         }) or []
-        if not page:
-            break
+        if not page: break
         yield page
-        got = len(page)
-        total += got
-        skip += got
-        if total >= TOP or got < 100:
-            break
+        got = len(page); total += got; skip += got
+        if total >= TOP or got < 100: break
         time.sleep(THROTTLE)
 
 def _fetch_ids_chunk(ids_chunk):
@@ -203,31 +202,23 @@ def _fetch_ids_chunk(ids_chunk):
     }) or []
 
 def fetch_by_ids(ids):
-    if not ids:
-        return
-    i = 0
-    n = len(ids)
-    chunk_size = max(1, DETAIL_IDS_CHUNK)
+    if not ids: return
+    i = 0; n = len(ids); chunk_size = max(1, DETAIL_IDS_CHUNK)
     while i < n:
-        end = min(i + chunk_size, n)
-        part = ids[i:end]
+        end = min(i + chunk_size, n); part = ids[i:end]
         try:
             page = _fetch_ids_chunk(part)
-            if page:
-                yield page
-            i = end
-            time.sleep(THROTTLE)
+            if page: yield page
+            i = end; time.sleep(THROTTLE)
         except requests.HTTPError:
-            if chunk_size == 1:
-                raise
+            if chunk_size == 1: raise
             chunk_size = max(1, chunk_size // 2)
 
 def map_row(t):
-    owner = t.get("owner") or {}
+    owner = t.get("owner") or {}  # agente (vem no payload sem expand)
     resp_id = iint(owner.get("id"))
     resp_name = owner.get("businessName") or owner.get("fullName")
-    org_id = None
-    org_name = None
+    org_id = None; org_name = None
     clients = t.get("clients") or []
     if clients:
         org = clients[0].get("organization") or {}
@@ -271,8 +262,7 @@ def get_audit_ids(limit=AUDIT_LIMIT):
     return [r[0] for r in rows]
 
 def clear_audit_ids(ids):
-    if not ids:
-        return
+    if not ids: return
     sql = f"""
       delete from {T_AUDIT}
       where table_name = any(%s)
@@ -288,13 +278,18 @@ def main():
         with c.cursor() as cur:
             cur.execute(GET_LASTRUN)
             since = cur.fetchone()[0]
+    now_utc = datetime.now(timezone.utc)
     if since == datetime(1970,1,1,tzinfo=timezone.utc):
-        since = datetime.now(timezone.utc) - timedelta(days=7)
+        since = now_utc - timedelta(days=7)
+    if since > now_utc:
+        since = now_utc - timedelta(minutes=5)  # nunca pedir futuro
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00","Z")
+
     rows = []
     for page in fetch_pages_since(since_iso):
         for t in page:
             rows.append(map_row(t))
+
     audit_ids = get_audit_ids(AUDIT_LIMIT)
     if audit_ids:
         seen = set(r["ticket_id"] for r in rows)
@@ -303,16 +298,16 @@ def main():
         for page in fetch_by_ids(ids_to_fetch):
             for t in page:
                 rows.append(map_row(t))
-                try:
-                    processed_ids.add(int(t.get("id")))
-                except Exception:
-                    pass
+                try: processed_ids.add(int(t.get("id")))
+                except Exception: pass
         if processed_ids:
             clear_audit_ids(list(processed_ids))
+
     if rows:
         with conn() as c:
             with c.cursor() as cur:
                 psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=200)
+
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(SET_LASTRUN)
