@@ -5,13 +5,17 @@ API_BASE = "https://api.movidesk.com/public/v1/tickets"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
-# Quantos tickets por execução
-BATCH_SIZE   = int(os.getenv("BATCH_SIZE", "10"))
-# Quantos IDs por requisição ao Movidesk (será reduzido em caso de erro 400)
+# ======= CONTROLES =======
+# Se BATCH_SIZE <= 0: roda "ilimitado" (consome tudo que estiver na audit em laços)
+BATCH_SIZE    = int(os.getenv("BATCH_SIZE", "0"))
+# Quantos IDs da audit por passada (por segurança/memória)
+AUDIT_LIMIT   = int(os.getenv("AUDIT_LIMIT", "300"))
+# Tamanho do pedaço por chamada ao Movidesk (reduz dinamicamente se 400)
 ACTIONS_CHUNK = int(os.getenv("ACTIONS_CHUNK", "10"))
-# Limite máximo que podemos puxar da audit (antes de recortar para BATCH_SIZE)
-AUDIT_LIMIT  = int(os.getenv("AUDIT_LIMIT", "300"))
-THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.5"))
+THROTTLE_SEC  = float(os.getenv("THROTTLE_SEC", "0.5"))
+# Se quiser completar com pendências do tickets_resolvidos quando a audit zerar
+FILL_FROM_TICKETS = os.getenv("FILL_FROM_TICKETS", "false").lower() in ("1","true","yes")
+# =========================
 
 SCHEMA    = "visualizacao_resolvidos"
 T_TICKETS = f"{SCHEMA}.tickets_resolvidos"
@@ -39,7 +43,6 @@ def cleanup_incomplete_rows(conn):
         cur.execute(sql)
     conn.commit()
 
-# ====== FOCO NA AUDIT: apenas 'resolvidos_acoes' ======
 def get_audit_ids(conn, limit_):
     sql = f"""
       select ticket_id
@@ -64,7 +67,6 @@ def clear_audit_ids(conn, ids):
     with conn.cursor() as cur:
         cur.execute(sql, (ids,))
     conn.commit()
-# ======================================================
 
 def select_next_ticket_ids(conn, limit_, exclude_ids):
     sql = f"""
@@ -101,7 +103,7 @@ def movidesk_request(params, max_retries=4):
         if r.status_code == 200:
             return r.json()
         if r.status_code in (429,500,502,503,504):
-            if _sleep_retry_after(r): 
+            if _sleep_retry_after(r):
                 continue
             time.sleep(1 + 2*i)
             continue
@@ -128,9 +130,9 @@ def fetch_actions_chunk(ids_chunk):
 
 def fetch_actions_for_ids(ids):
     out = {}
+    ids = list(dict.fromkeys(ids))
     chunk = max(1, ACTIONS_CHUNK)
     i = 0
-    ids = list(dict.fromkeys(ids))
     while i < len(ids):
         part = ids[i:i+chunk]
         try:
@@ -157,7 +159,7 @@ def fetch_actions_for_ids(ids):
                 out[tid] = cleaned
             i += len(part)
             time.sleep(THROTTLE_SEC)
-        except requests.HTTPError:
+        except requests.HTTPError as e:
             if chunk == 1:
                 raise
             chunk = max(1, chunk // 2)
@@ -175,41 +177,61 @@ def upsert_actions(conn, rows):
         psycopg2.extras.execute_batch(cur, sql, rows, page_size=200)
     conn.commit()
 
+def process_ids(conn, ids):
+    if not ids:
+        return 0, 0
+    print(f"Processando {len(ids)} ticket(s): {ids[:10]}{' ...' if len(ids)>10 else ''}")
+    actions_map = fetch_actions_for_ids(ids)
+    rows, processed = [], []
+    for tid in ids:
+        acoes = actions_map.get(tid, [])
+        rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
+        if tid in actions_map:  # limpa audit só quando veio payload do Movidesk
+            processed.append(tid)
+    if rows:
+        upsert_actions(conn, rows)
+    if processed:
+        clear_audit_ids(conn, processed)
+    return len(rows), len(processed)
+
 def main():
+    total_rows, total_cleared = 0, 0
     with get_conn() as conn:
         cleanup_incomplete_rows(conn)
 
-        # 1) Pega somente o que consta na audit para 'resolvidos_acoes'
-        audit_pick = get_audit_ids(conn, min(AUDIT_LIMIT, BATCH_SIZE))
-        ids = list(audit_pick)[:BATCH_SIZE]
+        ilimitado = (BATCH_SIZE <= 0)
 
-        # 2) Se faltar, completa olhando diferenças pelo last_update
-        if len(ids) < BATCH_SIZE:
-            fill = select_next_ticket_ids(conn, BATCH_SIZE - len(ids), ids)
-            ids.extend(fill)
+        while True:
+            # 1) pega um "page" da audit
+            page_limit = AUDIT_LIMIT if ilimitado else min(AUDIT_LIMIT, BATCH_SIZE)
+            ids = get_audit_ids(conn, page_limit)
 
-        ids = ids[:BATCH_SIZE]
-        if not ids:
-            print("Nenhum ticket pendente para ações.")
-            return
+            # 2) se não tem audit…
+            if not ids:
+                if not FILL_FROM_TICKETS:
+                    break
+                # …opcionalmente completa do tickets_resolvidos
+                ids = select_next_ticket_ids(conn, page_limit, [])
+                if not ids:
+                    break
 
-        print(f"Processando {len(ids)} ticket(s): {ids}")
-        actions_map = fetch_actions_for_ids(ids)
+            # 3) em modo limitado, corta para BATCH_SIZE
+            if not ilimitado and len(ids) > BATCH_SIZE:
+                ids = ids[:BATCH_SIZE]
 
-        rows, processed = [], []
-        for tid in ids:
-            acoes = actions_map.get(tid, [])
-            rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
-            if tid in actions_map:  # só limpa audit se veio o payload
-                processed.append(tid)
+            got, cleared = process_ids(conn, ids)
+            total_rows += got
+            total_cleared += cleared
 
-        if rows:
-            upsert_actions(conn, rows)
+            # 4) sai se era um único lote
+            if not ilimitado:
+                break
 
-        if processed:
-            clear_audit_ids(conn, processed)
+            # 5) em modo ilimitado, continua até a audit esvaziar
+            if got == 0:
+                break
 
-        print(f"Gravou {len(rows)} ticket(s). Limpou {len(processed)} da audit.")
+        print(f"Gravou {total_rows} ticket(s) e limpou {total_cleared} da audit.")
 
 if __name__ == "__main__":
     main()
