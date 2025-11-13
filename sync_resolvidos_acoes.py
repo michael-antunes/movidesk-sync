@@ -5,12 +5,15 @@ API_BASE = "https://api.movidesk.com/public/v1/tickets"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10"))
+# Quantos tickets por execução
+BATCH_SIZE   = int(os.getenv("BATCH_SIZE", "10"))
+# Quantos IDs por requisição ao Movidesk (será reduzido em caso de erro 400)
 ACTIONS_CHUNK = int(os.getenv("ACTIONS_CHUNK", "10"))
-AUDIT_LIMIT = int(os.getenv("AUDIT_LIMIT", "300"))
+# Limite máximo que podemos puxar da audit (antes de recortar para BATCH_SIZE)
+AUDIT_LIMIT  = int(os.getenv("AUDIT_LIMIT", "300"))
 THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.5"))
 
-SCHEMA = "visualizacao_resolvidos"
+SCHEMA    = "visualizacao_resolvidos"
 T_TICKETS = f"{SCHEMA}.tickets_resolvidos"
 T_ACOES   = f"{SCHEMA}.resolvidos_acoes"
 T_AUDIT   = f"{SCHEMA}.audit_recent_missing"
@@ -36,12 +39,13 @@ def cleanup_incomplete_rows(conn):
         cur.execute(sql)
     conn.commit()
 
+# ====== FOCO NA AUDIT: apenas 'resolvidos_acoes' ======
 def get_audit_ids(conn, limit_):
     sql = f"""
-      select distinct ticket_id
+      select ticket_id
       from {T_AUDIT}
-      where table_name in ('resolvidos_acoes','{T_ACOES}')
-      order by ticket_id desc
+      where table_name = 'resolvidos_acoes'
+      order by run_id desc, ticket_id desc
       limit %s
     """
     with conn.cursor() as cur:
@@ -54,12 +58,13 @@ def clear_audit_ids(conn, ids):
         return
     sql = f"""
       delete from {T_AUDIT}
-      where table_name in ('resolvidos_acoes','{T_ACOES}')
+      where table_name = 'resolvidos_acoes'
         and ticket_id = any(%s)
     """
     with conn.cursor() as cur:
         cur.execute(sql, (ids,))
     conn.commit()
+# ======================================================
 
 def select_next_ticket_ids(conn, limit_, exclude_ids):
     sql = f"""
@@ -173,27 +178,37 @@ def upsert_actions(conn, rows):
 def main():
     with get_conn() as conn:
         cleanup_incomplete_rows(conn)
+
+        # 1) Pega somente o que consta na audit para 'resolvidos_acoes'
         audit_pick = get_audit_ids(conn, min(AUDIT_LIMIT, BATCH_SIZE))
         ids = list(audit_pick)[:BATCH_SIZE]
+
+        # 2) Se faltar, completa olhando diferenças pelo last_update
         if len(ids) < BATCH_SIZE:
             fill = select_next_ticket_ids(conn, BATCH_SIZE - len(ids), ids)
             ids.extend(fill)
+
         ids = ids[:BATCH_SIZE]
         if not ids:
             print("Nenhum ticket pendente para ações.")
             return
+
         print(f"Processando {len(ids)} ticket(s): {ids}")
         actions_map = fetch_actions_for_ids(ids)
+
         rows, processed = [], []
         for tid in ids:
             acoes = actions_map.get(tid, [])
             rows.append((tid, json.dumps(acoes, ensure_ascii=False)))
-            if tid in actions_map:
+            if tid in actions_map:  # só limpa audit se veio o payload
                 processed.append(tid)
+
         if rows:
             upsert_actions(conn, rows)
+
         if processed:
             clear_audit_ids(conn, processed)
+
         print(f"Gravou {len(rows)} ticket(s). Limpou {len(processed)} da audit.")
 
 if __name__ == "__main__":
