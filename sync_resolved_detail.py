@@ -4,7 +4,7 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import requests
 import psycopg2
@@ -27,10 +27,7 @@ def conn():
 
 def ensure_schema():
     with conn() as c, c.cursor() as cur:
-        # schema
         cur.execute("create schema if not exists visualizacao_resolvidos")
-
-        # tabela base
         cur.execute("""
             create table if not exists visualizacao_resolvidos.tickets_resolvidos(
               ticket_id integer primary key,
@@ -53,16 +50,13 @@ def ensure_schema():
               organization_name text
             )
         """)
-
-        # garante colunas (sem DO/format e sem placeholders)
+        # garante colunas (sem DO/format)
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_id text")
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_name text")
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_team_id text")
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists owner_team_name text")
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists organization_id text")
         cur.execute("alter table visualizacao_resolvidos.tickets_resolvidos add column if not exists organization_name text")
-
-        # controle
         cur.execute("""
             create table if not exists visualizacao_resolvidos.sync_control(
               name text primary key,
@@ -122,7 +116,6 @@ def req(url, params, retries=4):
         if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(1.5 * (i + 1))
             continue
-        # expõe o corpo p/ debug
         raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {r.url} - body: {r.text}", response=r)
     raise requests.HTTPError("Falhou após tentativas")
 
@@ -136,20 +129,22 @@ def to_utc(dt_str):
         return None
 
 
-def fetch_pages(since_iso):
+def fetch_pages(since_iso: str):
+    """
+    Busca páginas de tickets resolvidos/fechados/cancelados desde since_iso.
+    NÃO seleciona 'ownerTeamId' (não existe no DTO de tickets).
+    """
     url = f"{BASE}/tickets"
 
-    # incluir ownerTeamId no select (sem expand ownerTeam)
     select_fields = ",".join([
         "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
-        "origin","category","urgency",
-        "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-        "ownerTeamId"
+        "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel"
     ])
 
-    # navegações válidas
+    # pega owner (p/ owner_id/name) e organization via clients
     expand = "owner,clients($expand=organization)"
 
+    # DateTimeOffset sem aspas
     filtro = ("(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') "
               f"and lastUpdate ge {since_iso}")
 
@@ -176,42 +171,56 @@ def fetch_pages(since_iso):
         time.sleep(THROTTLE)
 
 
-def fetch_teams_names(team_ids: List[int]) -> Dict[str, str]:
-    """Resolve nomes das equipes via /teams -> {str(id): name}."""
-    out: Dict[str, str] = {}
-    if not team_ids:
+def fetch_owners_teams(owner_ids: List[str]) -> Dict[str, Tuple[str, str]]:
+    """
+    Resolve o time do responsável via /persons com $expand=teams.
+    Retorna { owner_id: (team_id, team_name) } (pega o primeiro time se houver).
+    """
+    out: Dict[str, Tuple[str, str]] = {}
+    if not owner_ids:
         return out
+
+    # normaliza e remove None/vazios
+    uniq = sorted({oid for oid in owner_ids if oid})
 
     def chunks(lst, n):
         for i in range(0, len(lst), n):
             yield lst[i:i+n]
 
-    uniq = sorted({int(x) for x in team_ids if x is not None})
-    for ck in chunks(uniq, 50):
+    for ck in chunks(uniq, 40):
+        f = " or ".join([f"id eq {oid}" for oid in ck])
         try:
-            f = " or ".join([f"id eq {i}" for i in ck])
-            data = req(f"{BASE}/teams", {
+            data = req(f"{BASE}/persons", {
                 "token": API_TOKEN,
-                "$select": "id,name",
+                "$select": "id",
+                "$expand": "teams($select=id,name)",
                 "$filter": f,
                 "$top": len(ck)
             }) or []
-            for t in data:
-                out[str(t.get("id"))] = t.get("name") or ""
+            for p in data:
+                pid = str(p.get("id"))
+                teams = p.get("teams") or []
+                if teams:
+                    t0 = teams[0]
+                    out[pid] = (str(t0.get("id")) if t0.get("id") is not None else None,
+                                t0.get("name") or "")
         except Exception:
+            # não faz hard-fail — só deixa sem time
             pass
         time.sleep(THROTTLE)
     return out
 
 
-def map_row(t, team_names: Dict[str, str]):
+def map_row(t: dict, teams_by_owner: Dict[str, Tuple[str, str]]):
     owner = (t.get("owner") or {})
     owner_id = owner.get("id")
+    owner_id_str = str(owner_id) if owner_id is not None else None
     owner_name = owner.get("businessName") or owner.get("fullName") or owner.get("name")
 
-    team_id = t.get("ownerTeamId")
-    team_id_str = str(team_id) if team_id is not None else None
-    team_name = team_names.get(team_id_str) if team_id_str else None
+    team_id = None
+    team_name = None
+    if owner_id_str and owner_id_str in teams_by_owner:
+        team_id, team_name = teams_by_owner[owner_id_str]
 
     org_id = None
     org_name = None
@@ -234,9 +243,9 @@ def map_row(t, team_names: Dict[str, str]):
         "service_first_level": t.get("serviceFirstLevel"),
         "service_second_level": t.get("serviceSecondLevel"),
         "service_third_level": t.get("serviceThirdLevel"),
-        "owner_id": owner_id,
+        "owner_id": owner_id_str,
         "owner_name": owner_name,
-        "owner_team_id": team_id_str,
+        "owner_team_id": team_id,
         "owner_team_name": team_name,
         "organization_id": org_id,
         "organization_name": org_name
@@ -256,20 +265,17 @@ def main():
     since_iso = since.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     raw_pages: List[dict] = []
-    team_ids: List[int] = []
+    owner_ids: List[str] = []
 
     for page in fetch_pages(since_iso):
         raw_pages.extend(page)
         for t in page:
-            tid = t.get("ownerTeamId")
-            if tid is not None:
-                try:
-                    team_ids.append(int(tid))
-                except Exception:
-                    pass
+            oid = (t.get("owner") or {}).get("id")
+            if oid is not None:
+                owner_ids.append(str(oid))
 
-    team_names = fetch_teams_names(team_ids)
-    rows = [map_row(t, team_names) for t in raw_pages]
+    teams_by_owner = fetch_owners_teams(owner_ids)
+    rows = [map_row(t, teams_by_owner) for t in raw_pages]
 
     if rows:
         with conn() as c, c.cursor() as cur:
