@@ -79,21 +79,8 @@ def ensure_schema():
               end if;
             end$$
             """, (SCHEMA, SCHEMA, SCHEMA, SCHEMA, SCHEMA, SCHEMA))
-            cur.execute(f"""
-            create table if not exists {T_SYNC}(
-              name text primary key,
-              last_update timestamptz default now(),
-              last_index_run_at timestamptz,
-              last_detail_run_at timestamptz
-            )
-            """)
-            cur.execute(f"""
-            create table if not exists {T_AUDIT}(
-              run_id bigint not null,
-              table_name text not null,
-              ticket_id integer not null
-            )
-            """)
+            cur.execute(f"create table if not exists {T_SYNC}(name text primary key,last_update timestamptz default now(),last_index_run_at timestamptz,last_detail_run_at timestamptz)")
+            cur.execute(f"create table if not exists {T_AUDIT}(run_id bigint not null,table_name text not null,ticket_id integer not null)")
             cur.execute(f"create index if not exists ix_tk_res_last_update on {T_TICKETS}(last_update)")
             cur.execute(f"create index if not exists ix_audit_tbl_ticket on {T_AUDIT}(table_name,ticket_id)")
     return True
@@ -138,11 +125,10 @@ def req(url, params, retries=4):
         if r.status_code == 200:
             return r.json()
         if r.status_code in (429,500,502,503,504):
-            sleep_s = float(r.headers.get("Retry-After") or 0) or (1.5 * (i + 1))
-            time.sleep(sleep_s); continue
+            time.sleep(float(r.headers.get("Retry-After") or 0) or (1.5 * (i + 1)))
+            continue
         try:
-            msg = r.text[:300]
-            print(f"[HTTP {r.status_code}] {msg}")
+            print(f"[HTTP {r.status_code}] {r.text[:300]}")
         except Exception:
             pass
         r.raise_for_status()
@@ -165,9 +151,8 @@ def iint(x):
 SELECT_FIELDS = ",".join([
     "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
     "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
-    "ownerTeam","ownerTeamId"
+    "ownerTeam"
 ])
-# sem expand do owner (causava 400). Mantém org:
 EXPAND_FIELDS = "clients($expand=organization)"
 
 def fetch_pages_since(since_iso):
@@ -215,7 +200,7 @@ def fetch_by_ids(ids):
             chunk_size = max(1, chunk_size // 2)
 
 def map_row(t):
-    owner = t.get("owner") or {}  # agente (vem no payload sem expand)
+    owner = t.get("owner") or {}
     resp_id = iint(owner.get("id"))
     resp_name = owner.get("businessName") or owner.get("fullName")
     org_id = None; org_name = None
@@ -224,7 +209,6 @@ def map_row(t):
         org = clients[0].get("organization") or {}
         org_id = org.get("id")
         org_name = org.get("businessName") or org.get("fullName")
-    team_id = t.get("ownerTeamId")
     team_name = t.get("ownerTeam")
     return {
         "ticket_id": t.get("id"),
@@ -241,7 +225,7 @@ def map_row(t):
         "service_third_level":  t.get("serviceThirdLevel"),
         "responsible_id": resp_id,
         "responsible_name": resp_name,
-        "owner_id": str(team_id) if team_id is not None else None,
+        "owner_id": None,
         "owner_name": team_name,
         "organization_id": org_id,
         "organization_name": org_name
@@ -281,9 +265,7 @@ def main():
     now_utc = datetime.now(timezone.utc)
     if since == datetime(1970,1,1,tzinfo=timezone.utc):
         since = now_utc - timedelta(days=7)
-    if since > now_utc:
-        since = now_utc - timedelta(minutes=5)  # nunca pedir futuro
-    since_iso = since.replace(microsecond=0).isoformat().replace("+00:00","Z")
+    since_iso = min(since, now_utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
 
     rows = []
     for page in fetch_pages_since(since_iso):
@@ -307,7 +289,6 @@ def main():
         with conn() as c:
             with c.cursor() as cur:
                 psycopg2.extras.execute_batch(cur, UPSERT, rows, page_size=200)
-
     with conn() as c:
         with c.cursor() as cur:
             cur.execute(SET_LASTRUN)
