@@ -164,7 +164,7 @@ SELECT_FIELDS = ",".join([
     "origin","category","urgency","serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
     "ownerTeam","ownerTeamId"
 ])
-EXPAND_FIELDS = "responsible,clients($expand=organization)"
+EXPAND_FIELDS = "owner,clients($expand=organization)"
 
 def fetch_pages_since(since_iso):
     url = "https://api.movidesk.com/public/v1/tickets"
@@ -223,9 +223,9 @@ def fetch_by_ids(ids):
             chunk_size = max(1, chunk_size // 2)
 
 def map_row(t):
-    resp = t.get("responsible") or {}
-    resp_id = iint(resp.get("id"))
-    resp_name = resp.get("businessName") or resp.get("fullName")
+    owner = t.get("owner") or {}
+    resp_id = iint(owner.get("id"))
+    resp_name = owner.get("businessName") or owner.get("fullName")
     org_id = None
     org_name = None
     clients = t.get("clients") or []
