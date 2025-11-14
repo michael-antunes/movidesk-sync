@@ -16,22 +16,10 @@ if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
 IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.25"))
+THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.25"))
+REQ_MAX_RETRIES = int(os.getenv("REQ_MAX_RETRIES", "6"))
 
-def req(url: str, params: Dict[str, Any]) -> Any:
-    all_params = {"token": API_TOKEN, **params}
-    r = requests.get(url, params=all_params, timeout=60)
-    if r.status_code == 200:
-        try:
-            return r.json()
-        except Exception:
-            return None
-    try:
-        full = r.url.replace(API_TOKEN, "***")
-    except Exception:
-        full = url
-    body = r.text[:5000]
-    raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {full} - body: {body}", response=r)
+TRANSIENT = {429, 500, 502, 503, 504}
 
 def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
     for i in range(0, len(seq), size):
@@ -129,26 +117,58 @@ EXPAND_EXPR = ",".join([
     "customFieldValues($select=customFieldId,value)"
 ])
 
-def _fetch_ids_once(ids: List[int]) -> List[Dict[str, Any]]:
-    filt = " or ".join([f"id eq {i}" for i in ids])
-    params = {
-        "$select": SELECT_FIELDS,
-        "$expand": EXPAND_EXPR,
-        "$filter": filt,
-        "$top": 100,
-    }
-    data = req(BASE_URL, params) or []
-    time.sleep(THROTTLE_SEC)
-    return data
+def _sleep_retry_after(r):
+    try:
+        v = r.headers.get("retry-after")
+        if not v:
+            return False
+        s = int(str(v).strip())
+        time.sleep(max(1, s))
+        return True
+    except Exception:
+        return False
 
-def fetch_group_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
-    if not ids:
-        return []
-    return _fetch_ids_once(ids)
+def movidesk_get(params: Dict[str, Any]) -> Any:
+    for i in range(REQ_MAX_RETRIES):
+        r = requests.get(BASE_URL, params={"token": API_TOKEN, **params}, timeout=60)
+        if r.status_code == 200:
+            try:
+                return r.json() or []
+            finally:
+                time.sleep(THROTTLE_SEC)
+        if r.status_code in TRANSIENT:
+            if _sleep_retry_after(r):
+                continue
+            time.sleep(1 + i*2)
+            continue
+        try:
+            full = r.url.replace(API_TOKEN, "***")
+        except Exception:
+            full = BASE_URL
+        body = r.text[:5000]
+        raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {full} - body: {body}", response=r)
+    r.raise_for_status()
+
+def fetch_group(ids: List[int]) -> List[Dict[str, Any]]:
+    try:
+        filt = " or ".join([f"id eq {i}" for i in ids])
+        params = {"$select": SELECT_FIELDS, "$expand": EXPAND_EXPR, "$filter": filt, "$top": 100}
+        return movidesk_get(params) or []
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", 0)
+        if code in TRANSIENT and len(ids) > 1:
+            mid = max(1, len(ids)//2)
+            left  = fetch_group(ids[:mid])
+            right = fetch_group(ids[mid:])
+            return (left or []) + (right or [])
+        raise
 
 def fetch_by_ids(all_ids: List[int], group_size: int = IDS_GROUP_SIZE) -> Iterable[List[Dict[str, Any]]]:
     for group in chunked(all_ids, group_size):
-        yield fetch_group_by_ids(group)
+        try:
+            yield fetch_group(group)
+        except Exception as e:
+            logging.warning("Falha no grupo %s: %s", group[:3], e)
 
 def safe_get_owner(t: Dict[str, Any]) -> Dict[str, Any]:
     return (t.get("owner") or {}) if isinstance(t.get("owner"), dict) else {}
