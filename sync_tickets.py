@@ -126,7 +126,7 @@ def get_table_columns(conn):
             """
             select column_name
             from information_schema.columns
-            where table_schema = 'visualizacao'
+            where table_schema = 'visualizacao_atual'
               and table_name = 'movidesk_tickets_abertos'
             order by ordinal_position
             """
@@ -140,7 +140,7 @@ def build_sql(cols):
     values = ",".join([f"%({c})s" for c in cols])
     sets = ",".join([f"{c}=excluded.{c}" for c in cols_wo_id])
     return f"""
-    insert into visualizacao.movidesk_tickets_abertos ({insert_cols})
+    insert into visualizacao_atual.movidesk_tickets_abertos ({insert_cols})
     values ({values})
     on conflict (id) do update set {sets}
     """
@@ -174,7 +174,7 @@ def upsert_rows(conn, rows):
     sql = build_sql(cols)
     payload = [{c: r.get(c) for c in cols} for r in rows]
     with conn.cursor() as cur:
-        cur.execute("truncate table visualizacao.movidesk_tickets_abertos")
+        cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
         if payload:
             psycopg2.extras.execute_batch(cur, sql, payload, page_size=200)
     conn.commit()
