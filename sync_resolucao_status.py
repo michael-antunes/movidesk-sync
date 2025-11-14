@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os
-import time
 import json
+import time
 import logging
 from typing import Any, Dict, List, Iterable
 
@@ -11,40 +11,40 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)7s  %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
 
-# ==================== Config ====================
-API_BASE   = "https://api.movidesk.com/public/v1/tickets"
-API_TOKEN  = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-NEON_DSN   = os.getenv("NEON_DSN")
+API_BASE = "https://api.movidesk.com/public/v1/tickets"
+API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+NEON_DSN  = os.getenv("NEON_DSN")
 
-SCHEMA_AUD = "visualizacao_resolvidos"
-SCHEMA_RPS = "visualizacao_resolucao"
+# ----- controles -----
+IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))   # grupo no $filter (evita MaxNodeCount)
+BATCH_LIMIT    = int(os.getenv("BATCH_LIMIT", "300"))     # quantos IDs por rodada (máx por execução)
+THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35")) # pausa leve entre chamadas
+MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "4"))
+# ---------------------
 
-# Lê da fila por “páginas”
-AUDIT_LIMIT   = int(os.getenv("AUDIT_LIMIT",   "300"))  # por rodada
-# Se BATCH_SIZE > 0, processa só esse tanto e termina; se <=0, consome tudo o que houver
-BATCH_SIZE    = int(os.getenv("BATCH_SIZE",    "0"))
-# Tamanho do grupo de IDs por chamada OData (evita MaxNodeCount)
-IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-# Espaço entre chamadas (throttling amigável)
-THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35"))
+SCHEMA_RES   = "visualizacao_resolvidos"
+SCHEMA_DET   = "visualizacao_resolucao"
+TBL_AUDIT    = f"{SCHEMA_RES}.audit_recent_missing"
+TBL_STATUS   = f"{SCHEMA_DET}.resolucao_por_status"
 
 if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-# ==================== HTTP helpers ====================
-
 SESS = requests.Session()
-SESS.headers.update({"User-Agent": "movidesk-sync/resolucao-status"})
+SESS.headers.update({"User-Agent": "movidesk-sync/resolucao_por_status"})
+
+# --------------------------------------------------------
+# Utilitários
+# --------------------------------------------------------
+def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
 def _sleep_retry_after(r: requests.Response) -> bool:
-    """Respeita Retry-After se existir; retorna True se dormiu."""
     try:
-        ra = r.headers.get("Retry-After")
+        ra = r.headers.get("retry-after")
         if not ra:
             return False
         time.sleep(max(1, int(str(ra).strip())))
@@ -52,11 +52,12 @@ def _sleep_retry_after(r: requests.Response) -> bool:
     except Exception:
         return False
 
-def od_get(params: Dict[str, Any], max_retries: int = 5) -> Any:
-    """Chamada OData com backoff/Retry-After e mensagens úteis de erro."""
+def md_get(params: Dict[str, Any]) -> Any:
+    """GET com retentativas para 429/5xx. 4xx ≠ 429 é erro duro."""
     p = dict(params or {})
     p["token"] = API_TOKEN
-    for i in range(max_retries):
+    last_err = None
+    for i in range(MAX_RETRIES):
         r = SESS.get(API_BASE, params=p, timeout=60)
         if r.status_code == 200:
             try:
@@ -68,208 +69,133 @@ def od_get(params: Dict[str, Any], max_retries: int = 5) -> Any:
                 continue
             time.sleep(min(60, 1 + 2*i))
             continue
-        # erro “duro”
-        url = r.url.replace(API_TOKEN, "***") if API_TOKEN else r.url
-        raise requests.HTTPError(f"[HTTP {r.status_code}] {url} :: {r.text[:800]}", response=r)
-    r.raise_for_status()  # última tentativa
+        # erro duro (ex.: 400 por expand inválido)
+        last_err = r
+        break
+    if last_err is None:
+        r.raise_for_status()
+    # log seguro sem vazar token
+    try:
+        safe_url = last_err.url.replace(API_TOKEN, "***")
+    except Exception:
+        safe_url = API_BASE
+    logging.warning("Erro HTTP duro em fetch_chunk: [HTTP %s] %s :: %s",
+                    last_err.status_code, safe_url, last_err.text)
+    last_err.raise_for_status()
 
-# ==================== DB helpers ====================
-
-def get_conn():
-    return psycopg2.connect(NEON_DSN)
-
-def get_audit_page(conn, limit_: int) -> List[int]:
-    """
-    Busca um 'page' de IDs da fila, priorizando os maiores ticket_id
-    (e em empate, o run mais recente).
-    """
+def get_audit_ids(conn, limit_: int) -> List[int]:
+    """Busca a fila (apenas resolucao_por_status), IDs mais altos primeiro."""
     sql = f"""
-        select ticket_id
-          from {SCHEMA_AUD}.audit_recent_missing
-         where table_name = 'resolucao_por_status'
-         order by ticket_id desc, run_id desc
-         limit %s
+      select distinct ticket_id
+      from {TBL_AUDIT}
+      where table_name = 'resolucao_por_status'
+      order by ticket_id desc
+      limit %s
     """
     with conn.cursor() as cur:
         cur.execute(sql, (limit_,))
-        return [r[0] for r in cur.fetchall() or []]
+        rows = cur.fetchall() or []
+    return [r[0] for r in rows]
 
 def clear_audit_ids(conn, ids: List[int]) -> None:
     if not ids:
         return
     sql = f"""
-        delete from {SCHEMA_AUD}.audit_recent_missing
-         where table_name = 'resolucao_por_status'
-           and ticket_id = any(%s)
+      delete from {TBL_AUDIT}
+      where table_name = 'resolucao_por_status'
+        and ticket_id = any(%s)
     """
     with conn.cursor() as cur:
         cur.execute(sql, (ids,))
     conn.commit()
 
-def heartbeat_sync(conn, name="resolucao_por_status") -> None:
-    """
-    Marca um 'heartbeat' em visualizacao_resolucao.sync_cntrol (nome do usuário).
-    """
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            create table if not exists {SCHEMA_RPS}.sync_cntrol(
-                name text primary key,
-                last_update timestamp not null,
-                key text,
-                value text
-            )
-        """)
-        cur.execute(f"""
-            insert into {SCHEMA_RPS}.sync_cntrol(name,last_update)
-            values (%s, now())
-            on conflict (name) do update
-                set last_update = excluded.last_update
-        """, (name,))
-    conn.commit()
-
-# ==================== Movidesk fetch ====================
-
-def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
-    for i in range(0, len(seq), size):
-        yield seq[i:i+size]
-
-def build_expand():
-    # Puxa histórico de status com agente e possíveis times
-    return (
-        "statusHistories("
-        "$select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;"
-        "$expand=changedBy($select=id,businessName;$expand=teams($select=businessName))"
-        ")"
-    )
+# --------------------------------------------------------
+# Movidesk fetch
+# --------------------------------------------------------
+# IMPORTANTE: sem expand de "teams" (não existe em TicketPersonApiDto → 400)
+SELECT_FIELDS = "id,ownerTeam"
+EXPAND_EXPR   = (
+    "statusHistories("
+    "$select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;"
+    "$expand=changedBy($select=id,businessName)"
+    ")"
+)
 
 def fetch_chunk(ids_chunk: List[int]) -> List[Dict[str, Any]]:
     if not ids_chunk:
         return []
-    filt = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
+    filtro = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
     params = {
-        "$select": "id,ownerTeam",
-        "$expand": build_expand(),
-        "$filter": filt,
-        "$top": 100
+        "$select": SELECT_FIELDS,
+        "$expand": EXPAND_EXPR,
+        "$filter": filtro,
+        "$top": 100,
+        "includeDeletedItems": "true",
     }
-    data = od_get(params) or []
-    # Movidesk pode retornar 1 objeto isolado em alguns casos improváveis
-    return data if isinstance(data, list) else [data]
+    data = md_get(params)
+    return data or []
 
-# ==================== Transform ====================
-
-GENERIC_TEAMS = {
-    "administradores","agente administrador","administrators","agent administrator",
-    "default","geral","todos","all","users","usuários","colaboradores"
-}
-TEAM_PRIORITY = ["telefone","chat","n1","n2","cs","suporte","service desk","desenvolvimento","squad","projeto"]
-
-def _owner_team_name(ticket: Dict[str, Any]) -> str:
-    ot = ticket.get("ownerTeam")
-    if isinstance(ot, dict):
-        return (ot.get("businessName") or "").strip()
-    if isinstance(ot, str):
-        return ot.strip()
+# --------------------------------------------------------
+# Mapping helpers
+# --------------------------------------------------------
+def _name_from_obj_or_str(x) -> str:
+    if isinstance(x, dict):
+        return (x.get("businessName") or x.get("name") or "").strip()
+    if isinstance(x, str):
+        return x.strip()
     return ""
 
-def _pick_team(changed_by: Dict[str, Any], owner_team: str, changed_by_team: Any) -> str:
-    # 1) se statusHistory trouxe changedByTeam, usa
-    if isinstance(changed_by_team, dict):
-        n = (changed_by_team.get("businessName") or "").strip()
-        if n:
-            return n
-    if isinstance(changed_by_team, str):
-        n = changed_by_team.strip()
-        if n:
-            return n
+def _owner_team_name(ticket: Dict[str, Any]) -> str:
+    return _name_from_obj_or_str(ticket.get("ownerTeam"))
 
-    # 2) tenta pelos teams do agente (exclui genéricos, prioriza por palavras-chave)
-    names: List[str] = []
-    if isinstance(changed_by, dict):
-        teams = changed_by.get("teams")
-        if isinstance(teams, list):
-            for t in teams:
-                n = (t.get("businessName") if isinstance(t, dict) else (t if isinstance(t, str) else "")) or ""
-                n = n.strip()
-                low = n.lower()
-                if n and low not in GENERIC_TEAMS and not low.startswith("admin"):
-                    names.append(n)
+def _team_from_history(h: Dict[str, Any], fallback_owner: str) -> str:
+    # prioriza changedByTeam (string ou objeto); senão usa ownerTeam do ticket
+    n = _name_from_obj_or_str(h.get("changedByTeam"))
+    return n or fallback_owner or ""
 
-    names = list(dict.fromkeys(names))
-    if not names and isinstance(changed_by, dict):
-        teams = changed_by.get("teams")
-        if isinstance(teams, list):
-            for t in teams:
-                n = (t.get("businessName") if isinstance(t, dict) else (t if isinstance(t, str) else "")) or ""
-                n = n.strip()
-                if n:
-                    names.append(n)
-        names = list(dict.fromkeys(names))
-
-    if names:
-        lowered = [n.lower() for n in names]
-        for key in TEAM_PRIORITY:
-            for i, low in enumerate(lowered):
-                if key in low:
-                    return names[i]
-        return names[0]
-
-    # 3) fallback para a equipe do ticket
-    return owner_team or ""
-
-def map_rows(ticket: Dict[str, Any]) -> List[tuple]:
-    """
-    Produz linhas para upsert:
-      (ticket_id, status, justificativa, seconds_uti, permanency_time_fulltime_seconds,
-       changed_by_json, changed_date, agent_name, team_name, time_squad)
-    """
+def extract_rows(ticket: Dict[str, Any]) -> List[tuple]:
     tid = int(ticket.get("id"))
     owner_team = _owner_team_name(ticket)
-    out: List[tuple] = []
-
-    for h in ticket.get("statusHistories") or []:
+    rows = []
+    for h in (ticket.get("statusHistories") or []):
+        changed_date = h.get("changedDate")
+        if not changed_date:
+            continue  # PK inclui changed_date → precisamos dele
         status = h.get("status") or ""
         justificativa = h.get("justification") or ""
         sec_work = int(h.get("permanencyTimeWorkingTime") or 0)
         sec_full = float(h.get("permanencyTimeFullTime") or 0.0)
         changed_by = h.get("changedBy") or {}
-        agent = changed_by.get("businessName") if isinstance(changed_by, dict) else ""
-        team = _pick_team(changed_by, owner_team, h.get("changedByTeam"))
-        changed_date = h.get("changedDate")
-        # time_squad: mantemos vazio; triggers podem preencher (se houver)
-        out.append((
+        agent_name = ""
+        if isinstance(changed_by, dict):
+            agent_name = (changed_by.get("businessName") or "").strip()
+        team_name = _team_from_history(h, owner_team)
+        # time_squad: não há campo específico no payload; manter NULL/'' (ajuste se houver regra)
+        time_squad = None
+
+        rows.append((
             tid, status, justificativa, sec_work, sec_full,
             json.dumps(changed_by, ensure_ascii=False),
-            changed_date, agent or "", team or "", None  # time_squad
+            changed_date, agent_name, team_name, time_squad
         ))
-    return out
+    return rows
 
-def dedupe(rows: List[tuple]) -> List[tuple]:
-    seen = set()
-    out: List[tuple] = []
-    for r in rows:
-        key = (r[0], r[1], r[2], r[6])  # ticket_id, status, justificativa, changed_date
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
-
-# ==================== Upsert ====================
-
+# --------------------------------------------------------
+# UPSERT
+# --------------------------------------------------------
 UPSERT_SQL = f"""
-insert into {SCHEMA_RPS}.resolucao_por_status
+insert into {TBL_STATUS}
 (ticket_id, status, justificativa, seconds_uti, permanency_time_fulltime_seconds,
  changed_by, changed_date, agent_name, team_name, time_squad)
 values %s
 on conflict (ticket_id, status, justificativa, changed_date) do update set
-  seconds_uti                         = excluded.seconds_uti,
-  permanency_time_fulltime_seconds    = excluded.permanency_time_fulltime_seconds,
-  changed_by                          = excluded.changed_by,
-  agent_name                          = excluded.agent_name,
-  team_name                           = excluded.team_name,
-  time_squad                          = excluded.time_squad,
-  imported_at                         = now()
+  seconds_uti = excluded.seconds_uti,
+  permanency_time_fulltime_seconds = excluded.permanency_time_fulltime_seconds,
+  changed_by = excluded.changed_by,
+  agent_name = excluded.agent_name,
+  team_name  = excluded.team_name,
+  time_squad = excluded.time_squad,
+  imported_at = now()
 """
 
 def upsert_rows(conn, rows: List[tuple]) -> None:
@@ -279,94 +205,58 @@ def upsert_rows(conn, rows: List[tuple]) -> None:
         execute_values(cur, UPSERT_SQL, rows, page_size=200)
     conn.commit()
 
-# ==================== Main loop ====================
-
-def process_ids(conn, ids: List[int]) -> int:
-    """
-    Busca tickets em grupos (maiores IDs primeiro já vem do SELECT),
-    grava linhas e limpa da audit somente os IDs que vieram com payload.
-    """
-    if not ids:
-        return 0
-
-    group = max(1, IDS_GROUP_SIZE)
-    processed_ids: List[int] = []
-    total_rows = 0
-
-    i = 0
-    while i < len(ids):
-        part = ids[i:i+group]
-        try:
-            data = fetch_chunk(part)
-        except requests.HTTPError as e:
-            # se vier erro de complexidade (ex.: MaxNodeCount), reduz o grupo
-            if group > 1 and any(code in str(e).lower() for code in ["maxnodecount", "request too long", "odata"]):
-                group = max(1, group // 2)
-                logging.warning("Reducing group size to %s due to OData limits", group)
-                continue
-            else:
-                logging.warning("Erro HTTP duro em fetch_chunk: %s", e)
-                # avança mesmo assim pra não travar na mesma página
-                i += len(part)
-                continue
-
-        rows_all: List[tuple] = []
-        got_tids = set()
-
-        for t in data or []:
-            try:
-                tid = int(t.get("id"))
-                got_tids.add(tid)
-                rows = dedupe(map_rows(t))
-                rows_all.extend(rows)
-            except Exception as ex:
-                logging.warning("Falha ao mapear ticket: %s :: %s", t.get("id"), ex)
-
-        if rows_all:
-            upsert_rows(conn, rows_all)
-            total_rows += len(rows_all)
-
-        if got_tids:
-            clear_audit_ids(conn, sorted(got_tids, reverse=True))
-            processed_ids.extend(sorted(got_tids, reverse=True))
-
-        i += len(part)
-
-    if processed_ids:
-        logging.info("Processados (e limpos da audit): %d tickets", len(processed_ids))
-    return total_rows
-
+# --------------------------------------------------------
+# Main
+# --------------------------------------------------------
 def main():
-    total_upsert = 0
-    with get_conn() as conn:
-        heartbeat_sync(conn)  # cria tabela se preciso e marca heartbeat
-        ilimitado = (BATCH_SIZE <= 0)
+    with psycopg2.connect(NEON_DSN) as conn:
+        # 1) pega fila (maiores IDs primeiro)
+        ids = get_audit_ids(conn, BATCH_LIMIT)
+        if not ids:
+            logging.info("Fila vazia para resolucao_por_status. Nada a fazer.")
+            return
 
-        while True:
-            page_limit = AUDIT_LIMIT if ilimitado else min(AUDIT_LIMIT, BATCH_SIZE)
-            ids = get_audit_page(conn, page_limit)
+        logging.info("Lote da fila (maiores IDs primeiro): %s ...", ids[:10])
 
-            if not ids:
-                logging.info("Fila vazia para 'resolucao_por_status'. Nada a fazer.")
-                break
+        total_rows = 0
+        processed_for_clear: List[int] = []
 
-            if not ilimitado and len(ids) > BATCH_SIZE:
-                ids = ids[:BATCH_SIZE]
+        # 2) busca por grupos (evitar MaxNodeCount)
+        for grp in chunked(ids, IDS_GROUP_SIZE):
+            data = fetch_chunk(grp)
+            if not data:
+                continue
 
-            logging.info("Lote da fila (maiores IDs primeiro): %s%s",
-                         ids[:10], " ..." if len(ids) > 10 else "")
-            total_upsert += process_ids(conn, ids)
+            # mapeia e grava
+            rows_to_upsert: List[tuple] = []
+            got_ids: List[int] = []
 
-            if not ilimitado:
-                break  # modo 'um único lote'
+            for ticket in data:
+                try:
+                    tid = int(ticket.get("id"))
+                except Exception:
+                    continue
+                ticket_rows = extract_rows(ticket)
+                if ticket_rows:
+                    rows_to_upsert.extend(ticket_rows)
+                    got_ids.append(tid)
 
-            # loop até esvaziar a audit ou não gerar mais nada
-            if len(ids) < page_limit:
-                break
+            if rows_to_upsert:
+                upsert_rows(conn, rows_to_upsert)
+                total_rows += len(rows_to_upsert)
 
-        heartbeat_sync(conn)  # marca finalização do ciclo
+            # Só limpa da audit os IDs que de fato retornaram do Movidesk
+            if got_ids:
+                processed_for_clear.extend(got_ids)
 
-    logging.info("FIM. Linhas upsertadas: %d", total_upsert)
+        # 3) limpa fila
+        if processed_for_clear:
+            processed_for_clear = sorted(list(set(processed_for_clear)))
+            clear_audit_ids(conn, processed_for_clear)
+
+        logging.info("Finalizado. Linhas upsertadas: %d | IDs limpos da audit: %d",
+                     total_rows, len(processed_for_clear))
+
 
 if __name__ == "__main__":
     main()
