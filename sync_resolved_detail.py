@@ -9,26 +9,16 @@ from psycopg2.extras import execute_values
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
 
-# ==== Config ====
 BASE_URL = "https://api.movidesk.com/public/v1/tickets"
-
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 NEON_DSN  = os.getenv("NEON_DSN")
-
 if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-# Tamanho dos lotes de IDs no $filter (evita MaxNodeCount=100 do OData)
 IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-
-# Intervalo entre chamadas (cautela contra throttling)
 THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.25"))
 
-# ==========================================
-# Infra
-# ==========================================
 def req(url: str, params: Dict[str, Any]) -> Any:
-    """GET com tratamento de erro que mostra URL e body para debug."""
     all_params = {"token": API_TOKEN, **params}
     r = requests.get(url, params=all_params, timeout=60)
     if r.status_code == 200:
@@ -36,48 +26,47 @@ def req(url: str, params: Dict[str, Any]) -> Any:
             return r.json()
         except Exception:
             return None
-
-    # Monta URL final só para log (sem vazar o token real)
     try:
         full = r.url.replace(API_TOKEN, "***")
     except Exception:
         full = url
-
     body = r.text[:5000]
     raise requests.HTTPError(f"{r.status_code} {r.reason} - url: {full} - body: {body}", response=r)
-
 
 def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
     for i in range(0, len(seq), size):
         yield seq[i:i+size]
 
+def addcol(conn, col: str, typ: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            select 1
+              from information_schema.columns
+             where table_schema='visualizacao_resolvidos'
+               and table_name='tickets_resolvidos'
+               and column_name=%s
+             limit 1
+        """, (col,))
+        if cur.fetchone():
+            return
+        cur.execute(f"alter table visualizacao_resolvidos.tickets_resolvidos add column {col} {typ}")
+    conn.commit()
 
 def ensure_schema(conn) -> None:
-    """
-    Garante:
-      - schema visualizacao_resolvidos
-      - tabelas auxiliares detail_control e sync_control (evita UndefinedTable)
-      - colunas novas em tickets_resolvidos usadas por este sync
-    NÃO remove nada.
-    """
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
-
         cur.execute("""
             create table if not exists visualizacao_resolvidos.detail_control (
                 ticket_id   integer primary key,
                 last_update timestamptz default now()
             )
         """)
-
         cur.execute("""
             create table if not exists visualizacao_resolvidos.sync_control (
                 name        text primary key,
                 last_update timestamptz default now()
             )
         """)
-
-        # Garante que a tabela principal existe (sem recriar)
         cur.execute("""
             create table if not exists visualizacao_resolvidos.tickets_resolvidos(
               ticket_id integer primary key,
@@ -101,74 +90,39 @@ def ensure_schema(conn) -> None:
               adicional_nome text
             )
         """)
-
     conn.commit()
+    addcol(conn, "owner_id", "text")
+    addcol(conn, "owner_name", "text")
+    addcol(conn, "owner_team_name", "text")
+    addcol(conn, "organization_id", "text")
+    addcol(conn, "organization_name", "text")
+    addcol(conn, "subject", "text")
+    addcol(conn, "adicional_nome", "text")
+    addcol(conn, "last_update", "timestamptz")
 
-    def addcol(col: str, typ: str) -> None:
-        with conn.cursor() as cur:
-            cur.execute("""
-                select 1
-                  from information_schema.columns
-                 where table_schema='visualizacao_resolvidos'
-                   and table_name='tickets_resolvidos'
-                   and column_name=%s
-                 limit 1
-            """, (col,))
-            if cur.fetchone():
-                return
-            cur.execute(f"alter table visualizacao_resolvidos.tickets_resolvidos add column {col} {typ}")
-        conn.commit()
-        logging.info("added column %s %s", col, typ)
-
-    # Apenas garante as colunas que este job usa (idempotente)
-    addcol("owner_id", "text")
-    addcol("owner_name", "text")
-    addcol("owner_team_name", "text")
-    addcol("organization_id", "text")
-    addcol("organization_name", "text")
-    addcol("subject", "text")
-    addcol("adicional_nome", "text")
-    addcol("last_update", "timestamptz")
-    # As colunas de datas/status já estão previstas no create acima,
-    # mas o addcol acima mantém idempotência caso a tabela já exista.
-
-
-# ==========================================
-# Leitura de pendências no audit
-# ==========================================
 def get_audit_ids(conn, limit: int = 600) -> List[int]:
-    """
-    Busca IDs únicos na audit_recent_missing para a tabela 'tickets_resolvidos'.
-    Sem depender de run_id (pega o que estiver lá).
-    """
     with conn.cursor() as cur:
         cur.execute("""
-            select distinct ticket_id
+            select ticket_id
               from visualizacao_resolvidos.audit_recent_missing
              where table_name = 'tickets_resolvidos'
-             order by ticket_id
+             group by ticket_id
+             order by max(run_id) desc, ticket_id desc
              limit %s
         """, (limit,))
         rows = cur.fetchall() or []
-    ids = [r[0] for r in rows]
+    ids = [int(r[0]) for r in rows]
     logging.info("Audit pendentes: %d", len(ids))
     return ids
 
-
-# ==========================================
-# Fetch por IDs em grupos (evita MaxNodeCount)
-# ==========================================
 SELECT_FIELDS = ",".join([
     "id","status","resolvedIn","closedIn","canceledIn","lastUpdate",
     "origin","category","urgency",
     "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
     "subject",
-    "ownerTeam"  # apenas o nome da equipe (string)
+    "ownerTeam"
 ])
 
-# - owner: pego id e businessName
-# - clients/organization: id e businessName (org do primeiro client, se houver)
-# - customFieldValues: apenas customFieldId,value (usado p/ 29077)
 EXPAND_EXPR = ",".join([
     "owner($select=id,businessName)",
     "clients($expand=organization($select=id,businessName))",
@@ -176,7 +130,6 @@ EXPAND_EXPR = ",".join([
 ])
 
 def _fetch_ids_once(ids: List[int]) -> List[Dict[str, Any]]:
-    # Monta filtro "id eq X or id eq Y ..."
     filt = " or ".join([f"id eq {i}" for i in ids])
     params = {
         "$select": SELECT_FIELDS,
@@ -185,30 +138,18 @@ def _fetch_ids_once(ids: List[int]) -> List[Dict[str, Any]]:
         "$top": 100,
     }
     data = req(BASE_URL, params) or []
-    # Respeita throttling leve
     time.sleep(THROTTLE_SEC)
     return data
 
-
 def fetch_group_by_ids(ids: List[int]) -> List[Dict[str, Any]]:
-    # Protege contra listas vazias
     if not ids:
         return []
-    # Busca de uma vez só este grupo (tamanho já controlado no caller)
     return _fetch_ids_once(ids)
 
-
 def fetch_by_ids(all_ids: List[int], group_size: int = IDS_GROUP_SIZE) -> Iterable[List[Dict[str, Any]]]:
-    """
-    Itera por grupos para não estourar MaxNodeCount do OData.
-    """
     for group in chunked(all_ids, group_size):
         yield fetch_group_by_ids(group)
 
-
-# ==========================================
-# Mapeamento p/ upsert
-# ==========================================
 def safe_get_owner(t: Dict[str, Any]) -> Dict[str, Any]:
     return (t.get("owner") or {}) if isinstance(t.get("owner"), dict) else {}
 
@@ -220,14 +161,9 @@ def safe_get_org(t: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 def extract_custom_29077(t: Dict[str, Any]) -> str:
-    """
-    Procura no array customFieldValues um item com customFieldId == 29077
-    e retorna seu 'value' como texto.
-    """
     cfvals = t.get("customFieldValues") or []
     try:
         for cf in cfvals:
-            # Alguns tenantes retornam como string, outros como int:
             cfid = cf.get("customFieldId")
             if cfid is None:
                 continue
@@ -235,7 +171,6 @@ def extract_custom_29077(t: Dict[str, Any]) -> str:
                 val = cf.get("value")
                 if val is None:
                     return None
-                # Se vier dict/array, serializa para texto simples
                 if isinstance(val, (dict, list)):
                     return str(val)
                 return str(val)
@@ -246,13 +181,10 @@ def extract_custom_29077(t: Dict[str, Any]) -> str:
 def map_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
     owner = safe_get_owner(t)
     org   = safe_get_org(t)
-
     owner_id   = owner.get("id")
     owner_name = owner.get("businessName")
-
     org_id   = org.get("id")
     org_name = org.get("businessName")
-
     row = {
         "ticket_id": int(t.get("id")),
         "status": t.get("status"),
@@ -276,10 +208,6 @@ def map_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
     }
     return row
 
-
-# ==========================================
-# Upsert + marcações
-# ==========================================
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
 (ticket_id,status,last_resolved_at,last_closed_at,last_cancelled_at,last_update,
@@ -318,7 +246,6 @@ def upsert_rows(conn, rows: List[Dict[str, Any]]) -> None:
         ) for r in rows], page_size=200)
     conn.commit()
 
-
 def clear_audit_for(conn, ticket_ids: List[int]) -> None:
     if not ticket_ids:
         return
@@ -330,19 +257,15 @@ def clear_audit_for(conn, ticket_ids: List[int]) -> None:
         """, (ticket_ids,))
     conn.commit()
 
-
 def mark_sync(conn, ticket_ids: List[int]) -> None:
     if not ticket_ids:
         return
     with conn.cursor() as cur:
-        # detail_control: upsert last_update = now()
         execute_values(cur, """
             insert into visualizacao_resolvidos.detail_control (ticket_id, last_update)
             values %s
             on conflict (ticket_id) do update set last_update = now()
         """, [(tid, None) for tid in ticket_ids])
-
-        # sync_control: marca execução deste job
         cur.execute("""
             insert into visualizacao_resolvidos.sync_control (name, last_update)
             values ('tickets_resolvidos', now())
@@ -350,42 +273,29 @@ def mark_sync(conn, ticket_ids: List[int]) -> None:
         """)
     conn.commit()
 
-
-# ==========================================
-# Main
-# ==========================================
 def main():
     with psycopg2.connect(NEON_DSN) as conn:
         ensure_schema(conn)
-
         audit_ids = get_audit_ids(conn, limit=600)
         if not audit_ids:
             logging.info("Nenhum ticket em audit_recent_missing para tickets_resolvidos. Nada a fazer.")
             return
-
         total_ok = 0
         processed_ids: List[int] = []
-
         for page in fetch_by_ids(audit_ids, group_size=IDS_GROUP_SIZE):
             if not page:
                 continue
             rows = [map_ticket_row(t) for t in page if t and t.get("id")]
             if not rows:
                 continue
-
             upsert_rows(conn, rows)
             ids_this = [r["ticket_id"] for r in rows]
             processed_ids.extend(ids_this)
             total_ok += len(rows)
-
         if processed_ids:
-            # Marca execução e limpa os IDs do audit (a trigger de limpeza por NULL continuará atuando se necessário)
             mark_sync(conn, processed_ids)
             clear_audit_for(conn, processed_ids)
-
-        logging.info("Upsert concluído. Registros gravados: %d (IDs distintos: %d)",
-                     total_ok, len(set(processed_ids)))
-
+        logging.info("Upsert concluído. Registros gravados: %d (IDs distintos: %d)", total_ok, len(set(processed_ids)))
 
 if __name__ == "__main__":
     main()
