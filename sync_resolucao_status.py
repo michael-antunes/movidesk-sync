@@ -1,193 +1,104 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, time, json, logging
+
+import os
+import time
+import json
+import logging
 from typing import Any, Dict, List, Iterable
-import requests, psycopg2
+
+import requests
+import psycopg2
 from psycopg2.extras import execute_values
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)7s  %(message)s"
+)
 
-API_BASE = "https://api.movidesk.com/public/v1/tickets"
-TOKEN    = os.environ["MOVIDESK_TOKEN"] or os.environ["MOVIDESK_API_TOKEN"]
-DSN      = os.environ["NEON_DSN"]
+# ==================== Config ====================
+API_BASE   = "https://api.movidesk.com/public/v1/tickets"
+API_TOKEN  = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+NEON_DSN   = os.getenv("NEON_DSN")
 
-SCHEMA_RESOLVIDOS = "visualizacao_resolvidos"
-SCHEMA_RESOLUCAO  = "visualizacao_resolucao"
+SCHEMA_AUD = "visualizacao_resolvidos"
+SCHEMA_RPS = "visualizacao_resolucao"
 
+# Lê da fila por “páginas”
+AUDIT_LIMIT   = int(os.getenv("AUDIT_LIMIT",   "300"))  # por rodada
+# Se BATCH_SIZE > 0, processa só esse tanto e termina; se <=0, consome tudo o que houver
+BATCH_SIZE    = int(os.getenv("BATCH_SIZE",    "0"))
+# Tamanho do grupo de IDs por chamada OData (evita MaxNodeCount)
 IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-BATCH_LIMIT    = int(os.getenv("BATCH_LIMIT", "300"))
+# Espaço entre chamadas (throttling amigável)
 THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35"))
-MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "4"))
 
-def _sleep_retry_after(resp: requests.Response) -> bool:
+if not API_TOKEN or not NEON_DSN:
+    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
+
+# ==================== HTTP helpers ====================
+
+SESS = requests.Session()
+SESS.headers.update({"User-Agent": "movidesk-sync/resolucao-status"})
+
+def _sleep_retry_after(r: requests.Response) -> bool:
+    """Respeita Retry-After se existir; retorna True se dormiu."""
     try:
-        ra = resp.headers.get("Retry-After")
-        if not ra: return False
+        ra = r.headers.get("Retry-After")
+        if not ra:
+            return False
         time.sleep(max(1, int(str(ra).strip())))
         return True
     except Exception:
         return False
 
-def req(params: Dict[str, Any]) -> Any:
-    p = dict(params or {}); p["token"] = TOKEN
-    for i in range(MAX_RETRIES):
-        r = requests.get(API_BASE, params=p, timeout=60)
-        if r.status_code == 200: return r.json()
-        if r.status_code in (429,500,502,503,504):
-            if _sleep_retry_after(r): continue
-            time.sleep(1 + 2*i); continue
-        full = r.url.replace(TOKEN, "***") if TOKEN else r.url
-        body = (r.text or "")[:2000]
-        raise requests.HTTPError(f"[HTTP {r.status_code}] {full}\n{body}", response=r)
-    r.raise_for_status()
+def od_get(params: Dict[str, Any], max_retries: int = 5) -> Any:
+    """Chamada OData com backoff/Retry-After e mensagens úteis de erro."""
+    p = dict(params or {})
+    p["token"] = API_TOKEN
+    for i in range(max_retries):
+        r = SESS.get(API_BASE, params=p, timeout=60)
+        if r.status_code == 200:
+            try:
+                return r.json()
+            finally:
+                time.sleep(THROTTLE_SEC)
+        if r.status_code in (429, 500, 502, 503, 504):
+            if _sleep_retry_after(r):
+                continue
+            time.sleep(min(60, 1 + 2*i))
+            continue
+        # erro “duro”
+        url = r.url.replace(API_TOKEN, "***") if API_TOKEN else r.url
+        raise requests.HTTPError(f"[HTTP {r.status_code}] {url} :: {r.text[:800]}", response=r)
+    r.raise_for_status()  # última tentativa
 
-def ensure_structure(conn):
-    with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {SCHEMA_RESOLUCAO}")
-        cur.execute(f"""
-            create table if not exists {SCHEMA_RESOLUCAO}.resolucao_por_status(
-                ticket_id integer not null,
-                status text not null,
-                justificativa text not null,
-                seconds_uti integer,
-                permanency_time_fulltime_seconds double precision,
-                changed_by jsonb,
-                changed_date timestamp,
-                imported_at timestamp default now(),
-                agent_name text default '',
-                team_name text default '',
-                time_squad text,
-                primary key (ticket_id, status, justificativa, changed_date)
-            )
-        """)
-        cur.execute(f"""
-            create table if not exists {SCHEMA_RESOLUCAO}.sync_control(
-                name text primary key,
-                last_update timestamp not null default now(),
-                key text,
-                value text
-            )
-        """)
-    conn.commit()
+# ==================== DB helpers ====================
 
-def get_audit_ids(conn, limit_) -> List[int]:
+def get_conn():
+    return psycopg2.connect(NEON_DSN)
+
+def get_audit_page(conn, limit_: int) -> List[int]:
+    """
+    Busca um 'page' de IDs da fila, priorizando os maiores ticket_id
+    (e em empate, o run mais recente).
+    """
     sql = f"""
-        select distinct ticket_id
-          from {SCHEMA_RESOLVIDOS}.audit_recent_missing
+        select ticket_id
+          from {SCHEMA_AUD}.audit_recent_missing
          where table_name = 'resolucao_por_status'
-         order by ticket_id desc
+         order by ticket_id desc, run_id desc
          limit %s
     """
     with conn.cursor() as cur:
         cur.execute(sql, (limit_,))
-        rows = cur.fetchall() or []
-    ids = [int(r[0]) for r in rows]
-    logging.info("IDs na audit (resolucao_por_status): %d (maior primeiro)", len(ids))
-    return ids
+        return [r[0] for r in cur.fetchall() or []]
 
-def chunked(lst: List[int], size: int) -> Iterable[List[int]]:
-    for i in range(0, len(lst), size):
-        yield lst[i:i+size]
-
-def _pick_team_name(owner_team, changed_by, changed_by_team) -> str:
-    if isinstance(changed_by_team, str):
-        n = changed_by_team.strip()
-        if n: return n
-    if isinstance(changed_by_team, dict):
-        n = (changed_by_team.get("businessName") or "").strip()
-        if n: return n
-    teams = []
-    if isinstance(changed_by, dict):
-        arr = changed_by.get("teams") or []
-        if isinstance(arr, list):
-            for t in arr:
-                n = (t.get("businessName") if isinstance(t,dict) else (t if isinstance(t,str) else "")) or ""
-                n = n.strip()
-                if n: teams.append(n)
-    return teams[0] if teams else (owner_team or "")
-
-def _pick_time_squad(changed_by) -> str:
-    if not isinstance(changed_by, dict): return ""
-    arr = changed_by.get("teams") or []
-    if not isinstance(arr, list): return ""
-    for t in arr:
-        n = (t.get("businessName") if isinstance(t,dict) else (t if isinstance(t,str) else "")) or ""
-        n = (n or "").strip()
-        if n and "squad" in n.lower(): return n
-    return ""
-
-def map_histories(ticket: Dict[str, Any]) -> List[Dict[str, Any]]:
-    tid = int(ticket.get("id"))
-    ot = ticket.get("ownerTeam"); owner_team = (ot if isinstance(ot,str) else (ot or {}).get("businessName") or "").strip()
-    out = []
-    for h in ticket.get("statusHistories") or []:
-        cb = h.get("changedBy") or {}
-        out.append({
-            "ticket_id": tid,
-            "status": h.get("status") or "",
-            "justificativa": h.get("justification") or "",
-            "seconds_uti": int(h.get("permanencyTimeWorkingTime") or 0),
-            "permanency_time_fulltime_seconds": float(h.get("permanencyTimeFullTime") or 0),
-            "changed_by": cb,
-            "changed_date": h.get("changedDate"),
-            "agent_name": (cb.get("businessName") or "").strip() if isinstance(cb,dict) else "",
-            "team_name": _pick_team_name(owner_team, cb, h.get("changedByTeam")),
-            "time_squad": _pick_time_squad(cb),
-        })
-    return out
-
-SELECT_FIELDS = "id,ownerTeam"
-EXPAND_FIELDS = (
-    "statusHistories("
-    "$select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;"
-    "$expand=changedBy($select=id,businessName;$expand=teams($select=businessName))"
-    ")"
-)
-
-def fetch_group(ids: List[int]) -> List[Dict[str, Any]]:
-    if not ids: return []
-    filtro = " or ".join([f"id eq {int(i)}" for i in ids])
-    params = {"$select": SELECT_FIELDS, "$expand": EXPAND_FIELDS, "$filter": filtro, "$top": 100}
-    data = req(params) or []
-    # >>> garante processar primeiro os maiores IDs
-    try:
-        data.sort(key=lambda t: int(t.get("id", 0)), reverse=True)
-    except Exception:
-        pass
-    time.sleep(THROTTLE_SEC)
-    return data
-
-def upsert_rows(conn, rows: List[Dict[str, Any]]) -> int:
-    if not rows: return 0
-    payload = [(
-        r["ticket_id"], r["status"], r["justificativa"],
-        r["seconds_uti"], r["permanency_time_fulltime_seconds"],
-        json.dumps(r["changed_by"], ensure_ascii=False),
-        r["changed_date"], r["agent_name"], r["team_name"], r["time_squad"]
-    ) for r in rows]
+def clear_audit_ids(conn, ids: List[int]) -> None:
+    if not ids:
+        return
     sql = f"""
-        insert into {SCHEMA_RESOLUCAO}.resolucao_por_status
-          (ticket_id, status, justificativa, seconds_uti,
-           permanency_time_fulltime_seconds, changed_by, changed_date,
-           agent_name, team_name, time_squad)
-        values %s
-        on conflict (ticket_id, status, justificativa, changed_date) do update set
-           seconds_uti = excluded.seconds_uti,
-           permanency_time_fulltime_seconds = excluded.permanency_time_fulltime_seconds,
-           changed_by = excluded.changed_by,
-           agent_name = excluded.agent_name,
-           team_name  = excluded.team_name,
-           time_squad = excluded.time_squad,
-           imported_at = now()
-    """
-    with conn.cursor() as cur:
-        execute_values(cur, sql, payload, page_size=200)
-    conn.commit()
-    return len(rows)
-
-def clear_audit(conn, ids: List[int]):
-    if not ids: return
-    sql = f"""
-        delete from {SCHEMA_RESOLVIDOS}.audit_recent_missing
+        delete from {SCHEMA_AUD}.audit_recent_missing
          where table_name = 'resolucao_por_status'
            and ticket_id = any(%s)
     """
@@ -195,53 +106,267 @@ def clear_audit(conn, ids: List[int]):
         cur.execute(sql, (ids,))
     conn.commit()
 
-def heartbeat(conn):
+def heartbeat_sync(conn, name="resolucao_por_status") -> None:
+    """
+    Marca um 'heartbeat' em visualizacao_resolucao.sync_cntrol (nome do usuário).
+    """
     with conn.cursor() as cur:
         cur.execute(f"""
-            insert into {SCHEMA_RESOLUCAO}.sync_control (name, last_update)
-            values ('resolucao_por_status', now())
-            on conflict (name) do update set last_update = excluded.last_update
+            create table if not exists {SCHEMA_RPS}.sync_cntrol(
+                name text primary key,
+                last_update timestamp not null,
+                key text,
+                value text
+            )
         """)
+        cur.execute(f"""
+            insert into {SCHEMA_RPS}.sync_cntrol(name,last_update)
+            values (%s, now())
+            on conflict (name) do update
+                set last_update = excluded.last_update
+        """, (name,))
     conn.commit()
 
-def main():
-    with psycopg2.connect(DSN) as conn:
-        ensure_structure(conn)
+# ==================== Movidesk fetch ====================
 
-        ids = get_audit_ids(conn, BATCH_LIMIT)  # já vem DESC
-        if not ids:
-            logging.info("Nada para fazer (audit vazia).")
-            heartbeat(conn); return
+def chunked(seq: List[int], size: int) -> Iterable[List[int]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
-        total_upserts, processed_ids = 0, []
+def build_expand():
+    # Puxa histórico de status com agente e possíveis times
+    return (
+        "statusHistories("
+        "$select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate,changedByTeam;"
+        "$expand=changedBy($select=id,businessName;$expand=teams($select=businessName))"
+        ")"
+    )
 
-        for group in chunked(ids, IDS_GROUP_SIZE):
+def fetch_chunk(ids_chunk: List[int]) -> List[Dict[str, Any]]:
+    if not ids_chunk:
+        return []
+    filt = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
+    params = {
+        "$select": "id,ownerTeam",
+        "$expand": build_expand(),
+        "$filter": filt,
+        "$top": 100
+    }
+    data = od_get(params) or []
+    # Movidesk pode retornar 1 objeto isolado em alguns casos improváveis
+    return data if isinstance(data, list) else [data]
+
+# ==================== Transform ====================
+
+GENERIC_TEAMS = {
+    "administradores","agente administrador","administrators","agent administrator",
+    "default","geral","todos","all","users","usuários","colaboradores"
+}
+TEAM_PRIORITY = ["telefone","chat","n1","n2","cs","suporte","service desk","desenvolvimento","squad","projeto"]
+
+def _owner_team_name(ticket: Dict[str, Any]) -> str:
+    ot = ticket.get("ownerTeam")
+    if isinstance(ot, dict):
+        return (ot.get("businessName") or "").strip()
+    if isinstance(ot, str):
+        return ot.strip()
+    return ""
+
+def _pick_team(changed_by: Dict[str, Any], owner_team: str, changed_by_team: Any) -> str:
+    # 1) se statusHistory trouxe changedByTeam, usa
+    if isinstance(changed_by_team, dict):
+        n = (changed_by_team.get("businessName") or "").strip()
+        if n:
+            return n
+    if isinstance(changed_by_team, str):
+        n = changed_by_team.strip()
+        if n:
+            return n
+
+    # 2) tenta pelos teams do agente (exclui genéricos, prioriza por palavras-chave)
+    names: List[str] = []
+    if isinstance(changed_by, dict):
+        teams = changed_by.get("teams")
+        if isinstance(teams, list):
+            for t in teams:
+                n = (t.get("businessName") if isinstance(t, dict) else (t if isinstance(t, str) else "")) or ""
+                n = n.strip()
+                low = n.lower()
+                if n and low not in GENERIC_TEAMS and not low.startswith("admin"):
+                    names.append(n)
+
+    names = list(dict.fromkeys(names))
+    if not names and isinstance(changed_by, dict):
+        teams = changed_by.get("teams")
+        if isinstance(teams, list):
+            for t in teams:
+                n = (t.get("businessName") if isinstance(t, dict) else (t if isinstance(t, str) else "")) or ""
+                n = n.strip()
+                if n:
+                    names.append(n)
+        names = list(dict.fromkeys(names))
+
+    if names:
+        lowered = [n.lower() for n in names]
+        for key in TEAM_PRIORITY:
+            for i, low in enumerate(lowered):
+                if key in low:
+                    return names[i]
+        return names[0]
+
+    # 3) fallback para a equipe do ticket
+    return owner_team or ""
+
+def map_rows(ticket: Dict[str, Any]) -> List[tuple]:
+    """
+    Produz linhas para upsert:
+      (ticket_id, status, justificativa, seconds_uti, permanency_time_fulltime_seconds,
+       changed_by_json, changed_date, agent_name, team_name, time_squad)
+    """
+    tid = int(ticket.get("id"))
+    owner_team = _owner_team_name(ticket)
+    out: List[tuple] = []
+
+    for h in ticket.get("statusHistories") or []:
+        status = h.get("status") or ""
+        justificativa = h.get("justification") or ""
+        sec_work = int(h.get("permanencyTimeWorkingTime") or 0)
+        sec_full = float(h.get("permanencyTimeFullTime") or 0.0)
+        changed_by = h.get("changedBy") or {}
+        agent = changed_by.get("businessName") if isinstance(changed_by, dict) else ""
+        team = _pick_team(changed_by, owner_team, h.get("changedByTeam"))
+        changed_date = h.get("changedDate")
+        # time_squad: mantemos vazio; triggers podem preencher (se houver)
+        out.append((
+            tid, status, justificativa, sec_work, sec_full,
+            json.dumps(changed_by, ensure_ascii=False),
+            changed_date, agent or "", team or "", None  # time_squad
+        ))
+    return out
+
+def dedupe(rows: List[tuple]) -> List[tuple]:
+    seen = set()
+    out: List[tuple] = []
+    for r in rows:
+        key = (r[0], r[1], r[2], r[6])  # ticket_id, status, justificativa, changed_date
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+# ==================== Upsert ====================
+
+UPSERT_SQL = f"""
+insert into {SCHEMA_RPS}.resolucao_por_status
+(ticket_id, status, justificativa, seconds_uti, permanency_time_fulltime_seconds,
+ changed_by, changed_date, agent_name, team_name, time_squad)
+values %s
+on conflict (ticket_id, status, justificativa, changed_date) do update set
+  seconds_uti                         = excluded.seconds_uti,
+  permanency_time_fulltime_seconds    = excluded.permanency_time_fulltime_seconds,
+  changed_by                          = excluded.changed_by,
+  agent_name                          = excluded.agent_name,
+  team_name                           = excluded.team_name,
+  time_squad                          = excluded.time_squad,
+  imported_at                         = now()
+"""
+
+def upsert_rows(conn, rows: List[tuple]) -> None:
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        execute_values(cur, UPSERT_SQL, rows, page_size=200)
+    conn.commit()
+
+# ==================== Main loop ====================
+
+def process_ids(conn, ids: List[int]) -> int:
+    """
+    Busca tickets em grupos (maiores IDs primeiro já vem do SELECT),
+    grava linhas e limpa da audit somente os IDs que vieram com payload.
+    """
+    if not ids:
+        return 0
+
+    group = max(1, IDS_GROUP_SIZE)
+    processed_ids: List[int] = []
+    total_rows = 0
+
+    i = 0
+    while i < len(ids):
+        part = ids[i:i+group]
+        try:
+            data = fetch_chunk(part)
+        except requests.HTTPError as e:
+            # se vier erro de complexidade (ex.: MaxNodeCount), reduz o grupo
+            if group > 1 and any(code in str(e).lower() for code in ["maxnodecount", "request too long", "odata"]):
+                group = max(1, group // 2)
+                logging.warning("Reducing group size to %s due to OData limits", group)
+                continue
+            else:
+                logging.warning("Erro HTTP duro em fetch_chunk: %s", e)
+                # avança mesmo assim pra não travar na mesma página
+                i += len(part)
+                continue
+
+        rows_all: List[tuple] = []
+        got_tids = set()
+
+        for t in data or []:
             try:
-                data = fetch_group(group)  # ordenado por id desc
-                rows_all: List[Dict[str, Any]] = []
-                for t in data or []:
-                    rows_all.extend(map_histories(t))
+                tid = int(t.get("id"))
+                got_tids.add(tid)
+                rows = dedupe(map_rows(t))
+                rows_all.extend(rows)
+            except Exception as ex:
+                logging.warning("Falha ao mapear ticket: %s :: %s", t.get("id"), ex)
 
-                # >>> insere com os maiores IDs primeiro (e, dentro do ticket, pelo changed_date)
-                rows_all.sort(key=lambda r: (-int(r["ticket_id"]), str(r["changed_date"]) if r["changed_date"] else ""))
+        if rows_all:
+            upsert_rows(conn, rows_all)
+            total_rows += len(rows_all)
 
-                if rows_all:
-                    total_upserts += upsert_rows(conn, rows_all)
+        if got_tids:
+            clear_audit_ids(conn, sorted(got_tids, reverse=True))
+            processed_ids.extend(sorted(got_tids, reverse=True))
 
-                returned = []
-                for t in data or []:
-                    try: returned.append(int(t.get("id")))
-                    except Exception: pass
-                if returned:
-                    processed_ids.extend(returned)
-            except requests.HTTPError as e:
-                logging.warning("Falha no grupo %s: %s", group, e)
+        i += len(part)
 
-        if processed_ids:
-            clear_audit(conn, list(set(processed_ids)))
-        heartbeat(conn)
-        logging.info("Finalizado. Upserts: %d | IDs limpos: %d",
-                     total_upserts, len(set(processed_ids)))
+    if processed_ids:
+        logging.info("Processados (e limpos da audit): %d tickets", len(processed_ids))
+    return total_rows
+
+def main():
+    total_upsert = 0
+    with get_conn() as conn:
+        heartbeat_sync(conn)  # cria tabela se preciso e marca heartbeat
+        ilimitado = (BATCH_SIZE <= 0)
+
+        while True:
+            page_limit = AUDIT_LIMIT if ilimitado else min(AUDIT_LIMIT, BATCH_SIZE)
+            ids = get_audit_page(conn, page_limit)
+
+            if not ids:
+                logging.info("Fila vazia para 'resolucao_por_status'. Nada a fazer.")
+                break
+
+            if not ilimitado and len(ids) > BATCH_SIZE:
+                ids = ids[:BATCH_SIZE]
+
+            logging.info("Lote da fila (maiores IDs primeiro): %s%s",
+                         ids[:10], " ..." if len(ids) > 10 else "")
+            total_upsert += process_ids(conn, ids)
+
+            if not ilimitado:
+                break  # modo 'um único lote'
+
+            # loop até esvaziar a audit ou não gerar mais nada
+            if len(ids) < page_limit:
+                break
+
+        heartbeat_sync(conn)  # marca finalização do ciclo
+
+    logging.info("FIM. Linhas upsertadas: %d", total_upsert)
 
 if __name__ == "__main__":
     main()
