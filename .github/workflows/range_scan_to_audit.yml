@@ -2,18 +2,18 @@ name: Movidesk - Range scan semanal -> audit (tickets_resolvidos)
 
 on:
   schedule:
-   
+    # 20:00 America/Sao_Paulo ~ 23:00 UTC
     - cron: "0 23 * * 4"
   workflow_dispatch: {}
 
 concurrency:
   group: range-scan-semanal
-  cancel-in-progress: false   
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 4320   
+    timeout-minutes: 4320  # até 3 dias
     steps:
       - uses: actions/checkout@v4
 
@@ -25,10 +25,10 @@ jobs:
 
       - name: Range scan (loop contínuo até data_fim == ultima_data_validada)
         env:
-          NEON_DSN:            ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN:      ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_API_TOKEN:  ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT:    "400"
-          RANGE_SCAN_THROTTLE: "0.25"
-          RANGE_SCAN_SLEEP_SEC:"600"     
+          NEON_DSN:             ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN:       ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN:   ${{ secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_LIMIT:     "400"
+          RANGE_SCAN_THROTTLE:  "0.25"
+          RANGE_SCAN_SLEEP_SEC: "600"   # 10 minutos entre ciclos
         run: python range_scan_to_audit.py
