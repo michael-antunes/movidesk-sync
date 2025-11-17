@@ -1,45 +1,38 @@
-name: Movidesk - Range scan semanal -> audit (tickets_resolvidos)
+name: Movidesk - Range scan worker (*/10min até concluir)
 
 on:
   schedule:
-    # 20:00 America/Sao_Paulo ~ 23:00 UTC (toda quinta)
-    - cron: "0 23 * * 4"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
 
 concurrency:
-  group: range-scan-semanal
+  group: range-scan-worker
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    # deixe o job com folga; o script para sozinho em ~4 min
-    timeout-minutes: 15
+    # o script limita a ~4min; 10min dá folga de setup/pip
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
 
-      # cria requirements.txt para habilitar cache de pip
-      - name: Create requirements.txt
-        run: |
-          echo "requests" > requirements.txt
-          echo "psycopg2-binary" >> requirements.txt
-
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
+          cache: pip
 
-      - run: pip install -r requirements.txt
+      - run: pip install requests psycopg2-binary
 
-      - name: Range scan (loop até data_fim == ultima_data_validada, com teto de ~4min)
+      - name: Range scan (curto; avança janela e para quando terminar)
         env:
-          NEON_DSN:               ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN:         ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_API_TOKEN:     ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT:       "400"
-          RANGE_SCAN_THROTTLE:    "0.25"
-          RANGE_SCAN_MAX_RUNTIME_SEC: "240"   # ~4 minutos de trabalho real
-          RANGE_SCAN_SLEEP_SEC:   "0"         # não dormir entre ciclos neste job
+          NEON_DSN:                   ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN:             ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN:         ${{ secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_LIMIT:           "400"
+          RANGE_SCAN_THROTTLE:        "0.25"
+          RANGE_SCAN_MAX_RUNTIME_SEC: "240"   # ~4 min por execução
+          RANGE_SCAN_SLEEP_SEC:       "0"     # sem dormir dentro do run
         run: python range_scan_to_audit.py
