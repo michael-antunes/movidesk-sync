@@ -1,4 +1,4 @@
-name: Movidesk - Range scan worker (*/10min até concluir)
+name: Movidesk - Range scan worker (*/10m até completar)
 
 on:
   schedule:
