@@ -3,7 +3,7 @@ name: Movidesk - Tickets resolvidos (detail)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/3 * * * *"   # UTC
+    - cron: "*/5 * * * *"   # UTC
 
 concurrency:
   group: movidesk-detail-${{ github.ref }}
