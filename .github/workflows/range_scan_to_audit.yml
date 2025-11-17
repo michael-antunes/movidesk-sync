@@ -1,38 +1,34 @@
-name: Movidesk - Range scan reset (weekly)
+name: Movidesk - Range scan semanal -> audit (tickets_resolvidos)
 
 on:
   schedule:
-    - cron: "0 23 * * 4"   # 23:00 UTC de quinta = 20:00 BRT
+    # 20:00 America/Sao_Paulo ~ 23:00 UTC
+    - cron: "0 23 * * 4"
   workflow_dispatch: {}
 
+concurrency:
+  group: range-scan-semanal
+  cancel-in-progress: false
+
 jobs:
-  reset:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install psycopg2-binary
-      - name: Reset cursor (quinta 20h BRT)
+
+      - run: pip install requests psycopg2-binary
+
+      - name: Range scan (loop contínuo até data_fim == ultima_data_validada)
         env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          python - <<'PY'
-          import os, psycopg2
-          dsn = os.environ["NEON_DSN"]
-          with psycopg2.connect(dsn) as c, c.cursor() as cur:
-              cur.execute("""
-                  insert into visualizacao_resolvidos.range_scan_control(data_inicio,data_fim,ultima_data_validada)
-                  values (now(), timestamptz '2018-01-01 00:00:00+00', now())
-                  on conflict do nothing
-              """)
-              cur.execute("""
-                  update visualizacao_resolvidos.range_scan_control
-                     set data_inicio = now(),
-                         data_fim = timestamptz '2018-01-01 00:00:00+00',
-                         ultima_data_validada = now()
-              """)
-              c.commit()
-          print("reset feito.")
-          PY
+          NEON_DSN:             ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN:       ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN:   ${{ secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_LIMIT:     "400"
+          RANGE_SCAN_THROTTLE:  "0.25"
+          RANGE_SCAN_SLEEP_SEC: "600"   # 10 minutos entre ciclos
+        run: python range_scan_to_audit.py
