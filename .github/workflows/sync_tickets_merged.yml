@@ -1,0 +1,25 @@
+name: Movidesk - Tickets mesclados
+
+on:
+  schedule:
+    - cron: "15 * * * *"   # de hora em hora no min 15 (ajuste como preferir)
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests psycopg2-binary
+      - name: Sync merges
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          THROTTLE_SEC: "0.25"
+          MERGED_BATCH: "300"
+        run: python sync_tickets_merged.py
