@@ -10,6 +10,10 @@ concurrency:
   group: range-scan-kickoff
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  actions: write   # <-- necessário para acionar outro workflow
+
 jobs:
   kickoff:
     runs-on: ubuntu-latest
@@ -30,3 +34,11 @@ jobs:
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python range_scan_kickoff.py
+
+      - name: Disparar o worker agora (workflow_dispatch)
+        run: |
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
+            -d '{"ref":"main"}'
