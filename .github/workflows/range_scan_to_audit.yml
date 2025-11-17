@@ -1,8 +1,11 @@
+# .github/workflows/range_scan_to_audit.yml
 name: Movidesk - Range scan -> audit (tickets_resolvidos)
+
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0 20 * * 4"   # toda quinta-feira às 20:00 (UTC)
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
