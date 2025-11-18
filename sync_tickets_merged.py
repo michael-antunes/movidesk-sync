@@ -76,6 +76,9 @@ def normalize_merged_response(raw):
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
+        v = raw.get("mergedTickets")
+        if isinstance(v, list):
+            return v
         for key in ("value", "items", "data", "tickets", "results"):
             v = raw.get(key)
             if isinstance(v, list):
@@ -108,17 +111,26 @@ def try_fetch_dedicated(conn):
     for it in data:
         if not isinstance(it, dict):
             continue
-        src = it.get("sourceId") or it.get("ticketId") or it.get("source") or it.get("fromId")
-        dst = it.get("targetId") or it.get("mergedIntoId") or it.get("target") or it.get("toId")
-        dt = it.get("mergedDate") or it.get("performedAt") or it.get("date")
+        principal = it.get("ticketId") or it.get("id")
+        merged_ids_raw = it.get("mergedTicketsIds") or it.get("mergedTicketsId")
+        dt = it.get("lastUpdate") or it.get("mergedDate") or it.get("performedAt") or it.get("date")
         try:
-            src = int(src) if src is not None else None
-            dst = int(dst) if dst is not None else None
+            principal = int(str(principal)) if principal is not None else None
         except Exception:
+            principal = None
+        if not principal or not merged_ids_raw:
             continue
-        if not src:
-            continue
-        rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
+        if isinstance(merged_ids_raw, (list, tuple, set)):
+            ids_list = merged_ids_raw
+        else:
+            parts = re.split(r"[,\s;]+", str(merged_ids_raw))
+            ids_list = [p for p in parts if p]
+        for sid in ids_list:
+            try:
+                src = int(str(sid))
+            except Exception:
+                continue
+            rows.append((src, principal, dt, json.dumps(it, ensure_ascii=False)))
     if not rows:
         print("tickets_mesclados: /tickets/merged não retornou nenhum registro válido.")
         return False
@@ -201,7 +213,12 @@ def main():
         ensure_table(conn)
         ok = try_fetch_dedicated(conn)
         if not ok:
-            run_fallback(conn)
+            try:
+                run_fallback(conn)
+            except requests.HTTPError as e:
+                print(f"[WARN] fallback por histories falhou: {e}")
+            except Exception as e:
+                print(f"[WARN] erro inesperado no fallback: {e}")
         print("tickets_mesclados: sincronização concluída.")
 
 if __name__ == "__main__":
