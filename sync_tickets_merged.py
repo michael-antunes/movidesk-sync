@@ -146,14 +146,18 @@ def register_sync_run(conn, last_update):
                 """
                 insert into visualizacao_resolvidos.sync_control(name, job_name, last_update)
                 values (%s, %s, %s)
+                on conflict (name) do update set
+                  job_name    = excluded.job_name,
+                  last_update = excluded.last_update,
+                  run_at      = now()
                 """,
                 (job, job, last_update),
             )
         else:
             cur.execute(
                 """
-                insert into visualizacao_resolvidos.sync_control(job_name, last_update)
-                values (%s, %s)
+                insert into visualizacao_resolvidos.sync_control(job_name, last_update, run_at)
+                values (%s, %s, now())
                 """,
                 (job, last_update),
             )
