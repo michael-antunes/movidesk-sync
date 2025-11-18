@@ -11,7 +11,7 @@ from psycopg2.extras import execute_values
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
-BATCH = int(os.getenv("MERGED_BATCH", "200"))
+BATCH = int(os.getenv("MERGED_BATCH", "400"))
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
 
 if not TOKEN or not DSN:
@@ -55,6 +55,23 @@ def ensure_table(conn):
         )
     conn.commit()
 
+def ensure_sync_control(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            create table if not exists visualizacao_resolvidos.sync_control(
+              id bigserial primary key,
+              job_name text not null,
+              last_update timestamptz,
+              run_at timestamptz default now()
+            )
+            """
+        )
+        cur.execute(
+            "create index if not exists ix_sync_control_job on visualizacao_resolvidos.sync_control(job_name, last_update)"
+        )
+    conn.commit()
+
 def upsert_rows(conn, rows):
     if not rows:
         return
@@ -90,11 +107,27 @@ def normalize_merged_response(raw):
     print("tickets_mesclados: tipo inesperado em /tickets/merged:", type(raw).__name__)
     return []
 
-def get_last_merged_at(conn):
+def get_last_sync_update(conn):
     with conn.cursor() as cur:
-        cur.execute("select max(merged_at) from visualizacao_resolvidos.tickets_mesclados")
+        cur.execute(
+            "select max(last_update) from visualizacao_resolvidos.sync_control where job_name = %s",
+            ("tickets_merged",),
+        )
         row = cur.fetchone()
         return row[0]
+
+def register_sync_run(conn, last_update):
+    if not last_update:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into visualizacao_resolvidos.sync_control(job_name, last_update)
+            values (%s, %s)
+            """,
+            ("tickets_merged", last_update),
+        )
+    conn.commit()
 
 def fmt_dt_for_md(d):
     if not d:
@@ -108,17 +141,18 @@ def fmt_dt_for_md(d):
     return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def try_fetch_dedicated(conn):
-    last_dt = get_last_merged_at(conn)
+    last_dt = get_last_sync_update(conn)
     now_dt = datetime.now(timezone.utc)
     base_params = {}
-    if last_dt:
-        s = fmt_dt_for_md(last_dt)
-        if s:
-            base_params["startDate"] = s
+    s = fmt_dt_for_md(last_dt)
+    if s:
+        base_params["startDate"] = s
     base_params["endDate"] = fmt_dt_for_md(now_dt)
     page = 1
     total_pages = None
     total_inserted = 0
+    processed = 0
+    max_dt_val = None
     while True:
         params = dict(base_params)
         params["pageNumber"] = page
@@ -163,18 +197,29 @@ def try_fetch_dedicated(conn):
                 parts = re.split(r"[,\s;]+", str(merged_ids_raw))
                 ids_list = [p for p in parts if p]
             for sid in ids_list:
+                if processed >= BATCH:
+                    break
                 try:
                     src = int(str(sid))
                 except Exception:
                     continue
                 rows.append((src, principal, dt_val, json.dumps(it, ensure_ascii=False)))
+                processed += 1
+                if dt_val and (max_dt_val is None or str(dt_val) > str(max_dt_val)):
+                    max_dt_val = dt_val
+            if processed >= BATCH:
+                break
         if rows:
             upsert_rows(conn, rows)
             total_inserted += len(rows)
+        if processed >= BATCH:
+            break
         if total_pages is not None and page >= total_pages:
             break
         page += 1
         time.sleep(THROTTLE)
+    if max_dt_val:
+        register_sync_run(conn, max_dt_val)
     if total_inserted == 0:
         print("tickets_mesclados: nenhum novo registro via /tickets/merged.")
         return True
@@ -261,6 +306,7 @@ def run_fallback(conn):
 def main():
     with psycopg2.connect(DSN) as conn:
         ensure_table(conn)
+        ensure_sync_control(conn)
         ok = try_fetch_dedicated(conn)
         if not ok:
             try:
