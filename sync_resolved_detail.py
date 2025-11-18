@@ -17,6 +17,7 @@ if not TOKEN or not DSN:
 S = requests.Session()
 S.headers.update({"User-Agent": "movidesk-sync/detail"})
 
+
 def md_get(path_or_full, params=None, ok_404=False):
     url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
     p = dict(params or {})
@@ -33,6 +34,7 @@ def md_get(path_or_full, params=None, ok_404=False):
             return r2.json() or {}
     r.raise_for_status()
 
+
 SQL_GET_PENDING = """
 select ticket_id
   from visualizacao_resolvidos.audit_recent_missing
@@ -47,6 +49,7 @@ delete from visualizacao_resolvidos.audit_recent_missing
  where table_name = 'tickets_resolvidos'
    and ticket_id = any(%s)
 """
+
 
 def register_ticket_failure(conn, ticket_id, reason):
     with conn.cursor() as cur:
@@ -66,3 +69,154 @@ def register_ticket_failure(conn, ticket_id, reason):
             (ticket_id,),
         )
     conn.commit()
+
+
+def get_pending_ids(conn, limit):
+    with conn.cursor() as cur:
+        cur.execute(SQL_GET_PENDING, (limit,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def build_detail_row(ticket):
+    owner = ticket.get("owner") or {}
+    org = ticket.get("organization") or {}
+    clients = ticket.get("clients") or []
+    client = clients[0] if clients else {}
+    return (
+        int(ticket["id"]),
+        ticket.get("status"),
+        ticket.get("lastResolvedDate"),
+        ticket.get("lastClosedDate"),
+        ticket.get("lastCancelledDate"),
+        ticket.get("lastUpdate"),
+        ticket.get("origin"),
+        ticket.get("category"),
+        ticket.get("urgency"),
+        ticket.get("serviceFirstLevel"),
+        ticket.get("serviceSecondLevel"),
+        ticket.get("serviceThirdLevel"),
+        owner.get("id"),
+        owner.get("businessName"),
+        owner.get("team"),
+        org.get("id"),
+        org.get("businessName"),
+        ticket.get("subject"),
+        client.get("businessName"),
+    )
+
+
+def upsert_details(conn, rows):
+    if not rows:
+        return
+    sql = """
+    insert into visualizacao_resolvidos.tickets_resolvidos (
+      ticket_id,
+      status,
+      last_resolved_at,
+      last_closed_at,
+      last_cancelled_at,
+      last_update,
+      origin,
+      category,
+      urgency,
+      service_first_level,
+      service_second_level,
+      service_third_level,
+      owner_id,
+      owner_name,
+      owner_team_name,
+      organization_id,
+      organization_name,
+      subject,
+      adicional_nome
+    )
+    values %s
+    on conflict (ticket_id) do update set
+      status               = excluded.status,
+      last_resolved_at     = excluded.last_resolved_at,
+      last_closed_at       = excluded.last_closed_at,
+      last_cancelled_at    = excluded.last_cancelled_at,
+      last_update          = excluded.last_update,
+      origin               = excluded.origin,
+      category             = excluded.category,
+      urgency              = excluded.urgency,
+      service_first_level  = excluded.service_first_level,
+      service_second_level = excluded.service_second_level,
+      service_third_level  = excluded.service_third_level,
+      owner_id             = excluded.owner_id,
+      owner_name           = excluded.owner_name,
+      owner_team_name      = excluded.owner_team_name,
+      organization_id      = excluded.organization_id,
+      organization_name    = excluded.organization_name,
+      subject              = excluded.subject,
+      adicional_nome       = excluded.adicional_nome
+    """
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=200)
+    conn.commit()
+
+
+def delete_processed_from_missing(conn, ids):
+    if not ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(SQL_DELETE_MISSING, (ids,))
+    conn.commit()
+
+
+def main():
+    with psycopg2.connect(DSN) as conn:
+        pending = get_pending_ids(conn, BATCH)
+        if not pending:
+            print("detail: nenhum ticket pendente em audit_recent_missing.")
+            return
+        detalhes = []
+        ok_ids = []
+        for tid in pending:
+            try:
+                data = md_get(
+                    f"tickets/{tid}",
+                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
+                    ok_404=True,
+                )
+            except requests.HTTPError as e:
+                try:
+                    status = e.response.status_code
+                except Exception:
+                    status = None
+                register_ticket_failure(conn, tid, f"http_error_{status or 'unknown'}")
+                continue
+            except Exception:
+                register_ticket_failure(conn, tid, "exception_api")
+                continue
+            if data is None:
+                register_ticket_failure(conn, tid, "not_found_404")
+                continue
+            if isinstance(data, list):
+                if not data:
+                    register_ticket_failure(conn, tid, "empty_list")
+                    continue
+                ticket = data[0]
+            else:
+                ticket = data
+            if not ticket.get("id"):
+                register_ticket_failure(conn, tid, "missing_id")
+                continue
+            try:
+                row = build_detail_row(ticket)
+            except Exception:
+                register_ticket_failure(conn, tid, "build_row_error")
+                continue
+            detalhes.append(row)
+            ok_ids.append(tid)
+            time.sleep(THROTTLE)
+        if not detalhes:
+            print("detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch.")
+            return
+        upsert_details(conn, detalhes)
+        delete_processed_from_missing(conn, ok_ids)
+        print(f"detail: {len(ok_ids)} tickets processados e removidos do missing.")
+
+
+if __name__ == "__main__":
+    main()
