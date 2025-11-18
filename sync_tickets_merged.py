@@ -60,12 +60,20 @@ def ensure_sync_control(conn):
         cur.execute(
             """
             create table if not exists visualizacao_resolvidos.sync_control(
-              id bigserial primary key,
-              job_name text not null,
+              job_name text,
               last_update timestamptz,
               run_at timestamptz default now()
             )
             """
+        )
+        cur.execute(
+            "alter table visualizacao_resolvidos.sync_control add column if not exists job_name text"
+        )
+        cur.execute(
+            "alter table visualizacao_resolvidos.sync_control add column if not exists last_update timestamptz"
+        )
+        cur.execute(
+            "alter table visualizacao_resolvidos.sync_control add column if not exists run_at timestamptz default now()"
         )
         cur.execute(
             "create index if not exists ix_sync_control_job on visualizacao_resolvidos.sync_control(job_name, last_update)"
