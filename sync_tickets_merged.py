@@ -2,6 +2,8 @@ import os
 import re
 import time
 import json
+from datetime import datetime, timezone
+
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
@@ -88,54 +90,95 @@ def normalize_merged_response(raw):
     print("tickets_mesclados: tipo inesperado em /tickets/merged:", type(raw).__name__)
     return []
 
+def get_last_merged_at(conn):
+    with conn.cursor() as cur:
+        cur.execute("select max(merged_at) from visualizacao_resolvidos.tickets_mesclados")
+        row = cur.fetchone()
+        return row[0]
+
+def fmt_dt_for_md(d):
+    if not d:
+        return None
+    if isinstance(d, str):
+        return d
+    if not isinstance(d, datetime):
+        return str(d)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 def try_fetch_dedicated(conn):
-    try:
-        raw = md_get("tickets/merged", params={"$orderby": "mergedDate desc", "$top": 1000}, ok_404=True)
-    except requests.HTTPError as e:
-        print(f"[WARN] dedicated endpoint not available ({e}). Using fallback by histories.")
-        return False
-    except Exception as e:
-        print(f"[WARN] erro ao chamar /tickets/merged: {e}. Usando fallback por histories.")
-        return False
-
-    if raw is None:
-        print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
-        return False
-
-    data = normalize_merged_response(raw)
-    if not data:
-        print("tickets_mesclados: /tickets/merged não retornou registros utilizáveis.")
-        return False
-
-    rows = []
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        principal = it.get("ticketId") or it.get("id")
-        merged_ids_raw = it.get("mergedTicketsIds") or it.get("mergedTicketsId")
-        dt = it.get("lastUpdate") or it.get("mergedDate") or it.get("performedAt") or it.get("date")
+    last_dt = get_last_merged_at(conn)
+    now_dt = datetime.now(timezone.utc)
+    base_params = {}
+    if last_dt:
+        s = fmt_dt_for_md(last_dt)
+        if s:
+            base_params["startDate"] = s
+    base_params["endDate"] = fmt_dt_for_md(now_dt)
+    page = 1
+    total_pages = None
+    total_inserted = 0
+    while True:
+        params = dict(base_params)
+        params["pageNumber"] = page
         try:
-            principal = int(str(principal)) if principal is not None else None
-        except Exception:
-            principal = None
-        if not principal or not merged_ids_raw:
-            continue
-        if isinstance(merged_ids_raw, (list, tuple, set)):
-            ids_list = merged_ids_raw
-        else:
-            parts = re.split(r"[,\s;]+", str(merged_ids_raw))
-            ids_list = [p for p in parts if p]
-        for sid in ids_list:
-            try:
-                src = int(str(sid))
-            except Exception:
+            raw = md_get("tickets/merged", params=params, ok_404=True)
+        except requests.HTTPError as e:
+            print(f"[WARN] dedicated endpoint not available ({e}). Using fallback by histories.")
+            return False
+        except Exception as e:
+            print(f"[WARN] erro ao chamar /tickets/merged: {e}. Usando fallback por histories.")
+            return False
+        if raw is None:
+            print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
+            return False
+        data = normalize_merged_response(raw)
+        if not data:
+            break
+        if isinstance(raw, dict) and total_pages is None:
+            pn = raw.get("pageNumber") or ""
+            m = re.search(r"of\s+(\d+)", str(pn))
+            if m:
+                try:
+                    total_pages = int(m.group(1))
+                except Exception:
+                    total_pages = None
+        rows = []
+        for it in data:
+            if not isinstance(it, dict):
                 continue
-            rows.append((src, principal, dt, json.dumps(it, ensure_ascii=False)))
-    if not rows:
-        print("tickets_mesclados: /tickets/merged não retornou nenhum registro válido.")
-        return False
-    upsert_rows(conn, rows)
-    print(f"tickets_mesclados: {len(rows)} registros inseridos via /tickets/merged.")
+            principal = it.get("ticketId") or it.get("id")
+            merged_ids_raw = it.get("mergedTicketsIds") or it.get("mergedTicketsId")
+            dt_val = it.get("lastUpdate") or it.get("mergedDate") or it.get("performedAt") or it.get("date")
+            try:
+                principal = int(str(principal)) if principal is not None else None
+            except Exception:
+                principal = None
+            if not principal or not merged_ids_raw:
+                continue
+            if isinstance(merged_ids_raw, (list, tuple, set)):
+                ids_list = merged_ids_raw
+            else:
+                parts = re.split(r"[,\s;]+", str(merged_ids_raw))
+                ids_list = [p for p in parts if p]
+            for sid in ids_list:
+                try:
+                    src = int(str(sid))
+                except Exception:
+                    continue
+                rows.append((src, principal, dt_val, json.dumps(it, ensure_ascii=False)))
+        if rows:
+            upsert_rows(conn, rows)
+            total_inserted += len(rows)
+        if total_pages is not None and page >= total_pages:
+            break
+        page += 1
+        time.sleep(THROTTLE)
+    if total_inserted == 0:
+        print("tickets_mesclados: nenhum novo registro via /tickets/merged.")
+        return True
+    print(f"tickets_mesclados: {total_inserted} registros inseridos via /tickets/merged.")
     return True
 
 JUSTIF_RX = re.compile(r"(mescl|merge|unid|duplic)", re.I)
@@ -157,18 +200,25 @@ def get_a_candidate_ids(conn, limit):
         )
         return [r[0] for r in cur.fetchall()]
 
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
 def fetch_histories_for(ids):
     if not ids:
         return []
-    filtro = " or ".join([f"id eq {i}" for i in ids])
-    params = {
-        "$select": "id",
-        "$filter": filtro,
-        "$expand": "statusHistories($select=status,justification,changedDate)",
-    }
-    data = md_get("tickets", params)
-    time.sleep(THROTTLE)
-    return data or []
+    all_data = []
+    for chunk in chunked(ids, 40):
+        filtro = " or ".join([f"id eq {i}" for i in chunk])
+        params = {
+            "$select": "id",
+            "$filter": filtro,
+            "$expand": "statusHistories($select=status,justification,changedDate)",
+        }
+        data = md_get("tickets", params)
+        all_data.extend(data or [])
+        time.sleep(THROTTLE)
+    return all_data
 
 def extract_merge_from_histories(item):
     tid = item.get("id")
