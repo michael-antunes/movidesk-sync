@@ -2,7 +2,7 @@ name: Movidesk - Tickets mesclados
 
 on:
   schedule:
-    - cron: "15 * * * *"   # de hora em hora no min 15 (ajuste como preferir)
+    - cron: "15 * * * *"
   workflow_dispatch: {}
 
 jobs:
