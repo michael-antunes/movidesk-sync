@@ -70,37 +70,64 @@ def upsert_rows(conn, rows):
         execute_values(cur, sql, rows, page_size=200)
     conn.commit()
 
+def normalize_merged_response(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("value", "items", "data", "tickets", "results"):
+            v = raw.get(key)
+            if isinstance(v, list):
+                return v
+        print("tickets_mesclados: resposta inesperada de /tickets/merged:", json.dumps(raw, ensure_ascii=False)[:400])
+        return []
+    print("tickets_mesclados: tipo inesperado em /tickets/merged:", type(raw).__name__)
+    return []
+
 def try_fetch_dedicated(conn):
     try:
-        data = md_get("tickets/merged", params={"$orderby": "mergedDate desc", "$top": 1000}, ok_404=True)
-        if data is None:
-            print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
-            return False
-        rows = []
-        for it in data or []:
-            src = it.get("sourceId") or it.get("ticketId") or it.get("source") or it.get("fromId")
-            dst = it.get("targetId") or it.get("mergedIntoId") or it.get("target") or it.get("toId")
-            dt = it.get("mergedDate") or it.get("performedAt") or it.get("date")
-            try:
-                src = int(src) if src is not None else None
-                dst = int(dst) if dst is not None else None
-            except Exception:
-                continue
-            if not src:
-                continue
-            rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
-        if not rows:
-            print("tickets_mesclados: /tickets/merged não retornou nenhum registro.")
-            return False
-        upsert_rows(conn, rows)
-        print(f"tickets_mesclados: {len(rows)} registros inseridos via /tickets/merged.")
-        return True
+        raw = md_get("tickets/merged", params={"$orderby": "mergedDate desc", "$top": 1000}, ok_404=True)
     except requests.HTTPError as e:
         print(f"[WARN] dedicated endpoint not available ({e}). Using fallback by histories.")
         return False
+    except Exception as e:
+        print(f"[WARN] erro ao chamar /tickets/merged: {e}. Usando fallback por histories.")
+        return False
+
+    if raw is None:
+        print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
+        return False
+
+    data = normalize_merged_response(raw)
+    if not data:
+        print("tickets_mesclados: /tickets/merged não retornou registros utilizáveis.")
+        return False
+
+    rows = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        src = it.get("sourceId") or it.get("ticketId") or it.get("source") or it.get("fromId")
+        dst = it.get("targetId") or it.get("mergedIntoId") or it.get("target") or it.get("toId")
+        dt = it.get("mergedDate") or it.get("performedAt") or it.get("date")
+        try:
+            src = int(src) if src is not None else None
+            dst = int(dst) if dst is not None else None
+        except Exception:
+            continue
+        if not src:
+            continue
+        rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
+    if not rows:
+        print("tickets_mesclados: /tickets/merged não retornou nenhum registro válido.")
+        return False
+    upsert_rows(conn, rows)
+    print(f"tickets_mesclados: {len(rows)} registros inseridos via /tickets/merged.")
+    return True
 
 JUSTIF_RX = re.compile(r"(mescl|merge|unid|duplic)", re.I)
-TARGET_ID_RX = re.compile(r"(?:#|n[ºo]\\s*|id\\s*:?|ticket\\s*:?|protocolo\\s*:?)[^\\d]*(\\d{3,})", re.I)
+TARGET_ID_RX = re.compile(r"(?:#|n[ºo]\s*|id\s*:?|ticket\s*:?|protocolo\s*:?)[^\d]*(\d{3,})", re.I)
 
 def get_a_candidate_ids(conn, limit):
     with conn.cursor() as cur:
