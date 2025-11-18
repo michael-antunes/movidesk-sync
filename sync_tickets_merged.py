@@ -75,10 +75,21 @@ def ensure_sync_control(conn):
         cur.execute(
             "alter table visualizacao_resolvidos.sync_control add column if not exists run_at timestamptz default now()"
         )
-        cur.execute(
-            "create index if not exists ix_sync_control_job on visualizacao_resolvidos.sync_control(job_name, last_update)"
-        )
     conn.commit()
+
+def sync_control_has_name_column(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select 1
+              from information_schema.columns
+             where table_schema = 'visualizacao_resolvidos'
+               and table_name   = 'sync_control'
+               and column_name  = 'name'
+             limit 1
+            """
+        )
+        return cur.fetchone() is not None
 
 def upsert_rows(conn, rows):
     if not rows:
@@ -127,14 +138,25 @@ def get_last_sync_update(conn):
 def register_sync_run(conn, last_update):
     if not last_update:
         return
+    job = "tickets_merged"
+    has_name = sync_control_has_name_column(conn)
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into visualizacao_resolvidos.sync_control(job_name, last_update)
-            values (%s, %s)
-            """,
-            ("tickets_merged", last_update),
-        )
+        if has_name:
+            cur.execute(
+                """
+                insert into visualizacao_resolvidos.sync_control(name, job_name, last_update)
+                values (%s, %s, %s)
+                """,
+                (job, job, last_update),
+            )
+        else:
+            cur.execute(
+                """
+                insert into visualizacao_resolvidos.sync_control(job_name, last_update)
+                values (%s, %s)
+                """,
+                (job, last_update),
+            )
     conn.commit()
 
 def fmt_dt_for_md(d):
