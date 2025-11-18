@@ -257,7 +257,10 @@ def try_fetch_dedicated(conn):
     return True
 
 JUSTIF_RX = re.compile(r"(mescl|merge|unid|duplic)", re.I)
-TARGET_ID_RX = re.compile(r"(?:#|n[ºo]\s*|id\s*:?|ticket\s*:?|protocolo\s*:?)[^\d]*(\d{3,})", re.I)
+TARGET_ID_RX = re.compile(
+    r"(?:#|n[ºo]\s*|id\s*:?|ticket\s*:?|protocolo\s*:?)[^\d]*(\d{3,})",
+    re.I,
+)
 
 def get_missing_candidate_ids_from_audit(conn, limit):
     with conn.cursor() as cur:
@@ -302,9 +305,10 @@ def extract_merge_from_histories(item):
     best_dt, target = None, None
     for h in item.get("statusHistories") or []:
         just = (h.get("justification") or "")[:400]
-        if not JUSTIF_RX.search(just or ""):
-            continue
+        has_merge_word = bool(JUSTIF_RX.search(just or ""))
         m = TARGET_ID_RX.search(just or "")
+        if not has_merge_word and not m:
+            continue
         if m:
             try:
                 target = int(m.group(1))
