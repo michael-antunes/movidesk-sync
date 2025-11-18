@@ -229,16 +229,18 @@ def try_fetch_dedicated(conn):
 JUSTIF_RX = re.compile(r"(mescl|merge|unid|duplic)", re.I)
 TARGET_ID_RX = re.compile(r"(?:#|n[ºo]\s*|id\s*:?|ticket\s*:?|protocolo\s*:?)[^\d]*(\d{3,})", re.I)
 
-def get_a_candidate_ids(conn, limit):
+def get_missing_candidate_ids_from_audit(conn, limit):
     with conn.cursor() as cur:
         cur.execute(
             """
-            select t.ticket_id
-              from visualizacao_resolvidos.tickets_resolvidos t
+            select a.ticket_id
+              from visualizacao_resolvidos.audit_recent_missing a
          left join visualizacao_resolvidos.tickets_mesclados tm
-                on tm.ticket_id = t.ticket_id
-             where tm.ticket_id is null
-          order by t.last_update desc nulls last, t.ticket_id desc
+                on tm.ticket_id = a.ticket_id
+             where a.table_name = 'tickets_resolvidos'
+               and tm.ticket_id is null
+          group by a.ticket_id
+          order by max(a.run_id) desc, a.ticket_id desc
              limit %s
             """,
             (limit,),
@@ -285,10 +287,10 @@ def extract_merge_from_histories(item):
         return int(tid), target, best_dt
     return None
 
-def run_fallback(conn):
-    ids = get_a_candidate_ids(conn, BATCH)
+def run_fallback_for_missing(conn):
+    ids = get_missing_candidate_ids_from_audit(conn, BATCH)
     if not ids:
-        print("tickets_mesclados: fallback não encontrou candidatos em tickets_resolvidos.")
+        print("tickets_mesclados: fallback(missing) não encontrou candidatos em audit_recent_missing.")
         return
     data = fetch_histories_for(ids)
     rows = []
@@ -298,23 +300,22 @@ def run_fallback(conn):
             src, dst, dt = got
             rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
     if not rows:
-        print(f"tickets_mesclados: fallback processou {len(ids)} tickets mas não identificou merges.")
+        print(f"tickets_mesclados: fallback(missing) processou {len(ids)} tickets mas não identificou merges.")
         return
     upsert_rows(conn, rows)
-    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback de statusHistories.")
+    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback de statusHistories para missing.")
 
 def main():
     with psycopg2.connect(DSN) as conn:
         ensure_table(conn)
         ensure_sync_control(conn)
-        ok = try_fetch_dedicated(conn)
-        if not ok:
-            try:
-                run_fallback(conn)
-            except requests.HTTPError as e:
-                print(f"[WARN] fallback por histories falhou: {e}")
-            except Exception as e:
-                print(f"[WARN] erro inesperado no fallback: {e}")
+        try_fetch_dedicated(conn)
+        try:
+            run_fallback_for_missing(conn)
+        except requests.HTTPError as e:
+            print(f"[WARN] fallback(missing) por histories falhou: {e}")
+        except Exception as e:
+            print(f"[WARN] erro inesperado no fallback(missing): {e}")
         print("tickets_mesclados: sincronização concluída.")
 
 if __name__ == "__main__":
