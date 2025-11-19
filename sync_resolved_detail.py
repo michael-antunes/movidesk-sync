@@ -72,6 +72,8 @@ def register_ticket_failure(conn, ticket_id, reason):
 
 
 def get_pending_ids(conn, limit):
+    if limit is None or limit <= 0:
+        limit = 200
     with conn.cursor() as cur:
         cur.execute(SQL_GET_PENDING, (limit,))
         return [r[0] for r in cur.fetchall()]
@@ -156,7 +158,7 @@ def upsert_details(conn, rows):
     conn.commit()
 
 
-def delete_processed_from_missing(conn, ids):
+def delete_from_missing(conn, ids):
     if not ids:
         return
     with conn.cursor() as cur:
@@ -175,7 +177,6 @@ def main():
         print(f"detail: {total_pendentes} tickets pendentes em audit_recent_missing (limite={BATCH}).")
 
         detalhes = []
-        ok_ids = []
         fail_reasons = {}
         fail_samples = {}
 
@@ -246,11 +247,10 @@ def main():
                 continue
 
             detalhes.append(row)
-            ok_ids.append(tid)
             time.sleep(THROTTLE)
 
-        total_ok = len(ok_ids)
-        total_fail = sum(fail_reasons.values())
+        total_ok = len(detalhes)
+        total_fail = total_pendentes - total_ok
 
         print(f"detail: processados neste ciclo: ok={total_ok}, falhas={total_fail}.")
 
@@ -260,13 +260,11 @@ def main():
                 sample = fail_samples.get(r)
                 print(f"  - {r}: {c} tickets (exemplo ticket_id={sample})")
 
-        if not detalhes:
-            print("detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch.")
-            return
+        if detalhes:
+            upsert_details(conn, detalhes)
 
-        upsert_details(conn, detalhes)
-        delete_processed_from_missing(conn, ok_ids)
-        print(f"detail: {total_ok} tickets upsertados em tickets_resolvidos e removidos do missing.")
+        delete_from_missing(conn, pending)
+        print(f"detail: {total_pendentes} tickets removidos de audit_recent_missing (ok + falhas).")
 
 
 if __name__ == "__main__":
