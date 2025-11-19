@@ -167,18 +167,25 @@ def delete_processed_from_missing(conn, ids):
 def main():
     with psycopg2.connect(DSN) as conn:
         pending = get_pending_ids(conn, BATCH)
+        total_pendentes = len(pending)
         if not pending:
             print("detail: nenhum ticket pendente em audit_recent_missing.")
             return
+
+        print(f"detail: {total_pendentes} tickets pendentes em audit_recent_missing (limite={BATCH}).")
+
         detalhes = []
         ok_ids = []
+        fail_reasons = {}
+        fail_samples = {}
+
         for tid in pending:
+            reason = None
+
             try:
                 data = md_get(
                     f"tickets/{tid}",
-                    params={
-                        "$expand": "clients,createdBy,owner,actions,customFields"
-                    },
+                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
                     ok_404=True,
                 )
             except requests.HTTPError as e:
@@ -186,38 +193,80 @@ def main():
                     status = e.response.status_code
                 except Exception:
                     status = None
-                register_ticket_failure(conn, tid, f"http_error_{status or 'unknown'}")
+                reason = f"http_error_{status or 'unknown'}"
+                register_ticket_failure(conn, tid, reason)
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                if reason not in fail_samples:
+                    fail_samples[reason] = tid
                 continue
             except Exception:
-                register_ticket_failure(conn, tid, "exception_api")
+                reason = "exception_api"
+                register_ticket_failure(conn, tid, reason)
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                if reason not in fail_samples:
+                    fail_samples[reason] = tid
                 continue
+
             if data is None:
-                register_ticket_failure(conn, tid, "not_found_404")
+                reason = "not_found_404"
+                register_ticket_failure(conn, tid, reason)
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                if reason not in fail_samples:
+                    fail_samples[reason] = tid
                 continue
+
             if isinstance(data, list):
                 if not data:
-                    register_ticket_failure(conn, tid, "empty_list")
+                    reason = "empty_list"
+                    register_ticket_failure(conn, tid, reason)
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                    if reason not in fail_samples:
+                        fail_samples[reason] = tid
                     continue
                 ticket = data[0]
             else:
                 ticket = data
+
             if not ticket.get("id"):
-                register_ticket_failure(conn, tid, "missing_id")
+                reason = "missing_id"
+                register_ticket_failure(conn, tid, reason)
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                if reason not in fail_samples:
+                    fail_samples[reason] = tid
                 continue
+
             try:
                 row = build_detail_row(ticket)
             except Exception:
-                register_ticket_failure(conn, tid, "build_row_error")
+                reason = "build_row_error"
+                register_ticket_failure(conn, tid, reason)
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                if reason not in fail_samples:
+                    fail_samples[reason] = tid
                 continue
+
             detalhes.append(row)
             ok_ids.append(tid)
             time.sleep(THROTTLE)
+
+        total_ok = len(ok_ids)
+        total_fail = sum(fail_reasons.values())
+
+        print(f"detail: processados neste ciclo: ok={total_ok}, falhas={total_fail}.")
+
+        if fail_reasons:
+            print("detail: razões de falha neste ciclo:")
+            for r, c in fail_reasons.items():
+                sample = fail_samples.get(r)
+                print(f"  - {r}: {c} tickets (exemplo ticket_id={sample})")
+
         if not detalhes:
             print("detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch.")
             return
+
         upsert_details(conn, detalhes)
         delete_processed_from_missing(conn, ok_ids)
-        print(f"detail: {len(ok_ids)} tickets processados e removidos do missing.")
+        print(f"detail: {total_ok} tickets upsertados em tickets_resolvidos e removidos do missing.")
 
 
 if __name__ == "__main__":
