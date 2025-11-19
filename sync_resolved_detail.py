@@ -176,7 +176,9 @@ def main():
             try:
                 data = md_get(
                     f"tickets/{tid}",
-                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
+                    params={
+                        "$expand": "clients,createdBy,owner,actions,customFields"
+                    },
                     ok_404=True,
                 )
             except requests.HTTPError as e:
