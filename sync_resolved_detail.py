@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
@@ -55,21 +54,18 @@ def register_ticket_failure(conn, ticket_id, reason):
     with conn.cursor() as cur:
         cur.execute(
             """
-            delete from visualizacao_resolvidos.audit_ticket_watch
-             where table_name = 'tickets_resolvidos'
-               and ticket_id = %s
-            """,
-            (ticket_id,),
-        )
-        cur.execute(
-            """
             insert into visualizacao_resolvidos.audit_ticket_watch(
               table_name,
               ticket_id,
               last_seen_at,
-              last_reason
+              last_reason,
+              hit_count
             )
-            values ('tickets_resolvidos', %s, now(), %s)
+            values ('tickets_resolvidos', %s, now(), %s, 1)
+            on conflict (table_name, ticket_id) do update set
+              last_seen_at = excluded.last_seen_at,
+              last_reason  = excluded.last_reason,
+              hit_count    = audit_ticket_watch.hit_count + 1
             """,
             (ticket_id, reason),
         )
@@ -171,6 +167,29 @@ def delete_from_missing(conn, ids):
     conn.commit()
 
 
+def fetch_ticket_with_fallback(ticket_id):
+    data = md_get(
+        f"tickets/{ticket_id}",
+        params={"$expand": "clients,createdBy,owner,actions,customFields"},
+        ok_404=True,
+    )
+    if data is None:
+        data = md_get(
+            "tickets",
+            params={
+                "$filter": f"id eq {ticket_id}",
+                "$expand": "clients,createdBy,owner,actions,customFields",
+                "$top": 1,
+            },
+            ok_404=False,
+        )
+    if isinstance(data, list):
+        if not data:
+            return None
+        return data[0]
+    return data
+
+
 def main():
     with psycopg2.connect(DSN) as conn:
         pending = get_pending_ids(conn, BATCH)
@@ -187,51 +206,29 @@ def main():
 
         for tid in pending:
             reason = None
+            ticket = None
 
             try:
-                data = md_get(
-                    f"tickets/{tid}",
-                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
-                    ok_404=True,
-                )
+                ticket = fetch_ticket_with_fallback(tid)
             except requests.HTTPError as e:
                 try:
                     status = e.response.status_code
                 except Exception:
                     status = None
                 reason = f"http_error_{status or 'unknown'}"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
             except Exception:
                 reason = "exception_api"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
 
-            if data is None:
+            if ticket is None and reason is None:
                 reason = "not_found_404"
+
+            if reason is not None:
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
+                time.sleep(THROTTLE)
                 continue
-
-            if isinstance(data, list):
-                if not data:
-                    reason = "empty_list"
-                    register_ticket_failure(conn, tid, reason)
-                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                    if reason not in fail_samples:
-                        fail_samples[reason] = tid
-                    continue
-                ticket = data[0]
-            else:
-                ticket = data
 
             if not ticket.get("id"):
                 reason = "missing_id"
@@ -239,6 +236,7 @@ def main():
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
+                time.sleep(THROTTLE)
                 continue
 
             try:
@@ -249,6 +247,7 @@ def main():
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
+                time.sleep(THROTTLE)
                 continue
 
             detalhes.append(row)
