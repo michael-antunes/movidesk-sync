@@ -63,10 +63,15 @@ def register_ticket_failure(conn, ticket_id, reason):
         )
         cur.execute(
             """
-            insert into visualizacao_resolvidos.audit_ticket_watch(table_name, ticket_id, last_seen_at)
-            values ('tickets_resolvidos', %s, now())
+            insert into visualizacao_resolvidos.audit_ticket_watch(
+              table_name,
+              ticket_id,
+              last_seen_at,
+              last_reason
+            )
+            values ('tickets_resolvidos', %s, now(), %s)
             """,
-            (ticket_id,),
+            (ticket_id, reason),
         )
     conn.commit()
 
