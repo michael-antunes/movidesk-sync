@@ -35,7 +35,7 @@ def _req(url, params=None, timeout=90):
                 print("HTTP ERROR", r.status_code, r.text[:1200])
             except Exception:
                 pass
-        r.raise_for_status()
+            r.raise_for_status()
         return r.json() if r.text else None
 
 
@@ -123,10 +123,21 @@ def mark_processed(conn, ticket_ids):
     return len(ticket_ids)
 
 
+def new_connection():
+    return psycopg2.connect(
+        NEON_DSN,
+        sslmode="require",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+
+
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-    conn = psycopg2.connect(NEON_DSN)
+    conn = new_connection()
     try:
         ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
         if not ticket_ids:
@@ -147,12 +158,33 @@ def main():
             rows.append(row)
             reprocessed_ids.append(tid)
             time.sleep(THROTTLE)
-        n_upsert = upsert_rows(conn, rows)
-        n_delete = mark_processed(conn, reprocessed_ids)
+        for attempt in range(2):
+            try:
+                n_upsert = upsert_rows(conn, rows)
+                break
+            except psycopg2.OperationalError as e:
+                print("OperationalError no UPSERT, reconectando:", e)
+                conn.close()
+                if attempt == 1:
+                    raise
+                conn = new_connection()
+        for attempt in range(2):
+            try:
+                n_delete = mark_processed(conn, reprocessed_ids)
+                break
+            except psycopg2.OperationalError as e:
+                print("OperationalError no DELETE, reconectando:", e)
+                conn.close()
+                if attempt == 1:
+                    raise
+                conn = new_connection()
         print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
         print(f"DELETE MISSING: {n_delete}")
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
