@@ -1,92 +1,104 @@
 import os
+import time
 import requests
 import psycopg2
 import psycopg2.extras
 
-NEON_DSN = os.environ["NEON_DATABASE_URL"]
-MOVIDESK_BASE_URL = "https://api.movidesk.com/public/v1/tickets"
-MOVIDESK_TOKEN = os.environ["MOVIDESK_TOKEN"]
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+NEON_DSN = os.getenv("NEON_DSN")
+
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
+BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
 
 
-def get_conn():
-    return psycopg2.connect(NEON_DSN, sslmode="require")
+def iint(x):
+    try:
+        s = str(x)
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
 
 
-def select_missing_ticket_ids(conn, limit):
-    sql = """
-        select ticket_id
-        from visualizacao_resolvidos.audit_recent_missing
-        where table_name = 'tickets_resolvidos'
-        order by ticket_id desc
-        limit %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
+def http_get(url, params=None, timeout=90, allow_400=False):
+    while True:
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
+            print(f"Throttling {r.status_code}, esperando {wait}s")
+            time.sleep(wait)
+            continue
+        if allow_400 and r.status_code == 400:
+            print("HTTP 400 para", url, "params", params)
+            return None
+        if r.status_code == 404:
+            print("HTTP 404 para", url, "params", params)
+            return None
+        if r.status_code >= 400:
+            try:
+                print("HTTP ERROR", r.status_code, r.text[:800])
+            except Exception:
+                pass
+            r.raise_for_status()
+        return r.json() if r.text else None
 
 
 def fetch_ticket_detail(ticket_id):
+    url = f"{API_BASE}/tickets"
     params = {
-        "token": MOVIDESK_TOKEN,
-        "id": ticket_id
+        "token": API_TOKEN,
+        "id": ticket_id,
+        "includeDeletedItems": "true",
     }
-    resp = requests.get(f"{MOVIDESK_BASE_URL}/{ticket_id}", params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    data = http_get(url, params=params, timeout=120, allow_400=True)
+    return data
 
 
-def normalize_row(ticket_json):
-    ticket_id = ticket_json["id"]
-    owner_name = ticket_json.get("owner", {}).get("businessName")
-    owner_team_name = ticket_json.get("ownerTeam", {}).get("name")
-    origin = ticket_json.get("origin")
-    importance = ticket_json.get("importance")
-    urgency = ticket_json.get("urgency")
-    status = ticket_json.get("status")
-    subject = ticket_json.get("subject")
-    created_date = ticket_json.get("createdDate")
-    resolved_in = ticket_json.get("resolvedIn")
-    return (
-        ticket_id,
-        owner_name,
-        owner_team_name,
-        origin,
-        importance,
-        urgency,
-        status,
-        subject,
-        created_date,
-        resolved_in,
-    )
+def map_row(t):
+    owner = t.get("owner") or {}
+    return {
+        "ticket_id": iint(t.get("id")),
+        "status": t.get("status"),
+        "owner_name": owner.get("businessName") or owner.get("name"),
+        "owner_team_name": t.get("ownerTeam"),
+        "origin": t.get("origin"),
+    }
 
 
 UPSERT_SQL = """
-insert into visualizacao_resolvidos.tickets_resolvidos_detail (
-    ticket_id,
-    owner_name,
-    owner_team_name,
-    origin,
-    importance,
-    urgency,
-    status,
-    subject,
-    created_date,
-    resolved_in
-) values (
-    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-)
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id,status,owner_name,owner_team_name,origin)
+values (%(ticket_id)s,%(status)s,%(owner_name)s,%(owner_team_name)s,%(origin)s)
 on conflict (ticket_id) do update set
-    owner_name = excluded.owner_name,
-    owner_team_name = excluded.owner_team_name,
-    origin = excluded.origin,
-    importance = excluded.importance,
-    urgency = excluded.urgency,
-    status = excluded.status,
-    subject = excluded.subject,
-    created_date = excluded.created_date,
-    resolved_in = excluded.resolved_in
+  status = excluded.status,
+  owner_name = excluded.owner_name,
+  owner_team_name = excluded.owner_team_name,
+  origin = excluded.origin
 """
+
+
+DELETE_MISSING_SQL = """
+delete from visualizacao_resolvidos.audit_recent_missing
+where table_name = 'tickets_resolvidos'
+  and ticket_id = any(%s)
+"""
+
+
+def select_missing_ticket_ids(conn, limit):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select distinct ticket_id
+            from visualizacao_resolvidos.audit_recent_missing
+            where table_name = 'tickets_resolvidos'
+            order by ticket_id desc
+            limit %s
+        """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [r[0] for r in rows]
 
 
 def upsert_rows(conn, rows):
@@ -100,62 +112,69 @@ def upsert_rows(conn, rows):
 
 def delete_from_audit(conn, ticket_ids):
     if not ticket_ids:
-        return
-    sql = """
-        delete from visualizacao_resolvidos.audit_recent_missing
-        where table_name = 'tickets_resolvidos'
-          and ticket_id = any(%s)
-    """
+        return 0
     with conn.cursor() as cur:
-        cur.execute(sql, (ticket_ids,))
+        cur.execute(DELETE_MISSING_SQL, (ticket_ids,))
     conn.commit()
-
-
-def process_batch(conn, ticket_ids):
-    rows = []
-    for tid in ticket_ids:
-        data = fetch_ticket_detail(tid)
-        rows.append(normalize_row(data))
-    upsert_rows(conn, rows)
-    delete_from_audit(conn, ticket_ids)
-
-
-def process_with_skip(conn, all_ticket_ids, batch_size=100):
-    skipped = []
-
-    def safe_process(batch):
-        nonlocal skipped
-        if not batch:
-            return
-        try:
-            process_batch(conn, batch)
-        except requests.HTTPError as e:
-            status = e.response.status_code
-            if status == 400 and len(batch) > 1:
-                mid = len(batch) // 2
-                safe_process(batch[:mid])
-                safe_process(batch[mid:])
-            elif status == 400 and len(batch) == 1:
-                skipped.append(batch[0])
-            else:
-                raise
-
-    for i in range(0, len(all_ticket_ids), batch_size):
-        safe_process(all_ticket_ids[i:i + batch_size])
-
-    return skipped
+    return len(ticket_ids)
 
 
 def main():
-    conn = get_conn()
+    if not API_TOKEN or not NEON_DSN:
+        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+
+    conn = psycopg2.connect(NEON_DSN, sslmode="require")
     try:
-        missing_ids = select_missing_ticket_ids(conn, 5000)
-        print(f"Reprocessando {len(missing_ids)} tickets da audit")
-        skipped = process_with_skip(conn, missing_ids, batch_size=100)
-        if skipped:
-            print(f"Tickets ignorados por erro 400: {skipped}")
-        else:
-            print("Todos os tickets do lote foram processados")
+        ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
+        if not ticket_ids:
+            print("Nenhum ticket pendente para reprocessar.")
+            return
+
+        print(f"Reprocessando {len(ticket_ids)} tickets (mais novos primeiro): {ticket_ids}")
+
+        rows = []
+        ok_ids = []
+        skipped_400 = []
+        skipped_sem_dado = []
+
+        for tid in ticket_ids:
+            try:
+                t = fetch_ticket_detail(tid)
+            except requests.HTTPError as e:
+                print(f"Erro HTTP fatal para ticket {tid}: {e}")
+                continue
+
+            if not t:
+                skipped_sem_dado.append(tid)
+                continue
+
+            if not isinstance(t, dict) or t.get("id") is None:
+                skipped_sem_dado.append(tid)
+                continue
+
+            row = map_row(t)
+            if row.get("ticket_id") is None:
+                skipped_sem_dado.append(tid)
+                continue
+            if row.get("status") is None:
+                skipped_sem_dado.append(tid)
+                continue
+
+            rows.append(row)
+            ok_ids.append(tid)
+            time.sleep(THROTTLE)
+
+        n_upsert = upsert_rows(conn, rows)
+        n_delete = delete_from_audit(conn, ok_ids)
+
+        print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
+        print(f"DELETE MISSING: {n_delete}")
+
+        if skipped_400:
+            print("Tickets com HTTP 400, deixados na audit:", skipped_400)
+        if skipped_sem_dado:
+            print("Tickets sem dado/status válido, deixados na audit:", skipped_sem_dado)
+
     finally:
         conn.close()
 
