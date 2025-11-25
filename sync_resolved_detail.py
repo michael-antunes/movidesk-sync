@@ -1,17 +1,15 @@
 import os
 import time
-import json
 import requests
 import psycopg2
 import psycopg2.extras
-import datetime
 
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
+
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
 BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
-DETAIL_TABLE = os.getenv("MOVIDESK_DETAIL_TABLE", "visualizacao_resolvidos.tickets_resolvidos")
 
 
 def iint(x):
@@ -58,28 +56,22 @@ def fetch_ticket_detail(ticket_id):
 
 def map_row(t):
     owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    first_client = clients[0] if isinstance(clients, list) and clients else {}
     return {
         "ticket_id": iint(t.get("id")),
         "owner_name": owner.get("businessName") or owner.get("name"),
         "owner_team_name": t.get("ownerTeam"),
         "origin": t.get("origin"),
-        "raw_payload": t,
-        "imported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
 
-UPSERT_SQL = f"""
-insert into {DETAIL_TABLE}
-(ticket_id,owner_name,owner_team_name,origin,raw_payload,imported_at)
-values (%(ticket_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s,%(raw_payload)s,%(imported_at)s)
+UPSERT_SQL = """
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id,owner_name,owner_team_name,origin)
+values (%(ticket_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s)
 on conflict (ticket_id) do update set
   owner_name = excluded.owner_name,
   owner_team_name = excluded.owner_team_name,
-  origin = excluded.origin,
-  raw_payload = excluded.raw_payload,
-  imported_at = excluded.imported_at
+  origin = excluded.origin
 """
 
 
@@ -90,26 +82,13 @@ where table_name = 'tickets_resolvidos'
 """
 
 
-def _normalize_row_for_db(row):
-    out = {}
-    for k, v in row.items():
-        if isinstance(v, (dict, list)):
-            out[k] = json.dumps(v, ensure_ascii=False)
-        else:
-            out[k] = v
-    return out
-
-
 def upsert_rows(conn, rows):
     if not rows:
         return 0
-    safe_rows = [_normalize_row_for_db(r) for r in rows if isinstance(r, dict)]
-    if not safe_rows:
-        return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, safe_rows, page_size=200)
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
     conn.commit()
-    return len(safe_rows)
+    return len(rows)
 
 
 def select_missing_ticket_ids(conn, limit):
