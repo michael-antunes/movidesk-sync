@@ -50,7 +50,6 @@ def map_row(t):
     clients = t.get("clients") or []
     first_client = clients[0] if clients else {}
     org = first_client.get("organization") or {}
-
     return {
         "ticket_id": t.get("id"),
         "protocol": t.get("protocol"),
@@ -164,8 +163,7 @@ def select_missing_ticket_ids(conn, limit):
     sql = """
         SELECT ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing
-        WHERE processed_at IS NULL
-        ORDER BY last_seen_at DESC NULLS LAST, ticket_id
+        ORDER BY ticket_id
         LIMIT %s
     """
     with conn.cursor() as cur:
@@ -178,8 +176,7 @@ def mark_processed(conn, ticket_ids):
     if not ticket_ids:
         return
     sql = """
-        UPDATE visualizacao_resolvidos.audit_recent_missing
-        SET processed_at = now()
+        DELETE FROM visualizacao_resolvidos.audit_recent_missing
         WHERE ticket_id = ANY(%s)
     """
     with conn.cursor() as cur:
