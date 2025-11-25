@@ -168,9 +168,28 @@ def select_missing_ticket_ids(conn, limit):
     with conn.cursor() as cur:
         cur.execute(
             """
-            select distinct ticket_id
-            from visualizacao_resolvidos.audit_recent_missing
-            where table_name = 'tickets_resolvidos'
+            with to_fix as (
+              select distinct ticket_id
+              from visualizacao_resolvidos.audit_recent_missing
+              where table_name = 'tickets_resolvidos'
+              union
+              select ticket_id
+              from visualizacao_resolvidos.tickets_resolvidos
+              where
+                organization_name is null
+                or organization_id is null
+                or category is null
+                or urgency is null
+                or service_first_level is null
+                or service_second_level is null
+                or service_third_level is null
+                or last_update is null
+                or owner_id is null
+                or subject is null
+                or adicional_nome is null
+            )
+            select ticket_id
+            from to_fix
             order by ticket_id desc
             limit %s
         """,
@@ -205,7 +224,7 @@ def main():
     try:
         ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
         if not ticket_ids:
-            print("Nenhum ticket pendente para reprocessar.")
+            print("Nenhum ticket pendente para reprocessar (audit + incompletos).")
             return
         print(f"Reprocessando {len(ticket_ids)} tickets (mais novos primeiro): {ticket_ids}")
         rows = []
@@ -237,7 +256,7 @@ def main():
         print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
         print(f"DELETE MISSING: {n_delete}")
         if skipped_invalid:
-            print("Tickets sem dado válido, deixados na audit:", skipped_invalid)
+            print("Tickets sem dado válido, deixados para trás:", skipped_invalid)
     finally:
         conn.close()
 
