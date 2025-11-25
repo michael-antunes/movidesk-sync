@@ -100,7 +100,7 @@ def select_missing_ticket_ids(conn, limit):
             select distinct ticket_id
             from visualizacao_resolvidos.audit_recent_missing
             where table_name = 'tickets_resolvidos'
-            order by run_id desc nulls last, ticket_id desc
+            order by ticket_id desc
             limit %s
         """,
             (limit,),
