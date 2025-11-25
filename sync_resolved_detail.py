@@ -11,6 +11,9 @@ NEON_DSN = os.getenv("NEON_DSN")
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
 BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
 
+CUSTOM_NOME_FIELD_ID = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_ID", "").strip()
+CUSTOM_NOME_FIELD_LABEL = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_LABEL", "").strip().lower()
+
 
 def iint(x):
     try:
@@ -18,6 +21,15 @@ def iint(x):
         return int(s) if s.isdigit() else None
     except Exception:
         return None
+
+
+def norm_ts(x):
+    if not x:
+        return None
+    s = str(x).strip()
+    if not s or s.startswith("0001-01-01"):
+        return None
+    return s
 
 
 def http_get(url, params=None, timeout=90, allow_400=False):
@@ -48,33 +60,100 @@ def fetch_ticket_detail(ticket_id):
     url = f"{API_BASE}/tickets"
     params = {
         "token": API_TOKEN,
-        "id": ticket_id,
-        "includeDeletedItems": "true",
+        "$select": "id,subject,status,baseStatus,ownerTeam,origin,category,urgency,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,lastUpdate",
+        "$expand": "clients($expand=organization),owner,customFieldValues",
+        "$filter": f"id eq {ticket_id}",
+        "$top": 1,
+        "$skip": 0,
     }
     data = http_get(url, params=params, timeout=120, allow_400=True)
-    return data
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict) and data.get("id") is not None:
+        return data
+    return None
+
+
+def extract_custom_nome(ticket):
+    pools = []
+    for k in ("customFieldValues", "customFields", "additionalFields"):
+        v = ticket.get(k)
+        if isinstance(v, list):
+            pools.extend(v)
+    if not pools:
+        return None
+    if CUSTOM_NOME_FIELD_ID:
+        for e in pools:
+            if not isinstance(e, dict):
+                continue
+            cid = str(e.get("customFieldId") or e.get("id") or "").strip()
+            if cid == CUSTOM_NOME_FIELD_ID:
+                for vk in ("value", "currentValue", "text", "valueName", "name", "option"):
+                    val = e.get(vk)
+                    if isinstance(val, list):
+                        val = ", ".join(str(x) for x in val if x not in ("", None))
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    if CUSTOM_NOME_FIELD_LABEL:
+        for e in pools:
+            if not isinstance(e, dict):
+                continue
+            label = str(e.get("field") or e.get("name") or e.get("label") or "").strip().lower()
+            if label == CUSTOM_NOME_FIELD_LABEL:
+                for vk in ("value", "currentValue", "text", "valueName", "name", "option"):
+                    val = e.get(vk)
+                    if isinstance(val, list):
+                        val = ", ".join(str(x) for x in val if x not in ("", None))
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    return None
 
 
 def map_row(t):
     owner = t.get("owner") or {}
+    clients = t.get("clients") or []
+    c0 = clients[0] if isinstance(clients, list) and clients else {}
+    org = c0.get("organization") or {}
     return {
         "ticket_id": iint(t.get("id")),
         "status": t.get("status"),
+        "owner_id": iint(owner.get("id") or owner.get("personId")),
         "owner_name": owner.get("businessName") or owner.get("name"),
         "owner_team_name": t.get("ownerTeam"),
         "origin": t.get("origin"),
+        "organization_id": org.get("id"),
+        "organization_name": org.get("businessName"),
+        "category": t.get("category"),
+        "urgency": t.get("urgency"),
+        "service_first_level": t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level": t.get("serviceThirdLevel"),
+        "last_update": norm_ts(t.get("lastUpdate")),
+        "subject": t.get("subject"),
+        "adicional_nome": extract_custom_nome(t),
     }
 
 
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,owner_name,owner_team_name,origin)
-values (%(ticket_id)s,%(status)s,%(owner_name)s,%(owner_team_name)s,%(origin)s)
+(ticket_id,status,owner_id,owner_name,owner_team_name,origin,organization_id,organization_name,category,urgency,service_first_level,service_second_level,service_third_level,last_update,subject,adicional_nome)
+values (%(ticket_id)s,%(status)s,%(owner_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s,%(organization_id)s,%(organization_name)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,%(last_update)s,%(subject)s,%(adicional_nome)s)
 on conflict (ticket_id) do update set
   status = excluded.status,
+  owner_id = excluded.owner_id,
   owner_name = excluded.owner_name,
   owner_team_name = excluded.owner_team_name,
-  origin = excluded.origin
+  origin = excluded.origin,
+  organization_id = excluded.organization_id,
+  organization_name = excluded.organization_name,
+  category = excluded.category,
+  urgency = excluded.urgency,
+  service_first_level = excluded.service_first_level,
+  service_second_level = excluded.service_second_level,
+  service_third_level = excluded.service_third_level,
+  last_update = excluded.last_update,
+  subject = excluded.subject,
+  adicional_nome = excluded.adicional_nome
 """
 
 
@@ -122,59 +201,43 @@ def delete_from_audit(conn, ticket_ids):
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-
     conn = psycopg2.connect(NEON_DSN, sslmode="require")
     try:
         ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
         if not ticket_ids:
             print("Nenhum ticket pendente para reprocessar.")
             return
-
         print(f"Reprocessando {len(ticket_ids)} tickets (mais novos primeiro): {ticket_ids}")
-
         rows = []
         ok_ids = []
-        skipped_400 = []
-        skipped_sem_dado = []
-
+        skipped_invalid = []
         for tid in ticket_ids:
             try:
                 t = fetch_ticket_detail(tid)
             except requests.HTTPError as e:
                 print(f"Erro HTTP fatal para ticket {tid}: {e}")
                 continue
-
             if not t:
-                skipped_sem_dado.append(tid)
+                skipped_invalid.append(tid)
                 continue
-
+            if isinstance(t, list):
+                t = t[0] if t else None
             if not isinstance(t, dict) or t.get("id") is None:
-                skipped_sem_dado.append(tid)
+                skipped_invalid.append(tid)
                 continue
-
             row = map_row(t)
             if row.get("ticket_id") is None:
-                skipped_sem_dado.append(tid)
+                skipped_invalid.append(tid)
                 continue
-            if row.get("status") is None:
-                skipped_sem_dado.append(tid)
-                continue
-
             rows.append(row)
             ok_ids.append(tid)
             time.sleep(THROTTLE)
-
         n_upsert = upsert_rows(conn, rows)
         n_delete = delete_from_audit(conn, ok_ids)
-
         print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
         print(f"DELETE MISSING: {n_delete}")
-
-        if skipped_400:
-            print("Tickets com HTTP 400, deixados na audit:", skipped_400)
-        if skipped_sem_dado:
-            print("Tickets sem dado/status válido, deixados na audit:", skipped_sem_dado)
-
+        if skipped_invalid:
+            print("Tickets sem dado válido, deixados na audit:", skipped_invalid)
     finally:
         conn.close()
 
