@@ -35,7 +35,7 @@ def _req(url, params=None, timeout=90):
                 print("HTTP ERROR", r.status_code, r.text[:1200])
             except Exception:
                 pass
-            r.raise_for_status()
+        r.raise_for_status()
         return r.json() if r.text else None
 
 
@@ -58,6 +58,7 @@ def map_row(t):
     owner = t.get("owner") or {}
     return {
         "ticket_id": iint(t.get("id")),
+        "status": t.get("status"),
         "owner_name": owner.get("businessName") or owner.get("name"),
         "owner_team_name": t.get("ownerTeam"),
         "origin": t.get("origin"),
@@ -66,9 +67,10 @@ def map_row(t):
 
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,owner_name,owner_team_name,origin)
-values (%(ticket_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s)
+(ticket_id,status,owner_name,owner_team_name,origin)
+values (%(ticket_id)s,%(status)s,%(owner_name)s,%(owner_team_name)s,%(origin)s)
 on conflict (ticket_id) do update set
+  status = excluded.status,
   owner_name = excluded.owner_name,
   owner_team_name = excluded.owner_team_name,
   origin = excluded.origin
@@ -139,6 +141,8 @@ def main():
                 continue
             row = map_row(t)
             if row.get("ticket_id") is None:
+                continue
+            if row.get("status") is None:
                 continue
             rows.append(row)
             reprocessed_ids.append(tid)
