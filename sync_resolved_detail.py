@@ -10,6 +10,7 @@ NEON_DSN = os.getenv("NEON_DSN")
 
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
 BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
+CHUNK_SIZE = int(os.getenv("MOVIDESK_DETAIL_CHUNK_SIZE", "25"))
 
 
 def iint(x):
@@ -84,45 +85,6 @@ where table_name = 'tickets_resolvidos'
 """
 
 
-def upsert_rows(conn, rows):
-    if not rows:
-        return 0
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
-    conn.commit()
-    return len(rows)
-
-
-def select_missing_ticket_ids(conn, limit):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select distinct ticket_id
-            from visualizacao_resolvidos.audit_recent_missing
-            where table_name = 'tickets_resolvidos'
-            order by ticket_id
-            limit %s
-        """,
-            (limit,),
-        )
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
-
-
-def mark_processed(conn, ticket_ids):
-    if not ticket_ids:
-        return 0
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(
-            cur,
-            DELETE_MISSING_SQL,
-            [(tid,) for tid in ticket_ids],
-            page_size=200,
-        )
-    conn.commit()
-    return len(ticket_ids)
-
-
 def new_connection():
     return psycopg2.connect(
         NEON_DSN,
@@ -134,57 +96,140 @@ def new_connection():
     )
 
 
+def select_missing_ticket_ids(limit):
+    conn = new_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select distinct ticket_id
+                from visualizacao_resolvidos.audit_recent_missing
+                where table_name = 'tickets_resolvidos'
+                order by ticket_id
+                limit %s
+            """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
+
+
+def upsert_chunk(conn, rows):
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=len(rows))
+    conn.commit()
+    return len(rows)
+
+
+def delete_chunk(conn, ticket_ids):
+    if not ticket_ids:
+        return 0
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_batch(
+            cur,
+            DELETE_MISSING_SQL,
+            [(tid,) for tid in ticket_ids],
+            page_size=len(ticket_ids),
+        )
+    conn.commit()
+    return len(ticket_ids)
+
+
+def chunked(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def robust_upsert(rows):
+    total = 0
+    for chunk in chunked(rows, CHUNK_SIZE):
+        if not chunk:
+            continue
+        for attempt in range(2):
+            conn = None
+            try:
+                conn = new_connection()
+                total += upsert_chunk(conn, chunk)
+                break
+            except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+                print("DB error no UPSERT chunk, tentativa", attempt + 1, ":", e)
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if attempt == 1:
+                    raise
+                time.sleep(2)
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    return total
+
+
+def robust_delete(ticket_ids):
+    total = 0
+    for chunk in chunked(ticket_ids, CHUNK_SIZE):
+        if not chunk:
+            continue
+        for attempt in range(2):
+            conn = None
+            try:
+                conn = new_connection()
+                total += delete_chunk(conn, chunk)
+                break
+            except (psycopg2.OperationalError, psycopg2.DatabaseError) as e:
+                print("DB error no DELETE chunk, tentativa", attempt + 1, ":", e)
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if attempt == 1:
+                    raise
+                time.sleep(2)
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+    return total
+
+
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-    conn = new_connection()
-    try:
-        ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
-        if not ticket_ids:
-            print("Nenhum ticket pendente para reprocessar.")
-            return
-        print(f"Reprocessando {len(ticket_ids)} tickets: {ticket_ids}")
-        rows = []
-        reprocessed_ids = []
-        for tid in ticket_ids:
-            t = fetch_ticket_detail(tid)
-            if not isinstance(t, dict) or t.get("id") is None:
-                continue
-            row = map_row(t)
-            if row.get("ticket_id") is None:
-                continue
-            if row.get("status") is None:
-                continue
-            rows.append(row)
-            reprocessed_ids.append(tid)
-            time.sleep(THROTTLE)
-        for attempt in range(2):
-            try:
-                n_upsert = upsert_rows(conn, rows)
-                break
-            except psycopg2.OperationalError as e:
-                print("OperationalError no UPSERT, reconectando:", e)
-                conn.close()
-                if attempt == 1:
-                    raise
-                conn = new_connection()
-        for attempt in range(2):
-            try:
-                n_delete = mark_processed(conn, reprocessed_ids)
-                break
-            except psycopg2.OperationalError as e:
-                print("OperationalError no DELETE, reconectando:", e)
-                conn.close()
-                if attempt == 1:
-                    raise
-                conn = new_connection()
-        print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
-        print(f"DELETE MISSING: {n_delete}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    ticket_ids = select_missing_ticket_ids(BATCH_LIMIT)
+    if not ticket_ids:
+        print("Nenhum ticket pendente para reprocessar.")
+        return
+    print(f"Reprocessando {len(ticket_ids)} tickets: {ticket_ids}")
+    rows = []
+    reprocessed_ids = []
+    for tid in ticket_ids:
+        t = fetch_ticket_detail(tid)
+        if not isinstance(t, dict) or t.get("id") is None:
+            continue
+        row = map_row(t)
+        if row.get("ticket_id") is None:
+            continue
+        if row.get("status") is None:
+            continue
+        rows.append(row)
+        reprocessed_ids.append(tid)
+        time.sleep(THROTTLE)
+    n_upsert = robust_upsert(rows)
+    n_delete = robust_delete(reprocessed_ids)
+    print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
+    print(f"DELETE MISSING: {n_delete}")
 
 
 if __name__ == "__main__":
