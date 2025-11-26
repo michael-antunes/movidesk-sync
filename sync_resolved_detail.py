@@ -26,7 +26,7 @@ CRITICAL_FIELDS = [
     "last_closed_at",
 ]
 
-# ID do campo adicional "Nome" = 29077
+# ID do campo adicional "Nome" = 29077 (confirmado por você)
 ADICIONAL_NOME_ID = 29077
 
 
@@ -41,7 +41,13 @@ def get_connection():
     return conn
 
 
-def movidesk_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def movidesk_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """
+    Chama a API do Movidesk.
+
+    - Não faz paginação (não precisa para /tickets?id=...).
+    - Em caso de 404, retorna {}.
+    """
     if not API_TOKEN:
         raise RuntimeError("MOVIDESK_TOKEN não configurado")
 
@@ -54,7 +60,6 @@ def movidesk_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
     resp = requests.get(url, params=params, timeout=30)
     if resp.status_code == 404:
-        # ticket não existe mais
         return {}
     resp.raise_for_status()
     return resp.json()
@@ -69,11 +74,13 @@ def normalize(text: Optional[str]) -> str:
 # --------------------------------------------------------------------
 def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Calcula last_resolved_at e last_closed_at a partir da lista de actions do ticket.
+    Calcula last_resolved_at e last_closed_at a partir das actions do ticket.
 
-    Regras:
+    Regras (pra bater com o que você descreveu):
       - resolved_at: primeira vez que o status vira 'Resolvido' OU 'Cancelado'
       - closed_at  : última vez que o status vira 'Fechado'
+
+    Cancelado NÃO tem data de fechamento, então só resolved_at.
     """
     resolved_at: Optional[str] = None
     closed_at: Optional[str] = None
@@ -94,9 +101,11 @@ def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Opt
 
         status_str = normalize(action.get("status") or action.get("statusName"))
 
+        # primeira resolução (Resolvido ou Cancelado)
         if ("resolvido" in status_str or "cancelado" in status_str) and resolved_at is None:
             resolved_at = created
 
+        # última vez que virou Fechado
         if "fechado" in status_str:
             closed_at = created
 
@@ -104,7 +113,7 @@ def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Opt
 
 
 # --------------------------------------------------------------------
-# Extração de campos do ticket
+# Extração de campos do ticket (org, serviço, adicionais)
 # --------------------------------------------------------------------
 def extract_adicional_nome(ticket: Dict[str, Any]) -> Optional[str]:
     """
@@ -163,6 +172,7 @@ def extract_service_levels(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optio
     second = service.get("secondLevel") or service.get("serviceSecondLevel")
     third = service.get("thirdLevel") or service.get("serviceThirdLevel")
 
+    # fallback em campos soltos
     if not second:
         second = ticket.get("serviceSecondLevel")
     if not third:
@@ -181,7 +191,7 @@ def extract_service_levels(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optio
 
 def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Converte o JSON do ticket em uma linha para o tickets_resolvidos.
+    Converte o JSON do ticket em uma linha para a tabela tickets_resolvidos.
     """
     ticket_id = ticket.get("id") or ticket.get("ticketId")
     if ticket_id is None:
@@ -264,6 +274,34 @@ def delete_from_missing(cur, ticket_ids: List[int]) -> int:
 
 
 # --------------------------------------------------------------------
+# Leitura do ticket na API (CORRIGIDO: /tickets?id=... )
+# --------------------------------------------------------------------
+def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
+    """
+    Busca o ticket na API usando /tickets?id=... (padrão Movidesk).
+    A API costuma retornar uma lista; aqui normalizamos pra um único dict.
+    """
+    data = movidesk_get(
+        "tickets",
+        params={
+            "id": ticket_id,
+            "include": "actions,service,organization,customFieldValues",
+        },
+    )
+
+    if not data:
+        return {}
+
+    if isinstance(data, list):
+        if not data:
+            return {}
+        return data[0]
+
+    # se por acaso vier como objeto único
+    return data
+
+
+# --------------------------------------------------------------------
 # UPSERT no detalhe
 # --------------------------------------------------------------------
 def upsert_detail(cur, rows: List[Dict[str, Any]]) -> int:
@@ -327,14 +365,9 @@ def main():
 
         for i, ticket_id in enumerate(ticket_ids, start=1):
             try:
-                ticket = movidesk_get(
-                    f"tickets/{ticket_id}",
-                    params={
-                        "include": "actions,service,organization,customFieldValues",
-                    },
-                )
+                ticket = fetch_ticket(ticket_id)
                 if not ticket:
-                    print(f"[WARN] ticket {ticket_id} não encontrado na API (404).")
+                    print(f"[WARN] ticket {ticket_id} não encontrado na API (404 ou vazio).")
                     continue
 
                 row = map_row(ticket)
