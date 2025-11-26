@@ -89,12 +89,13 @@ def get_pending_ids(conn, limit: int) -> List[int]:
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
     """
     Registra motivo da falha em audit_ticket_watch.
+    OBS: tabela não tem mais coluna 'source', então gravamos só (ticket_id, reason).
     """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO audit_ticket_watch (ticket_id, source, reason)
-            VALUES (%s, 'sync_resolved_detail', %s)
+            INSERT INTO audit_ticket_watch (ticket_id, reason)
+            VALUES (%s, %s)
             """,
             (ticket_id, reason),
         )
@@ -167,7 +168,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     """
     Monta o dicionário de campos para tickets_resolvidos.
 
-    **FOCO NOS TEMPOS**:
+    FOCO NOS TEMPOS:
     - Usa resolvedIn / closedIn primeiro;
     - Se vierem nulos, tenta inferir a partir de statusHistories.
     """
