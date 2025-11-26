@@ -15,7 +15,6 @@ SCHEMA_DST = "visualizacao_resolucao"
 T_AUDIT = f"{SCHEMA_AUD}.audit_recent_missing"
 T_RPS   = f"{SCHEMA_DST}.resolucao_por_status"
 
-# controles
 IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
 AUDIT_LIMIT    = int(os.getenv("AUDIT_LIMIT", "300"))
 THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35"))
@@ -25,6 +24,7 @@ if not API_TOKEN or not NEON_DSN:
 
 SESS = requests.Session()
 SESS.headers.update({"User-Agent": "movidesk-sync/resolucao-status"})
+
 
 def _sleep_retry_after(r):
     try:
@@ -36,6 +36,7 @@ def _sleep_retry_after(r):
         pass
     return False
 
+
 def md_get(params, max_retries=4):
     p = dict(params or {})
     p["token"] = API_TOKEN
@@ -43,11 +44,15 @@ def md_get(params, max_retries=4):
     for i in range(max_retries):
         r = SESS.get(API_BASE, params=p, timeout=60)
         if r.status_code == 200:
-            return r.json() or []
+            try:
+                js = r.json() or []
+            except ValueError:
+                return []
+            return js
         if r.status_code in (429, 500, 502, 503, 504):
             if _sleep_retry_after(r):
                 continue
-            time.sleep(1 + 2*i)
+            time.sleep(1 + 2 * i)
             last_err = requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
             continue
         r.raise_for_status()
@@ -55,10 +60,8 @@ def md_get(params, max_retries=4):
         last_err.response.raise_for_status()
     return []
 
+
 def get_audit_ids(conn, limit_):
-    """
-    Busca SOMENTE da audit Recent Missing, maiores IDs primeiro.
-    """
     sql = f"""
       select ticket_id
         from {T_AUDIT}
@@ -74,6 +77,7 @@ def get_audit_ids(conn, limit_):
                  ids[:10], " ..." if len(ids) > 10 else "")
     return ids
 
+
 def clear_audit_ids(conn, ids):
     if not ids:
         return
@@ -86,12 +90,12 @@ def clear_audit_ids(conn, ids):
         cur.execute(sql, (ids,))
     conn.commit()
 
+
 def build_expand_param():
-    # !!! Importante: SEM changedByTeam (causava 400)
-    # Pegar working/fulltime seconds, status/justification/changedDate e o changedBy (para agente)
     exp = "statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=id,businessName))"
     logging.info("EXPAND usado (debug): %s", exp)
     return exp
+
 
 def fetch_chunk(ids_chunk):
     if not ids_chunk:
@@ -104,12 +108,20 @@ def fetch_chunk(ids_chunk):
         "$top": 100,
         "includeDeletedItems": "true",
     }
-    return md_get(params) or []
+    raw = md_get(params) or []
+    if isinstance(raw, dict):
+        data = raw.get("items") or raw.get("value") or []
+    else:
+        data = raw
+    if isinstance(data, dict):
+        data = data.get("items") or data.get("value") or []
+    data = data or []
+    logging.info("fetch_chunk: ids=%s... -> %d item(s) da API",
+                 ids_chunk[:5], len(data))
+    return data
+
 
 def normalize_changed_date(s: str) -> str | None:
-    """
-    Normaliza para string no formato 'YYYY-MM-DD HH:MM:SS' (UTC, sem tz).
-    """
     if not s:
         return None
     try:
@@ -119,19 +131,15 @@ def normalize_changed_date(s: str) -> str | None:
         dt = dt.astimezone(timezone.utc).replace(microsecond=0, tzinfo=None)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return s  # deixa passar; o Postgres ainda pode converter
+        return s
+
 
 def map_rows(item):
-    """
-    Transforma 1 ticket em várias linhas para resolucao_por_status.
-    Deduplicação será feita depois.
-    """
     out = []
     tid = int(item.get("id"))
     owner_team = item.get("ownerTeam") or ""
     if isinstance(owner_team, dict):
         owner_team = owner_team.get("businessName") or ""
-
     for h in (item.get("statusHistories") or []):
         status = h.get("status") or ""
         justific = h.get("justification") or ""
@@ -140,8 +148,6 @@ def map_rows(item):
         chg = h.get("changedBy") or {}
         agent = chg.get("businessName") if isinstance(chg, dict) else ""
         dt = normalize_changed_date(h.get("changedDate"))
-
-        # time_squad não vem na API aqui; mantemos vazio
         row = (
             tid,
             status,
@@ -152,10 +158,11 @@ def map_rows(item):
             dt,
             agent or "",
             owner_team or "",
-            ""  # time_squad
+            ""
         )
         out.append(row)
     return out
+
 
 UPSERT_SQL = f"""
 insert into {T_RPS}
@@ -172,26 +179,21 @@ on conflict (ticket_id, status, justificativa, changed_date) do update set
   imported_at = now()
 """
 
+
 def dedupe_rows(rows):
-    """
-    Remove duplicatas por (ticket_id, status, justificativa, changed_date).
-    Em caso de colisão, prefere:
-      - quem tiver agent_name ou team_name preenchidos;
-      - maior seconds_uti.
-    """
     best = {}
     for r in rows:
-        key = (r[0], r[1], r[2], r[6])  # tid, status, justific, changed_date
+        key = (r[0], r[1], r[2], r[6])
         cur = best.get(key)
         if cur is None:
             best[key] = r
             continue
-        # pontuação simples para decidir:
-        score_cur = (1 if (cur[7] or cur[8]) else 0, cur[3])    # (tem agente/equipe?, seconds_uti)
+        score_cur = (1 if (cur[7] or cur[8]) else 0, cur[3])
         score_new = (1 if (r[7] or r[8]) else 0, r[3])
         if score_new > score_cur:
             best[key] = r
     return list(best.values())
+
 
 def upsert_rows(conn, rows):
     if not rows:
@@ -202,32 +204,29 @@ def upsert_rows(conn, rows):
     conn.commit()
     return len(rows)
 
+
 def main():
     total_upserts = 0
     cleared = 0
 
     with psycopg2.connect(NEON_DSN) as conn:
-        # 1) pega um page da audit (SOMENTE da audit)
         ids = get_audit_ids(conn, AUDIT_LIMIT)
         if not ids:
             logging.info("Fila vazia para 'resolucao_por_status'. Nada a fazer.")
             return
 
-        # 2) busca na API em grupos
         all_rows = []
         processed_ids = set()
         i = 0
         while i < len(ids):
-            chunk = ids[i:i+IDS_GROUP_SIZE]
+            chunk = ids[i:i + IDS_GROUP_SIZE]
             i += IDS_GROUP_SIZE
             try:
                 data = fetch_chunk(chunk)
             except requests.HTTPError as e:
                 logging.warning("Erro HTTP duro em fetch_chunk: %s :: %s", e, getattr(e.response, "text", ""))
-                # não limpa audit desses IDs, tenta no próximo run
                 continue
 
-            # mapeia
             for item in data or []:
                 try:
                     tid = int(item.get("id"))
@@ -240,12 +239,10 @@ def main():
 
             time.sleep(THROTTLE_SEC)
 
-        # 3) grava (dedupe interno no upsert_rows)
         wrote = upsert_rows(conn, all_rows)
         total_upserts += wrote
         logging.info("Gravadas %d linha(s) em %s.", wrote, T_RPS)
 
-        # 4) limpa da audit somente os IDs que tivemos payload
         if processed_ids:
             clear_audit_ids(conn, list(processed_ids))
             cleared += len(processed_ids)
@@ -255,6 +252,6 @@ def main():
 
     logging.info("Fim. upserts=%d, audit_cleared_ids=%d", total_upserts, cleared)
 
+
 if __name__ == "__main__":
     main()
-
