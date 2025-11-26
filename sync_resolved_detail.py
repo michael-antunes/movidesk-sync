@@ -60,11 +60,8 @@ def fetch_ticket_detail(ticket_id):
     url = f"{API_BASE}/tickets"
     params = {
         "token": API_TOKEN,
-        "$select": "id,subject,status,baseStatus,ownerTeam,origin,category,urgency,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,lastUpdate",
-        "$expand": "clients($expand=organization),owner,customFieldValues",
-        "$filter": f"id eq {ticket_id}",
-        "$top": 1,
-        "$skip": 0,
+        "id": ticket_id,
+        "includeDeletedItems": "true",
     }
     data = http_get(url, params=params, timeout=120, allow_400=True)
     if isinstance(data, list) and data:
@@ -75,37 +72,31 @@ def fetch_ticket_detail(ticket_id):
 
 
 def extract_custom_nome(ticket):
-    pools = []
-    for k in ("customFieldValues", "customFields", "additionalFields"):
-        v = ticket.get(k)
-        if isinstance(v, list):
-            pools.extend(v)
-    if not pools:
+    values = ticket.get("customFieldValues") or []
+    if not isinstance(values, list):
         return None
     if CUSTOM_NOME_FIELD_ID:
-        for e in pools:
+        for e in values:
             if not isinstance(e, dict):
                 continue
             cid = str(e.get("customFieldId") or e.get("id") or "").strip()
             if cid == CUSTOM_NOME_FIELD_ID:
-                for vk in ("value", "currentValue", "text", "valueName", "name", "option"):
-                    val = e.get(vk)
-                    if isinstance(val, list):
-                        val = ", ".join(str(x) for x in val if x not in ("", None))
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
+                val = e.get("value") or e.get("currentValue") or e.get("text") or e.get("valueName") or e.get("name")
+                if isinstance(val, list):
+                    val = ", ".join(str(x) for x in val if x not in ("", None))
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
     if CUSTOM_NOME_FIELD_LABEL:
-        for e in pools:
+        for e in values:
             if not isinstance(e, dict):
                 continue
             label = str(e.get("field") or e.get("name") or e.get("label") or "").strip().lower()
             if label == CUSTOM_NOME_FIELD_LABEL:
-                for vk in ("value", "currentValue", "text", "valueName", "name", "option"):
-                    val = e.get(vk)
-                    if isinstance(val, list):
-                        val = ", ".join(str(x) for x in val if x not in ("", None))
-                    if isinstance(val, str) and val.strip():
-                        return val.strip()
+                val = e.get("value") or e.get("currentValue") or e.get("text") or e.get("valueName") or e.get("name")
+                if isinstance(val, list):
+                    val = ", ".join(str(x) for x in val if x not in ("", None))
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
     return None
 
 
@@ -159,7 +150,7 @@ on conflict (ticket_id) do update set
 
 DELETE_MISSING_SQL = """
 delete from visualizacao_resolvidos.audit_recent_missing
-where table_name = 'tickets_resolvidos'
+where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
   and ticket_id = any(%s)
 """
 
@@ -168,11 +159,12 @@ def select_missing_ticket_ids(conn, limit):
     with conn.cursor() as cur:
         cur.execute(
             """
-            with to_fix as (
+            with audit_ids as (
               select distinct ticket_id
               from visualizacao_resolvidos.audit_recent_missing
-              where table_name = 'tickets_resolvidos'
-              union
+              where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
+            ),
+            incomplete as (
               select ticket_id
               from visualizacao_resolvidos.tickets_resolvidos
               where
@@ -187,6 +179,11 @@ def select_missing_ticket_ids(conn, limit):
                 or owner_id is null
                 or subject is null
                 or adicional_nome is null
+            ),
+            to_fix as (
+              select ticket_id from audit_ids
+              union
+              select ticket_id from incomplete
             )
             select ticket_id
             from to_fix
