@@ -54,10 +54,12 @@ def md_get(path: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = Fa
 
 def get_pending_ids(conn, limit: int) -> List[int]:
     """
-    Busca os ticket_id que estão em audit_recent_missing para a tabela tickets_resolvidos,
-    especificamente para os campos de tempo (last_resolved_at, last_closed_at).
+    Busca os ticket_id que estão em audit_recent_missing para a tabela tickets_resolvidos.
 
-    Usa audit_recent_missing + audit_recent_run e deduplica no Python.
+    A trigger nova joga tudo pra missing, então:
+    - filtramos só por table_name = 'tickets_resolvidos'
+    - ordenamos pelos runs mais recentes
+    - deduplicamos por ticket_id em Python
     """
     sql = """
         SELECT
@@ -67,7 +69,6 @@ def get_pending_ids(conn, limit: int) -> List[int]:
         JOIN audit_recent_run r
           ON r.id = m.run_id
         WHERE m.table_name = 'tickets_resolvidos'
-          AND m.column_name IN ('last_resolved_at', 'last_closed_at')
         ORDER BY r.run_at DESC, m.ticket_id DESC
         LIMIT %s
     """
@@ -101,8 +102,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
 
 def mark_still_missing(conn, ticket_id: int, missing_fields: List[str]) -> None:
     """
-    Mesmo após chamar a API ainda ficamos sem alguns campos -> registramos em audit_ticket_watch
-    para análise posterior.
+    Mesmo após chamar a API ainda ficamos sem alguns campos -> registramos em audit_ticket_watch.
     """
     reason = "still_null_fields:" + ",".join(sorted(missing_fields))
     register_ticket_failure(conn, ticket_id, reason)
@@ -132,7 +132,8 @@ def delete_processed_from_missing(conn, ids: List[int]) -> None:
 
 def parse_datetime(value: Optional[str]) -> Optional[str]:
     """
-    A API já manda os datetimes em ISO 8601; deixamos como string e deixamos o psycopg2 converter.
+    A API já manda os datetimes em ISO 8601; deixamos como string
+    e deixamos o psycopg2 converter.
     """
     if not value:
         return None
