@@ -1,259 +1,232 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import os, time, json, logging, requests, psycopg2
-from datetime import datetime, timezone
-from psycopg2.extras import execute_values
+import os
+import time
+import json
+import requests
+import psycopg2
+import psycopg2.extras
+import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+NEON_DSN = os.getenv("NEON_DSN")
 
-API_BASE = "https://api.movidesk.com/public/v1/tickets"
-API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-NEON_DSN  = os.getenv("NEON_DSN")
+CHAT_ORIGINS = {5, 6, 23, 25, 26, 27}
 
-SCHEMA_AUD = "visualizacao_resolvidos"
-SCHEMA_DST = "visualizacao_resolucao"
-T_AUDIT = f"{SCHEMA_AUD}.audit_recent_missing"
-T_RPS   = f"{SCHEMA_DST}.resolucao_por_status"
 
-# controles
-IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-AUDIT_LIMIT    = int(os.getenv("AUDIT_LIMIT", "300"))
-THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35"))
+def to_iso_z(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    else:
+        dt = dt.astimezone(datetime.timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-if not API_TOKEN or not NEON_DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-SESS = requests.Session()
-SESS.headers.update({"User-Agent": "movidesk-sync/resolucao-status"})
-
-def _sleep_retry_after(r):
+def iint(x):
     try:
-        ra = r.headers.get("retry-after")
-        if ra:
-            time.sleep(max(1, int(str(ra).strip())))
-            return True
+        if x is None:
+            return None
+        return int(x)
     except Exception:
-        pass
-    return False
-
-def md_get(params, max_retries=4):
-    p = dict(params or {})
-    p["token"] = API_TOKEN
-    last_err = None
-    for i in range(max_retries):
-        r = SESS.get(API_BASE, params=p, timeout=60)
-        if r.status_code == 200:
-            return r.json() or []
-        if r.status_code in (429, 500, 502, 503, 504):
-            if _sleep_retry_after(r):
-                continue
-            time.sleep(1 + 2*i)
-            last_err = requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
-            continue
-        r.raise_for_status()
-    if last_err:
-        last_err.response.raise_for_status()
-    return []
-
-def get_audit_ids(conn, limit_):
-    """
-    Busca SOMENTE da audit Recent Missing, maiores IDs primeiro.
-    """
-    sql = f"""
-      select ticket_id
-        from {T_AUDIT}
-       where table_name = 'resolucao_por_status'
-       order by run_id desc, ticket_id desc
-       limit %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit_,))
-        rows = cur.fetchall() or []
-    ids = [r[0] for r in rows]
-    logging.info("Lote da fila (maiores IDs primeiro): %s%s",
-                 ids[:10], " ..." if len(ids) > 10 else "")
-    return ids
-
-def clear_audit_ids(conn, ids):
-    if not ids:
-        return
-    sql = f"""
-      delete from {T_AUDIT}
-       where table_name = 'resolucao_por_status'
-         and ticket_id = any(%s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ids,))
-    conn.commit()
-
-def build_expand_param():
-    # !!! Importante: SEM changedByTeam (causava 400)
-    # Pegar working/fulltime seconds, status/justification/changedDate e o changedBy (para agente)
-    exp = "statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=id,businessName))"
-    logging.info("EXPAND usado (debug): %s", exp)
-    return exp
-
-def fetch_chunk(ids_chunk):
-    if not ids_chunk:
-        return []
-    filtro = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
-    params = {
-        "$select": "id,ownerTeam",
-        "$expand": build_expand_param(),
-        "$filter": filtro,
-        "$top": 100,
-        "includeDeletedItems": "true",
-    }
-    return md_get(params) or []
-
-def normalize_changed_date(s: str) -> str | None:
-    """
-    Normaliza para string no formato 'YYYY-MM-DD HH:MM:SS' (UTC, sem tz).
-    """
-    if not s:
         return None
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(timezone.utc).replace(microsecond=0, tzinfo=None)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return s  # deixa passar; o Postgres ainda pode converter
 
-def map_rows(item):
-    """
-    Transforma 1 ticket em várias linhas para resolucao_por_status.
-    Deduplicação será feita depois.
-    """
-    out = []
-    tid = int(item.get("id"))
-    owner_team = item.get("ownerTeam") or ""
-    if isinstance(owner_team, dict):
-        owner_team = owner_team.get("businessName") or ""
 
-    for h in (item.get("statusHistories") or []):
-        status = h.get("status") or ""
-        justific = h.get("justification") or ""
-        sec_work = h.get("permanencyTimeWorkingTime") or 0
-        sec_full = h.get("permanencyTimeFullTime") or 0
-        chg = h.get("changedBy") or {}
-        agent = chg.get("businessName") if isinstance(chg, dict) else ""
-        dt = normalize_changed_date(h.get("changedDate"))
+def _req(url, params, max_retries=3):
+    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
+    last_exc = None
+    for _ in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=90)
+            if r.status_code == 200:
+                return r.json()
+            last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(throttle)
+    if last_exc:
+        raise last_exc
+    return None
 
-        # time_squad não vem na API aqui; mantemos vazio
-        row = (
-            tid,
-            status,
-            justific,
-            int(sec_work or 0),
-            float(sec_full or 0.0),
-            json.dumps(chg, ensure_ascii=False),
-            dt,
-            agent or "",
-            owner_team or "",
-            ""  # time_squad
+
+def get_since_from_db(conn, days_back, overlap_minutes):
+    with conn.cursor() as cur:
+        cur.execute(
+            "select max(changed_date) from visualizacao_resolucao.resolucao_por_status"
         )
-        out.append(row)
-    return out
+        row = cur.fetchone()
+    now_utc = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+    if row and row[0]:
+        since = row[0]
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=datetime.timezone.utc)
+        since = since - datetime.timedelta(minutes=overlap_minutes)
+    else:
+        since = now_utc - datetime.timedelta(days=days_back)
+    return since
 
-UPSERT_SQL = f"""
-insert into {T_RPS}
-(ticket_id, status, justificativa, seconds_uti, permanency_time_fulltime_seconds,
- changed_by, changed_date, agent_name, team_name, time_squad)
-values %s
-on conflict (ticket_id, status, justificativa, changed_date) do update set
-  seconds_uti = excluded.seconds_uti,
-  permanency_time_fulltime_seconds = excluded.permanency_time_fulltime_seconds,
-  changed_by  = excluded.changed_by,
-  agent_name  = excluded.agent_name,
-  team_name   = excluded.team_name,
-  time_squad  = excluded.time_squad,
-  imported_at = now()
+
+def fetch_status_history(since_iso):
+    url = f"{API_BASE}/tickets/statusHistory"
+    limit = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
+    starting_after = None
+    items = []
+    while True:
+        params = {
+            "token": API_TOKEN,
+            "changedDateGreaterThan": since_iso,
+            "limit": limit,
+        }
+        if starting_after:
+            params["startingAfter"] = starting_after
+        page = _req(url, params) or {}
+        page_items = page.get("items") or []
+        items.extend(page_items)
+        if not page_items or not bool(page.get("hasMore")):
+            break
+        starting_after = page_items[-1].get("id")
+        time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.2")))
+    return items
+
+
+def map_row(r):
+    return {
+        "id": r.get("id"),
+        "ticket_id": r.get("ticketId"),
+        "agent_name": r.get("agentName"),
+        "changed_date": r.get("changedDate"),
+        "status": r.get("status"),
+        "permanency_time_fulltime_seconds": iint(
+            r.get("permanencyTimeFulltimeSeconds")
+        ),
+    }
+
+
+UPSERT_SQL = """
+insert into visualizacao_resolucao.resolucao_por_status
+(id,ticket_id,agent_name,changed_date,status,permanency_time_fulltime_seconds)
+values (%(id)s,%(ticket_id)s,%(agent_name)s,%(changed_date)s,%(status)s,%(permanency_time_fulltime_seconds)s)
+on conflict (id) do update set
+  ticket_id = excluded.ticket_id,
+  agent_name = excluded.agent_name,
+  changed_date = excluded.changed_date,
+  status = excluded.status,
+  permanency_time_fulltime_seconds = excluded.permanency_time_fulltime_seconds
 """
 
-def dedupe_rows(rows):
-    """
-    Remove duplicatas por (ticket_id, status, justificativa, changed_date).
-    Em caso de colisão, prefere:
-      - quem tiver agent_name ou team_name preenchidos;
-      - maior seconds_uti.
-    """
-    best = {}
-    for r in rows:
-        key = (r[0], r[1], r[2], r[6])  # tid, status, justific, changed_date
-        cur = best.get(key)
-        if cur is None:
-            best[key] = r
-            continue
-        # pontuação simples para decidir:
-        score_cur = (1 if (cur[7] or cur[8]) else 0, cur[3])    # (tem agente/equipe?, seconds_uti)
-        score_new = (1 if (r[7] or r[8]) else 0, r[3])
-        if score_new > score_cur:
-            best[key] = r
-    return list(best.values())
 
 def upsert_rows(conn, rows):
     if not rows:
         return 0
-    rows = dedupe_rows(rows)
     with conn.cursor() as cur:
-        execute_values(cur, UPSERT_SQL, rows, page_size=200)
-    conn.commit()
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=1000)
     return len(rows)
 
+
+def select_ticket_ids_chat_to_update(conn, limit_):
+    sql = """
+        select ra.ticket_id
+        from visualizacao_resolvidos.resolvidos_acoes ra
+        join visualizacao_resolvidos.tickets_resolvidos tr
+          on tr.ticket_id = ra.ticket_id
+        where tr.origin in (23, 25, 26, 27)
+          and jsonb_typeof(ra.acoes) = 'array'
+          and (
+              (ra.acoes->0->>'description') is null
+              or ra.acoes->0->>'description' = ''
+          )
+        order by ra.ticket_id
+        limit %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (limit_,))
+        rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+
+def fetch_ticket_chat_actions(ticket_id):
+    params = {
+        "token": API_TOKEN,
+        "id": ticket_id,
+        "$select": "id,actions",
+        "$expand": "actions($select=id,origin,type,status,createdDate,createdBy,description,attachments)",
+    }
+    url = f"{API_BASE}/tickets"
+    r = requests.get(url, params=params, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Movidesk API error for ticket {ticket_id}: {r.status_code} {r.text}"
+        )
+    data = r.json()
+    if isinstance(data, list):
+        ticket = data[0] if data else {}
+    else:
+        ticket = data
+    actions = ticket.get("actions") or []
+    result = []
+    for a in actions:
+        if a.get("origin") in CHAT_ORIGINS:
+            result.append(a)
+    return result
+
+
+def update_resolvidos_acoes_chat(conn, ticket_id, actions):
+    payload = json.dumps(actions, ensure_ascii=False)
+    sql = """
+        update visualizacao_resolvidos.resolvidos_acoes
+           set acoes = %s
+         where ticket_id = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (payload, ticket_id))
+
+
+def sync_chat_resolvidos_acoes(conn, limit_):
+    ticket_ids = select_ticket_ids_chat_to_update(conn, limit_)
+    if not ticket_ids:
+        print("SYNC CHAT: nenhum ticket para atualizar")
+        return 0
+    updated = 0
+    for idx, ticket_id in enumerate(ticket_ids, start=1):
+        try:
+            actions = fetch_ticket_chat_actions(ticket_id)
+            update_resolvidos_acoes_chat(conn, ticket_id, actions)
+            updated += 1
+            print(
+                f"SYNC CHAT: ticket {ticket_id} atualizado com {len(actions)} ações de chat"
+            )
+        except Exception as exc:
+            print(f"SYNC CHAT ERRO ticket {ticket_id}: {exc}")
+        if idx < len(ticket_ids):
+            time.sleep(6)
+    return updated
+
+
 def main():
-    total_upserts = 0
-    cleared = 0
+    if not API_TOKEN:
+        raise RuntimeError("MOVIDESK_TOKEN não definido")
+    if not NEON_DSN:
+        raise RuntimeError("NEON_DSN não definido")
 
-    with psycopg2.connect(NEON_DSN) as conn:
-        # 1) pega um page da audit (SOMENTE da audit)
-        ids = get_audit_ids(conn, AUDIT_LIMIT)
-        if not ids:
-            logging.info("Fila vazia para 'resolucao_por_status'. Nada a fazer.")
-            return
+    days_back = int(os.getenv("MOVIDESK_RPS_DAYS", "120"))
+    overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
+    chat_limit = int(os.getenv("MOVIDESK_CHAT_LIMIT", "200"))
 
-        # 2) busca na API em grupos
-        all_rows = []
-        processed_ids = set()
-        i = 0
-        while i < len(ids):
-            chunk = ids[i:i+IDS_GROUP_SIZE]
-            i += IDS_GROUP_SIZE
-            try:
-                data = fetch_chunk(chunk)
-            except requests.HTTPError as e:
-                logging.warning("Erro HTTP duro em fetch_chunk: %s :: %s", e, getattr(e.response, "text", ""))
-                # não limpa audit desses IDs, tenta no próximo run
-                continue
+    conn = psycopg2.connect(NEON_DSN)
+    conn.autocommit = True
+    try:
+        since_dt = get_since_from_db(conn, days_back, overlap_minutes)
+        since_iso = to_iso_z(since_dt)
 
-            # mapeia
-            for item in data or []:
-                try:
-                    tid = int(item.get("id"))
-                except Exception:
-                    continue
-                rows = map_rows(item)
-                if rows:
-                    all_rows.extend(rows)
-                    processed_ids.add(tid)
+        resp = fetch_status_history(since_iso)
+        rows = [map_row(x) for x in resp if isinstance(x, dict)]
+        n = upsert_rows(conn, rows)
 
-            time.sleep(THROTTLE_SEC)
+        print(f"DESDE {since_iso} | UPSERT RPS: {n}")
 
-        # 3) grava (dedupe interno no upsert_rows)
-        wrote = upsert_rows(conn, all_rows)
-        total_upserts += wrote
-        logging.info("Gravadas %d linha(s) em %s.", wrote, T_RPS)
+        n_chat = sync_chat_resolvidos_acoes(conn, chat_limit)
+        print(f"SYNC CHAT RESOLVIDOS_ACOES: {n_chat}")
+    finally:
+        conn.close()
 
-        # 4) limpa da audit somente os IDs que tivemos payload
-        if processed_ids:
-            clear_audit_ids(conn, list(processed_ids))
-            cleared += len(processed_ids)
-            logging.info("Limpou %d ticket(s) da audit.", len(processed_ids))
-        else:
-            logging.info("Nenhum ticket com payload; audit não foi limpa.")
-
-    logging.info("Fim. upserts=%d, audit_cleared_ids=%d", total_upserts, cleared)
 
 if __name__ == "__main__":
     main()
