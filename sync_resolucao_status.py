@@ -116,7 +116,7 @@ def build_expand_param():
 def fetch_chunk(ids_chunk):
     if not ids_chunk:
         return []
-    filtro = " or ".join([f"id eq {int(i)}" for i in ids_chunk])
+    filtro = " ".join(f"id eq {int(i)} or" for i in ids_chunk)[:-3]
     params = {
         "$select": "id,ownerTeam",
         "$expand": build_expand_param(),
@@ -248,17 +248,25 @@ def main():
                     e,
                     getattr(e.response, "text", ""),
                 )
+                # não marca como processado; deixa na audit para tentar depois
                 continue
 
-            for item in data or []:
-                try:
-                    tid = int(item.get("id"))
-                except Exception:
-                    continue
-                rows = map_rows(item)
-                if rows:
-                    all_rows.extend(rows)
-                    processed_ids.add(tid)
+            if not data:
+                logging.info(
+                    "Chunk sem payload na API, marcando IDs como processados mesmo assim: %s",
+                    chunk,
+                )
+                processed_ids.update(int(x) for x in chunk)
+            else:
+                for item in data or []:
+                    try:
+                        tid = int(item.get("id"))
+                    except Exception:
+                        continue
+                    rows = map_rows(item)
+                    if rows:
+                        all_rows.extend(rows)
+                        processed_ids.add(tid)
 
             time.sleep(THROTTLE_SEC)
 
