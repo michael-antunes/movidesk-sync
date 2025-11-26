@@ -90,8 +90,11 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
     """
     Registra falha em audit_ticket_watch.
 
-    IMPORTANTE: pela sua base, a tabela NÃO tem colunas source/reason.
-    Então aqui gravamos só o ticket_id; o detalhe do motivo fica no log.
+    IMPORTANTE:
+    - Tabela tem apenas ticket_id como PK.
+    - Usamos ON CONFLICT DO NOTHING para não estourar UniqueViolation
+      quando o mesmo ticket falha mais de uma vez.
+    O motivo fica registrado somente nos logs.
     """
     logger.debug("Registrando falha para ticket %s: %s", ticket_id, reason)
     with conn.cursor() as cur:
@@ -99,6 +102,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
             """
             INSERT INTO audit_ticket_watch (ticket_id)
             VALUES (%s)
+            ON CONFLICT (ticket_id) DO NOTHING
             """,
             (ticket_id,),
         )
