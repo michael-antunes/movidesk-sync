@@ -88,16 +88,19 @@ def get_pending_ids(conn, limit: int) -> List[int]:
 
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
     """
-    Registra motivo da falha em audit_ticket_watch.
-    OBS: tabela não tem mais coluna 'source', então gravamos só (ticket_id, reason).
+    Registra falha em audit_ticket_watch.
+
+    IMPORTANTE: pela sua base, a tabela NÃO tem colunas source/reason.
+    Então aqui gravamos só o ticket_id; o detalhe do motivo fica no log.
     """
+    logger.debug("Registrando falha para ticket %s: %s", ticket_id, reason)
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO audit_ticket_watch (ticket_id, reason)
-            VALUES (%s, %s)
+            INSERT INTO audit_ticket_watch (ticket_id)
+            VALUES (%s)
             """,
-            (ticket_id, reason),
+            (ticket_id,),
         )
 
 
