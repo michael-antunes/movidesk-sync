@@ -1,371 +1,336 @@
 import os
 import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 import psycopg2
 import psycopg2.extras
 
-# -------------------------------------------------------------------
-# Configuração básica
-# -------------------------------------------------------------------
-
+# --------------------------------------------------------------------
+# Configuração
+# --------------------------------------------------------------------
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))  # segundos entre requisições
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
-THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
-BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
+# Campos que queremos inspecionar quando ficam NULL
+CRITICAL_FIELDS = [
+    "organization_id",
+    "organization_name",
+    "service_second_level",
+    "service_third_level",
+    "adicional_nome",
+    "last_resolved_at",
+    "last_closed_at",
+]
 
-# Campo adicional "Nome" (ID 29077 por padrão)
-DEFAULT_NOME_FIELD_ID = "29077"
-CUSTOM_NOME_FIELD_ID = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_ID", DEFAULT_NOME_FIELD_ID).strip()
-CUSTOM_NOME_FIELD_LABEL = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_LABEL", "").strip().lower()
-
-
-# -------------------------------------------------------------------
-# Helpers gerais
-# -------------------------------------------------------------------
-
-def iint(x):
-    """Converte para int ou retorna None."""
-    try:
-        s = str(x)
-        return int(s) if s.isdigit() else None
-    except Exception:
-        return None
+# ID do campo adicional "Nome" = 29077
+ADICIONAL_NOME_ID = 29077
 
 
-def norm_ts(x):
-    """Normaliza timestamp vindo da API (ignora 0001-01-01 etc.)."""
-    if not x:
-        return None
-    s = str(x).strip()
-    if not s or s.startswith("0001-01-01"):
-        return None
-    return s
+# --------------------------------------------------------------------
+# Helpers genéricos
+# --------------------------------------------------------------------
+def get_connection():
+    if not NEON_DSN:
+        raise RuntimeError("NEON_DSN não configurado")
+    conn = psycopg2.connect(NEON_DSN, sslmode="require")
+    conn.autocommit = False
+    return conn
 
 
-def http_get(url, params=None, timeout=90, allow_400=False):
-    """GET com tratamento de throttle (429/503) e 400/404 opcionais."""
-    while True:
-        r = requests.get(url, params=params, timeout=timeout)
+def movidesk_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not API_TOKEN:
+        raise RuntimeError("MOVIDESK_TOKEN não configurado")
 
-        # Throttling
-        if r.status_code in (429, 503):
-            retry = r.headers.get("retry-after")
-            wait = int(retry) if str(retry).isdigit() else 60
-            print(f"Throttling {r.status_code}, esperando {wait}s")
-            time.sleep(wait)
+    if params is None:
+        params = {}
+
+    params = dict(params)
+    params["token"] = API_TOKEN
+
+    url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
+    resp = requests.get(url, params=params, timeout=30)
+    if resp.status_code == 404:
+        # ticket não existe mais
+        return {}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def normalize(text: Optional[str]) -> str:
+    return (text or "").strip().lower()
+
+
+# --------------------------------------------------------------------
+# Cálculo de datas de resolução / fechamento
+# --------------------------------------------------------------------
+def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Calcula last_resolved_at e last_closed_at a partir da lista de actions do ticket.
+
+    Regras:
+      - resolved_at: primeira vez que o status vira 'Resolvido' OU 'Cancelado'
+      - closed_at  : última vez que o status vira 'Fechado'
+    """
+    resolved_at: Optional[str] = None
+    closed_at: Optional[str] = None
+
+    actions = ticket.get("actions") or []
+    if not isinstance(actions, list):
+        return resolved_at, closed_at
+
+    # Ordena pela data da ação
+    def _created(a):
+        return a.get("createdDate") or ""
+
+    actions_sorted = sorted(actions, key=_created)
+
+    for action in actions_sorted:
+        created = action.get("createdDate")
+        if not created:
             continue
 
-        # 400 / 404 opcionais
-        if allow_400 and r.status_code == 400:
-            print("HTTP 400 para", url, "params", params)
-            return None
+        status_str = normalize(action.get("status") or action.get("statusName"))
 
-        if r.status_code == 404:
-            print("HTTP 404 para", url, "params", params)
-            return None
+        # 1) Resolução (Resolvido ou Cancelado)
+        if ("resolvido" in status_str or "cancelado" in status_str) and resolved_at is None:
+            resolved_at = created
 
-        if r.status_code >= 400:
+        # 2) Fechamento
+        if "fechado" in status_str:
+            # pega sempre a última vez que virou Fechado
+            closed_at = created
+
+    return resolved_at, closed_at
+
+
+# --------------------------------------------------------------------
+# Extração de campos do ticket
+# --------------------------------------------------------------------
+def extract_adicional_nome(ticket: Dict[str, Any]) -> Optional[str]:
+    """
+    Campo adicional "Nome" (id 29077) mapeado para adicional_nome.
+    A API do Movidesk pode devolver como 'customFieldValues' ou 'customFields'.
+    """
+    for key in ("customFieldValues", "customFields", "additionalFields"):
+        fields = ticket.get(key)
+        if not isinstance(fields, list):
+            continue
+
+        for f in fields:
             try:
-                print("HTTP ERROR", r.status_code, r.text[:800])
+                fid = f.get("id") or f.get("fieldId")
+                if isinstance(fid, str) and fid.isdigit():
+                    fid = int(fid)
+                if fid == ADICIONAL_NOME_ID:
+                    # value / fieldValue / texto
+                    for vk in ("value", "fieldValue", "text", "displayValue"):
+                        if f.get(vk):
+                            return str(f[vk]).strip()
             except Exception:
-                pass
-            r.raise_for_status()
-
-        return r.json() if r.text else None
-
-
-# -------------------------------------------------------------------
-# API Movidesk
-# -------------------------------------------------------------------
-
-def fetch_ticket_detail(ticket_id):
-    """Busca o ticket completo na API do Movidesk."""
-    url = f"{API_BASE}/tickets"
-    params = {
-        "token": API_TOKEN,
-        "id": ticket_id,
-        "includeDeletedItems": "true",
-        "$expand": "clients($expand=organization),owner,customFieldValues",
-    }
-
-    data = http_get(url, params=params, timeout=120, allow_400=True)
-
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict) and data.get("id") is not None:
-        return data
-
+                # qualquer problema aqui, ignora e tenta o próximo
+                continue
     return None
 
 
-def extract_custom_nome(ticket):
+def extract_organization(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extrai o valor do campo adicional "Nome".
-    Prioriza o customFieldId (29077 por padrão) e depois tenta por label.
+    Tenta pegar organization_id e organization_name.
     """
-    values = ticket.get("customFieldValues") or []
-    if not isinstance(values, list):
-        return None
+    org = (
+        ticket.get("organization")
+        or ticket.get("ownerOrganization")
+        or ticket.get("clientOrganization")
+    )
 
-    # 1) Pelo ID fixo / env
-    if CUSTOM_NOME_FIELD_ID:
-        for e in values:
-            if not isinstance(e, dict):
-                continue
-            cid = str(e.get("customFieldId") or e.get("id") or "").strip()
-            if cid == CUSTOM_NOME_FIELD_ID:
-                val = (
-                    e.get("value")
-                    or e.get("currentValue")
-                    or e.get("text")
-                    or e.get("valueName")
-                    or e.get("name")
-                )
-                if isinstance(val, list):
-                    val = ", ".join(str(x) for x in val if x not in ("", None))
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
+    if not isinstance(org, dict):
+        return None, None
 
-    # 2) Pelo label (caso tenha configurado no env)
-    if CUSTOM_NOME_FIELD_LABEL:
-        for e in values:
-            if not isinstance(e, dict):
-                continue
-            label = (
-                str(
-                    e.get("field")
-                    or e.get("name")
-                    or e.get("label")
-                    or ""
-                )
-                .strip()
-                .lower()
-            )
-            if label == CUSTOM_NOME_FIELD_LABEL:
-                val = (
-                    e.get("value")
-                    or e.get("currentValue")
-                    or e.get("text")
-                    or e.get("valueName")
-                    or e.get("name")
-                )
-                if isinstance(val, list):
-                    val = ", ".join(str(x) for x in val if x not in ("", None))
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
+    org_id = org.get("id") or org.get("organizationId")
+    org_name = org.get("businessName") or org.get("name") or org.get("fantasyName")
 
-    return None
+    if org_id is not None:
+        org_id = str(org_id)
+
+    if org_name is not None:
+        org_name = str(org_name)
+
+    return org_id, org_name
 
 
-def pick_organization_from_clients(clients):
+def extract_service_levels(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Escolhe a organização correta a partir de clients:
-    - tenta o client com isRequester = true
-    - se não tiver, pega o primeiro que tiver organization preenchida
-    - se ainda não tiver, retorna {}.
+    Extrai serviço 2º e 3º nível (quando existirem).
+    A estrutura pode variar, então vamos tentar alguns caminhos.
     """
-    if not isinstance(clients, list) or not clients:
-        return {}
+    service = ticket.get("service") or {}
 
-    # 1) Client solicitante
-    requester = None
-    for c in clients:
-        if isinstance(c, dict) and c.get("isRequester"):
-            requester = c
-            break
+    second = service.get("secondLevel") or service.get("serviceSecondLevel")
+    third = service.get("thirdLevel") or service.get("serviceThirdLevel")
 
-    # 2) Primeiro com organization
-    candidate = requester
-    if candidate is None:
-        for c in clients:
-            if isinstance(c, dict) and c.get("organization"):
-                candidate = c
-                break
+    # alguns ambientes usam campos flat no ticket
+    if not second:
+        second = ticket.get("serviceSecondLevel")
+    if not third:
+        third = ticket.get("serviceThirdLevel")
 
-    # 3) Fallback pro primeiro da lista
-    if candidate is None:
-        candidate = clients[0]
+    if isinstance(second, dict):
+        second = second.get("name") or second.get("description")
+    if isinstance(third, dict):
+        third = third.get("name") or third.get("description")
 
-    org = {}
-    if isinstance(candidate, dict):
-        org = candidate.get("organization") or {}
+    second = str(second).strip() if second else None
+    third = str(third).strip() if third else None
 
-    return org if isinstance(org, dict) else {}
+    return second, third
 
 
-def map_row(t):
-    """Monta o dicionário da linha para gravar em tickets_resolvidos."""
-    owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    org = pick_organization_from_clients(clients)
+def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converte o JSON do ticket em uma linha para o tickets_resolvidos.
+    """
+    ticket_id = ticket.get("id") or ticket.get("ticketId")
+    if ticket_id is None:
+        raise ValueError("Ticket sem id")
 
-    row = {
-        "ticket_id": iint(t.get("id")),
-        "status": t.get("status"),
-        "owner_id": iint(owner.get("id") or owner.get("personId")),
-        "owner_name": owner.get("businessName") or owner.get("name"),
-        "owner_team_name": t.get("ownerTeam"),
-        "origin": t.get("origin"),
-        "organization_id": org.get("id"),
-        "organization_name": org.get("businessName"),
-        "category": t.get("category"),
-        "urgency": t.get("urgency"),
-        "service_first_level": t.get("serviceFirstLevel"),
-        "service_second_level": t.get("serviceSecondLevel"),
-        "service_third_level": t.get("serviceThirdLevel"),
-        "last_update": norm_ts(t.get("lastUpdate")),
-        "subject": t.get("subject"),
-        "adicional_nome": extract_custom_nome(t),
+    status = ticket.get("status") or ""
+    origin = ticket.get("origin")
+
+    # Campos base
+    row: Dict[str, Any] = {
+        "ticket_id": int(ticket_id),
+        "status": str(status),
+        "origin": str(origin) if origin is not None else None,
+        "last_resolved_at": None,
+        "last_closed_at": None,
+        "organization_id": None,
+        "organization_name": None,
+        "service_second_level": None,
+        "service_third_level": None,
+        "adicional_nome": None,
     }
 
-    # Debug leve só pra acompanhar campos realmente importantes
-    null_keys = [k for k, v in row.items() if v is None and k not in ("owner_team_name", "adicional_nome")]
-    if null_keys:
-        print(f"[DEBUG] ticket {row['ticket_id']} campos ainda NULL depois do map_row: {null_keys}")
+    # Organização
+    org_id, org_name = extract_organization(ticket)
+    row["organization_id"] = org_id
+    row["organization_name"] = org_name
+
+    # Serviços 2º / 3º nível
+    second, third = extract_service_levels(ticket)
+    row["service_second_level"] = second
+    row["service_third_level"] = third
+
+    # Campo adicional "Nome"
+    row["adicional_nome"] = extract_adicional_nome(ticket)
+
+    # Datas de resolução / fechamento
+    resolved_at, closed_at = compute_resolution_dates(ticket)
+    row["last_resolved_at"] = resolved_at
+    row["last_closed_at"] = closed_at
+
+    # Loga campos críticos ainda NULL (pra debug)
+    null_fields = [f for f in CRITICAL_FIELDS if row.get(f) is None]
+    if null_fields:
+        print(
+            f"[DEBUG] ticket {row['ticket_id']} campos ainda NULL depois do map_row: {null_fields}"
+        )
 
     return row
 
 
-# -------------------------------------------------------------------
-# SQL de UPSERT em tickets_resolvidos
-# -------------------------------------------------------------------
-
-UPSERT_SQL = """
-insert into visualizacao_resolvidos.tickets_resolvidos (
-    ticket_id,
-    status,
-    owner_id,
-    owner_name,
-    owner_team_name,
-    origin,
-    organization_id,
-    organization_name,
-    category,
-    urgency,
-    service_first_level,
-    service_second_level,
-    service_third_level,
-    last_update,
-    subject,
-    adicional_nome
-)
-values (
-    %(ticket_id)s,
-    %(status)s,
-    %(owner_id)s,
-    %(owner_name)s,
-    %(owner_team_name)s,
-    %(origin)s,
-    %(organization_id)s,
-    %(organization_name)s,
-    %(category)s,
-    %(urgency)s,
-    %(service_first_level)s,
-    %(service_second_level)s,
-    %(service_third_level)s,
-    %(last_update)s,
-    %(subject)s,
-    %(adicional_nome)s
-)
-on conflict (ticket_id) do update set
-    status             = excluded.status,
-    owner_id           = excluded.owner_id,
-    owner_name         = excluded.owner_name,
-    owner_team_name    = excluded.owner_team_name,
-    origin             = excluded.origin,
-    organization_id    = excluded.organization_id,
-    organization_name  = excluded.organization_name,
-    category           = excluded.category,
-    urgency            = excluded.urgency,
-    service_first_level  = excluded.service_first_level,
-    service_second_level = excluded.service_second_level,
-    service_third_level  = excluded.service_third_level,
-    last_update        = excluded.last_update,
-    subject            = excluded.subject,
-    adicional_nome     = excluded.adicional_nome
-"""
-
-
-# -------------------------------------------------------------------
-# Funções de banco (missing → watch)
-# -------------------------------------------------------------------
-
-def select_missing_ticket_ids(conn, limit):
+# --------------------------------------------------------------------
+# Banco: leitura dos tickets em missing
+# --------------------------------------------------------------------
+def fetch_missing_ticket_ids(cur, limit: int) -> List[int]:
     """
-    Lê os tickets pendentes na audit_recent_missing referentes a tickets_resolvidos.
+    Busca até 'limit' tickets para reprocessar a partir de audit_recent_missing.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select ticket_id
-            from visualizacao_resolvidos.audit_recent_missing
-            where table_name in (
-                'tickets_resolvidos',
-                'visualizacao_resolvidos.tickets_resolvidos'
-            )
-            order by run_id desc, ticket_id desc
-            limit %s
-            """,
-            (limit,),
-        )
-        rows = cur.fetchall()
+    cur.execute(
+        """
+        SELECT ticket_id
+        FROM visualizacao_resolvidos.audit_recent_missing
+        WHERE table_name = 'tickets_resolvidos'
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
     return [r[0] for r in rows]
 
 
-def upsert_rows(conn, rows):
-    """Executa o batch de UPSERT no Postgres."""
-    if not rows:
-        return 0
-
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
-    conn.commit()
-    return len(rows)
-
-
-def delete_from_audit(conn, ticket_ids):
-    """
-    Remove da audit_recent_missing os tickets que foram
-    processados com sucesso.
-    """
+def delete_from_missing(cur, ticket_ids: List[int]) -> int:
     if not ticket_ids:
         return 0
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            delete from visualizacao_resolvidos.audit_recent_missing
-            where table_name in (
-                'tickets_resolvidos',
-                'visualizacao_resolvidos.tickets_resolvidos'
-            )
-              and ticket_id = any(%s)
-            """,
-            (ticket_ids,),
-        )
-        deleted = cur.rowcount
-
-    conn.commit()
-    return deleted
+    cur.execute(
+        """
+        DELETE FROM visualizacao_resolvidos.audit_recent_missing
+        WHERE table_name = 'tickets_resolvidos'
+          AND ticket_id = ANY(%s)
+        """,
+        (ticket_ids,),
+    )
+    return cur.rowcount
 
 
-# -------------------------------------------------------------------
-# main()
-# -------------------------------------------------------------------
+# --------------------------------------------------------------------
+# UPSERT no detalhe
+# --------------------------------------------------------------------
+def upsert_detail(cur, rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
 
+    columns = [
+        "ticket_id",
+        "status",
+        "origin",
+        "last_resolved_at",
+        "last_closed_at",
+        "organization_id",
+        "organization_name",
+        "service_second_level",
+        "service_third_level",
+        "adicional_nome",
+    ]
+
+    values = [[row.get(col) for col in columns] for row in rows]
+
+    sql = f"""
+        INSERT INTO visualizacao_resolvidos.tickets_resolvidos
+        ({", ".join(columns)})
+        VALUES %s
+        ON CONFLICT (ticket_id) DO UPDATE SET
+            status              = EXCLUDED.status,
+            origin              = EXCLUDED.origin,
+            last_resolved_at    = EXCLUDED.last_resolved_at,
+            last_closed_at      = EXCLUDED.last_closed_at,
+            organization_id     = EXCLUDED.organization_id,
+            organization_name   = EXCLUDED.organization_name,
+            service_second_level = EXCLUDED.service_second_level,
+            service_third_level  = EXCLUDED.service_third_level,
+            adicional_nome       = EXCLUDED.adicional_nome;
+    """
+
+    psycopg2.extras.execute_values(cur, sql, values, page_size=100)
+    return len(rows)
+
+
+# --------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------
 def main():
-    if not API_TOKEN or not NEON_DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
-
-    conn = psycopg2.connect(NEON_DSN, sslmode="require")
-
+    conn = get_connection()
     try:
-        ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
+        with conn.cursor() as cur:
+            ticket_ids = fetch_missing_ticket_ids(cur, BATCH_SIZE)
 
         if not ticket_ids:
-            print("Nenhum ticket pendente em audit_recent_missing para tickets_resolvidos.")
+            print("Nenhum ticket na audit_recent_missing para reprocessar, saindo.")
             return
 
         print(
@@ -373,57 +338,38 @@ def main():
             f"(mais novos primeiro): {ticket_ids}"
         )
 
-        rows = []
-        ok_ids = []
-        kept_in_missing = []
+        rows: List[Dict[str, Any]] = []
 
-        for tid in ticket_ids:
+        for i, ticket_id in enumerate(ticket_ids, start=1):
             try:
-                t = fetch_ticket_detail(tid)
-            except requests.HTTPError as e:
-                # Falha fatal na API -> mantém na missing para análise posterior
-                print(f"Erro HTTP fatal para ticket {tid}: {e}")
-                kept_in_missing.append(tid)
-                continue
+                ticket = movidesk_get(f"tickets/{ticket_id}", params={"include": "actions,service,organization,customFieldValues"})
+                if not ticket:
+                    # 404 ou algo assim: ainda assim vamos remover do missing
+                    print(f"[WARN] ticket {ticket_id} não encontrado na API (404).")
+                    continue
 
-            if not t:
-                print(f"[WARN] ticket {tid}: API não retornou dados, mantendo na missing.")
-                kept_in_missing.append(tid)
-                continue
+                row = map_row(ticket)
+                rows.append(row)
 
-            if isinstance(t, list):
-                t = t[0] if t else None
+            except Exception as e:
+                print(f"[ERROR] Falha ao processar ticket {ticket_id}: {e}")
 
-            if not isinstance(t, dict) or t.get("id") is None:
-                print(f"[WARN] ticket {tid}: resposta inesperada da API: {t}")
-                kept_in_missing.append(tid)
-                continue
+            # respeita throttling
+            if THROTTLE > 0 and i < len(ticket_ids):
+                time.sleep(THROTTLE)
 
-            row = map_row(t)
+        with conn.cursor() as cur:
+            updated = upsert_detail(cur, rows)
+            print(f"UPSERT detail: {updated} linhas atualizadas.")
 
-            if row.get("ticket_id") is None:
-                print(f"[WARN] ticket {tid}: map_row sem ticket_id, mantendo na missing.")
-                kept_in_missing.append(tid)
-                continue
+            deleted = delete_from_missing(cur, ticket_ids)
+            print(f"DELETE MISSING: {deleted}")
 
-            rows.append(row)
-            ok_ids.append(tid)
-
-            # respeita throttle da API
-            time.sleep(THROTTLE)
-
-        n_upsert = upsert_rows(conn, rows)
-        n_delete = delete_from_audit(conn, ok_ids)
-
-        print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
-        print(f"DELETE MISSING: {n_delete}")
-
-        if kept_in_missing:
-            print(
-                "Tickets que permaneceram em audit_recent_missing por falha/mapeamento:",
-                kept_in_missing,
-            )
-
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[FATAL] Erro ao executar sync_resolved_detail: {e}")
+        raise
     finally:
         conn.close()
 
