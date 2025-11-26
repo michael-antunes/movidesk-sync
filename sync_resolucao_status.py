@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, time, json, logging, requests, psycopg2
+import os
+import time
+import json
+import logging
+import requests
+import psycopg2
 from datetime import datetime, timezone
 from psycopg2.extras import execute_values
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)7s  %(message)s"
+)
 
 API_BASE = "https://api.movidesk.com/public/v1/tickets"
 API_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-NEON_DSN  = os.getenv("NEON_DSN")
+NEON_DSN = os.getenv("NEON_DSN")
 
 SCHEMA_AUD = "visualizacao_resolvidos"
 SCHEMA_DST = "visualizacao_resolucao"
 T_AUDIT = f"{SCHEMA_AUD}.audit_recent_missing"
-T_RPS   = f"{SCHEMA_DST}.resolucao_por_status"
+T_RPS = f"{SCHEMA_DST}.resolucao_por_status"
 
 IDS_GROUP_SIZE = int(os.getenv("IDS_GROUP_SIZE", "12"))
-AUDIT_LIMIT    = int(os.getenv("AUDIT_LIMIT", "300"))
-THROTTLE_SEC   = float(os.getenv("THROTTLE_SEC", "0.35"))
+AUDIT_LIMIT = int(os.getenv("AUDIT_LIMIT", "300"))
+THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.35"))
 
 if not API_TOKEN or not NEON_DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
@@ -73,8 +81,11 @@ def get_audit_ids(conn, limit_):
         cur.execute(sql, (limit_,))
         rows = cur.fetchall() or []
     ids = [r[0] for r in rows]
-    logging.info("Lote da fila (maiores IDs primeiro): %s%s",
-                 ids[:10], " ..." if len(ids) > 10 else "")
+    logging.info(
+        "Lote da fila (maiores IDs primeiro): %s%s",
+        ids[:10],
+        " ..." if len(ids) > 10 else ""
+    )
     return ids
 
 
@@ -92,7 +103,12 @@ def clear_audit_ids(conn, ids):
 
 
 def build_expand_param():
-    exp = "statusHistories($select=status,justification,permanencyTimeFullTime,permanencyTimeWorkingTime,changedDate;$expand=changedBy($select=id,businessName))"
+    exp = (
+        "statusHistories("
+        "$select=status,justification,permanencyTimeFullTime,"
+        "permanencyTimeWorkingTime,changedDate;"
+        "$expand=changedBy($select=id,businessName))"
+    )
     logging.info("EXPAND usado (debug): %s", exp)
     return exp
 
@@ -116,8 +132,11 @@ def fetch_chunk(ids_chunk):
     if isinstance(data, dict):
         data = data.get("items") or data.get("value") or []
     data = data or []
-    logging.info("fetch_chunk: ids=%s... -> %d item(s) da API",
-                 ids_chunk[:5], len(data))
+    logging.info(
+        "fetch_chunk: ids=%s... -> %d item(s) da API",
+        ids_chunk[:5],
+        len(data),
+    )
     return data
 
 
@@ -158,7 +177,7 @@ def map_rows(item):
             dt,
             agent or "",
             owner_team or "",
-            ""
+            "",
         )
         out.append(row)
     return out
@@ -224,7 +243,11 @@ def main():
             try:
                 data = fetch_chunk(chunk)
             except requests.HTTPError as e:
-                logging.warning("Erro HTTP duro em fetch_chunk: %s :: %s", e, getattr(e.response, "text", ""))
+                logging.warning(
+                    "Erro HTTP duro em fetch_chunk: %s :: %s",
+                    e,
+                    getattr(e.response, "text", ""),
+                )
                 continue
 
             for item in data or []:
