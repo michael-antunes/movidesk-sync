@@ -10,7 +10,7 @@ API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
-CHAT_ORIGINS = {5, 6, 23, 25, 26, 27}
+CHAT_ORIGINS = {"5", "6", "23", "25", "26", "27"}
 
 
 def to_iso_z(dt):
@@ -37,15 +37,14 @@ def _req(url, params, max_retries=3):
         try:
             r = requests.get(url, params=params, timeout=90)
             if r.status_code == 200:
-                return r.json()
+                if r.text:
+                    return r.json()
+                return {}
             if r.status_code in (429, 503):
-                retry = r.headers.get("retry-after")
-                if retry is not None:
-                    try:
-                        wait = int(str(retry))
-                    except Exception:
-                        wait = 30
-                else:
+                retry_after = r.headers.get("retry-after")
+                try:
+                    wait = int(str(retry_after)) if retry_after is not None else 30
+                except Exception:
                     wait = 30
                 time.sleep(wait)
                 last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
@@ -56,7 +55,7 @@ def _req(url, params, max_retries=3):
         time.sleep(throttle)
     if last_exc:
         raise last_exc
-    return None
+    return {}
 
 
 def get_since_from_db(conn, days_back, overlap_minutes):
@@ -79,6 +78,7 @@ def get_since_from_db(conn, days_back, overlap_minutes):
 def fetch_status_history(since_iso):
     url = f"{API_BASE}/tickets/statusHistory"
     limit = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
+    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
     starting_after = None
     items = []
     while True:
@@ -95,14 +95,14 @@ def fetch_status_history(since_iso):
         if not page_items or not bool(page.get("hasMore")):
             break
         starting_after = page_items[-1].get("id")
-        time.sleep(float(os.getenv("MOVIDESK_THROTTLE", "0.2")))
+        time.sleep(throttle)
     return items
 
 
 def map_row(r):
     return {
-        "id": r.get("id"),
-        "ticket_id": r.get("ticketId"),
+        "id": str(r.get("id") or ""),
+        "ticket_id": iint(r.get("ticketId")),
         "agent_name": r.get("agentName"),
         "changed_date": r.get("changedDate"),
         "status": r.get("status"),
@@ -129,7 +129,7 @@ def upsert_rows(conn, rows):
     if not rows:
         return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=1000)
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=500)
     return len(rows)
 
 
@@ -139,12 +139,7 @@ def select_ticket_ids_chat_to_update(conn, limit_):
         from visualizacao_resolvidos.resolvidos_acoes ra
         join visualizacao_resolvidos.tickets_resolvidos tr
           on tr.ticket_id = ra.ticket_id
-        where tr.origin in ('23', '25', '26', '27')
-          and jsonb_typeof(ra.acoes) = 'array'
-          and (
-              (ra.acoes->0->>'description') is null
-              or ra.acoes->0->>'description' = ''
-          )
+        where tr.origin in ('5', '6', '23', '25', '26', '27')
         order by ra.ticket_id
         limit %s
     """
@@ -154,12 +149,12 @@ def select_ticket_ids_chat_to_update(conn, limit_):
     return [r[0] for r in rows]
 
 
-def fetch_ticket_chat_actions(ticket_id):
+def fetch_ticket_actions_with_html(ticket_id):
     params = {
         "token": API_TOKEN,
         "id": ticket_id,
         "$select": "id,actions",
-        "$expand": "actions($select=id,origin,type,status,createdDate,createdBy,description,attachments)",
+        "$expand": "actions($select=id,origin,type,status,createdDate,createdBy,description,htmlDescription,attachments)",
     }
     url = f"{API_BASE}/tickets"
     r = requests.get(url, params=params, timeout=90)
@@ -173,14 +168,10 @@ def fetch_ticket_chat_actions(ticket_id):
     else:
         ticket = data
     actions = ticket.get("actions") or []
-    result = []
-    for a in actions:
-        if a.get("origin") in CHAT_ORIGINS:
-            result.append(a)
-    return result
+    return actions
 
 
-def update_resolvidos_acoes_chat(conn, ticket_id, actions):
+def update_resolvidos_acoes(conn, ticket_id, actions):
     payload = json.dumps(actions, ensure_ascii=False)
     sql = """
         update visualizacao_resolvidos.resolvidos_acoes
@@ -196,19 +187,19 @@ def sync_chat_resolvidos_acoes(conn, limit_):
     if not ticket_ids:
         print("SYNC CHAT: nenhum ticket para atualizar")
         return 0
-    updated = 0    
+    updated = 0
     for idx, ticket_id in enumerate(ticket_ids, start=1):
         try:
-            actions = fetch_ticket_chat_actions(ticket_id)
-            update_resolvidos_acoes_chat(conn, ticket_id, actions)
+            actions = fetch_ticket_actions_with_html(ticket_id)
+            update_resolvidos_acoes(conn, ticket_id, actions)
             updated += 1
             print(
-                f"SYNC CHAT: ticket {ticket_id} atualizado com {len(actions)} ações de chat"
+                f"SYNC CHAT: ticket {ticket_id} atualizado com {len(actions)} ações"
             )
         except Exception as exc:
             print(f"SYNC CHAT ERRO ticket {ticket_id}: {exc}")
         if idx < len(ticket_ids):
-            time.sleep(6)
+            time.sleep(5)
     return updated
 
 
@@ -220,7 +211,7 @@ def main():
 
     days_back = int(os.getenv("MOVIDESK_RPS_DAYS", "120"))
     overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
-    chat_limit = int(os.getenv("MOVIDESK_CHAT_LIMIT", "200"))
+    chat_limit = int(os.getenv("MOVIDESK_CHAT_LIMIT", "100"))
 
     conn = psycopg2.connect(NEON_DSN)
     conn.autocommit = True
@@ -236,7 +227,6 @@ def main():
 
         rows = [map_row(x) for x in resp if isinstance(x, dict)]
         n = upsert_rows(conn, rows)
-
         print(f"DESDE {since_iso} | UPSERT RPS: {n}")
 
         n_chat = sync_chat_resolvidos_acoes(conn, chat_limit)
