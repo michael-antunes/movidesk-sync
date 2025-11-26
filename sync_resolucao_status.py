@@ -38,6 +38,18 @@ def _req(url, params, max_retries=3):
             r = requests.get(url, params=params, timeout=90)
             if r.status_code == 200:
                 return r.json()
+            if r.status_code in (429, 503):
+                retry = r.headers.get("retry-after")
+                if retry is not None:
+                    try:
+                        wait = int(str(retry))
+                    except Exception:
+                        wait = 30
+                else:
+                    wait = 30
+                time.sleep(wait)
+                last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
+                continue
             last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
         except Exception as exc:
             last_exc = exc
@@ -216,7 +228,12 @@ def main():
         since_dt = get_since_from_db(conn, days_back, overlap_minutes)
         since_iso = to_iso_z(since_dt)
 
-        resp = fetch_status_history(since_iso)
+        try:
+            resp = fetch_status_history(since_iso)
+        except Exception as exc:
+            print(f"ERRO AO CHAMAR /tickets/statusHistory: {exc}")
+            resp = []
+
         rows = [map_row(x) for x in resp if isinstance(x, dict)]
         n = upsert_rows(conn, rows)
 
