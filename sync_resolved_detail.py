@@ -1,22 +1,18 @@
+#!/usr/bin/env python3
 import os
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
-import psycopg2.extras
+from psycopg2 import errors
 
-# ---------------------------------------------------------------------------
-# Configurações
-# ---------------------------------------------------------------------------
 
-API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
-API_TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN = os.getenv("NEON_DSN")
-
-BATCH_SIZE = int(os.getenv("SYNC_RESOLVED_DETAIL_BATCH", "100"))
-THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.5"))
+# ------------------------------------------------------------------------------
+# Configuração básica
+# ------------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,280 +20,310 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sync_resolved_detail")
 
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+API_TOKEN = os.getenv("MOVIDESK_TOKEN")
+DSN = os.getenv("NEON_DSN") or os.getenv("POSTGRES_DSN")
 
-# ---------------------------------------------------------------------------
-# Helpers de API
-# ---------------------------------------------------------------------------
+BATCH_SIZE = int(os.getenv("DETAIL_BATCH_SIZE", "100"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))  # segundos entre chamadas
+
+
+# ------------------------------------------------------------------------------
+# Util Movidesk
+# ------------------------------------------------------------------------------
 
 def md_get(path: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = False) -> Any:
     """
-    Chama a API do Movidesk com tratamento básico de erro.
-    Mantém a mesma assinatura utilizada nos outros scripts.
+    Chama a API do Movidesk com token e retorna JSON.
+    Se ok_404=True, devolve None em caso de 404.
     """
-    if API_TOKEN is None:
-        raise RuntimeError("MOVIDESK_TOKEN não configurado")
+    if params is None:
+        params = {}
+
+    qp = {"token": API_TOKEN}
+    qp.update(params)
 
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
-    query = dict(params or {})
-    query["token"] = API_TOKEN
+    resp = requests.get(url, params=qp, timeout=30)
 
-    resp = requests.get(url, params=query, timeout=30)
     if resp.status_code == 404 and ok_404:
         return None
+
     resp.raise_for_status()
     return resp.json()
 
 
-# ---------------------------------------------------------------------------
-# Helpers de banco / auditoria
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Helpers de data / status
+# ------------------------------------------------------------------------------
 
-def get_pending_ids(conn, limit: int) -> List[int]:
-    """
-    Busca os ticket_id que estão em audit_recent_missing para a tabela tickets_resolvidos.
-
-    A trigger nova joga tudo pra missing, então:
-    - filtramos só por table_name = 'tickets_resolvidos'
-    - ordenamos pelos runs mais recentes
-    - deduplicamos por ticket_id em Python
-    """
-    sql = """
-        SELECT
-            m.ticket_id,
-            r.run_at
-        FROM audit_recent_missing m
-        JOIN audit_recent_run r
-          ON r.id = m.run_id
-        WHERE m.table_name = 'tickets_resolvidos'
-        ORDER BY r.run_at DESC, m.ticket_id DESC
-        LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-
-    seen = set()
-    pending: List[int] = []
-    for ticket_id, _run_at in rows:
-        if ticket_id not in seen:
-            seen.add(ticket_id)
-            pending.append(ticket_id)
-
-    return pending
-
-
-def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
-    """
-    Registra falha em audit_ticket_watch.
-
-    IMPORTANTE:
-    - Tabela tem apenas ticket_id como PK.
-    - Usamos ON CONFLICT DO NOTHING para não estourar UniqueViolation
-      quando o mesmo ticket falha mais de uma vez.
-    O motivo fica registrado somente nos logs.
-    """
-    logger.debug("Registrando falha para ticket %s: %s", ticket_id, reason)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO audit_ticket_watch (ticket_id)
-            VALUES (%s)
-            ON CONFLICT (ticket_id) DO NOTHING
-            """,
-            (ticket_id,),
-        )
-
-
-def mark_still_missing(conn, ticket_id: int, missing_fields: List[str]) -> None:
-    """
-    Mesmo após chamar a API ainda ficamos sem alguns campos -> registramos em audit_ticket_watch.
-    """
-    reason = "still_null_fields:" + ",".join(sorted(missing_fields))
-    register_ticket_failure(conn, ticket_id, reason)
-
-
-def delete_processed_from_missing(conn, ids: List[int]) -> None:
-    """
-    Remove da audit_recent_missing todos os registros da tabela tickets_resolvidos
-    para os ticket_id processados com sucesso.
-    """
-    if not ids:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM audit_recent_missing
-            WHERE table_name = 'tickets_resolvidos'
-              AND ticket_id = ANY(%s)
-            """,
-            (ids,),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Mapeamento de campos do ticket -> tickets_resolvidos
-# ---------------------------------------------------------------------------
-
-def parse_datetime(value: Optional[str]) -> Optional[str]:
-    """
-    A API já manda os datetimes em ISO 8601; deixamos como string
-    e deixamos o psycopg2 converter.
-    """
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
-    return value
+    try:
+        # Movidesk normalmente manda ISO 8601, às vezes com "Z"
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
 
 
-def extract_custom_field(ticket: Dict[str, Any], field_id: int) -> Optional[str]:
+STATUS_RESOLVIDO = {"resolvido", "resolved"}
+STATUS_FECHADO = {"fechado", "closed"}
+STATUS_CANCELADO = {"cancelado", "cancelled", "canceled"}
+
+
+def extract_status_times(ticket: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime]]:
     """
-    Busca um customField específico (ex: CSAT 137641) na estrutura retornada.
+    Percorre as ações do ticket e extrai:
+      - last_resolved_at: última ação que colocou o ticket em status 'Resolvido'
+      - last_closed_at:   última ação que colocou o ticket em 'Fechado' ou 'Cancelado'
+
+    Para cancelados, usamos last_closed_at como “data de cancelamento”.
     """
-    customs = ticket.get("customFields") or []
-    for cf in customs:
-        if cf.get("id") == field_id:
-            val = cf.get("value")
-            if isinstance(val, str) and not val.strip():
-                return None
-            return val
+    actions = ticket.get("actions") or []
+    last_resolved_at: Optional[datetime] = None
+    last_closed_at: Optional[datetime] = None
 
-    # Alguns ambientes usam 'customFieldValues'
-    for cf in ticket.get("customFieldValues") or []:
-        if cf.get("customFieldId") == field_id:
-            val = cf.get("value")
-            if isinstance(val, str) and not val.strip():
-                return None
-            return val
+    for ac in actions:
+        created_raw = (
+            ac.get("createdDate")
+            or ac.get("createdDateUtc")
+            or ac.get("created_at")
+        )
+        created = parse_dt(created_raw)
+        if not created:
+            continue
 
-    return None
+        status_value = ac.get("status") or ac.get("statusName") or ""
+        if isinstance(status_value, dict):
+            status_value = (
+                status_value.get("name")
+                or status_value.get("description")
+                or ""
+            )
+
+        status_str = str(status_value).strip().lower()
+
+        # Resolvido
+        if status_str in STATUS_RESOLVIDO:
+            if not last_resolved_at or created > last_resolved_at:
+                last_resolved_at = created
+
+        # Fechado ou Cancelado -> usamos last_closed_at
+        if status_str in STATUS_FECHADO or status_str in STATUS_CANCELADO:
+            if not last_closed_at or created > last_closed_at:
+                last_closed_at = created
+
+    return last_resolved_at, last_closed_at
 
 
 def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Monta o dicionário de campos para tickets_resolvidos.
-
-    FOCO NOS TEMPOS:
-    - Usa resolvedIn / closedIn primeiro;
-    - Se vierem nulos, tenta inferir a partir de statusHistories.
+    Monta apenas o que precisamos para esse job:
+      - ticket_id
+      - last_resolved_at
+      - last_closed_at
     """
-    ticket_id = int(ticket["id"])
-    status = ticket.get("status")
+    tid = ticket.get("id")
+    if tid is None:
+        raise ValueError("ticket sem id")
 
-    # Tempos principais
-    resolved_at = parse_datetime(ticket.get("resolvedIn"))
-    closed_at = parse_datetime(ticket.get("closedIn"))
+    last_resolved_at, last_closed_at = extract_status_times(ticket)
 
-    histories = ticket.get("statusHistories") or []
-
-    if not resolved_at:
-        for h in histories:
-            sb = (h.get("statusBase") or "").lower()
-            st = (h.get("status") or "").lower()
-            if sb == "resolved" or "resolvido" in st:
-                resolved_at = parse_datetime(h.get("changedDate"))
-                break
-
-    if not closed_at:
-        for h in histories:
-            sb = (h.get("statusBase") or "").lower()
-            st = (h.get("status") or "").lower()
-            if sb == "closed" or "fechado" in st:
-                closed_at = parse_datetime(h.get("changedDate"))
-                break
-
-    # Organização / hotel
-    org = ticket.get("organization") or {}
-    organization_id = org.get("id")
-    organization_name = org.get("businessName") or org.get("name")
-
-    # Outros campos que já existiam na tabela
-    origin = ticket.get("origin")
-    adicional_nome = ticket.get("subject")
-
-    # CSAT – pode não existir
-    adicional_csat = extract_custom_field(ticket, 137641)
-
-    row = {
-        "ticket_id": ticket_id,
-        "status": status,
-        "last_resolved_at": resolved_at,
-        "last_closed_at": closed_at,
-        "organization_id": organization_id,
-        "organization_name": organization_name,
-        "origin": origin,
-        "adicional_nome": adicional_nome,
-        "adicional_137641_avaliado_csat": adicional_csat,
+    return {
+        "ticket_id": int(tid),
+        "last_resolved_at": last_resolved_at,
+        "last_closed_at": last_closed_at,
     }
-    return row
 
 
-def upsert_details(conn, rows: List[Dict[str, Any]]) -> None:
+# ------------------------------------------------------------------------------
+# Interação com o banco: missing, watch e update de tempos
+# ------------------------------------------------------------------------------
+
+def get_pending_ids(conn, limit: int) -> List[int]:
     """
-    INSERT/UPDATE em tickets_resolvidos dos campos controlados aqui.
+    Busca até `limit` ticket_ids em audit_recent_missing para os quais faltam
+    os campos de tempo (last_resolved_at / last_closed_at).
+
+    Tenta usar o schema novo (table_name/column_name). Se não existir coluna
+    ou tabela, faz fallback pra versões mais simples ou retorna lista vazia.
     """
-    if not rows:
+    sql_full = """
+        WITH last_runs AS (
+            SELECT
+                m.ticket_id,
+                MAX(r.run_at) AS last_run_at
+            FROM audit_recent_missing m
+            JOIN audit_recent_run r ON r.id = m.run_id
+            WHERE m.table_name IN ('tickets_resolvidos', 'tickets_resolvidos_detail')
+              AND m.column_name IN ('last_resolved_at', 'last_closed_at')
+            GROUP BY m.ticket_id
+        )
+        SELECT ticket_id
+        FROM last_runs
+        ORDER BY last_run_at DESC, ticket_id DESC
+        LIMIT %s
+    """
+
+    sql_fallback = """
+        SELECT DISTINCT m.ticket_id
+        FROM audit_recent_missing m
+        JOIN audit_recent_run r ON r.id = m.run_id
+        ORDER BY r.run_at DESC, m.ticket_id DESC
+        LIMIT %s
+    """
+
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(sql_full, (limit,))
+            except errors.UndefinedColumn:
+                conn.rollback()
+                logger.warning(
+                    "detail: audit_recent_missing sem table_name/column_name; "
+                    "usando consulta fallback."
+                )
+                with conn.cursor() as cur2:
+                    cur2.execute(sql_fallback, (limit,))
+                    rows = cur2.fetchall()
+                    return [r[0] for r in rows]
+            rows = cur.fetchall()
+            return [r[0] for r in rows]
+
+    except errors.UndefinedTable:
+        conn.rollback()
+        logger.error(
+            "detail: tabela audit_recent_missing não existe neste banco. "
+            "Sem tickets pendentes para processar."
+        )
+        return []
+
+
+def delete_processed_from_missing(conn, ids: List[int]) -> None:
+    """
+    Remove da audit_recent_missing os tickets que já foram atualizados com sucesso.
+
+    Tenta usar filtro por table_name/column_name; se não existir coluna, apaga
+    só por ticket_id; se não existir tabela, apenas loga erro.
+    """
+    if not ids:
         return
 
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(
-            cur,
-            """
-            INSERT INTO tickets_resolvidos (
-                ticket_id,
-                status,
-                last_resolved_at,
-                last_closed_at,
-                organization_id,
-                organization_name,
-                origin,
-                adicional_nome,
-                adicional_137641_avaliado_csat
-            )
-            VALUES (
-                %(ticket_id)s,
-                %(status)s,
-                %(last_resolved_at)s,
-                %(last_closed_at)s,
-                %(organization_id)s,
-                %(organization_name)s,
-                %(origin)s,
-                %(adicional_nome)s,
-                %(adicional_137641_avaliado_csat)s
-            )
-            ON CONFLICT (ticket_id) DO UPDATE SET
-                status = EXCLUDED.status,
-                last_resolved_at = EXCLUDED.last_resolved_at,
-                last_closed_at = EXCLUDED.last_closed_at,
-                organization_id = EXCLUDED.organization_id,
-                organization_name = EXCLUDED.organization_name,
-                origin = EXCLUDED.origin,
-                adicional_nome = EXCLUDED.adicional_nome,
-                adicional_137641_avaliado_csat = EXCLUDED.adicional_137641_avaliado_csat
-            """,
-            rows,
-            page_size=50,
+    sql_delete_full = """
+        DELETE FROM audit_recent_missing
+        WHERE ticket_id = ANY(%s)
+          AND table_name IN ('tickets_resolvidos', 'tickets_resolvidos_detail')
+          AND column_name IN ('last_resolved_at', 'last_closed_at')
+    """
+
+    sql_delete_simple = """
+        DELETE FROM audit_recent_missing
+        WHERE ticket_id = ANY(%s)
+    """
+
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(sql_delete_full, (ids,))
+            except errors.UndefinedColumn:
+                conn.rollback()
+                logger.warning(
+                    "detail: audit_recent_missing sem column_name/table_name; "
+                    "apagando apenas por ticket_id."
+                )
+                with conn.cursor() as cur2:
+                    cur2.execute(sql_delete_simple, (ids,))
+        conn.commit()
+        logger.info("DELETE MISSING: %d", len(ids))
+
+    except errors.UndefinedTable:
+        conn.rollback()
+        logger.error(
+            "detail: tabela audit_recent_missing não existe; nada foi deletado."
         )
 
 
-# ---------------------------------------------------------------------------
-# main()
-# ---------------------------------------------------------------------------
+def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
+    """
+    Registra falha em audit_ticket_watch (apenas ticket_id) e loga o motivo.
+
+    Usa ON CONFLICT DO NOTHING pra não estourar duplicate key em runs repetidos.
+    """
+    logger.warning("detail: falha ao processar ticket %s: %s", ticket_id, reason)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO audit_ticket_watch (ticket_id)
+                VALUES (%s)
+                ON CONFLICT (ticket_id) DO NOTHING
+                """,
+                (ticket_id,),
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(
+            "detail: erro ao registrar falha em audit_ticket_watch "
+            "para ticket %s: %s",
+            ticket_id,
+            e,
+        )
+
+
+def upsert_details(conn, rows: List[Dict[str, Any]]) -> int:
+    """
+    Atualiza last_resolved_at e last_closed_at em tickets_resolvidos_detail.
+
+    Só mexe nesses dois campos; o resto da linha permanece intacto.
+    """
+    if not rows:
+        return 0
+
+    updated = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            ticket_id = r["ticket_id"]
+            last_resolved_at = r.get("last_resolved_at")
+            last_closed_at = r.get("last_closed_at")
+
+            cur.execute(
+                """
+                UPDATE tickets_resolvidos_detail
+                SET last_resolved_at = COALESCE(%s, last_resolved_at),
+                    last_closed_at  = COALESCE(%s, last_closed_at)
+                WHERE ticket_id = %s
+                """,
+                (last_resolved_at, last_closed_at, ticket_id),
+            )
+            updated += cur.rowcount
+
+    conn.commit()
+    logger.info("UPSERT detail: %d linhas atualizadas.", updated)
+    return updated
+
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 
 def main() -> None:
     logger.info("Iniciando sync_resolved_detail (detail)...")
 
     if not DSN:
-        raise RuntimeError("NEON_DSN não configurado")
+        logger.critical("DSN do banco não configurado (NEON_DSN/POSTGRES_DSN).")
+        raise SystemExit(1)
 
     with psycopg2.connect(DSN) as conn:
-        conn.autocommit = False
-
         pending = get_pending_ids(conn, BATCH_SIZE)
         total_pendentes = len(pending)
 
         if not pending:
-            logger.info(
-                "detail: nenhum ticket pendente em audit_recent_missing para tickets_resolvidos."
-            )
+            logger.info("detail: nenhum ticket pendente em audit_recent_missing.")
             return
 
         logger.info(
@@ -313,40 +339,35 @@ def main() -> None:
 
         for tid in pending:
             reason: Optional[str] = None
+            ticket: Optional[Dict[str, Any]] = None
 
+            # --- chamada API ---------------------------------------------------
             try:
-                # IMPORTANTE: expand actions/customFields/statusHistories/organization,
-                # como na versão antiga que trazia corretamente os tempos.
                 data = md_get(
                     f"tickets/{tid}",
-                    params={
-                        "$expand": "clients,createdBy,owner,actions,customFields,"
-                                   "statusHistories,organization"
-                    },
+                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
                     ok_404=True,
                 )
             except requests.HTTPError as e:
-                status_code = getattr(e.response, "status_code", None)
-                reason = f"http_error_{status_code or 'unknown'}"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
+                try:
+                    status = e.response.status_code
+                except Exception:
+                    status = None
+                reason = f"http_error_{status or 'unknown'}"
             except Exception:
                 reason = "exception_api"
+
+            if reason:
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
+                fail_samples.setdefault(reason, tid)
                 continue
 
             if data is None:
                 reason = "not_found_404"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
+                fail_samples.setdefault(reason, tid)
                 continue
 
             if isinstance(data, list):
@@ -354,8 +375,7 @@ def main() -> None:
                     reason = "empty_list"
                     register_ticket_failure(conn, tid, reason)
                     fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                    if reason not in fail_samples:
-                        fail_samples[reason] = tid
+                    fail_samples.setdefault(reason, tid)
                     continue
                 ticket = data[0]
             else:
@@ -365,42 +385,34 @@ def main() -> None:
                 reason = "missing_id"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
+                fail_samples.setdefault(reason, tid)
                 continue
 
+            # --- monta linha de tempos ----------------------------------------
             try:
                 row = build_detail_row(ticket)
             except Exception:
                 reason = "build_row_error"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
+                fail_samples.setdefault(reason, tid)
                 continue
-
-            # Campos críticos de tempo ainda nulos?
-            missing_fields = [
-                field
-                for field in ("last_resolved_at", "last_closed_at")
-                if row.get(field) is None
-            ]
-            if missing_fields:
-                logger.debug(
-                    "ticket %s campos ainda NULL depois do build_detail_row: %s",
-                    tid,
-                    missing_fields,
-                )
-                mark_still_missing(conn, tid, missing_fields)
 
             detalhes.append(row)
             ok_ids.append(tid)
-            time.sleep(THROTTLE)
+
+            # Respeitar throttle da API
+            if THROTTLE > 0:
+                time.sleep(THROTTLE)
 
         total_ok = len(ok_ids)
         total_fail = sum(fail_reasons.values())
 
-        logger.info("detail: processados neste ciclo: ok=%d, falhas=%d.", total_ok, total_fail)
+        logger.info(
+            "detail: processados neste ciclo: ok=%d, falhas=%d.",
+            total_ok,
+            total_fail,
+        )
 
         if fail_reasons:
             logger.info("detail: razões de falha neste ciclo:")
@@ -410,18 +422,17 @@ def main() -> None:
 
         if not detalhes:
             logger.info(
-                "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
+                "detail: nenhum ticket com detalhe válido; "
+                "apenas falhas registradas em audit_ticket_watch."
             )
-            conn.commit()
             return
 
         upsert_details(conn, detalhes)
         delete_processed_from_missing(conn, ok_ids)
         logger.info(
-            "detail: %d tickets upsertados em tickets_resolvidos e removidos do missing.",
+            "detail: %d tickets processados e removidos do missing.",
             total_ok,
         )
-        conn.commit()
 
 
 if __name__ == "__main__":
