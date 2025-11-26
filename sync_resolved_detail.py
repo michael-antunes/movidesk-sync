@@ -1,6 +1,5 @@
 import os
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -83,7 +82,6 @@ def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Opt
     if not isinstance(actions, list):
         return resolved_at, closed_at
 
-    # Ordena pela data da ação
     def _created(a):
         return a.get("createdDate") or ""
 
@@ -96,13 +94,10 @@ def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Opt
 
         status_str = normalize(action.get("status") or action.get("statusName"))
 
-        # 1) Resolução (Resolvido ou Cancelado)
         if ("resolvido" in status_str or "cancelado" in status_str) and resolved_at is None:
             resolved_at = created
 
-        # 2) Fechamento
         if "fechado" in status_str:
-            # pega sempre a última vez que virou Fechado
             closed_at = created
 
     return resolved_at, closed_at
@@ -114,7 +109,6 @@ def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Opt
 def extract_adicional_nome(ticket: Dict[str, Any]) -> Optional[str]:
     """
     Campo adicional "Nome" (id 29077) mapeado para adicional_nome.
-    A API do Movidesk pode devolver como 'customFieldValues' ou 'customFields'.
     """
     for key in ("customFieldValues", "customFields", "additionalFields"):
         fields = ticket.get(key)
@@ -127,12 +121,10 @@ def extract_adicional_nome(ticket: Dict[str, Any]) -> Optional[str]:
                 if isinstance(fid, str) and fid.isdigit():
                     fid = int(fid)
                 if fid == ADICIONAL_NOME_ID:
-                    # value / fieldValue / texto
                     for vk in ("value", "fieldValue", "text", "displayValue"):
                         if f.get(vk):
                             return str(f[vk]).strip()
             except Exception:
-                # qualquer problema aqui, ignora e tenta o próximo
                 continue
     return None
 
@@ -165,14 +157,12 @@ def extract_organization(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optiona
 def extract_service_levels(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
     Extrai serviço 2º e 3º nível (quando existirem).
-    A estrutura pode variar, então vamos tentar alguns caminhos.
     """
     service = ticket.get("service") or {}
 
     second = service.get("secondLevel") or service.get("serviceSecondLevel")
     third = service.get("thirdLevel") or service.get("serviceThirdLevel")
 
-    # alguns ambientes usam campos flat no ticket
     if not second:
         second = ticket.get("serviceSecondLevel")
     if not third:
@@ -200,7 +190,6 @@ def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     status = ticket.get("status") or ""
     origin = ticket.get("origin")
 
-    # Campos base
     row: Dict[str, Any] = {
         "ticket_id": int(ticket_id),
         "status": str(status),
@@ -214,25 +203,20 @@ def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
         "adicional_nome": None,
     }
 
-    # Organização
     org_id, org_name = extract_organization(ticket)
     row["organization_id"] = org_id
     row["organization_name"] = org_name
 
-    # Serviços 2º / 3º nível
     second, third = extract_service_levels(ticket)
     row["service_second_level"] = second
     row["service_third_level"] = third
 
-    # Campo adicional "Nome"
     row["adicional_nome"] = extract_adicional_nome(ticket)
 
-    # Datas de resolução / fechamento
     resolved_at, closed_at = compute_resolution_dates(ticket)
     row["last_resolved_at"] = resolved_at
     row["last_closed_at"] = closed_at
 
-    # Loga campos críticos ainda NULL (pra debug)
     null_fields = [f for f in CRITICAL_FIELDS if row.get(f) is None]
     if null_fields:
         print(
@@ -248,13 +232,14 @@ def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_missing_ticket_ids(cur, limit: int) -> List[int]:
     """
     Busca até 'limit' tickets para reprocessar a partir de audit_recent_missing.
+    Ordena pelo run_id mais recente (e ticket_id desc).
     """
     cur.execute(
         """
         SELECT ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing
         WHERE table_name = 'tickets_resolvidos'
-        ORDER BY id DESC
+        ORDER BY run_id DESC, ticket_id DESC
         LIMIT %s
         """,
         (limit,),
@@ -305,12 +290,12 @@ def upsert_detail(cur, rows: List[Dict[str, Any]]) -> int:
         ({", ".join(columns)})
         VALUES %s
         ON CONFLICT (ticket_id) DO UPDATE SET
-            status              = EXCLUDED.status,
-            origin              = EXCLUDED.origin,
-            last_resolved_at    = EXCLUDED.last_resolved_at,
-            last_closed_at      = EXCLUDED.last_closed_at,
-            organization_id     = EXCLUDED.organization_id,
-            organization_name   = EXCLUDED.organization_name,
+            status               = EXCLUDED.status,
+            origin               = EXCLUDED.origin,
+            last_resolved_at     = EXCLUDED.last_resolved_at,
+            last_closed_at       = EXCLUDED.last_closed_at,
+            organization_id      = EXCLUDED.organization_id,
+            organization_name    = EXCLUDED.organization_name,
             service_second_level = EXCLUDED.service_second_level,
             service_third_level  = EXCLUDED.service_third_level,
             adicional_nome       = EXCLUDED.adicional_nome;
@@ -342,9 +327,13 @@ def main():
 
         for i, ticket_id in enumerate(ticket_ids, start=1):
             try:
-                ticket = movidesk_get(f"tickets/{ticket_id}", params={"include": "actions,service,organization,customFieldValues"})
+                ticket = movidesk_get(
+                    f"tickets/{ticket_id}",
+                    params={
+                        "include": "actions,service,organization,customFieldValues",
+                    },
+                )
                 if not ticket:
-                    # 404 ou algo assim: ainda assim vamos remover do missing
                     print(f"[WARN] ticket {ticket_id} não encontrado na API (404).")
                     continue
 
@@ -354,7 +343,6 @@ def main():
             except Exception as e:
                 print(f"[ERROR] Falha ao processar ticket {ticket_id}: {e}")
 
-            # respeita throttling
             if THROTTLE > 0 and i < len(ticket_ids):
                 time.sleep(THROTTLE)
 
