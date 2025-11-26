@@ -21,7 +21,6 @@ THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))  # segundos entre chama
 DETAIL_TABLE = "visualizacao_resolvidos.tickets_resolvidos"
 
 # Nome que as triggers gravam em visualizacao_resolvidos.audit_recent_missing.table_name
-# Ajusta aqui se no seu banco estiver diferente
 AUDIT_TABLE_NAME = "tickets_resolvidos"
 
 # Quantos tickets por rodada
@@ -69,7 +68,6 @@ def parse_utc(dt_str):
     if not dt_str:
         return None
     try:
-        # API às vezes vem com 'Z'
         dt_str = dt_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(dt_str)
         if dt.tzinfo is None:
@@ -133,15 +131,11 @@ def compute_resolution_dates(ticket: dict):
 # --------------------------------------------------------------------
 
 def safe_get_org(ticket: dict):
-    """
-    Tenta extrair organization_id e organization_name do primeiro client.
-    Se não achar, devolve (None, None).
-    """
+    """Extrai organization_id e organization_name do primeiro client, se existir."""
     clients = ticket.get("clients") or []
     if not clients:
         return None, None
 
-    # Estrutura comum: client["organization"]["id"] / ["businessName"]
     org = (clients[0] or {}).get("organization") or {}
     org_id = org.get("id")
     org_name = org.get("businessName") or org.get("name")
@@ -149,9 +143,7 @@ def safe_get_org(ticket: dict):
 
 
 def safe_get_service_levels(ticket: dict):
-    """
-    Extrai até 3 níveis de serviço se existirem.
-    """
+    """Extrai até 3 níveis de serviço se existirem."""
     service = ticket.get("service") or {}
     first_level = (service.get("firstLevel") or {}).get("name")
     second_level = (service.get("secondLevel") or {}).get("name")
@@ -176,7 +168,6 @@ def get_custom_field(ticket: dict, field_id_or_label: str):
 def map_ticket_to_detail_row(ticket: dict) -> dict:
     """
     Converte o JSON do ticket da API em um dict com as colunas da tabela DETAIL_TABLE.
-    Ajuste aqui se tiver mais colunas.
     """
     ticket_id = int(ticket["id"])
     status_text = ticket.get("status") or ticket.get("baseStatus")
@@ -216,14 +207,17 @@ def map_ticket_to_detail_row(ticket: dict) -> dict:
 def fetch_missing_ticket_ids(cur, limit: int):
     """
     Busca os ticket_id da audit_recent_missing para essa tabela,
-    ordenando do run mais recente pra trás.
+    pegando sempre os runs mais novos primeiro.
+
+    Usa run_id (não existe run_at nessa tabela).
     """
     cur.execute(
         """
-        SELECT DISTINCT ticket_id
+        SELECT ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing
         WHERE table_name = %s
-        ORDER BY run_at DESC, ticket_id DESC
+        GROUP BY ticket_id
+        ORDER BY max(run_id) DESC, ticket_id DESC
         LIMIT %s
         """,
         (AUDIT_TABLE_NAME, limit),
@@ -233,9 +227,7 @@ def fetch_missing_ticket_ids(cur, limit: int):
 
 
 def delete_from_missing(cur, ticket_ids):
-    """
-    Remove os tickets processados da audit_recent_missing para evitar loop infinito.
-    """
+    """Remove os tickets processados da audit_recent_missing."""
     if not ticket_ids:
         return 0
 
@@ -257,12 +249,10 @@ def delete_from_missing(cur, ticket_ids):
 def upsert_detail_rows(cur, rows):
     """
     Faz UPSERT na DETAIL_TABLE usando ticket_id como chave única.
-    Usa SQL dinâmico com as chaves do dicionário.
     """
     if not rows:
         return 0
 
-    # Garante ordem estável das colunas
     columns = list(rows[0].keys())
 
     col_list = ", ".join(columns)
@@ -300,7 +290,7 @@ def process_batch(cur, ticket_ids):
 
         row = map_ticket_to_detail_row(ticket)
 
-        # Só pra debug: mostra quais campos ainda ficaram como NULL
+        # Debug: mostra quais campos ainda ficaram NULL
         null_fields = [k for k, v in row.items() if v is None]
         if null_fields:
             logging.debug(
@@ -336,7 +326,7 @@ def main():
         updated, not_found = process_batch(cur, ticket_ids)
         logging.info("UPSERT detail: %d linhas atualizadas.", updated)
 
-        # Remove todos da missing (inclusive os 404, pra não ficar em loop)
+        # Remove todos da missing (inclui 404 pra não ficar em loop)
         deleted = delete_from_missing(cur, ticket_ids)
         logging.info("DELETE MISSING: %d", deleted)
 
