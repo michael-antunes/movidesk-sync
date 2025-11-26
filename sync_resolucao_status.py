@@ -139,7 +139,7 @@ def select_ticket_ids_chat_to_update(conn, limit_):
         from visualizacao_resolvidos.resolvidos_acoes ra
         join visualizacao_resolvidos.tickets_resolvidos tr
           on tr.ticket_id = ra.ticket_id
-        where tr.origin in (23, 25, 26, 27)
+        where tr.origin in ('23', '25', '26', '27')
           and jsonb_typeof(ra.acoes) = 'array'
           and (
               (ra.acoes->0->>'description') is null
@@ -196,7 +196,7 @@ def sync_chat_resolvidos_acoes(conn, limit_):
     if not ticket_ids:
         print("SYNC CHAT: nenhum ticket para atualizar")
         return 0
-    updated = 0
+    updated = 0    
     for idx, ticket_id in enumerate(ticket_ids, start=1):
         try:
             actions = fetch_ticket_chat_actions(ticket_id)
