@@ -11,7 +11,7 @@ NEON_DSN = os.getenv("NEON_DSN")
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
 BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
 
-# Campo adicional usado para "adicional_nome"
+# Config opcional para o campo "Nome" (adicional_nome)
 CUSTOM_NOME_FIELD_ID = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_ID", "").strip()
 CUSTOM_NOME_FIELD_LABEL = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_LABEL", "").strip().lower()
 
@@ -37,7 +37,7 @@ def http_get(url, params=None, timeout=90, allow_400=False):
     while True:
         r = requests.get(url, params=params, timeout=timeout)
 
-        # throttling da API Movidesk
+        # Throttling da API Movidesk
         if r.status_code in (429, 503):
             retry = r.headers.get("retry-after")
             wait = int(retry) if str(retry).isdigit() else 60
@@ -86,14 +86,18 @@ def fetch_ticket_detail(ticket_id):
 
 def extract_custom_nome(ticket):
     """
-    Extrai o valor do campo adicional configurado para 'adicional_nome'.
-    Pode usar o ID do campo ou o label, conforme variáveis de ambiente.
+    Tenta extrair o campo adicional "Nome" do ticket.
+
+    Estratégia:
+      1) se MOVIDESK_CUSTOM_NOME_FIELD_ID estiver definido, usa esse ID;
+      2) tenta bater pelo label configurado em MOVIDESK_CUSTOM_NOME_FIELD_LABEL;
+      3) fallback para qualquer campo cujo label seja "nome".
     """
     values = ticket.get("customFieldValues") or []
     if not isinstance(values, list):
         return None
 
-    # Prioriza buscar pelo ID exato
+    # 1) Busca por ID explícito
     if CUSTOM_NOME_FIELD_ID:
         for e in values:
             if not isinstance(e, dict):
@@ -112,48 +116,102 @@ def extract_custom_nome(ticket):
                 if isinstance(val, str) and val.strip():
                     return val.strip()
 
-    # Fallback por label / nome do campo
+    # Monta lista de labels aceitos (em lower)
+    labels_to_match = set()
     if CUSTOM_NOME_FIELD_LABEL:
-        for e in values:
-            if not isinstance(e, dict):
-                continue
-            label = (
-                str(
-                    e.get("field")
-                    or e.get("name")
-                    or e.get("label")
-                    or ""
-                )
-                .strip()
-                .lower()
-            )
-            if label == CUSTOM_NOME_FIELD_LABEL:
-                val = (
-                    e.get("value")
-                    or e.get("currentValue")
-                    or e.get("text")
-                    or e.get("valueName")
-                    or e.get("name")
-                )
-                if isinstance(val, list):
-                    val = ", ".join(str(x) for x in val if x not in ("", None))
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
+        labels_to_match.add(CUSTOM_NOME_FIELD_LABEL)
+    # fallback padrão se nada configurado
+    labels_to_match.add("nome")
+
+    # 2) Busca por label
+    for e in values:
+        if not isinstance(e, dict):
+            continue
+        label = (
+            str(e.get("field") or e.get("name") or e.get("label") or "")
+            .strip()
+            .lower()
+        )
+        if label not in labels_to_match:
+            continue
+
+        val = (
+            e.get("value")
+            or e.get("currentValue")
+            or e.get("text")
+            or e.get("valueName")
+            or e.get("name")
+        )
+        if isinstance(val, list):
+            val = ", ".join(str(x) for x in val if x not in ("", None))
+        if isinstance(val, str) and val.strip():
+            return val.strip()
 
     return None
 
 
+def pick_organization(ticket):
+    """
+    Decide qual organização usar para o ticket.
+
+    Regras:
+      1) client com isRequester = true e organization preenchida;
+      2) senão, primeiro client com organization não nulo;
+      3) senão, tenta bater organizationId do ticket com algum client;
+      4) senão, organização do owner (útil para tickets internos).
+    """
+    clients = ticket.get("clients") or []
+    org = None
+
+    if isinstance(clients, list):
+        # 1) requester
+        for c in clients:
+            if not isinstance(c, dict):
+                continue
+            if c.get("isRequester") and c.get("organization"):
+                org = c.get("organization")
+                break
+
+        # 2) qualquer client com org
+        if not org:
+            for c in clients:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("organization"):
+                    org = c.get("organization")
+                    break
+
+        # 3) tenta bater com organizationId do ticket
+        if not org:
+            oid = ticket.get("organizationId") or ticket.get("organization_id")
+            if oid:
+                soid = str(oid)
+                for c in clients:
+                    if not isinstance(c, dict):
+                        continue
+                    o = c.get("organization") or {}
+                    if str(o.get("id")) == soid:
+                        org = o
+                        break
+
+    # 4) fallback para organização do owner (tickets internos)
+    if not org:
+        owner = ticket.get("owner") or {}
+        org = owner.get("organization") or {}
+
+    org_id = org.get("id") if isinstance(org, dict) else None
+    org_name = org.get("businessName") if isinstance(org, dict) else None
+    return org_id, org_name
+
+
 def map_row(t):
     """
-    Mapeia o JSON do ticket da API para as colunas de tickets_resolvidos.
-    Os campos de datas de resolução/fechamento/cancelamento e CSAT
-    são tratados pelas triggers no banco, com base em resolucao_por_status,
-    FCR/CSAT etc. Aqui focamos em status, dono, organização, serviços etc.
+    Mapeia o JSON do ticket para as colunas de tickets_resolvidos.
+    Datas de resolução/fechamento/cancelamento continuam sendo
+    responsabilidade do pipeline de resolucao_por_status + triggers.
     """
     owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    c0 = clients[0] if isinstance(clients, list) and clients else {}
-    org = c0.get("organization") or {}
+    org_id, org_name = pick_organization(t)
 
     row = {
         "ticket_id": iint(t.get("id")),
@@ -162,8 +220,8 @@ def map_row(t):
         "owner_name": owner.get("businessName") or owner.get("name"),
         "owner_team_name": t.get("ownerTeam"),
         "origin": t.get("origin"),
-        "organization_id": org.get("id"),
-        "organization_name": org.get("businessName"),
+        "organization_id": org_id,
+        "organization_name": org_name,
         "category": t.get("category"),
         "urgency": t.get("urgency"),
         "service_first_level": t.get("serviceFirstLevel"),
@@ -174,7 +232,7 @@ def map_row(t):
         "adicional_nome": extract_custom_nome(t),
     }
 
-    # Só loga para debug; quem decide manter em missing ou não é o banco.
+    # log de debug, pra ver o que ainda vem nulo da API
     null_keys = [k for k, v in row.items() if v is None and k != "owner_team_name"]
     if null_keys:
         print(
@@ -242,9 +300,7 @@ UPSERT_SQL = """
 
 def select_missing_ticket_ids(conn, limit):
     """
-    Busca os tickets na fila de auditoria que são da tabela tickets_resolvidos.
-    As triggers no banco (resolvidos_acoes / tickets_resolvidos) garantem
-    que tickets com problemas de datas ou CSAT também sejam enfileirados aqui.
+    Busca tickets na fila audit_recent_missing relativos a tickets_resolvidos.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -330,9 +386,6 @@ def main():
                 continue
 
             rows.append(row)
-            # NÃO removemos da audit_recent_missing aqui.
-            # As triggers (fn_clear_audit_on_ticket_upsert / regras de watch)
-            # é que vão decidir se o ticket deve sair da fila ou permanecer.
             time.sleep(THROTTLE)
 
         n_upsert = upsert_rows(conn, rows)
