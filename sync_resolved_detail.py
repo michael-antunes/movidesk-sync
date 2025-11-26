@@ -4,6 +4,7 @@ import requests
 import psycopg2
 import psycopg2.extras
 
+
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
@@ -62,6 +63,7 @@ def fetch_ticket_detail(ticket_id):
         "token": API_TOKEN,
         "id": ticket_id,
         "includeDeletedItems": "true",
+        "$expand": "clients($expand=organization),owner,customFieldValues",
     }
     data = http_get(url, params=params, timeout=120, allow_400=True)
     if isinstance(data, list) and data:
@@ -75,24 +77,42 @@ def extract_custom_nome(ticket):
     values = ticket.get("customFieldValues") or []
     if not isinstance(values, list):
         return None
+
     if CUSTOM_NOME_FIELD_ID:
         for e in values:
             if not isinstance(e, dict):
                 continue
             cid = str(e.get("customFieldId") or e.get("id") or "").strip()
             if cid == CUSTOM_NOME_FIELD_ID:
-                val = e.get("value") or e.get("currentValue") or e.get("text") or e.get("valueName") or e.get("name")
+                val = (
+                    e.get("value")
+                    or e.get("currentValue")
+                    or e.get("text")
+                    or e.get("valueName")
+                    or e.get("name")
+                )
                 if isinstance(val, list):
                     val = ", ".join(str(x) for x in val if x not in ("", None))
                 if isinstance(val, str) and val.strip():
                     return val.strip()
+
     if CUSTOM_NOME_FIELD_LABEL:
         for e in values:
             if not isinstance(e, dict):
                 continue
-            label = str(e.get("field") or e.get("name") or e.get("label") or "").strip().lower()
+            label = (
+                str(e.get("field") or e.get("name") or e.get("label") or "")
+                .strip()
+                .lower()
+            )
             if label == CUSTOM_NOME_FIELD_LABEL:
-                val = e.get("value") or e.get("currentValue") or e.get("text") or e.get("valueName") or e.get("name")
+                val = (
+                    e.get("value")
+                    or e.get("currentValue")
+                    or e.get("text")
+                    or e.get("valueName")
+                    or e.get("name")
+                )
                 if isinstance(val, list):
                     val = ", ".join(str(x) for x in val if x not in ("", None))
                 if isinstance(val, str) and val.strip():
@@ -105,7 +125,8 @@ def map_row(t):
     clients = t.get("clients") or []
     c0 = clients[0] if isinstance(clients, list) and clients else {}
     org = c0.get("organization") or {}
-    return {
+
+    row = {
         "ticket_id": iint(t.get("id")),
         "status": t.get("status"),
         "owner_id": iint(owner.get("id") or owner.get("personId")),
@@ -124,11 +145,23 @@ def map_row(t):
         "adicional_nome": extract_custom_nome(t),
     }
 
+    null_keys = [k for k, v in row.items() if v is None and k != "owner_team_name"]
+    if null_keys:
+        print(f"[DEBUG] ticket {row['ticket_id']} campos ainda NULL depois do map_row: {null_keys}")
+
+    return row
+
 
 UPSERT_SQL = """
 insert into visualizacao_resolvidos.tickets_resolvidos
-(ticket_id,status,owner_id,owner_name,owner_team_name,origin,organization_id,organization_name,category,urgency,service_first_level,service_second_level,service_third_level,last_update,subject,adicional_nome)
-values (%(ticket_id)s,%(status)s,%(owner_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s,%(organization_id)s,%(organization_name)s,%(category)s,%(urgency)s,%(service_first_level)s,%(service_second_level)s,%(service_third_level)s,%(last_update)s,%(subject)s,%(adicional_nome)s)
+(ticket_id,status,owner_id,owner_name,owner_team_name,origin,
+ organization_id,organization_name,category,urgency,
+ service_first_level,service_second_level,service_third_level,
+ last_update,subject,adicional_nome)
+values (%(ticket_id)s,%(status)s,%(owner_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s,
+        %(organization_id)s,%(organization_name)s,%(category)s,%(urgency)s,
+        %(service_first_level)s,%(service_second_level)s,%(service_third_level)s,
+        %(last_update)s,%(subject)s,%(adicional_nome)s)
 on conflict (ticket_id) do update set
   status = excluded.status,
   owner_id = excluded.owner_id,
@@ -148,46 +181,14 @@ on conflict (ticket_id) do update set
 """
 
 
-DELETE_MISSING_SQL = """
-delete from visualizacao_resolvidos.audit_recent_missing
-where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
-  and ticket_id = any(%s)
-"""
-
-
 def select_missing_ticket_ids(conn, limit):
     with conn.cursor() as cur:
         cur.execute(
             """
-            with audit_ids as (
-              select distinct ticket_id
-              from visualizacao_resolvidos.audit_recent_missing
-              where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
-            ),
-            incomplete as (
-              select ticket_id
-              from visualizacao_resolvidos.tickets_resolvidos
-              where
-                organization_name is null
-                or organization_id is null
-                or category is null
-                or urgency is null
-                or service_first_level is null
-                or service_second_level is null
-                or service_third_level is null
-                or last_update is null
-                or owner_id is null
-                or subject is null
-                or adicional_nome is null
-            ),
-            to_fix as (
-              select ticket_id from audit_ids
-              union
-              select ticket_id from incomplete
-            )
             select ticket_id
-            from to_fix
-            order by ticket_id desc
+            from visualizacao_resolvidos.audit_recent_missing
+            where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
+            order by run_id desc, ticket_id desc
             limit %s
         """,
             (limit,),
@@ -209,51 +210,73 @@ def delete_from_audit(conn, ticket_ids):
     if not ticket_ids:
         return 0
     with conn.cursor() as cur:
-        cur.execute(DELETE_MISSING_SQL, (ticket_ids,))
+        cur.execute(
+            """
+            delete from visualizacao_resolvidos.audit_recent_missing
+            where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
+              and ticket_id = any(%s)
+        """,
+            (ticket_ids,),
+        )
+        deleted = cur.rowcount
     conn.commit()
-    return len(ticket_ids)
+    return deleted
 
 
 def main():
     if not API_TOKEN or not NEON_DSN:
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+
     conn = psycopg2.connect(NEON_DSN, sslmode="require")
     try:
         ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
         if not ticket_ids:
-            print("Nenhum ticket pendente para reprocessar (audit + incompletos).")
+            print("Nenhum ticket pendente em audit_recent_missing para tickets_resolvidos.")
             return
-        print(f"Reprocessando {len(ticket_ids)} tickets (mais novos primeiro): {ticket_ids}")
+
+        print(f"Reprocessando {len(ticket_ids)} tickets da audit_recent_missing (mais novos primeiro): {ticket_ids}")
+
         rows = []
         ok_ids = []
-        skipped_invalid = []
+        kept_in_missing = []
+
         for tid in ticket_ids:
             try:
                 t = fetch_ticket_detail(tid)
             except requests.HTTPError as e:
                 print(f"Erro HTTP fatal para ticket {tid}: {e}")
+                kept_in_missing.append(tid)
                 continue
+
             if not t:
-                skipped_invalid.append(tid)
+                print(f"[WARN] ticket {tid}: API não retornou dados, mantendo na missing.")
+                kept_in_missing.append(tid)
                 continue
+
             if isinstance(t, list):
                 t = t[0] if t else None
             if not isinstance(t, dict) or t.get("id") is None:
-                skipped_invalid.append(tid)
+                print(f"[WARN] ticket {tid}: resposta inesperada da API: {t}")
+                kept_in_missing.append(tid)
                 continue
+
             row = map_row(t)
             if row.get("ticket_id") is None:
-                skipped_invalid.append(tid)
+                print(f"[WARN] ticket {tid}: map_row sem ticket_id, mantendo na missing.")
+                kept_in_missing.append(tid)
                 continue
+
             rows.append(row)
             ok_ids.append(tid)
             time.sleep(THROTTLE)
+
         n_upsert = upsert_rows(conn, rows)
         n_delete = delete_from_audit(conn, ok_ids)
+
         print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
         print(f"DELETE MISSING: {n_delete}")
-        if skipped_invalid:
-            print("Tickets sem dado válido, deixados para trás:", skipped_invalid)
+        if kept_in_missing:
+            print("Tickets que permaneceram em audit_recent_missing por falha/mapeamento:", kept_in_missing)
     finally:
         conn.close()
 
