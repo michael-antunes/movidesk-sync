@@ -4,15 +4,15 @@ import requests
 import psycopg2
 import psycopg2.extras
 
-
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.3"))
 BATCH_LIMIT = int(os.getenv("MOVIDESK_DETAIL_BATCH_LIMIT", "100"))
 
-# Config opcional para o campo "Nome" (adicional_nome)
-CUSTOM_NOME_FIELD_ID = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_ID", "").strip()
+# Campo adicional "Nome" – código 29077
+# se não tiver definido no secret, força como 29077
+CUSTOM_NOME_FIELD_ID = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_ID", "29077").strip()
 CUSTOM_NOME_FIELD_LABEL = os.getenv("MOVIDESK_CUSTOM_NOME_FIELD_LABEL", "").strip().lower()
 
 
@@ -36,8 +36,6 @@ def norm_ts(x):
 def http_get(url, params=None, timeout=90, allow_400=False):
     while True:
         r = requests.get(url, params=params, timeout=timeout)
-
-        # Throttling da API Movidesk
         if r.status_code in (429, 503):
             retry = r.headers.get("retry-after")
             wait = int(retry) if str(retry).isdigit() else 60
@@ -64,9 +62,6 @@ def http_get(url, params=None, timeout=90, allow_400=False):
 
 
 def fetch_ticket_detail(ticket_id):
-    """
-    Busca o ticket completo na API.
-    """
     url = f"{API_BASE}/tickets"
     params = {
         "token": API_TOKEN,
@@ -74,7 +69,6 @@ def fetch_ticket_detail(ticket_id):
         "includeDeletedItems": "true",
         "$expand": "clients($expand=organization),owner,customFieldValues",
     }
-
     data = http_get(url, params=params, timeout=120, allow_400=True)
 
     if isinstance(data, list) and data:
@@ -84,25 +78,39 @@ def fetch_ticket_detail(ticket_id):
     return None
 
 
+def _normalize_custom_value(val):
+    if isinstance(val, list):
+        val = ", ".join(str(x) for x in val if x not in ("", None))
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return None
+    return val
+
+
 def extract_custom_nome(ticket):
     """
-    Tenta extrair o campo adicional "Nome" do ticket.
-
-    Estratégia:
-      1) se MOVIDESK_CUSTOM_NOME_FIELD_ID estiver definido, usa esse ID;
-      2) tenta bater pelo label configurado em MOVIDESK_CUSTOM_NOME_FIELD_LABEL;
-      3) fallback para qualquer campo cujo label seja "nome".
+    Prioridade:
+    1) Campo customizado com ID = CUSTOM_NOME_FIELD_ID (ex.: 29077)
+    2) Campo cujo label contenha 'nome'
+    3) Fallback: tenta pegar algum nome do cliente (quando fizer sentido)
     """
     values = ticket.get("customFieldValues") or []
     if not isinstance(values, list):
-        return None
+        values = []
 
-    # 1) Busca por ID explícito
+    # 1) Tenta primeiro pelo ID configurado (29077)
     if CUSTOM_NOME_FIELD_ID:
         for e in values:
             if not isinstance(e, dict):
                 continue
-            cid = str(e.get("customFieldId") or e.get("id") or "").strip()
+            cid = (
+                e.get("customFieldId")
+                or e.get("id")
+                or e.get("customField")
+                or e.get("customFieldID")
+            )
+            cid = str(cid).strip() if cid is not None else ""
             if cid == CUSTOM_NOME_FIELD_ID:
                 val = (
                     e.get("value")
@@ -111,107 +119,71 @@ def extract_custom_nome(ticket):
                     or e.get("valueName")
                     or e.get("name")
                 )
-                if isinstance(val, list):
-                    val = ", ".join(str(x) for x in val if x not in ("", None))
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
+                val = _normalize_custom_value(val)
+                if val is not None:
+                    return val
 
-    # Monta lista de labels aceitos (em lower)
-    labels_to_match = set()
+    # 2) Tenta por label / nome de campo contendo "nome"
     if CUSTOM_NOME_FIELD_LABEL:
-        labels_to_match.add(CUSTOM_NOME_FIELD_LABEL)
-    # fallback padrão se nada configurado
-    labels_to_match.add("nome")
+        target_label = CUSTOM_NOME_FIELD_LABEL
+    else:
+        # se não veio nada via env, usamos "nome" como padrão
+        target_label = "nome"
 
-    # 2) Busca por label
     for e in values:
         if not isinstance(e, dict):
             continue
         label = (
-            str(e.get("field") or e.get("name") or e.get("label") or "")
-            .strip()
-            .lower()
+            e.get("field")
+            or e.get("name")
+            or e.get("label")
+            or e.get("customField")
+            or e.get("customFieldLabel")
         )
-        if label not in labels_to_match:
+        if not isinstance(label, str):
+            continue
+        label_l = label.strip().lower()
+        if not label_l:
             continue
 
-        val = (
-            e.get("value")
-            or e.get("currentValue")
-            or e.get("text")
-            or e.get("valueName")
-            or e.get("name")
-        )
-        if isinstance(val, list):
-            val = ", ".join(str(x) for x in val if x not in ("", None))
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+        # se o label bater exatamente com o configurado OU contiver 'nome'
+        if label_l == target_label or ("nome" in label_l and target_label in ("", "nome")):
+            val = (
+                e.get("value")
+                or e.get("currentValue")
+                or e.get("text")
+                or e.get("valueName")
+                or e.get("name")
+            )
+            val = _normalize_custom_value(val)
+            if val is not None:
+                return val
+
+    # 3) Fallback: tenta achar algum "nome" do cliente (melhor do que NULL)
+    clients = ticket.get("clients") or []
+    c0 = clients[0] if isinstance(clients, list) and clients else {}
+    if isinstance(c0, dict):
+        # tenta alguns campos comuns de pessoa/contato do Movidesk
+        for key in (
+            "personName",
+            "personFullName",
+            "businessName",
+            "name",
+            "contactName",
+        ):
+            val = c0.get(key)
+            val = _normalize_custom_value(val)
+            if val is not None:
+                return val
 
     return None
 
 
-def pick_organization(ticket):
-    """
-    Decide qual organização usar para o ticket.
-
-    Regras:
-      1) client com isRequester = true e organization preenchida;
-      2) senão, primeiro client com organization não nulo;
-      3) senão, tenta bater organizationId do ticket com algum client;
-      4) senão, organização do owner (útil para tickets internos).
-    """
-    clients = ticket.get("clients") or []
-    org = None
-
-    if isinstance(clients, list):
-        # 1) requester
-        for c in clients:
-            if not isinstance(c, dict):
-                continue
-            if c.get("isRequester") and c.get("organization"):
-                org = c.get("organization")
-                break
-
-        # 2) qualquer client com org
-        if not org:
-            for c in clients:
-                if not isinstance(c, dict):
-                    continue
-                if c.get("organization"):
-                    org = c.get("organization")
-                    break
-
-        # 3) tenta bater com organizationId do ticket
-        if not org:
-            oid = ticket.get("organizationId") or ticket.get("organization_id")
-            if oid:
-                soid = str(oid)
-                for c in clients:
-                    if not isinstance(c, dict):
-                        continue
-                    o = c.get("organization") or {}
-                    if str(o.get("id")) == soid:
-                        org = o
-                        break
-
-    # 4) fallback para organização do owner (tickets internos)
-    if not org:
-        owner = ticket.get("owner") or {}
-        org = owner.get("organization") or {}
-
-    org_id = org.get("id") if isinstance(org, dict) else None
-    org_name = org.get("businessName") if isinstance(org, dict) else None
-    return org_id, org_name
-
-
 def map_row(t):
-    """
-    Mapeia o JSON do ticket para as colunas de tickets_resolvidos.
-    Datas de resolução/fechamento/cancelamento continuam sendo
-    responsabilidade do pipeline de resolucao_por_status + triggers.
-    """
     owner = t.get("owner") or {}
-    org_id, org_name = pick_organization(t)
+    clients = t.get("clients") or []
+    c0 = clients[0] if isinstance(clients, list) and clients else {}
+    org = c0.get("organization") or {}
 
     row = {
         "ticket_id": iint(t.get("id")),
@@ -220,8 +192,8 @@ def map_row(t):
         "owner_name": owner.get("businessName") or owner.get("name"),
         "owner_team_name": t.get("ownerTeam"),
         "origin": t.get("origin"),
-        "organization_id": org_id,
-        "organization_name": org_name,
+        "organization_id": org.get("id"),
+        "organization_name": org.get("businessName"),
         "category": t.get("category"),
         "urgency": t.get("urgency"),
         "service_first_level": t.get("serviceFirstLevel"),
@@ -232,87 +204,53 @@ def map_row(t):
         "adicional_nome": extract_custom_nome(t),
     }
 
-    # log de debug, pra ver o que ainda vem nulo da API
     null_keys = [k for k, v in row.items() if v is None and k != "owner_team_name"]
     if null_keys:
         print(
             f"[DEBUG] ticket {row['ticket_id']} campos ainda NULL depois do map_row: {null_keys}"
         )
-
     return row
 
 
 UPSERT_SQL = """
-    INSERT INTO visualizacao_resolvidos.tickets_resolvidos (
-        ticket_id,
-        status,
-        owner_id,
-        owner_name,
-        owner_team_name,
-        origin,
-        organization_id,
-        organization_name,
-        category,
-        urgency,
-        service_first_level,
-        service_second_level,
-        service_third_level,
-        last_update,
-        subject,
-        adicional_nome
-    )
-    VALUES (
-        %(ticket_id)s,
-        %(status)s,
-        %(owner_id)s,
-        %(owner_name)s,
-        %(owner_team_name)s,
-        %(origin)s,
-        %(organization_id)s,
-        %(organization_name)s,
-        %(category)s,
-        %(urgency)s,
-        %(service_first_level)s,
-        %(service_second_level)s,
-        %(service_third_level)s,
-        %(last_update)s,
-        %(subject)s,
-        %(adicional_nome)s
-    )
-    ON CONFLICT (ticket_id) DO UPDATE SET
-        status              = EXCLUDED.status,
-        owner_id            = EXCLUDED.owner_id,
-        owner_name          = EXCLUDED.owner_name,
-        owner_team_name     = EXCLUDED.owner_team_name,
-        origin              = EXCLUDED.origin,
-        organization_id     = EXCLUDED.organization_id,
-        organization_name   = EXCLUDED.organization_name,
-        category            = EXCLUDED.category,
-        urgency             = EXCLUDED.urgency,
-        service_first_level = EXCLUDED.service_first_level,
-        service_second_level= EXCLUDED.service_second_level,
-        service_third_level = EXCLUDED.service_third_level,
-        last_update         = EXCLUDED.last_update,
-        subject             = EXCLUDED.subject,
-        adicional_nome      = EXCLUDED.adicional_nome
+insert into visualizacao_resolvidos.tickets_resolvidos
+(ticket_id,status,owner_id,owner_name,owner_team_name,origin,
+ organization_id,organization_name,category,urgency,
+ service_first_level,service_second_level,service_third_level,
+ last_update,subject,adicional_nome)
+values
+(%(ticket_id)s,%(status)s,%(owner_id)s,%(owner_name)s,%(owner_team_name)s,%(origin)s,
+ %(organization_id)s,%(organization_name)s,%(category)s,%(urgency)s,
+ %(service_first_level)s,%(service_second_level)s,%(service_third_level)s,
+ %(last_update)s,%(subject)s,%(adicional_nome)s)
+on conflict (ticket_id) do update set
+    status = excluded.status,
+    owner_id = excluded.owner_id,
+    owner_name = excluded.owner_name,
+    owner_team_name = excluded.owner_team_name,
+    origin = excluded.origin,
+    organization_id = excluded.organization_id,
+    organization_name = excluded.organization_name,
+    category = excluded.category,
+    urgency = excluded.urgency,
+    service_first_level = excluded.service_first_level,
+    service_second_level = excluded.service_second_level,
+    service_third_level = excluded.service_third_level,
+    last_update = excluded.last_update,
+    subject = excluded.subject,
+    adicional_nome = excluded.adicional_nome
 """
 
 
 def select_missing_ticket_ids(conn, limit):
-    """
-    Busca tickets na fila audit_recent_missing relativos a tickets_resolvidos.
-    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT ticket_id
-              FROM visualizacao_resolvidos.audit_recent_missing
-             WHERE table_name IN (
-                     'tickets_resolvidos',
-                     'visualizacao_resolvidos.tickets_resolvidos'
-                   )
-             ORDER BY run_id DESC, ticket_id DESC
-             LIMIT %s
+            select ticket_id
+            from visualizacao_resolvidos.audit_recent_missing
+            where table_name in ('tickets_resolvidos','visualizacao_resolvidos.tickets_resolvidos')
+            order by run_id desc, ticket_id desc
+            limit %s
             """,
             (limit,),
         )
@@ -334,7 +272,6 @@ def main():
         raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
 
     conn = psycopg2.connect(NEON_DSN, sslmode="require")
-
     try:
         ticket_ids = select_missing_ticket_ids(conn, BATCH_LIMIT)
         if not ticket_ids:
@@ -348,22 +285,18 @@ def main():
         )
 
         rows = []
-        kept_in_missing = []
-
         for tid in ticket_ids:
             try:
                 t = fetch_ticket_detail(tid)
             except requests.HTTPError as e:
-                # Erro 4xx/5xx que não dá para tratar aqui: mantém na missing.
                 print(f"Erro HTTP fatal para ticket {tid}: {e}")
-                kept_in_missing.append(tid)
+                # se der pau de HTTP, deixa o ticket na missing para outra rodada
                 continue
 
             if not t:
                 print(
                     f"[WARN] ticket {tid}: API não retornou dados, mantendo na missing."
                 )
-                kept_in_missing.append(tid)
                 continue
 
             if isinstance(t, list):
@@ -373,16 +306,13 @@ def main():
                 print(
                     f"[WARN] ticket {tid}: resposta inesperada da API: {t}, mantendo na missing."
                 )
-                kept_in_missing.append(tid)
                 continue
 
             row = map_row(t)
-
             if row.get("ticket_id") is None:
                 print(
                     f"[WARN] ticket {tid}: map_row sem ticket_id, mantendo na missing."
                 )
-                kept_in_missing.append(tid)
                 continue
 
             rows.append(row)
@@ -390,12 +320,6 @@ def main():
 
         n_upsert = upsert_rows(conn, rows)
         print(f"UPSERT detail: {n_upsert} linhas atualizadas.")
-
-        if kept_in_missing:
-            print(
-                "Tickets que permaneceram em audit_recent_missing por falha/mapeamento:",
-                kept_in_missing,
-            )
 
     finally:
         conn.close()
