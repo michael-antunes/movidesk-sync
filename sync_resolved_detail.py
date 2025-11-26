@@ -24,7 +24,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("sync_resolved_detail")
 
-# --- Conexão com o banco ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Conexão com o banco
+# ---------------------------------------------------------------------------
 
 
 def get_db_connection():
@@ -34,37 +36,47 @@ def get_db_connection():
     conn = psycopg2.connect(NEON_DSN)
     conn.autocommit = False
 
-    # Garante que a gente enxerga as tabelas do seu schema
-    # (ajuste o nome 'tickets_movidesk' se o schema tiver outro nome)
+    # Ajuste aqui o schema caso o nome seja diferente
     with conn.cursor() as cur:
         try:
             cur.execute(
                 "SET search_path TO tickets_movidesk, visualizacao_resolvidos, public"
             )
         except Exception as e:
-            # Se der erro aqui, só loga e segue com o search_path padrão
             logger.warning("Não foi possível definir search_path customizado: %s", e)
-        # não precisa de commit aqui, search_path é config de sessão
 
     return conn
 
 
-# --- Fila de missing --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fila de missing (audit_recent_missing)
+# ---------------------------------------------------------------------------
 
 
 def fetch_missing_ticket_ids(cur, limit: int) -> List[int]:
     """
     Busca na audit_recent_missing os tickets marcados como faltando
-    para a tabela 'tickets_resolvidos', ordenando pelos runs mais recentes.
+    para a tabela 'tickets_resolvidos', pegando sempre o run mais recente
+    de cada ticket.
     """
     cur.execute(
         """
-        SELECT DISTINCT m.ticket_id
-        FROM audit_recent_missing m
-        JOIN audit_recent_run r
-          ON r.id = m.run_id
-        WHERE m.table_name = 'tickets_resolvidos'
-        ORDER BY r.run_at DESC, m.ticket_id DESC
+        SELECT ticket_id
+        FROM (
+            SELECT
+                m.ticket_id,
+                r.run_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.ticket_id
+                    ORDER BY r.run_at DESC
+                ) AS rn
+            FROM audit_recent_missing m
+            JOIN audit_recent_run r
+              ON r.id = m.run_id
+            WHERE m.table_name = 'tickets_resolvidos'
+        ) t
+        WHERE rn = 1
+        ORDER BY run_at DESC, ticket_id DESC
         LIMIT %s
         """,
         (limit,),
@@ -73,7 +85,9 @@ def fetch_missing_ticket_ids(cur, limit: int) -> List[int]:
     return [row[0] for row in rows]
 
 
-# --- API Movidesk -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# API Movidesk
+# ---------------------------------------------------------------------------
 
 session = requests.Session()
 
@@ -82,22 +96,20 @@ def fetch_ticket_from_api(ticket_id: int) -> Optional[Dict[str, Any]]:
     """
     Busca um ticket específico na API do Movidesk.
 
-    Usando o padrão OData, igual aos outros scripts:
-      GET /tickets?token=...&$filter=id eq {ticket_id}
+    Usando o endpoint /tickets/{id}?token=...
+    (igual à URL que você acessa no navegador).
     """
     if not API_TOKEN:
         raise RuntimeError("MOVIDESK_TOKEN não configurado")
 
+    url = f"{API_BASE}/tickets/{ticket_id}"
     params = {
         "token": API_TOKEN,
-        "$filter": f"id eq {ticket_id}",
         "$expand": (
             "owner,organization,clients,"
             "customFieldValues,customFieldValues($expand=items)"
         ),
     }
-
-    url = f"{API_BASE}/tickets"
 
     try:
         resp = session.get(url, params=params, timeout=30)
@@ -105,10 +117,13 @@ def fetch_ticket_from_api(ticket_id: int) -> Optional[Dict[str, Any]]:
         logger.error("Erro de conexão ao buscar ticket %s: %s", ticket_id, exc)
         return None
 
+    if resp.status_code == 404:
+        logger.warning("ticket %s não encontrado na API (404).", ticket_id)
+        return None
+
     if not resp.ok:
-        # 404 aqui significa que a API não achou o ticket com esse filtro
-        logger.warning(
-            "ticket %s: resposta HTTP %s da API (%s)",
+        logger.error(
+            "ticket %s: erro HTTP %s da API: %s",
             ticket_id,
             resp.status_code,
             resp.text[:300],
@@ -118,15 +133,8 @@ def fetch_ticket_from_api(ticket_id: int) -> Optional[Dict[str, Any]]:
     try:
         data = resp.json()
     except Exception as exc:
-        logger.error("Erro ao parsear JSON do ticket %s: %s", ticket_id, exc)
+        logger.error("ticket %s: erro ao parsear JSON: %s", ticket_id, exc)
         return None
-
-    # Por padrão o Movidesk devolve lista
-    if isinstance(data, list):
-        if not data:
-            logger.warning("ticket %s: resposta vazia da API.", ticket_id)
-            return None
-        return data[0]
 
     if not isinstance(data, dict):
         logger.error("ticket %s: JSON inesperado: %r", ticket_id, data)
@@ -137,8 +145,7 @@ def fetch_ticket_from_api(ticket_id: int) -> Optional[Dict[str, Any]]:
 
 def parse_datetime(value: Optional[str]) -> Optional[str]:
     """
-    Mantém simples: se vier string ISO, o Postgres converte;
-    se vier vazio/None, retorna None.
+    Deixa o Postgres converter a string ISO.
     """
     if not value:
         return None
@@ -162,7 +169,9 @@ def extract_resolved_closed_dates(ticket: Dict[str, Any]) -> Dict[str, Optional[
     }
 
 
-# --- Persistência em tickets_resolvidos -------------------------------------
+# ---------------------------------------------------------------------------
+# Persistência em visualizacao_resolvidos.tickets_resolvidos
+# ---------------------------------------------------------------------------
 
 
 def update_dates_in_db(cur, rows: List[Dict[str, Any]]) -> int:
@@ -195,7 +204,9 @@ def update_dates_in_db(cur, rows: List[Dict[str, Any]]) -> int:
     return cur.rowcount
 
 
-# --- Main -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -226,7 +237,7 @@ def main():
                 time.sleep(THROTTLE)
 
                 if ticket is None:
-                    # não conseguimos dados; deixamos nas filas
+                    # não conseguimos dados; mantemos esse ticket na fila de missing
                     continue
 
                 dates = extract_resolved_closed_dates(ticket)
@@ -256,9 +267,6 @@ def main():
                 )
 
             conn.commit()
-
-            # As triggers nas tabelas/visões é que vão limpar audit_recent_missing
-            # e alimentar audit_ticket_watch conforme sua lógica de missing.
 
     except Exception as exc:
         logger.critical("Erro ao executar sync_resolved_detail: %s", exc, exc_info=True)
