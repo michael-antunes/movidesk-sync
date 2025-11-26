@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import requests
 import psycopg2
 import psycopg2.extras
@@ -10,69 +9,54 @@ API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
 
-CHAT_ORIGINS = {"5", "6", "23", "25", "26", "27"}
-
 
 def to_iso_z(dt):
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    else:
-        dt = dt.astimezone(datetime.timezone.utc)
-    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def iint(x):
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-
-def _req(url, params, max_retries=3):
-    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
-    last_exc = None
-    for _ in range(max_retries):
-        try:
-            r = requests.get(url, params=params, timeout=90)
-            if r.status_code == 200:
-                if r.text:
-                    return r.json()
-                return {}
-            if r.status_code in (429, 503):
-                retry_after = r.headers.get("retry-after")
-                try:
-                    wait = int(str(retry_after)) if retry_after is not None else 30
-                except Exception:
-                    wait = 30
-                time.sleep(wait)
-                last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
-                continue
-            last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text}")
-        except Exception as exc:
-            last_exc = exc
-        time.sleep(throttle)
-    if last_exc:
-        raise last_exc
-    return {}
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def get_since_from_db(conn, days_back, overlap_minutes):
     with conn.cursor() as cur:
         cur.execute(
-            "select max(changed_date) from visualizacao_resolucao.resolucao_por_status"
+            """
+            select max(changed_date)
+            from visualizacao_resolucao.resolucao_por_status
+        """
         )
-        row = cur.fetchone()
-    now_utc = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-    if row and row[0]:
-        since = row[0]
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=datetime.timezone.utc)
-        since = since - datetime.timedelta(minutes=overlap_minutes)
+        max_date = cur.fetchone()[0]
+    if max_date:
+        since_dt = max_date - datetime.timedelta(minutes=overlap_minutes)
     else:
-        since = now_utc - datetime.timedelta(days=days_back)
-    return since
+        since_dt = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(days=days_back)
+    return since_dt
+
+
+def iint(x):
+    try:
+        s = str(x)
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
+
+
+def _req(url, params, timeout=90):
+    while True:
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
+            retry = r.headers.get("retry-after")
+            wait = int(retry) if str(retry).isdigit() else 60
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            return []
+        if r.status_code >= 400:
+            try:
+                print("HTTP ERROR", r.status_code, r.text[:1200])
+            except Exception:
+                pass
+            r.raise_for_status()
+        return r.json() if r.text else []
 
 
 def fetch_status_history(since_iso):
@@ -129,108 +113,27 @@ def upsert_rows(conn, rows):
     if not rows:
         return 0
     with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=500)
+        psycopg2.extras.execute_batch(cur, UPSERT_SQL, rows, page_size=200)
+    conn.commit()
     return len(rows)
 
 
-def select_ticket_ids_chat_to_update(conn, limit_):
-    sql = """
-        select ra.ticket_id
-        from visualizacao_resolvidos.resolvidos_acoes ra
-        join visualizacao_resolvidos.tickets_resolvidos tr
-          on tr.ticket_id = ra.ticket_id
-        where tr.origin in ('5', '6', '23', '25', '26', '27')
-        order by ra.ticket_id
-        limit %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit_,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
-
-
-def fetch_ticket_actions_with_html(ticket_id):
-    params = {
-        "token": API_TOKEN,
-        "id": ticket_id,
-        "$select": "id,actions",
-        "$expand": "actions($select=id,origin,type,status,createdDate,createdBy,description,htmlDescription,attachments)",
-    }
-    url = f"{API_BASE}/tickets"
-    r = requests.get(url, params=params, timeout=90)
-    if r.status_code != 200:
-        raise RuntimeError(
-            f"Movidesk API error for ticket {ticket_id}: {r.status_code} {r.text}"
-        )
-    data = r.json()
-    if isinstance(data, list):
-        ticket = data[0] if data else {}
-    else:
-        ticket = data
-    actions = ticket.get("actions") or []
-    return actions
-
-
-def update_resolvidos_acoes(conn, ticket_id, actions):
-    payload = json.dumps(actions, ensure_ascii=False)
-    sql = """
-        update visualizacao_resolvidos.resolvidos_acoes
-           set acoes = %s
-         where ticket_id = %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (payload, ticket_id))
-
-
-def sync_chat_resolvidos_acoes(conn, limit_):
-    ticket_ids = select_ticket_ids_chat_to_update(conn, limit_)
-    if not ticket_ids:
-        print("SYNC CHAT: nenhum ticket para atualizar")
-        return 0
-    updated = 0
-    for idx, ticket_id in enumerate(ticket_ids, start=1):
-        try:
-            actions = fetch_ticket_actions_with_html(ticket_id)
-            update_resolvidos_acoes(conn, ticket_id, actions)
-            updated += 1
-            print(
-                f"SYNC CHAT: ticket {ticket_id} atualizado com {len(actions)} ações"
-            )
-        except Exception as exc:
-            print(f"SYNC CHAT ERRO ticket {ticket_id}: {exc}")
-        if idx < len(ticket_ids):
-            time.sleep(5)
-    return updated
-
-
 def main():
-    if not API_TOKEN:
-        raise RuntimeError("MOVIDESK_TOKEN não definido")
-    if not NEON_DSN:
-        raise RuntimeError("NEON_DSN não definido")
-
+    if not API_TOKEN or not NEON_DSN:
+        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
     days_back = int(os.getenv("MOVIDESK_RPS_DAYS", "120"))
     overlap_minutes = int(os.getenv("MOVIDESK_OVERLAP_MIN", "10080"))
-    chat_limit = int(os.getenv("MOVIDESK_CHAT_LIMIT", "100"))
 
     conn = psycopg2.connect(NEON_DSN)
-    conn.autocommit = True
     try:
         since_dt = get_since_from_db(conn, days_back, overlap_minutes)
         since_iso = to_iso_z(since_dt)
 
-        try:
-            resp = fetch_status_history(since_iso)
-        except Exception as exc:
-            print(f"ERRO AO CHAMAR /tickets/statusHistory: {exc}")
-            resp = []
-
+        resp = fetch_status_history(since_iso)
         rows = [map_row(x) for x in resp if isinstance(x, dict)]
         n = upsert_rows(conn, rows)
-        print(f"DESDE {since_iso} | UPSERT RPS: {n}")
 
-        n_chat = sync_chat_resolvidos_acoes(conn, chat_limit)
-        print(f"SYNC CHAT RESOLVIDOS_ACOES: {n_chat}")
+        print(f"DESDE {since_iso} | UPSERT: {n}")
     finally:
         conn.close()
 
