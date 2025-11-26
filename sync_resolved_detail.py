@@ -1,399 +1,352 @@
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from datetime import datetime, timezone
 
 import requests
 import psycopg2
 import psycopg2.extras
 
+
 # --------------------------------------------------------------------
-# Configuração
+# Config
 # --------------------------------------------------------------------
+
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 NEON_DSN = os.getenv("NEON_DSN")
-THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))  # segundos entre requisições
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))  # segundos entre chamadas
 
-# Campos que queremos inspecionar quando ficam NULL
-CRITICAL_FIELDS = [
-    "organization_id",
-    "organization_name",
-    "service_second_level",
-    "service_third_level",
-    "adicional_nome",
-    "last_resolved_at",
-    "last_closed_at",
-]
+# Tabela de detalhe (onde ficam status, datas, organização etc.)
+DETAIL_TABLE = "visualizacao_resolvidos.tickets_resolvidos"
 
-# ID do campo adicional "Nome" = 29077 (confirmado por você)
-ADICIONAL_NOME_ID = 29077
+# Nome que as triggers gravam em visualizacao_resolvidos.audit_recent_missing.table_name
+# Ajusta aqui se no seu banco estiver diferente
+AUDIT_TABLE_NAME = "tickets_resolvidos"
+
+# Quantos tickets por rodada
+BATCH_SIZE = int(os.getenv("DETAIL_BATCH_SIZE", "100"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 
 # --------------------------------------------------------------------
-# Helpers genéricos
+# Helpers gerais
 # --------------------------------------------------------------------
-def get_connection():
+
+def get_db_conn():
     if not NEON_DSN:
         raise RuntimeError("NEON_DSN não configurado")
-    conn = psycopg2.connect(NEON_DSN, sslmode="require")
-    conn.autocommit = False
-    return conn
+    return psycopg2.connect(NEON_DSN)
 
 
-def movidesk_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """
-    Chama a API do Movidesk.
-
-    - Não faz paginação (não precisa para /tickets?id=...).
-    - Em caso de 404, retorna {}.
-    """
-    if not API_TOKEN:
-        raise RuntimeError("MOVIDESK_TOKEN não configurado")
-
+def movidesk_get(path, params=None):
+    """Chamada simples à API Movidesk com throttle."""
     if params is None:
         params = {}
+
+    if not API_TOKEN:
+        raise RuntimeError("MOVIDESK_TOKEN não configurado")
 
     params = dict(params)
     params["token"] = API_TOKEN
 
     url = f"{API_BASE.rstrip('/')}/{path.lstrip('/')}"
+    time.sleep(THROTTLE)
     resp = requests.get(url, params=params, timeout=30)
+
     if resp.status_code == 404:
-        return {}
+        return None
     resp.raise_for_status()
     return resp.json()
 
 
-def normalize(text: Optional[str]) -> str:
-    return (text or "").strip().lower()
+def parse_utc(dt_str):
+    """Converte string ISO da API em datetime com timezone UTC."""
+    if not dt_str:
+        return None
+    try:
+        # API às vezes vem com 'Z'
+        dt_str = dt_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------
-# Cálculo de datas de resolução / fechamento
+# Datas de resolução / fechamento
 # --------------------------------------------------------------------
-def compute_resolution_dates(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+
+def compute_resolution_dates(ticket: dict):
     """
-    Calcula last_resolved_at e last_closed_at a partir das actions do ticket.
+    Define last_resolved_at e last_closed_at usando os campos nativos:
 
-    Regras (pra bater com o que você descreveu):
-      - resolved_at: primeira vez que o status vira 'Resolvido' OU 'Cancelado'
-      - closed_at  : última vez que o status vira 'Fechado'
+    - baseStatus = Canceled
+        last_resolved_at = resolvedIn (ou closedIn)
+        last_closed_at   = NULL
 
-    Cancelado NÃO tem data de fechamento, então só resolved_at.
+    - baseStatus = Resolved
+        last_resolved_at = resolvedIn (ou closedIn)
+        last_closed_at   = NULL
+
+    - baseStatus = Closed
+        last_resolved_at = resolvedIn (se não tiver, usa closedIn)
+        last_closed_at   = closedIn
+
+    - Qualquer outro status → ambos NULL
     """
-    resolved_at: Optional[str] = None
-    closed_at: Optional[str] = None
+    base_status = (ticket.get("baseStatus") or "").strip()
 
-    actions = ticket.get("actions") or []
-    if not isinstance(actions, list):
-        return resolved_at, closed_at
+    resolved_in = parse_utc(ticket.get("resolvedIn"))
+    closed_in = parse_utc(ticket.get("closedIn"))
 
-    def _created(a):
-        return a.get("createdDate") or ""
+    last_resolved_at = None
+    last_closed_at = None
 
-    actions_sorted = sorted(actions, key=_created)
+    if base_status == "Canceled":
+        last_resolved_at = resolved_in or closed_in
+        last_closed_at = None
 
-    for action in actions_sorted:
-        created = action.get("createdDate")
-        if not created:
-            continue
+    elif base_status == "Resolved":
+        last_resolved_at = resolved_in or closed_in
+        last_closed_at = None
 
-        status_str = normalize(action.get("status") or action.get("statusName"))
+    elif base_status == "Closed":
+        last_resolved_at = resolved_in or closed_in
+        last_closed_at = closed_in
 
-        # primeira resolução (Resolvido ou Cancelado)
-        if ("resolvido" in status_str or "cancelado" in status_str) and resolved_at is None:
-            resolved_at = created
+    else:
+        last_resolved_at = None
+        last_closed_at = None
 
-        # última vez que virou Fechado
-        if "fechado" in status_str:
-            closed_at = created
-
-    return resolved_at, closed_at
+    return last_resolved_at, last_closed_at
 
 
 # --------------------------------------------------------------------
-# Extração de campos do ticket (org, serviço, adicionais)
+# Mapeamento do ticket da API -> linha da tabela DETAIL_TABLE
 # --------------------------------------------------------------------
-def extract_adicional_nome(ticket: Dict[str, Any]) -> Optional[str]:
-    """
-    Campo adicional "Nome" (id 29077) mapeado para adicional_nome.
-    """
-    for key in ("customFieldValues", "customFields", "additionalFields"):
-        fields = ticket.get(key)
-        if not isinstance(fields, list):
-            continue
 
-        for f in fields:
-            try:
-                fid = f.get("id") or f.get("fieldId")
-                if isinstance(fid, str) and fid.isdigit():
-                    fid = int(fid)
-                if fid == ADICIONAL_NOME_ID:
-                    for vk in ("value", "fieldValue", "text", "displayValue"):
-                        if f.get(vk):
-                            return str(f[vk]).strip()
-            except Exception:
-                continue
-    return None
-
-
-def extract_organization(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def safe_get_org(ticket: dict):
     """
-    Tenta pegar organization_id e organization_name.
+    Tenta extrair organization_id e organization_name do primeiro client.
+    Se não achar, devolve (None, None).
     """
-    org = (
-        ticket.get("organization")
-        or ticket.get("ownerOrganization")
-        or ticket.get("clientOrganization")
-    )
-
-    if not isinstance(org, dict):
+    clients = ticket.get("clients") or []
+    if not clients:
         return None, None
 
-    org_id = org.get("id") or org.get("organizationId")
-    org_name = org.get("businessName") or org.get("name") or org.get("fantasyName")
-
-    if org_id is not None:
-        org_id = str(org_id)
-
-    if org_name is not None:
-        org_name = str(org_name)
-
+    # Estrutura comum: client["organization"]["id"] / ["businessName"]
+    org = (clients[0] or {}).get("organization") or {}
+    org_id = org.get("id")
+    org_name = org.get("businessName") or org.get("name")
     return org_id, org_name
 
 
-def extract_service_levels(ticket: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def safe_get_service_levels(ticket: dict):
     """
-    Extrai serviço 2º e 3º nível (quando existirem).
+    Extrai até 3 níveis de serviço se existirem.
     """
     service = ticket.get("service") or {}
-
-    second = service.get("secondLevel") or service.get("serviceSecondLevel")
-    third = service.get("thirdLevel") or service.get("serviceThirdLevel")
-
-    # fallback em campos soltos
-    if not second:
-        second = ticket.get("serviceSecondLevel")
-    if not third:
-        third = ticket.get("serviceThirdLevel")
-
-    if isinstance(second, dict):
-        second = second.get("name") or second.get("description")
-    if isinstance(third, dict):
-        third = third.get("name") or third.get("description")
-
-    second = str(second).strip() if second else None
-    third = str(third).strip() if third else None
-
-    return second, third
+    first_level = (service.get("firstLevel") or {}).get("name")
+    second_level = (service.get("secondLevel") or {}).get("name")
+    third_level = (service.get("thirdLevel") or {}).get("name")
+    return first_level, second_level, third_level
 
 
-def map_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
+def get_custom_field(ticket: dict, field_id_or_label: str):
     """
-    Converte o JSON do ticket em uma linha para a tabela tickets_resolvidos.
+    Procura um customField pelo id OU pela label.
+    Devolve o 'value' se achar.
     """
-    ticket_id = ticket.get("id") or ticket.get("ticketId")
-    if ticket_id is None:
-        raise ValueError("Ticket sem id")
+    for f in ticket.get("customFields") or []:
+        if (
+            str(f.get("id")) == str(field_id_or_label)
+            or (f.get("label") or "").strip() == field_id_or_label
+        ):
+            return f.get("value")
+    return None
 
-    status = ticket.get("status") or ""
+
+def map_ticket_to_detail_row(ticket: dict) -> dict:
+    """
+    Converte o JSON do ticket da API em um dict com as colunas da tabela DETAIL_TABLE.
+    Ajuste aqui se tiver mais colunas.
+    """
+    ticket_id = int(ticket["id"])
+    status_text = ticket.get("status") or ticket.get("baseStatus")
+
+    last_resolved_at, last_closed_at = compute_resolution_dates(ticket)
+    organization_id, organization_name = safe_get_org(ticket)
+    service_first_level, service_second_level, service_third_level = safe_get_service_levels(ticket)
+
     origin = ticket.get("origin")
 
-    row: Dict[str, Any] = {
-        "ticket_id": int(ticket_id),
-        "status": str(status),
-        "origin": str(origin) if origin is not None else None,
-        "last_resolved_at": None,
-        "last_closed_at": None,
-        "organization_id": None,
-        "organization_name": None,
-        "service_second_level": None,
-        "service_third_level": None,
-        "adicional_nome": None,
+    # Exemplo de campo adicional (ajuste o identificador conforme seu ambiente)
+    adicional_nome = get_custom_field(ticket, "adicional_nome")
+    adicional_csat = get_custom_field(ticket, "137641")  # adicional_137641_avaliado_csat
+
+    row = {
+        "ticket_id": ticket_id,
+        "status_text": status_text,
+        "last_resolved_at": last_resolved_at,
+        "last_closed_at": last_closed_at,
+        "organization_id": organization_id,
+        "organization_name": organization_name,
+        "service_first_level": service_first_level,
+        "service_second_level": service_second_level,
+        "service_third_level": service_third_level,
+        "adicional_nome": adicional_nome,
+        "adicional_137641_avaliado_csat": adicional_csat,
+        "origin": origin,
     }
-
-    org_id, org_name = extract_organization(ticket)
-    row["organization_id"] = org_id
-    row["organization_name"] = org_name
-
-    second, third = extract_service_levels(ticket)
-    row["service_second_level"] = second
-    row["service_third_level"] = third
-
-    row["adicional_nome"] = extract_adicional_nome(ticket)
-
-    resolved_at, closed_at = compute_resolution_dates(ticket)
-    row["last_resolved_at"] = resolved_at
-    row["last_closed_at"] = closed_at
-
-    null_fields = [f for f in CRITICAL_FIELDS if row.get(f) is None]
-    if null_fields:
-        print(
-            f"[DEBUG] ticket {row['ticket_id']} campos ainda NULL depois do map_row: {null_fields}"
-        )
 
     return row
 
 
 # --------------------------------------------------------------------
-# Banco: leitura dos tickets em missing
+# Busca dos ticket_ids que estão na audit_recent_missing
 # --------------------------------------------------------------------
-def fetch_missing_ticket_ids(cur, limit: int) -> List[int]:
+
+def fetch_missing_ticket_ids(cur, limit: int):
     """
-    Busca até 'limit' tickets para reprocessar a partir de audit_recent_missing.
-    Ordena pelo run_id mais recente (e ticket_id desc).
+    Busca os ticket_id da audit_recent_missing para essa tabela,
+    ordenando do run mais recente pra trás.
     """
     cur.execute(
         """
-        SELECT ticket_id
+        SELECT DISTINCT ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing
-        WHERE table_name = 'tickets_resolvidos'
-        ORDER BY run_id DESC, ticket_id DESC
+        WHERE table_name = %s
+        ORDER BY run_at DESC, ticket_id DESC
         LIMIT %s
         """,
-        (limit,),
+        (AUDIT_TABLE_NAME, limit),
     )
     rows = cur.fetchall()
     return [r[0] for r in rows]
 
 
-def delete_from_missing(cur, ticket_ids: List[int]) -> int:
+def delete_from_missing(cur, ticket_ids):
+    """
+    Remove os tickets processados da audit_recent_missing para evitar loop infinito.
+    """
     if not ticket_ids:
         return 0
 
     cur.execute(
         """
         DELETE FROM visualizacao_resolvidos.audit_recent_missing
-        WHERE table_name = 'tickets_resolvidos'
+        WHERE table_name = %s
           AND ticket_id = ANY(%s)
         """,
-        (ticket_ids,),
+        (AUDIT_TABLE_NAME, ticket_ids),
     )
     return cur.rowcount
 
 
 # --------------------------------------------------------------------
-# Leitura do ticket na API (CORRIGIDO: /tickets?id=... )
+# UPSERT na tabela de detalhe
 # --------------------------------------------------------------------
-def fetch_ticket(ticket_id: int) -> Dict[str, Any]:
+
+def upsert_detail_rows(cur, rows):
     """
-    Busca o ticket na API usando /tickets?id=... (padrão Movidesk).
-    A API costuma retornar uma lista; aqui normalizamos pra um único dict.
+    Faz UPSERT na DETAIL_TABLE usando ticket_id como chave única.
+    Usa SQL dinâmico com as chaves do dicionário.
     """
-    data = movidesk_get(
-        "tickets",
-        params={
-            "id": ticket_id,
-            "include": "actions,service,organization,customFieldValues",
-        },
-    )
-
-    if not data:
-        return {}
-
-    if isinstance(data, list):
-        if not data:
-            return {}
-        return data[0]
-
-    # se por acaso vier como objeto único
-    return data
-
-
-# --------------------------------------------------------------------
-# UPSERT no detalhe
-# --------------------------------------------------------------------
-def upsert_detail(cur, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
 
-    columns = [
-        "ticket_id",
-        "status",
-        "origin",
-        "last_resolved_at",
-        "last_closed_at",
-        "organization_id",
-        "organization_name",
-        "service_second_level",
-        "service_third_level",
-        "adicional_nome",
-    ]
+    # Garante ordem estável das colunas
+    columns = list(rows[0].keys())
 
-    values = [[row.get(col) for col in columns] for row in rows]
+    col_list = ", ".join(columns)
+    placeholders = ", ".join([f"%({c})s" for c in columns])
+    updates = ", ".join([f"{c} = EXCLUDED.{c}" for c in columns if c != "ticket_id"])
 
     sql = f"""
-        INSERT INTO visualizacao_resolvidos.tickets_resolvidos
-        ({", ".join(columns)})
-        VALUES %s
+        INSERT INTO {DETAIL_TABLE} ({col_list})
+        VALUES ({placeholders})
         ON CONFLICT (ticket_id) DO UPDATE SET
-            status               = EXCLUDED.status,
-            origin               = EXCLUDED.origin,
-            last_resolved_at     = EXCLUDED.last_resolved_at,
-            last_closed_at       = EXCLUDED.last_closed_at,
-            organization_id      = EXCLUDED.organization_id,
-            organization_name    = EXCLUDED.organization_name,
-            service_second_level = EXCLUDED.service_second_level,
-            service_third_level  = EXCLUDED.service_third_level,
-            adicional_nome       = EXCLUDED.adicional_nome;
+            {updates}
     """
 
-    psycopg2.extras.execute_values(cur, sql, values, page_size=100)
+    psycopg2.extras.execute_batch(cur, sql, rows, page_size=100)
     return len(rows)
 
 
 # --------------------------------------------------------------------
-# Main
+# Fluxo principal
 # --------------------------------------------------------------------
+
+def process_batch(cur, ticket_ids):
+    """
+    Para cada ticket_id, chama a API, mapeia os campos e prepara as linhas.
+    """
+    rows = []
+    not_found_ids = []
+
+    for ticket_id in ticket_ids:
+        ticket = movidesk_get(f"tickets/{ticket_id}")
+        if ticket is None:
+            logging.warning("ticket %s não encontrado na API (404).", ticket_id)
+            not_found_ids.append(ticket_id)
+            continue
+
+        row = map_ticket_to_detail_row(ticket)
+
+        # Só pra debug: mostra quais campos ainda ficaram como NULL
+        null_fields = [k for k, v in row.items() if v is None]
+        if null_fields:
+            logging.debug(
+                "ticket %s campos ainda NULL depois do map_row: %s",
+                ticket_id,
+                null_fields,
+            )
+
+        rows.append(row)
+
+    updated = upsert_detail_rows(cur, rows)
+    return updated, not_found_ids
+
+
 def main():
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            ticket_ids = fetch_missing_ticket_ids(cur, BATCH_SIZE)
+    logging.info("Iniciando sync_resolved_detail (detail)...")
 
-        if not ticket_ids:
-            print("Nenhum ticket na audit_recent_missing para reprocessar, saindo.")
-            return
+    with get_db_conn() as conn:
+        conn.autocommit = False
+        cur = conn.cursor()
 
-        print(
-            f"Reprocessando {len(ticket_ids)} tickets da audit_recent_missing "
-            f"(mais novos primeiro): {ticket_ids}"
+        ticket_ids = fetch_missing_ticket_ids(cur, BATCH_SIZE)
+        logging.info(
+            "Reprocessando %d tickets da audit_recent_missing (mais novos primeiro): %s",
+            len(ticket_ids),
+            ticket_ids,
         )
 
-        rows: List[Dict[str, Any]] = []
+        if not ticket_ids:
+            logging.info("Nenhum ticket para processar, encerrando.")
+            return
 
-        for i, ticket_id in enumerate(ticket_ids, start=1):
-            try:
-                ticket = fetch_ticket(ticket_id)
-                if not ticket:
-                    print(f"[WARN] ticket {ticket_id} não encontrado na API (404 ou vazio).")
-                    continue
+        updated, not_found = process_batch(cur, ticket_ids)
+        logging.info("UPSERT detail: %d linhas atualizadas.", updated)
 
-                row = map_row(ticket)
-                rows.append(row)
-
-            except Exception as e:
-                print(f"[ERROR] Falha ao processar ticket {ticket_id}: {e}")
-
-            if THROTTLE > 0 and i < len(ticket_ids):
-                time.sleep(THROTTLE)
-
-        with conn.cursor() as cur:
-            updated = upsert_detail(cur, rows)
-            print(f"UPSERT detail: {updated} linhas atualizadas.")
-
-            deleted = delete_from_missing(cur, ticket_ids)
-            print(f"DELETE MISSING: {deleted}")
+        # Remove todos da missing (inclusive os 404, pra não ficar em loop)
+        deleted = delete_from_missing(cur, ticket_ids)
+        logging.info("DELETE MISSING: %d", deleted)
 
         conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"[FATAL] Erro ao executar sync_resolved_detail: {e}")
-        raise
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.exception("Erro ao executar sync_resolved_detail: %s", e)
+        print(f"[FATAL] Erro ao executar sync_resolved_detail: {e}")
+        raise
