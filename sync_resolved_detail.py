@@ -8,17 +8,13 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
-# -------------------------------------------------------------------
-# Config / ambiente
-# -------------------------------------------------------------------
-
 API_BASE = "https://api.movidesk.com/public/v1"
 
 MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN") or os.getenv("PG_DSN")
 
 BATCH = int(os.getenv("DETAIL_BATCH", "200"))
-THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
+THROTTLE = float(os.getenv("THROTTLE_SEC", "7.0"))
 MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "3"))
 
 if not MOVIDESK_TOKEN:
@@ -36,13 +32,16 @@ LOG = logging.getLogger("detail")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
 
+SELECT_FIELDS = (
+    "id,status,lastUpdate,origin,category,urgency,"
+    "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
+    "owner,organization,clients,subject,actions,customFields,createdBy"
+)
 
-# -------------------------------------------------------------------
-# Helpers de API
-# -------------------------------------------------------------------
+EXPAND_FULL = "clients,createdBy,owner,actions,customFields"
+
 
 def _parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
-    """Lê o header Retry-After (segundos)."""
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if not retry_after:
         return None
@@ -57,95 +56,63 @@ def md_get(
     params: Optional[Dict[str, Any]] = None,
     ok_404: bool = False,
 ) -> Any:
-    """
-    GET na API do Movidesk com tratamento de erros transitórios,
-    respeitando o header Retry-After para 429 (Too Many Requests).
-
-    Se ok_404=True, retorna None em caso de 404 ao invés de levantar erro.
-    """
     url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
     base_params = dict(params or {})
     base_params["token"] = MOVIDESK_TOKEN
 
-    last_exc: Optional[requests.HTTPError] = None
+    retries = 0
 
-    for attempt in range(1, MAX_429_RETRIES + 1):
+    while True:
         resp = SESSION.get(url, params=base_params, timeout=60)
 
-        # Sucesso
         if resp.status_code == 200:
             return resp.json() or {}
 
-        # 404 "controlado"
         if ok_404 and resp.status_code == 404:
             return None
 
-        # 429 => respeita Retry-After
         if resp.status_code == 429:
-            wait = _parse_retry_after(resp.headers)
-            if wait is None:
-                # Manual: 60 / 120 / 300; fallback conservador crescente
-                wait = 60 * attempt
+            retries += 1
+            wait = _parse_retry_after(resp.headers) or 60
             LOG.warning(
-                "HTTP 429 em %s (tentativa %d/%d, Retry-After=%s). Aguardando %s segundos...",
+                "detail: HTTP 429 em %s (tentativa %d/%d, Retry-After=%s). Aguardando %s segundos...",
                 url,
-                attempt,
+                retries,
                 MAX_429_RETRIES,
                 resp.headers.get("Retry-After"),
                 wait,
             )
-            time.sleep(wait)
-            try:
+            if retries >= MAX_429_RETRIES:
                 resp.raise_for_status()
-            except requests.HTTPError as exc:  # guarda exceção mais recente
-                last_exc = exc
+            time.sleep(wait)
             continue
 
-        # Erros 5xx => tenta de novo com backoff simples
         if resp.status_code in (500, 502, 503, 504):
-            backoff = 2 * attempt
+            retries += 1
+            backoff = 2 * retries
             LOG.warning(
-                "HTTP %s em %s (tentativa %d/%d). Aguardando %s segundos...",
+                "detail: HTTP %s em %s (tentativa %d/%d). Aguardando %s segundos...",
                 resp.status_code,
                 url,
-                attempt,
+                retries,
                 MAX_429_RETRIES,
                 backoff,
             )
-            time.sleep(backoff)
-            try:
+            if retries >= MAX_429_RETRIES:
                 resp.raise_for_status()
-            except requests.HTTPError as exc:
-                last_exc = exc
+            time.sleep(backoff)
             continue
 
-        # Demais códigos: 400, 401 etc -> erro "definitivo"
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            last_exc = exc
-        break
+        resp.raise_for_status()
 
-    # Se chegou aqui é porque não retornou 200/404 controlado
-    if last_exc is not None:
-        raise last_exc
-    resp.raise_for_status()
-
-
-# -------------------------------------------------------------------
-# Banco de dados
-# -------------------------------------------------------------------
 
 def get_pending_ids(conn, limit: int) -> List[int]:
-    """
-    Busca os ticket_id pendentes em visualizacao_resolvidos.audit_recent_missing
-    para a tabela 'tickets_resolvidos'.
-    """
     sql = """
-        SELECT DISTINCT ON (ticket_id) ticket_id
+        SELECT ticket_id
           FROM visualizacao_resolvidos.audit_recent_missing
          WHERE table_name = 'tickets_resolvidos'
-         ORDER BY ticket_id DESC, run_id DESC
+         GROUP BY ticket_id
+         ORDER BY max(run_id) DESC, ticket_id DESC
          LIMIT %s
     """
     with conn.cursor() as cur:
@@ -155,12 +122,6 @@ def get_pending_ids(conn, limit: int) -> List[int]:
 
 
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
-    """
-    Registra/atualiza falhas em audit_ticket_watch, sem estourar chave primária.
-    PK conhecida: (ticket_id).
-
-    A coluna de motivo não é usada aqui; o motivo fica apenas no log.
-    """
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -177,15 +138,11 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
                 (ticket_id,),
             )
         conn.commit()
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         LOG.error("detail: erro ao registrar falha em audit_ticket_watch (%s)", e)
 
 
 def delete_from_missing(conn, ids: List[int]) -> None:
-    """
-    Remove IDs processados (ok + falhas) de audit_recent_missing,
-    para não ficarem rodando em loop eterno.
-    """
     if not ids:
         return
 
@@ -199,17 +156,7 @@ def delete_from_missing(conn, ids: List[int]) -> None:
     conn.commit()
 
 
-# -------------------------------------------------------------------
-# Transformação de dados do ticket
-# -------------------------------------------------------------------
-
 def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
-    """
-    Converte string de data/hora da Movidesk em datetime do Python
-    usando apenas a stdlib (sem dateutil).
-
-    Aceita formatos ISO, com ou sem 'Z' no final.
-    """
     if not value:
         return None
     try:
@@ -220,10 +167,6 @@ def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
 
 
 def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
-    """
-    Monta a tupla na ordem exata das colunas de
-    visualizacao_resolvidos.tickets_resolvidos usadas hoje.
-    """
     actions = ticket.get("actions") or []
 
     last_resolved_at = None
@@ -251,7 +194,6 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
 
     final_status = (ticket.get("status") or "").strip()
 
-    # Regras de preenchimento para as colunas de resolved/closed/cancelled
     if final_status == "Cancelado":
         last_resolved_at_db = None
         last_closed_at_db = None
@@ -292,10 +234,6 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
         client.get("businessName"),
     )
 
-
-# -------------------------------------------------------------------
-# Upsert no banco
-# -------------------------------------------------------------------
 
 def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
     if not rows:
@@ -349,71 +287,21 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
     conn.commit()
 
 
-# -------------------------------------------------------------------
-# Busca com múltiplas estratégias (/tickets e /tickets/past)
-# -------------------------------------------------------------------
-
-SELECT_FIELDS = (
-    "id,status,lastUpdate,origin,category,urgency,"
-    "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
-    "owner,organization,clients,subject,actions,customFields,createdBy"
-)
-
-EXPAND_FULL = "clients,createdBy,owner,actions,customFields"
+def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(data, dict) and data.get("id"):
+        return data
+    if isinstance(data, list) and data:
+        item = data[0]
+        if isinstance(item, dict):
+            return item
+    return None
 
 
 def fetch_ticket_with_fallback(ticket_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Tenta buscar detalhes do ticket usando até 3 estratégias:
-
-      1) GET /tickets/{id}?$expand=...
-      2) GET /tickets?$filter=id eq {id}&$select=...&$expand=...
-      3) GET /tickets/past?$filter=id eq {id}&$select=...&$expand=...
-
-    Retorna (ticket_dict, reason). Se reason for None, a busca foi bem-sucedida.
-    """
     last_reason: Optional[str] = None
 
-    # 1) /tickets/{id}
     try:
         data = md_get(
-            f"tickets/{ticket_id}",
-            params={"$expand": EXPAND_FULL},
-            ok_404=True,
-        )
-        if data is not None:
-            if isinstance(data, list):
-                if data:
-                    return data[0], None
-                last_reason = "empty_list"
-            else:
-                return data, None
-        else:
-            last_reason = "not_found_404"
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", None)
-        msg: Optional[str] = None
-        try:
-            body = e.response.json()
-            msg = body.get("Message") or body.get("message")
-        except Exception:
-            msg = None
-
-        if status == 400 and msg and "select parameter is required" in msg:
-            # Manual de erro 400: falta $select -> tenta próxima estratégia
-            last_reason = "http_error_400_select_required"
-        elif status == 404:
-            last_reason = "not_found_404"
-        elif status == 429:
-            last_reason = "http_error_429"
-        else:
-            last_reason = f"http_error_{status or 'unknown'}"
-    except Exception:
-        last_reason = "exception_api"
-
-    # 2) /tickets? $filter=id eq ...
-    try:
-        data_list = md_get(
             "tickets",
             params={
                 "$filter": f"id eq {ticket_id}",
@@ -422,36 +310,25 @@ def fetch_ticket_with_fallback(ticket_id: int) -> Tuple[Optional[Dict[str, Any]]
             },
             ok_404=True,
         )
-        if data_list:
-            if isinstance(data_list, list):
-                return data_list[0], None
-            return data_list, None
-        else:
-            last_reason = last_reason or "not_found_404"
+        ticket = _first_ticket_from_response(data)
+        if ticket is not None:
+            return ticket, None
+        last_reason = "not_found_404"
     except requests.HTTPError as e:
         status = getattr(e.response, "status_code", None)
-        msg: Optional[str] = None
-        try:
-            body = e.response.json()
-            msg = body.get("Message") or body.get("message")
-        except Exception:
-            msg = None
-
         if status == 404:
             last_reason = "not_found_404"
-        elif status == 400 and msg and "query specified in the URI is not valid" in msg:
-            # Manual: erro de query (tipos incompatíveis etc.)
-            last_reason = "http_error_400_query_invalid"
         elif status == 429:
             last_reason = "http_error_429"
+        elif status == 400:
+            last_reason = "http_error_400"
         else:
             last_reason = f"http_error_{status or 'unknown'}"
     except Exception:
         last_reason = "exception_api"
 
-    # 3) /tickets/past? $filter=id eq ...
     try:
-        data_list = md_get(
+        data = md_get(
             "tickets/past",
             params={
                 "$filter": f"id eq {ticket_id}",
@@ -460,11 +337,9 @@ def fetch_ticket_with_fallback(ticket_id: int) -> Tuple[Optional[Dict[str, Any]]
             },
             ok_404=True,
         )
-        if data_list:
-            if isinstance(data_list, list):
-                return data_list[0], None
-            return data_list, None
-
+        ticket = _first_ticket_from_response(data)
+        if ticket is not None:
+            return ticket, None
         last_reason = last_reason or "not_found_404"
     except requests.HTTPError as e:
         status = getattr(e.response, "status_code", None)
@@ -481,10 +356,6 @@ def fetch_ticket_with_fallback(ticket_id: int) -> Tuple[Optional[Dict[str, Any]]
 
     return None, last_reason or "unknown"
 
-
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
 
 def main() -> None:
     with psycopg2.connect(DSN) as conn:
@@ -512,13 +383,11 @@ def main() -> None:
             ticket, reason = fetch_ticket_with_fallback(tid)
 
             if ticket is None:
-                # Falha em todas as estratégias
                 reason = reason or "unknown"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
-                # pequena pausa entre erros para não acumular "failed requests"
                 time.sleep(THROTTLE)
                 continue
 
@@ -556,7 +425,6 @@ def main() -> None:
                     sample,
                 )
 
-        # Se nenhum detalhe foi montado, apenas limpa a fila de missing
         if not detalhes:
             LOG.info(
                 "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
@@ -568,7 +436,6 @@ def main() -> None:
             )
             return
 
-        # Upsert e limpeza
         upsert_details(conn, detalhes)
         delete_from_missing(conn, pending)
         LOG.info(
