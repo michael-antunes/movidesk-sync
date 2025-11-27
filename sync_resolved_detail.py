@@ -7,7 +7,6 @@ from datetime import datetime
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from psycopg2 import errors
 
 # -------------------------------------------------------------------
 # Config / ambiente
@@ -41,7 +40,14 @@ SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
 # Movidesk API
 # -------------------------------------------------------------------
 
-def md_get(path_or_full: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = False):
+def md_get(
+    path_or_full: str,
+    params: Optional[Dict[str, Any]] = None,
+    ok_404: bool = False,
+):
+    """
+    Wrapper simples de GET na API Movidesk, com retry em erros transitórios.
+    """
     url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
     p = dict(params or {})
     p["token"] = MOVIDESK_TOKEN
@@ -66,56 +72,95 @@ def md_get(path_or_full: str, params: Optional[Dict[str, Any]] = None, ok_404: b
     r.raise_for_status()
 
 
-            # --------------------------------------------------------------------
-            # Busca do ticket com fallback igual ao sync_tickets.py
-            # --------------------------------------------------------------------
-            data = None
-            reason = None
+def fetch_ticket_with_fallback(tid: int) -> Optional[Dict[str, Any]]:
+    """
+    Busca um ticket de mais de uma forma, semelhante ao sync_tickets.py:
 
-            try:
-                # 1️⃣ Tentativa direta pelo ID
-                data = md_get(
-                    f"tickets/{tid}",
-                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
-                    ok_404=True,
-                )
+    1) /tickets/{id} com expand completo
+    2) /tickets?$filter=id eq {id} com expand completo
+    3) /tickets?$filter=id eq {id} com expand reduzido
 
-                # 2️⃣ Se 404, tenta via filtro
-                if data is None:
-                    data_list = md_get(
-                        "tickets",
-                        params={
-                            "$filter": f"id eq {tid}",
-                            "$expand": "clients,createdBy,owner,actions,customFields",
-                        },
-                        ok_404=True,
-                    )
-                    if isinstance(data_list, list) and data_list:
-                        data = data_list[0]
-                    else:
-                        data = data_list
+    Retorna:
+      - dict do ticket se encontrar
+      - None se realmente não existir (404 em todas as formas)
+      - pode lançar requests.HTTPError ou Exception para outros erros
+    """
+    # 1️⃣ Tentativa direta pelo ID
+    data = md_get(
+        f"tickets/{tid}",
+        params={"$expand": "clients,createdBy,owner,actions,customFields"},
+        ok_404=True,
+    )
 
-                # 3️⃣ Se ainda nada, tenta expand mínimo (sem customFields)
-                if data is None:
-                    data_list = md_get(
-                        "tickets",
-                        params={
-                            "$filter": f"id eq {tid}",
-                            "$expand": "clients,owner,actions",
-                        },
-                        ok_404=True,
-                    )
-                    if isinstance(data_list, list) and data_list:
-                        data = data_list[0]
-                    else:
-                        data = data_list
+    if isinstance(data, dict) and data.get("id"):
+        return data
 
-            except requests.HTTPError as e:
-                status = getattr(e.response, "status_code", None)
-                reason = f"http_error_{status or 'unknown'}"
-            except Exception:
-                reason = "exception_api"
+    if isinstance(data, list) and data:
+        # caso MUITO raro, mas por segurança
+        return data[0]
 
+    # Se chegou aqui, ou veio None (404) ou algo vazio ⇒ tenta via filtro
+
+    # 2️⃣ Via filtro com expand completo
+    data_list = md_get(
+        "tickets",
+        params={
+            "$filter": f"id eq {tid}",
+            "$expand": "clients,createdBy,owner,actions,customFields",
+        },
+        ok_404=True,
+    )
+
+    if isinstance(data_list, list) and data_list:
+        return data_list[0]
+    if isinstance(data_list, dict) and data_list.get("id"):
+        return data_list
+
+    # 3️⃣ Via filtro com expand reduzido
+    data_list = md_get(
+        "tickets",
+        params={
+            "$filter": f"id eq {tid}",
+            "$expand": "clients,owner,actions",
+        },
+        ok_404=True,
+    )
+
+    if isinstance(data_list, list) and data_list:
+        return data_list[0]
+    if isinstance(data_list, dict) and data_list.get("id"):
+        return data_list
+
+    # Nenhuma forma encontrou ⇒ trataremos como not_found_404 no main
+    return None
+
+
+# -------------------------------------------------------------------
+# Consulta de pendentes
+# -------------------------------------------------------------------
+
+SQL_GET_PENDING = """
+SELECT ticket_id
+  FROM visualizacao_resolvidos.audit_recent_missing
+ WHERE table_name = 'tickets_resolvidos'
+ GROUP BY ticket_id
+ ORDER BY max(run_id) DESC, ticket_id DESC
+ LIMIT %s
+"""
+
+
+def get_pending_ids(conn, limit: int) -> List[int]:
+    """
+    Lê os ticket_id pendentes em audit_recent_missing.
+    """
+    if not limit or limit <= 0:
+        limit = BATCH
+
+    with conn.cursor() as cur:
+        cur.execute(SQL_GET_PENDING, (limit,))
+        rows = cur.fetchall()
+
+    return [r[0] for r in rows]
 
 
 # -------------------------------------------------------------------
@@ -144,9 +189,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
             )
         conn.commit()
     except Exception as e:
-        LOG.error(
-            "detail: erro ao registrar falha em audit_ticket_watch (%s)", e
-        )
+        LOG.error("detail: erro ao registrar falha em audit_ticket_watch (%s)", e)
 
 
 def delete_from_missing(conn, ids: List[int]) -> None:
@@ -344,11 +387,7 @@ def main():
             reason = None
 
             try:
-                data = md_get(
-                    f"tickets/{tid}",
-                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
-                    ok_404=True,
-                )
+                data = fetch_ticket_with_fallback(tid)
             except requests.HTTPError as e:
                 status = getattr(e.response, "status_code", None)
                 reason = f"http_error_{status or 'unknown'}"
@@ -363,6 +402,7 @@ def main():
                 continue
 
             if data is None:
+                # Todas as formas de consulta retornaram "não encontrado"
                 reason = "not_found_404"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
