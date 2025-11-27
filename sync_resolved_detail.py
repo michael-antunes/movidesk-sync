@@ -17,15 +17,14 @@ API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 API_TOKEN = os.getenv("MOVIDESK_TOKEN")
 DSN = os.getenv("NEON_DSN") or os.getenv("DATABASE_URL")
 
-THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))  # pausa entre chamadas na API
-BATCH_SIZE = int(os.getenv("DETAIL_BATCH", "100"))        # qtd máxima de tickets por rodada
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))   # pausa entre chamadas na API
+BATCH_SIZE = int(os.getenv("DETAIL_BATCH", "100"))        # qtd máx de tickets por rodada
 
 LOGGER = logging.getLogger("detail")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers de API
@@ -62,7 +61,6 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
             v = v[:-1] + "+00:00"
         return datetime.fromisoformat(v)
     except Exception:
-        # tenta sem timezone
         try:
             return datetime.fromisoformat(v)
         except Exception:
@@ -89,18 +87,15 @@ def latest_status_times(actions: List[Dict[str, Any]]) -> Dict[str, datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Montagem das datas de resolved/closed/canceled
+# Montagem de last_resolved_at / last_closed_at
 # ---------------------------------------------------------------------------
 
 def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Monta os campos de detalhe a partir do ticket do Movidesk.
-
     Regras:
-      - status Cancelado  -> last_resolved_at = data do cancelamento
-      - status Resolvido  -> last_resolved_at = data de resolução
-      - status Fechado    -> last_resolved_at = data de resolução,
-                             last_closed_at   = data de fechamento
+      - Cancelado  -> last_resolved_at = data do cancelamento
+      - Resolvido  -> last_resolved_at = data de resolução
+      - Fechado    -> last_resolved_at = data de resolução, last_closed_at = fechamento
     """
     if "id" not in ticket:
         raise ValueError("ticket sem id")
@@ -112,11 +107,11 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     actions = ticket.get("actions") or []
     status_times = latest_status_times(actions)
 
-    # Campos nativos do Movidesk (preferencial)
+    # Campos nativos do Movidesk
     resolved_in = parse_dt(ticket.get("resolvedIn"))
     closed_in = parse_dt(ticket.get("closedIn"))
 
-    # Candidatos vindos das actions, se precisar
+    # Candidatos vindos das actions (backup)
     resolved_candidate = (
         resolved_in
         or status_times.get("Resolvido")
@@ -136,13 +131,11 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     last_closed_at: Optional[datetime] = None
 
     if "cancel" in status_lower:  # Cancelado / Canceled
-        # Para cancelado, usamos a data do cancelamento em last_resolved_at
         last_resolved_at = canceled_candidate or resolved_candidate or closed_candidate
         last_closed_at = None
 
     elif "fechad" in status_lower or "closed" in status_lower:
-        # Para fechado, last_resolved_at deve refletir a resolução (não o fechamento)
-        # Exemplo: Resolvido em 17/11, Fechado em 25/11
+        # Fechado: resolved = quando resolveu, closed = quando fechou
         last_resolved_at = resolved_candidate or canceled_candidate
         last_closed_at = closed_candidate
 
@@ -151,7 +144,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
         last_closed_at = None
 
     else:
-        # fallback genérico pra outros status
+        # fallback bem genérico
         last_resolved_at = resolved_candidate or canceled_candidate
         last_closed_at = closed_candidate
 
@@ -169,8 +162,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
 
 def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
     """
-    Busca tickets em audit_recent_missing (se a tabela existir).
-    Foca apenas em campos de datas de resolução/fechamento.
+    Busca em audit_recent_missing (quando existir) só colunas de data.
     """
     sql = """
         SELECT DISTINCT m.ticket_id
@@ -188,7 +180,7 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
 def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
     """
     Fallback: busca diretamente na tabela tickets_resolvidos
-    os tickets que ainda estão sem datas preenchidas.
+    os tickets sem datas preenchidas.
     """
     sql = """
         SELECT t.ticket_id
@@ -208,9 +200,10 @@ def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
 
 def get_pending_ids(conn, limit: int) -> List[int]:
     """
-    Tenta usar audit_recent_missing; se não existir ou der erro,
-    cai para busca direta em tickets_resolvidos.
+    Tenta audit_recent_missing; se der erro, cai em tickets_resolvidos;
+    se também der erro, retorna [] e não quebra o job.
     """
+    # 1) Tenta pelo missing
     try:
         return get_pending_ids_from_missing(conn, limit)
     except errors.UndefinedTable:
@@ -219,15 +212,32 @@ def get_pending_ids(conn, limit: int) -> List[int]:
             "detail: tabela audit_recent_missing não existe neste banco. "
             "Caindo para busca direta em tickets_resolvidos."
         )
-        return get_pending_ids_from_tickets(conn, limit)
     except Exception as e:
         conn.rollback()
         LOGGER.error(
             "detail: erro ao buscar pendentes em audit_recent_missing (%s). "
-            "Caindo para busca direta em tickets_resolvidos.",
+            "Caindo para tickets_resolvidos.",
             e,
         )
+
+    # 2) Fallback direto em tickets_resolvidos
+    try:
         return get_pending_ids_from_tickets(conn, limit)
+    except errors.UndefinedTable:
+        conn.rollback()
+        LOGGER.error(
+            "detail: tabela tickets_resolvidos não existe neste banco. "
+            "Nada para processar."
+        )
+        return []
+    except Exception as e:
+        conn.rollback()
+        LOGGER.error(
+            "detail: erro ao buscar pendentes em tickets_resolvidos (%s). "
+            "Nada para processar.",
+            e,
+        )
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +248,7 @@ _AUDIT_TICKET_WATCH_COLUMNS: Optional[set] = None
 
 
 def _ensure_audit_ticket_watch_columns(conn) -> set:
-    """Descobre colunas disponíveis em audit_ticket_watch para montar o INSERT adequado."""
+    """Descobre colunas disponíveis em audit_ticket_watch para montar o INSERT."""
     global _AUDIT_TICKET_WATCH_COLUMNS
     if _AUDIT_TICKET_WATCH_COLUMNS is not None:
         return _AUDIT_TICKET_WATCH_COLUMNS
@@ -260,9 +270,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
     """
     Registra problemas no processamento do ticket em audit_ticket_watch.
 
-    A função é tolerante ao esquema atual da tabela:
-    - se existir coluna reason/source, preenche;
-    - se só existir ticket_id, faz ON CONFLICT DO NOTHING.
+    Se a tabela/colunas não existirem, só loga o erro e segue.
     """
     try:
         cols = _ensure_audit_ticket_watch_columns(conn)
@@ -316,7 +324,6 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
                     (ticket_id, reason),
                 )
             else:
-                # tabela só tem ticket_id (como já vimos em alguns momentos)
                 cur.execute(
                     """
                     INSERT INTO audit_ticket_watch (ticket_id)
@@ -331,7 +338,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
 
 
 def delete_processed_from_missing(conn, ticket_ids: List[int]) -> None:
-    """Remove tickets já processados de audit_recent_missing, se a tabela existir."""
+    """Remove tickets processados de audit_recent_missing, se existir."""
     if not ticket_ids:
         return
     try:
@@ -375,10 +382,21 @@ def update_details(conn, rows: List[Dict[str, Any]]) -> None:
         for row in rows
     ]
 
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_batch(cur, sql, params, page_size=100)
-
-    LOGGER.info("detail: UPDATE detail: %s linhas atualizadas.", len(rows))
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, sql, params, page_size=100)
+        LOGGER.info("detail: UPDATE detail: %s linhas atualizadas.", len(rows))
+    except errors.UndefinedTable:
+        conn.rollback()
+        LOGGER.error(
+            "detail: tabela tickets_resolvidos não existe; não foi possível atualizar."
+        )
+    except Exception as e:
+        conn.rollback()
+        LOGGER.error(
+            "detail: erro ao atualizar tickets_resolvidos (%s).",
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +404,7 @@ def update_details(conn, rows: List[Dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    LOGGER.info("Iniciando sync_resolved_detail (detail)...")
+    LOGGER.info("detail: Iniciando sync_resolved_detail (detail)...")
 
     if not DSN:
         raise RuntimeError("NEON_DSN / DATABASE_URL não configurado")
@@ -471,7 +489,7 @@ def main() -> None:
                 fail_samples.setdefault(reason, tid)
                 continue
 
-            # se não conseguimos calcular nenhuma data para um status que teoricamente deveria ter
+            # marca algumas inconsistências, mas sem travar o processamento
             if (
                 row["status"] in ("Resolvido", "Fechado", "Cancelado")
                 and not row["last_resolved_at"]
@@ -481,7 +499,6 @@ def main() -> None:
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 fail_samples.setdefault(reason, tid)
-                # ainda assim seguimos em frente, gravando o que temos
 
             if row["status"] == "Fechado" and not row["last_closed_at"]:
                 reason = "missing_closed_for_status"
@@ -491,7 +508,6 @@ def main() -> None:
 
             detalhes.append(row)
             ok_ids.append(tid)
-
             time.sleep(THROTTLE)
 
         total_ok = len(ok_ids)
