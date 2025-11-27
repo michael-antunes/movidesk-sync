@@ -8,10 +8,6 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
-# -------------------------------------------------------------------
-# Config / ambiente
-# -------------------------------------------------------------------
-
 API_BASE = "https://api.movidesk.com/public/v1"
 
 MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
@@ -26,6 +22,28 @@ if not MOVIDESK_TOKEN:
 if not DSN:
     raise RuntimeError("Defina NEON_DSN (ou PG_DSN) com a string de conexão do banco")
 
+DETAIL_SELECT = ",".join(
+    [
+        "id",
+        "subject",
+        "type",
+        "status",
+        "baseStatus",
+        "ownerTeam",
+        "serviceFirstLevel",
+        "serviceSecondLevel",
+        "serviceThirdLevel",
+        "origin",
+        "category",
+        "urgency",
+        "createdDate",
+        "lastUpdate",
+    ]
+)
+
+DETAIL_EXPAND_FULL = "clients($expand=organization),createdBy,owner,actions,customFieldValues"
+DETAIL_EXPAND_LIGHT = "clients($expand=organization),owner,actions"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] detail: %(message)s",
@@ -36,108 +54,106 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
 
 
-# -------------------------------------------------------------------
-# Movidesk API
-# -------------------------------------------------------------------
-
 def md_get(
     path_or_full: str,
     params: Optional[Dict[str, Any]] = None,
     ok_404: bool = False,
 ):
-    """
-    Wrapper simples de GET na API Movidesk, com retry em erros transitórios.
-    """
     url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
     p = dict(params or {})
     p["token"] = MOVIDESK_TOKEN
 
-    r = SESSION.get(url, params=p, timeout=60)
-    if r.status_code == 200:
-        return r.json() or {}
+    while True:
+        r = SESSION.get(url, params=p, timeout=60)
 
-    if ok_404 and r.status_code == 404:
-        return None
+        if r.status_code in (429, 503):
+            ra = r.headers.get("retry-after")
+            try:
+                wait = int(str(ra)) if ra is not None and str(ra).isdigit() else 60
+            except Exception:
+                wait = 60
+            LOG.warning(
+                "detail: HTTP %s na API, aguardando %s segundos antes de tentar novamente.",
+                r.status_code,
+                wait,
+            )
+            time.sleep(wait)
+            continue
 
-    # tenta de novo em erros transitórios
-    if r.status_code in (429, 500, 502, 503, 504):
-        time.sleep(1.5)
-        r2 = SESSION.get(url, params=p, timeout=60)
-        if r2.status_code == 200:
-            return r2.json() or {}
-        if ok_404 and r2.status_code == 404:
+        if r.status_code == 404 and ok_404:
             return None
-        r2.raise_for_status()
 
-    r.raise_for_status()
+        if r.status_code >= 400:
+            try:
+                LOG.error(
+                    "detail: HTTP %s em %s: %s",
+                    r.status_code,
+                    url,
+                    r.text[:500],
+                )
+            except Exception:
+                pass
+            r.raise_for_status()
+
+        return r.json() if r.text else {}
 
 
-def fetch_ticket_with_fallback(tid: int) -> Optional[Dict[str, Any]]:
-    """
-    Busca um ticket de mais de uma forma, semelhante ao sync_tickets.py:
-
-    1) /tickets/{id} com expand completo
-    2) /tickets?$filter=id eq {id} com expand completo
-    3) /tickets?$filter=id eq {id} com expand reduzido
-
-    Retorna:
-      - dict do ticket se encontrar
-      - None se realmente não existir (404 em todas as formas)
-      - pode lançar requests.HTTPError ou Exception para outros erros
-    """
-    # 1️⃣ Tentativa direta pelo ID
-    data = md_get(
-        f"tickets/{tid}",
-        params={"$expand": "clients,createdBy,owner,actions,customFields"},
-        ok_404=True,
-    )
-
+def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
     if isinstance(data, dict) and data.get("id"):
         return data
-
     if isinstance(data, list) and data:
-        # caso MUITO raro, mas por segurança
-        return data[0]
-
-    # Se chegou aqui, ou veio None (404) ou algo vazio ⇒ tenta via filtro
-
-    # 2️⃣ Via filtro com expand completo
-    data_list = md_get(
-        "tickets",
-        params={
-            "$filter": f"id eq {tid}",
-            "$expand": "clients,createdBy,owner,actions,customFields",
-        },
-        ok_404=True,
-    )
-
-    if isinstance(data_list, list) and data_list:
-        return data_list[0]
-    if isinstance(data_list, dict) and data_list.get("id"):
-        return data_list
-
-    # 3️⃣ Via filtro com expand reduzido
-    data_list = md_get(
-        "tickets",
-        params={
-            "$filter": f"id eq {tid}",
-            "$expand": "clients,owner,actions",
-        },
-        ok_404=True,
-    )
-
-    if isinstance(data_list, list) and data_list:
-        return data_list[0]
-    if isinstance(data_list, dict) and data_list.get("id"):
-        return data_list
-
-    # Nenhuma forma encontrou ⇒ trataremos como not_found_404 no main
+        item = data[0]
+        if isinstance(item, dict):
+            return item
     return None
 
 
-# -------------------------------------------------------------------
-# Consulta de pendentes
-# -------------------------------------------------------------------
+def fetch_ticket_with_fallback(tid: int) -> Optional[Dict[str, Any]]:
+    params_base = {
+        "$select": DETAIL_SELECT,
+        "$filter": f"id eq {tid}",
+        "$top": 1,
+        "$skip": 0,
+    }
+
+    data = md_get(
+        "tickets",
+        params={**params_base, "$expand": DETAIL_EXPAND_FULL},
+        ok_404=True,
+    )
+    ticket = _first_ticket_from_response(data)
+    if ticket is not None:
+        return ticket
+
+    data = md_get(
+        "tickets/past",
+        params={**params_base, "$expand": DETAIL_EXPAND_FULL},
+        ok_404=True,
+    )
+    ticket = _first_ticket_from_response(data)
+    if ticket is not None:
+        return ticket
+
+    data = md_get(
+        "tickets",
+        params={**params_base, "$expand": DETAIL_EXPAND_LIGHT},
+        ok_404=True,
+    )
+    ticket = _first_ticket_from_response(data)
+    if ticket is not None:
+        return ticket
+
+    data = md_get(
+        "tickets/past",
+        params={**params_base, "$expand": DETAIL_EXPAND_LIGHT},
+        ok_404=True,
+    )
+    ticket = _first_ticket_from_response(data)
+    if ticket is not None:
+        return ticket
+
+    return None
+
 
 SQL_GET_PENDING = """
 SELECT ticket_id
@@ -150,9 +166,6 @@ SELECT ticket_id
 
 
 def get_pending_ids(conn, limit: int) -> List[int]:
-    """
-    Lê os ticket_id pendentes em audit_recent_missing.
-    """
     if not limit or limit <= 0:
         limit = BATCH
 
@@ -163,15 +176,7 @@ def get_pending_ids(conn, limit: int) -> List[int]:
     return [r[0] for r in rows]
 
 
-# -------------------------------------------------------------------
-# Auditoria de falhas
-# -------------------------------------------------------------------
-
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
-    """
-    Registra/atualiza falhas em audit_ticket_watch, sem estourar chave primária.
-    PK conhecida: (ticket_id).
-    """
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -193,10 +198,6 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
 
 
 def delete_from_missing(conn, ids: List[int]) -> None:
-    """
-    Remove IDs processados (ok + falhas) de audit_recent_missing,
-    para não ficarem rodando em loop eterno.
-    """
     if not ids:
         return
 
@@ -210,19 +211,10 @@ def delete_from_missing(conn, ids: List[int]) -> None:
     conn.commit()
 
 
-# -------------------------------------------------------------------
-# Transformação de dados do ticket
-# -------------------------------------------------------------------
-
 def parse_movidesk_datetime(value: Optional[str]):
-    """
-    Converte string de data/hora da Movidesk em datetime do Python
-    usando apenas a stdlib (sem dateutil).
-    """
     if not value:
         return None
     try:
-        # Movidesk pode mandar 'Z' no final => UTC
         s = value.replace("Z", "+00:00")
         return datetime.fromisoformat(s)
     except Exception:
@@ -230,10 +222,6 @@ def parse_movidesk_datetime(value: Optional[str]):
 
 
 def build_detail_row(ticket: Dict[str, Any]):
-    """
-    Monta a tupla na ordem exata das colunas conhecidas de
-    visualizacao_resolvidos.tickets_resolvidos.
-    """
     actions = ticket.get("actions") or []
 
     last_resolved_at = None
@@ -261,7 +249,6 @@ def build_detail_row(ticket: Dict[str, Any]):
 
     final_status = (ticket.get("status") or "").strip()
 
-    # Regras de preenchimento para as colunas de resolved/closed/cancelled
     if final_status == "Cancelado":
         last_resolved_at_db = None
         last_closed_at_db = None
@@ -279,6 +266,8 @@ def build_detail_row(ticket: Dict[str, Any]):
     org = ticket.get("organization") or {}
     clients = ticket.get("clients") or []
     client = clients[0] if clients else {}
+    if not org and isinstance(client, dict):
+        org = client.get("organization") or {}
 
     return (
         int(ticket["id"]),
@@ -302,10 +291,6 @@ def build_detail_row(ticket: Dict[str, Any]):
         client.get("businessName"),
     )
 
-
-# -------------------------------------------------------------------
-# Upsert no banco
-# -------------------------------------------------------------------
 
 def upsert_details(conn, rows: List[tuple]) -> None:
     if not rows:
@@ -359,10 +344,6 @@ def upsert_details(conn, rows: List[tuple]) -> None:
     conn.commit()
 
 
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
-
 def main():
     with psycopg2.connect(DSN) as conn:
         pending = get_pending_ids(conn, BATCH)
@@ -402,7 +383,6 @@ def main():
                 continue
 
             if data is None:
-                # Todas as formas de consulta retornaram "não encontrado"
                 reason = "not_found_404"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
