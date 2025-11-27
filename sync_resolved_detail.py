@@ -44,16 +44,7 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
         SELECT DISTINCT m.ticket_id
           FROM audit_recent_missing m
           JOIN audit_recent_run r ON r.id = m.run_id
-     LEFT JOIN audit_ticket_watch w
-            ON w.ticket_id = m.ticket_id
          WHERE m.table_name = 'tickets_resolvidos'
-           AND m.column_name IN (
-                'last_resolved_at',
-                'last_closed_at',
-                'last_cancelled_at',
-                'adicional_137641_avaliado_csat'
-           )
-           AND COALESCE(w.last_reason, '') <> 'not_found_404'
          ORDER BY r.run_at DESC, m.ticket_id DESC
          LIMIT %s
     """
@@ -61,10 +52,12 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
         cur.execute(sql, (limit,))
         rows = cur.fetchall()
 
-    if rows:
+    ids = [row[0] for row in rows]
+
+    if ids:
         logger.info(
             "detail: %s tickets pendentes em audit_recent_missing (limite=%s).",
-            len(rows),
+            len(ids),
             limit,
         )
     else:
@@ -72,23 +65,15 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
             "detail: nenhum registro pendente em audit_recent_missing para tickets_resolvidos."
         )
 
-    return [r[0] for r in rows]
+    return ids
 
 
 def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
     sql = """
         SELECT t.ticket_id
           FROM visualizacao_resolvidos.tickets_resolvidos t
-     LEFT JOIN audit_ticket_watch w
-            ON w.ticket_id = t.ticket_id
-         WHERE (
-                  t.last_resolved_at IS NULL
-               OR (t.status = 'Fechado'   AND t.last_closed_at    IS NULL)
-               OR (t.status = 'Cancelado' AND t.last_cancelled_at IS NULL)
-               OR t.adicional_137641_avaliado_csat IS NULL
-         )
+         WHERE (t.last_resolved_at IS NULL OR t.last_closed_at IS NULL)
            AND t.status IN ('Resolvido', 'Fechado', 'Cancelado')
-           AND COALESCE(w.last_reason, '') <> 'not_found_404'
          ORDER BY t.ticket_id DESC
          LIMIT %s
     """
@@ -96,10 +81,12 @@ def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
         cur.execute(sql, (limit,))
         rows = cur.fetchall()
 
-    if rows:
+    ids = [row[0] for row in rows]
+
+    if ids:
         logger.info(
             "detail: %s tickets pendentes em visualizacao_resolvidos.tickets_resolvidos (limite=%s).",
-            len(rows),
+            len(ids),
             limit,
         )
     else:
@@ -107,25 +94,21 @@ def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
             "detail: nenhum ticket pendente em visualizacao_resolvidos.tickets_resolvidos para atualização de detalhes."
         )
 
-    return [r[0] for r in rows]
+    return ids
 
 
 def get_pending_ids(conn, limit: int) -> List[int]:
     try:
-        ids = get_pending_ids_from_missing(conn, limit)
-        if ids:
-            return ids
+        return get_pending_ids_from_missing(conn, limit)
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
         logger.error(
-            "detail: tabela audit_recent_missing ou audit_ticket_watch não existe neste banco. "
-            "Caindo para busca direta em tickets_resolvidos."
+            "detail: tabela audit_recent_missing não existe neste banco. Caindo para busca direta em tickets_resolvidos."
         )
     except Exception as e:
         conn.rollback()
         logger.error(
-            "detail: erro ao consultar audit_recent_missing (%s). "
-            "Caindo para busca direta em tickets_resolvidos.",
+            "detail: erro ao consultar audit_recent_missing (%s). Caindo para tickets_resolvidos.",
             e,
         )
 
@@ -134,7 +117,7 @@ def get_pending_ids(conn, limit: int) -> List[int]:
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
         logger.error(
-            "detail: tabela visualizacao_resolvidos.tickets_resolvidos ou audit_ticket_watch não existe neste banco. Nada para processar."
+            "detail: tabela visualizacao_resolvidos.tickets_resolvidos não existe neste banco. Nada para processar."
         )
         return []
     except Exception as e:
@@ -156,20 +139,13 @@ def delete_processed_from_missing(conn, ids: List[int]) -> None:
                 DELETE FROM audit_recent_missing
                 WHERE table_name = 'tickets_resolvidos'
                   AND ticket_id = ANY(%s)
-                  AND column_name IN (
-                        'last_resolved_at',
-                        'last_closed_at',
-                        'last_cancelled_at',
-                        'adicional_137641_avaliado_csat'
-                  )
                 """,
                 (ids,),
             )
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
         logger.error(
-            "detail: tabela audit_recent_missing não existe ao tentar limpar pendências. "
-            "Ignorando limpeza."
+            "detail: tabela audit_recent_missing não existe ao tentar limpar pendências. Ignorando limpeza."
         )
     except Exception as e:
         conn.rollback()
