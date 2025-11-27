@@ -1,468 +1,333 @@
 import os
+import sys
 import time
 import logging
+import json
+import argparse
+from typing import Iterable, Dict, Any, List, Optional
 from typing import Any, Dict, List, Optional
 
-import requests
 import psycopg2
-from psycopg2.extras import execute_values
-from psycopg2 import errors
-from dateutil import parser  # já estava sendo usado na versão com actions
+import psycopg2.extras
+import requests
 
-
-# --------------------------------------------------------------------
-# Configuração básica
-# --------------------------------------------------------------------
-
-API_BASE = "https://api.movidesk.com/public/v1"
-
-MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-DSN = os.getenv("NEON_DSN") or os.getenv("PG_DSN")
-
-BATCH = int(os.getenv("DETAIL_BATCH", "200"))
-THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
-
-if not MOVIDESK_TOKEN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN ou MOVIDESK_API_TOKEN")
-
-if not DSN:
-    raise RuntimeError("Defina NEON_DSN (ou PG_DSN) com a string de conexão do banco")
-
+LOG = logging.getLogger("sync_resolved_detail")
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] detail: %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)7s  %(message)s",
 )
-LOG = logging.getLogger("detail")
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
+MOVIDESK_BASE = "https://api.movidesk.com/public/v1"
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+DSN = os.environ["NEON_DSN"]
+THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.25"))
 
+# Campos que iremos coletar no Movidesk
+SELECT_FIELDS = ",".join([
+    "id",
+    "status",
+    "resolvedIn",
+    "closedIn",
+    "canceledIn",              # <- importante!
+    "responsibleId",
+    "responsibleName",
+    "organizationId",
+    "organizationName",
+    "origin",
+    "category",
+    "urgency",
+    "serviceFirstLevel",
+    "serviceSecondLevel",
+    "serviceThirdLevel",
+])
 
-# --------------------------------------------------------------------
-# Função de chamada da API Movidesk
-# --------------------------------------------------------------------
+UPSERT_SQL = """
+INSERT INTO visualizacao_resolvidos.tickets_resolvidos (
+  ticket_id, status,
+  last_resolved_at, last_closed_at, last_cancelled_at,
+  responsible_id, responsible_name,
+  organization_id, organization_name,
+  origin, category, urgency,
+  service_first_level, service_second_level, service_third_level
+) VALUES (
+  %(ticket_id)s, %(status)s,
+  %(last_resolved_at)s, %(last_closed_at)s, %(last_cancelled_at)s,
+  %(responsible_id)s, %(responsible_name)s,
+  %(organization_id)s, %(organization_name)s,
+  %(origin)s, %(category)s, %(urgency)s,
+  %(service_first_level)s, %(service_second_level)s, %(service_third_level)s
+)
+ON CONFLICT (ticket_id) DO UPDATE SET
+  status               = EXCLUDED.status,
+  last_resolved_at     = EXCLUDED.last_resolved_at,
+  last_closed_at       = EXCLUDED.last_closed_at,
+  last_cancelled_at    = EXCLUDED.last_cancelled_at,
+  responsible_id       = EXCLUDED.responsible_id,
+  responsible_name     = EXCLUDED.responsible_name,
+  organization_id      = EXCLUDED.organization_id,
+  organization_name    = EXCLUDED.organization_name,
+  origin               = EXCLUDED.origin,
+  category             = EXCLUDED.category,
+  urgency              = EXCLUDED.urgency,
+  service_first_level  = EXCLUDED.service_first_level,
+  service_second_level = EXCLUDED.service_second_level,
+  service_third_level  = EXCLUDED.service_third_level
+"""
 
-def md_get(path_or_full: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = False):
+# ---------------------- Movidesk helpers ----------------------
+
+TOKEN = os.environ.get("MOVIDESK_TOKEN", "")
+DSN   = os.environ.get("NEON_DSN", "")
+THROTTLE = float(os.environ.get("MOVIDESK_THROTTLE", "0.20"))  # segundos entre chamadas
+
+session = requests.Session()
+session.headers.update({"Content-Type": "application/json; charset=utf-8"})
+session.headers.update({"Accept": "application/json"})
+
+CANCEL_WORDS = {"canceled", "cancelled", "cancelado", "cancelada"}
+
+def md_get_ticket(ticket_id: int) -> Dict[str, Any]:
+# --------------------------- util ---------------------------
+
+def norm_ts(v: Optional[str]) -> Optional[str]:
     """
-    GET simples na API Movidesk com tratamento de 429/5xx e 404 opcional.
+    Busca um ticket por ID usando OData (1 request por ID -> mais robusto).
+    Movidesk normalmente devolve ISO-8601 com offset (+00:00).
+    Para o DB (timestamptz) podemos mandar a string ISO direto.
     """
-    url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
-    p = dict(params or {})
-    p["token"] = MOVIDESK_TOKEN
-
-    r = SESSION.get(url, params=p, timeout=60)
-    if r.status_code == 200:
-        return r.json() or {}
-
-    if ok_404 and r.status_code == 404:
+    if not v:
         return None
+    s = str(v).strip()
+    return s or None
 
-    if r.status_code in (429, 500, 502, 503, 504):
-        time.sleep(1.5)
-        r2 = SESSION.get(url, params=p, timeout=60)
-        if r2.status_code == 200:
-            return r2.json() or {}
-        if ok_404 and r2.status_code == 404:
-            return None
-        r2.raise_for_status()
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
-    r.raise_for_status()
+# --------------------------- Movidesk ---------------------------
 
-
-# --------------------------------------------------------------------
-# Consulta de pendências (com fallback)
-# --------------------------------------------------------------------
-
-def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
+def md_get_ticket_with_history(ticket_id: int) -> Dict[str, Any]:
     """
-    Busca tickets pendentes em visualizacao_resolvidos.audit_recent_missing
-    usando audit_recent_run para ordenar pelos mais recentes.
+    Busca 1 ticket por id com campos principais + histories resumido.
     """
-    sql = """
-        SELECT DISTINCT m.ticket_id
-          FROM visualizacao_resolvidos.audit_recent_missing m
-          JOIN visualizacao_resolvidos.audit_recent_run   r ON r.id = m.run_id
-         WHERE m.table_name = 'tickets_resolvidos'
-         ORDER BY r.run_at DESC, m.ticket_id DESC
-         LIMIT %s
+    params = {
+        "token": TOKEN,
+        "$select": SELECT_FIELDS,
+        "$filter": f"id eq {ticket_id}",
+        "$top": 1,
+        "$select": ",".join([
+            "id","status",
+            "resolvedIn","closedIn","canceledIn","cancelledIn",
+            "responsibleId","responsibleName",
+            "organizationId","organizationName",
+            "origin","category","urgency",
+            "serviceFirstLevel","serviceSecondLevel","serviceThirdLevel",
+        ]),
+        "$expand": "histories($select=createdDate,field,oldValue,newValue,description)"
+    }
+    # NÃO usar $take (Movidesk não suporta) e NÃO colocar aspas em valores datetimetz do filtro.
+    url = f"{MOVIDESK_BASE}/tickets"
+    r = session.get(url, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+    payload = r.json()
+    if not payload:
+        raise KeyError(f"Ticket {ticket_id} não retornou na API")
+    return payload[0]
+    data = r.json()
+    if not data:
+        raise KeyError(f"Ticket {ticket_id} não encontrado")
+    return data[0]
+
+def norm_ts(v: Optional[str]) -> Optional[str]:
+def derive_cancelled_from_history(t: Dict[str, Any]) -> Optional[str]:
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
-
-
-def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
+    Normaliza campos datetime da API para None/ISO.
+    A API pode retornar null, string vazia ou '0001-01-01T00:00:00Z' para 'vazio'.
+    Quando o campo cancelado não vem direto, inferimos pelo histórico.
     """
-    Fallback: busca diretamente em visualizacao_resolvidos.tickets_resolvidos
-    tickets Resolvido/Fechado/Cancelado com last_resolved_at ou last_closed_at nulos.
+    if not v or v == "0001-01-01T00:00:00Z":
+        return None
+    return v  # psycopg2 aceita ISO 8601 e grava como timestamptz
+    hist = t.get("histories") or []
+    for h in hist:
+        field = (h.get("field") or "").strip().lower()
+        newv  = (h.get("newValue") or "").strip().lower()
+        desc  = (h.get("description") or "").strip().lower()
+
+        # troca de status / situação para cancelado
+        if field in {"status", "situation", "situação"} and newv in CANCEL_WORDS:
+            return norm_ts(h.get("createdDate"))
+
+        # alguns ambientes só deixam a palavra no description
+        if any(w in desc for w in CANCEL_WORDS):
+            return norm_ts(h.get("createdDate"))
+
+    return None
+
+def extract_ticket_row(t: Dict[str, Any]) -> Dict[str, Any]:
+    resolved  = norm_ts(t.get("resolvedIn"))
+    closed    = norm_ts(t.get("closedIn"))
+    cancelled = norm_ts(t.get("canceledIn")) or norm_ts(t.get("cancelledIn"))
+    if not cancelled:
+        cancelled = derive_cancelled_from_history(t)
+
+def row_from_ticket(t: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ticket_id": int(t["id"]),
+        "status": t.get("status"),
+        "last_resolved_at":  norm_ts(t.get("resolvedIn")),
+        "last_closed_at":    norm_ts(t.get("closedIn")),
+        "last_cancelled_at": norm_ts(t.get("canceledIn")),  # <- aqui!
+        "responsible_id":    t.get("responsibleId"),
+        "responsible_name":  t.get("responsibleName"),
+        "organization_id":   t.get("organizationId"),
+
+        "last_resolved_at": resolved,
+        "last_closed_at":   closed,
+        "last_cancelled_at": cancelled,
+
+        "responsible_id":   t.get("responsibleId"),
+        "responsible_name": t.get("responsibleName"),
+        "organization_id":  t.get("organizationId"),
+        "organization_name": t.get("organizationName"),
+        "origin":            t.get("origin"),
+        "category":          t.get("category"),
+        "urgency":           t.get("urgency"),
+        "origin": t.get("origin"),
+        "category": t.get("category"),
+        "urgency": t.get("urgency"),
+        "service_first_level":  t.get("serviceFirstLevel"),
+        "service_second_level": t.get("serviceSecondLevel"),
+        "service_third_level":  t.get("serviceThirdLevel"),
+    }
+
+# ---------------------- DB helpers ----------------------
+# --------------------------- DB ---------------------------
+
+def get_conn():
+    if not DSN:
+        raise RuntimeError("NEON_DSN não informado")
+    return psycopg2.connect(DSN)
+
+def get_ids_to_fill_cancelled(cur) -> List[int]:
+def ensure_schema(cur) -> None:
     """
-    sql = """
-        SELECT t.ticket_id
-          FROM visualizacao_resolvidos.tickets_resolvidos t
-         WHERE (t.last_resolved_at IS NULL OR t.last_closed_at IS NULL)
-           AND t.status IN ('Resolvido', 'Fechado', 'Cancelado')
-         ORDER BY t.ticket_id DESC
-         LIMIT %s
+    Se nenhum ID for passado na linha de comando, o script preenche
+    todos os tickets CANCELADOS que ainda não têm last_cancelled_at.
+    Garante colunas essenciais (não mexe nas geradas).
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+    cur.execute("""
+        CREATE SCHEMA IF NOT EXISTS visualizacao_resolvidos;
+        ALTER TABLE visualizacao_resolvidos.tickets_resolvidos
+            ADD COLUMN IF NOT EXISTS last_cancelled_at timestamptz;
+    """)
 
+def ids_pendentes_cancelled(cur, limit: int) -> List[int]:
+    cur.execute(f"""
+        SELECT ticket_id
+        FROM visualizacao_resolvidos.tickets_resolvidos
+        WHERE status ILIKE 'canc%'                -- Canceled/Cancelled
+          AND last_cancelled_at IS NULL
+        WHERE last_cancelled_at IS NULL
+          AND lower(status) IN ('canceled','cancelled','cancelado','cancelada')
+        ORDER BY ticket_id
+        LIMIT 1000
+        LIMIT {int(limit)};
+    """)
+    return [r[0] for r in cur.fetchall()]
 
-def get_pending_ids(conn, limit: int) -> List[int]:
+def upsert_ticket(cur, row: Dict[str, Any]) -> None:
+    cur.execute(UPSERT_SQL, row)
+
+# ---------------------- main ----------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Sync detail (tickets_resolvidos) incluindo last_cancelled_at")
+    p.add_argument("--ids", help="Lista de IDs separados por vírgula (opcional). Se não informar, busca no banco os cancelados sem data.")
     """
-    Primeiro tenta audit_recent_missing; se der erro, cai para tickets_resolvidos.
+    Atualiza campos de datas. Não sobrescreve com NULL.
     """
-    try:
-        return get_pending_ids_from_missing(conn, limit)
-    except errors.UndefinedTable:
-        conn.rollback()
-        LOG.info(
-            "detail: tabela audit_recent_missing não existe neste banco. "
-            "Caindo para busca direta em tickets_resolvidos."
-        )
-    except Exception as e:
-        conn.rollback()
-        LOG.error(
-            "detail: erro ao consultar visualizacao_resolvidos.audit_recent_missing (%s). "
-            "Caindo para tickets_resolvidos.",
-            e,
-        )
+    cur.execute("""
+        UPDATE visualizacao_resolvidos.tickets_resolvidos
+           SET last_resolved_at  = COALESCE(%s, last_resolved_at),
+               last_closed_at    = COALESCE(%s, last_closed_at),
+               last_cancelled_at = COALESCE(%s, last_cancelled_at)
+         WHERE ticket_id = %s
+    """, (
+        row["last_resolved_at"],
+        row["last_closed_at"],
+        row["last_cancelled_at"],
+        row["ticket_id"],
+    ))
 
-    try:
-        return get_pending_ids_from_tickets(conn, limit)
-    except errors.UndefinedTable:
-        conn.rollback()
-        LOG.info(
-            "detail: tabela visualizacao_resolvidos.tickets_resolvidos não existe neste banco. "
-            "Nada para processar."
-        )
-        return []
-    except Exception as e:
-        conn.rollback()
-        LOG.error(
-            "detail: erro ao consultar visualizacao_resolvidos.tickets_resolvidos (%s). "
-            "Nada para processar.",
-            e,
-        )
-        return []
+# --------------------------- CLI / main ---------------------------
 
-
-# --------------------------------------------------------------------
-# Auditoria de falhas
-# --------------------------------------------------------------------
-
-def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
-    """
-    Registra (ou atualiza) falha em visualizacao_resolvidos.audit_ticket_watch
-    sem gerar erro de chave duplicada.
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO visualizacao_resolvidos.audit_ticket_watch (
-                    table_name, ticket_id, last_seen_at
-                )
-                VALUES ('tickets_resolvidos', %s, now())
-                ON CONFLICT (ticket_id)
-                DO UPDATE SET
-                    table_name  = EXCLUDED.table_name,
-                    last_seen_at = EXCLUDED.last_seen_at
-                """,
-                (ticket_id,),
-            )
-        conn.commit()
-    except Exception as e:
-        # Não deixamos a sync quebrar por causa da auditoria
-        LOG.error(
-            "detail: erro ao registrar falha em audit_ticket_watch (%s)", e
-        )
-
-
-def delete_processed_from_missing(conn, ids: List[int]) -> None:
-    """
-    Remove do audit_recent_missing apenas os tickets processados com sucesso.
-    """
-    if not ids:
-        return
-
-    sql = """
-        DELETE FROM visualizacao_resolvidos.audit_recent_missing
-         WHERE table_name = 'tickets_resolvidos'
-           AND ticket_id = ANY(%s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ids,))
-    conn.commit()
-
-
-# --------------------------------------------------------------------
-# Montagem da linha de detalhe (corrigindo as datas)
-# --------------------------------------------------------------------
-
-def build_detail_row(ticket: Dict[str, Any]):
-    """
-    Usa o histórico de actions (status + createdDate) para montar:
-      - last_resolved_at_db
-      - last_closed_at_db
-      - last_cancelled_at (a partir do status Cancelado/Canceled)
-    Aplicando as regras de negócio já definidas:
-      - Resolvido  -> preenche last_resolved_at, last_closed_at = NULL
-      - Fechado    -> preserva last_resolved_at da resolução e preenche last_closed_at
-      - Cancelado  -> last_resolved_at = NULL, last_closed_at = NULL
-    """
-
-    actions = ticket.get("actions") or []
-
-    last_resolved_at = None
-    last_closed_at = None
-    canceled_at = None
-
-    for a in actions:
-        status = (a.get("status") or "").strip()
-        created = a.get("createdDate")
-        if not created:
-            continue
-
-        try:
-            dt = parser.isoparse(created)
-        except Exception:
-            # Se vier alguma data malformada, ignora essa action e segue
-            continue
-
-        if status in ("Resolvido", "Resolved"):
-            last_resolved_at = dt
-
-        if status in ("Fechado", "Closed"):
-            last_closed_at = dt
-
-        if status in ("Cancelado", "Canceled"):
-            canceled_at = dt
-
-    final_status = (ticket.get("status") or "").strip()
-
-    # Aplica as regras de preenchimento considerando o status final
-    if final_status == "Cancelado":
-        last_resolved_at_db = None
-        last_closed_at_db = None
-    elif final_status == "Resolvido":
-        last_resolved_at_db = last_resolved_at
-        last_closed_at_db = None
-    elif final_status == "Fechado":
-        last_resolved_at_db = last_resolved_at
-        last_closed_at_db = last_closed_at
-    else:
-        # Outros status (caso apareçam aqui por algum motivo)
-        last_resolved_at_db = last_resolved_at
-        last_closed_at_db = last_closed_at
-
-    owner = ticket.get("owner") or {}
-    org = ticket.get("organization") or {}
-    clients = ticket.get("clients") or []
-    client = clients[0] if clients else {}
-
-    # Ordem dos campos 100% alinhada com o INSERT em tickets_resolvidos
-    return (
-        int(ticket["id"]),
-        final_status or None,
-        last_resolved_at_db,
-        last_closed_at_db,
-        canceled_at,  # last_cancelled_at
-        ticket.get("lastUpdate"),
-        ticket.get("origin"),
-        ticket.get("category"),
-        ticket.get("urgency"),
-        ticket.get("serviceFirstLevel"),
-        ticket.get("serviceSecondLevel"),
-        ticket.get("serviceThirdLevel"),
-        owner.get("id"),
-        owner.get("businessName"),
-        owner.get("team"),
-        org.get("id"),
-        org.get("businessName"),
-        ticket.get("subject"),
-        client.get("businessName"),
-    )
-
-
-# --------------------------------------------------------------------
-# Upsert na tabela visualizacao_resolvidos.tickets_resolvidos
-# --------------------------------------------------------------------
-
-def upsert_details(conn, rows: List[tuple]) -> None:
-    if not rows:
-        return
-
-    sql = """
-    INSERT INTO visualizacao_resolvidos.tickets_resolvidos (
-      ticket_id,
-      status,
-      last_resolved_at,
-      last_closed_at,
-      last_cancelled_at,
-      last_update,
-      origin,
-      category,
-      urgency,
-      service_first_level,
-      service_second_level,
-      service_third_level,
-      owner_id,
-      owner_name,
-      owner_team_name,
-      organization_id,
-      organization_name,
-      subject,
-      adicional_nome
-    )
-    VALUES %s
-    ON CONFLICT (ticket_id) DO UPDATE SET
-      status               = EXCLUDED.status,
-      last_resolved_at     = EXCLUDED.last_resolved_at,
-      last_closed_at       = EXCLUDED.last_closed_at,
-      last_cancelled_at    = EXCLUDED.last_cancelled_at,
-      last_update          = EXCLUDED.last_update,
-      origin               = EXCLUDED.origin,
-      category             = EXCLUDED.category,
-      urgency              = EXCLUDED.urgency,
-      service_first_level  = EXCLUDED.service_first_level,
-      service_second_level = EXCLUDED.service_second_level,
-      service_third_level  = EXCLUDED.service_third_level,
-      owner_id             = EXCLUDED.owner_id,
-      owner_name           = EXCLUDED.owner_name,
-      owner_team_name      = EXCLUDED.owner_team_name,
-      organization_id      = EXCLUDED.organization_id,
-      organization_name    = EXCLUDED.organization_name,
-      subject              = EXCLUDED.subject,
-      adicional_nome       = EXCLUDED.adicional_nome
-    """
-    with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=200)
-    conn.commit()
-
-
-# --------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Preenche last_cancelled_at (e datas) em tickets_resolvidos")
+    p.add_argument("--ids", help="lista de IDs separados por vírgula (pula a seleção por status)", default="")
+    p.add_argument("--limit", type=int, default=1000, help="limite de pendentes por execução")
+    p.add_argument("--throttle", type=float, default=THROTTLE, help="intervalo entre chamadas à API em segundos")
+    return p.parse_args()
 
 def main():
+    if not TOKEN:
+        print("MOVIDESK_TOKEN não informado", file=sys.stderr)
+        sys.exit(1)
+
+    args = parse_args()
+    throttle = max(0.0, float(args.throttle))
+
     with psycopg2.connect(DSN) as conn:
-        pending = get_pending_ids(conn, BATCH)
-        total_pendentes = len(pending)
+    with get_conn() as conn:
+        conn.autocommit = False
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            ensure_schema(cur)
 
-        if not pending:
-            LOG.info("detail: nenhum ticket pendente em audit_recent_missing/tickets_resolvidos.")
-            return
-
-        LOG.info(
-            "detail: %d tickets pendentes para atualização de detalhes (limite=%d).",
-            total_pendentes,
-            BATCH,
-        )
-
-        detalhes: List[tuple] = []
-        ok_ids: List[int] = []
-        fail_reasons: Dict[str, int] = {}
-        fail_samples: Dict[str, int] = {}
-
-        for tid in pending:
-            reason = None
-
-            try:
-                data = md_get(
-                    f"tickets/{tid}",
-                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
-                    ok_404=True,
-                )
-            except requests.HTTPError as e:
-                status = getattr(e.response, "status_code", None)
-                reason = f"http_error_{status or 'unknown'}"
-            except Exception:
-                reason = "exception_api"
-
-            if reason is not None:
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
-
-            if data is None:
-                reason = "not_found_404"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
-
-            if isinstance(data, list):
-                if not data:
-                    reason = "empty_list"
-                    register_ticket_failure(conn, tid, reason)
-                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                    if reason not in fail_samples:
-                        fail_samples[reason] = tid
-                    continue
-                ticket = data[0]
+            if args.ids:
+                ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
+                ids = [int(x) for x in args.ids.split(",") if x.strip()]
             else:
-                ticket = data
+                ids = get_ids_to_fill_cancelled(cur)
+                ids = ids_pendentes_cancelled(cur, args.limit)
 
-            if not ticket.get("id"):
-                reason = "missing_id"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
+            if not ids:
+                LOG.info("Nenhum ID para processar.")
+                log("Nada pendente para preencher.")
+                return
 
-            try:
-                row = build_detail_row(ticket)
-            except Exception:
-                reason = "build_row_error"
-                register_ticket_failure(conn, tid, reason)
-                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                if reason not in fail_samples:
-                    fail_samples[reason] = tid
-                continue
+            LOG.info("Processando %d ticket(s)...", len(ids))
+            log(f"Processando {len(ids)} tickets...")
+            ok = 0
+            miss = 0
 
-            detalhes.append(row)
-            ok_ids.append(tid)
-            time.sleep(THROTTLE)
+            processed = 0
+            for i, ticket_id in enumerate(ids, start=1):
+            for i, tid in enumerate(ids, 1):
+                try:
+                    t = md_get_ticket(ticket_id)
+                    row = row_from_ticket(t)
+                    t = md_get_ticket_with_history(tid)
+                    row = extract_ticket_row(t)
+                    upsert_ticket(cur, row)
+                    processed += 1
+                    if THROTTLE > 0:
+                        time.sleep(THROTTLE)
+                    ok += 1
 
-        total_ok = len(ok_ids)
-        total_fail = sum(fail_reasons.values())
-        LOG.info(
-            "detail: processados neste ciclo: ok=%d, falhas=%d.",
-            total_ok,
-            total_fail,
-        )
+                except Exception as e:
+                    LOG.error("Falha no ticket %s: %s", ticket_id, e, exc_info=False)
+                    miss += 1
+                    log(f"[WARN] ticket {tid}: {e}")
 
-        if fail_reasons:
-            LOG.info("detail: razões de falha neste ciclo:")
-            for r, c in fail_reasons.items():
-                sample = fail_samples.get(r)
-                LOG.info(
-                    "detail:   - %s: %d tickets (exemplo ticket_id=%s)",
-                    r,
-                    c,
-                    sample,
-                )
+                if i % 50 == 0:
+                    conn.commit()
+                    LOG.info("Checkpoint: %d/%d confirmados", i, len(ids))
+                if throttle > 0:
+                    time.sleep(throttle)
 
-        if not detalhes:
-            LOG.info(
-                "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
-            )
-            return
-
-        upsert_details(conn, detalhes)
-        delete_processed_from_missing(conn, ok_ids)
-        LOG.info(
-            "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos "
-            "e removidos de visualizacao_resolvidos.audit_recent_missing.",
-            len(ok_ids),
-        )
-
+            conn.commit()
+            LOG.info("Finalizado. %d ticket(s) gravados/atualizados.", processed)
+            log(f"Concluído. Atualizados: {ok} | Falhas: {miss}")
 
 if __name__ == "__main__":
     main()
