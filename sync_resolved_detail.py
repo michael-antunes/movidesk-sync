@@ -44,6 +44,8 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
         SELECT DISTINCT m.ticket_id
           FROM audit_recent_missing m
           JOIN audit_recent_run r ON r.id = m.run_id
+     LEFT JOIN audit_ticket_watch w
+            ON w.ticket_id = m.ticket_id
          WHERE m.table_name = 'tickets_resolvidos'
            AND m.column_name IN (
                 'last_resolved_at',
@@ -51,6 +53,7 @@ def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
                 'last_cancelled_at',
                 'adicional_137641_avaliado_csat'
            )
+           AND COALESCE(w.last_reason, '') <> 'not_found_404'
          ORDER BY r.run_at DESC, m.ticket_id DESC
          LIMIT %s
     """
@@ -76,6 +79,8 @@ def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
     sql = """
         SELECT t.ticket_id
           FROM visualizacao_resolvidos.tickets_resolvidos t
+     LEFT JOIN audit_ticket_watch w
+            ON w.ticket_id = t.ticket_id
          WHERE (
                   t.last_resolved_at IS NULL
                OR (t.status = 'Fechado'   AND t.last_closed_at    IS NULL)
@@ -83,6 +88,7 @@ def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
                OR t.adicional_137641_avaliado_csat IS NULL
          )
            AND t.status IN ('Resolvido', 'Fechado', 'Cancelado')
+           AND COALESCE(w.last_reason, '') <> 'not_found_404'
          ORDER BY t.ticket_id DESC
          LIMIT %s
     """
@@ -112,7 +118,7 @@ def get_pending_ids(conn, limit: int) -> List[int]:
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
         logger.error(
-            "detail: tabela audit_recent_missing não existe neste banco. "
+            "detail: tabela audit_recent_missing ou audit_ticket_watch não existe neste banco. "
             "Caindo para busca direta em tickets_resolvidos."
         )
     except Exception as e:
@@ -128,7 +134,7 @@ def get_pending_ids(conn, limit: int) -> List[int]:
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
         logger.error(
-            "detail: tabela visualizacao_resolvidos.tickets_resolvidos não existe neste banco. Nada para processar."
+            "detail: tabela visualizacao_resolvidos.tickets_resolvidos ou audit_ticket_watch não existe neste banco. Nada para processar."
         )
         return []
     except Exception as e:
@@ -178,11 +184,14 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO audit_ticket_watch (ticket_id)
-                VALUES (%s)
-                ON CONFLICT (ticket_id) DO NOTHING
+                INSERT INTO audit_ticket_watch (ticket_id, hit_count, last_reason, last_seen_at)
+                VALUES (%s, 1, %s, now())
+                ON CONFLICT (ticket_id) DO UPDATE
+                  SET hit_count   = audit_ticket_watch.hit_count + 1,
+                      last_reason = EXCLUDED.last_reason,
+                      last_seen_at= now()
                 """,
-                (ticket_id,),
+                (ticket_id, reason),
             )
     except psycopg2.errors.UndefinedTable:
         conn.rollback()
@@ -323,6 +332,12 @@ def main():
 
     with psycopg2.connect(DSN) as conn:
         conn.autocommit = True
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET search_path TO visualizacao_resolvidos, public")
+        except Exception as e:
+            logger.error("detail: erro ao definir search_path (%s).", e)
 
         pending = get_pending_ids(conn, BATCH_SIZE)
         total_pendentes = len(pending)
