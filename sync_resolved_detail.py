@@ -54,6 +54,10 @@ DETAIL_SELECT = ",".join(
 DETAIL_EXPAND_FULL = "clients($expand=organization),createdBy,owner,actions,customFieldValues"
 
 
+# -------------------------------------------------------------------
+# HTTP helper Movidesk (com tratamento de 429/5xx)
+# -------------------------------------------------------------------
+
 def _parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
     val = headers.get("Retry-After") or headers.get("retry-after")
     if not val:
@@ -139,6 +143,10 @@ def md_get(
         resp.raise_for_status()
 
 
+# -------------------------------------------------------------------
+# Pending + auditoria (sem deletar de audit_recent_missing)
+# -------------------------------------------------------------------
+
 SQL_GET_PENDING = """
 SELECT arm.ticket_id,
        COALESCE(
@@ -192,19 +200,9 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
         LOG.error("detail: erro ao registrar falha em audit_ticket_watch (%s)", e)
 
 
-def delete_from_missing(conn, ids: List[int]) -> None:
-    if not ids:
-        return
-
-    sql = """
-        DELETE FROM visualizacao_resolvidos.audit_recent_missing
-         WHERE table_name = 'tickets_resolvidos'
-           AND ticket_id = ANY(%s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ids,))
-    conn.commit()
-
+# -------------------------------------------------------------------
+# Datas Movidesk + montagem da linha
+# -------------------------------------------------------------------
 
 def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
@@ -290,6 +288,10 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
+# -------------------------------------------------------------------
+# Upsert em tickets_resolvidos (sem mexer em audit_recent_missing)
+# -------------------------------------------------------------------
+
 def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
     if not rows:
         return
@@ -338,7 +340,7 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
       subject              = EXCLUDED.subject,
       adicional_nome       = EXCLUDED.adicional_nome,
       adicionado_em_tabela = COALESCE(
-          visualizacao_resolvidos.tickets_resolvidos.adicionado_em_tabela,
+          adicionado_em_tabela,
           EXCLUDED.adicionado_em_tabela
       )
     """
@@ -346,6 +348,32 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
         execute_values(cur, sql, rows, page_size=200)
     conn.commit()
 
+
+def debug_log_adicionado_sample(conn, sample_ids: List[int]) -> None:
+    if not sample_ids:
+        return
+    ids = sample_ids[:5]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ticket_id, adicionado_em_tabela
+              FROM visualizacao_resolvidos.tickets_resolvidos
+             WHERE ticket_id = ANY(%s)
+             ORDER BY ticket_id DESC
+            """,
+            (ids,),
+        )
+        rows = cur.fetchall()
+    LOG.info(
+        "detail: debug adicionado_em_tabela (até 5 ids=%s): %s",
+        ids,
+        rows,
+    )
+
+
+# -------------------------------------------------------------------
+# Estratégia de endpoint (tickets vs tickets/past)
+# -------------------------------------------------------------------
 
 def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
     if isinstance(data, dict) and data.get("id"):
@@ -444,6 +472,10 @@ def fetch_ticket_with_fallback(
     return None, last_reason or "unknown"
 
 
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
 def main() -> None:
     with psycopg2.connect(DSN) as conn:
         pending = get_pending_with_refdate(conn, BATCH)
@@ -540,18 +572,14 @@ def main() -> None:
             LOG.info(
                 "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
             )
-            delete_from_missing(conn, [tid for (tid, _d) in pending])
-            LOG.info(
-                "detail: %d tickets removidos de visualizacao_resolvidos.audit_recent_missing (ok + falhas).",
-                len(pending),
-            )
             return
 
         upsert_details(conn, detalhes)
-        delete_from_missing(conn, [tid for (tid, _d) in pending])
+        debug_log_adicionado_sample(conn, ok_ids)
+
         LOG.info(
             "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos "
-            "e removidos de visualizacao_resolvidos.audit_recent_missing (ok + falhas).",
+            "(limpeza de audit_recent_missing feita via trigger fn_clear_audit_on_ticket_upsert).",
             len(ok_ids),
         )
 
