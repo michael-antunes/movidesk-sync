@@ -13,7 +13,7 @@ API_BASE = "https://api.movidesk.com/public/v1"
 MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN") or os.getenv("PG_DSN")
 
-BATCH = int(os.getenv("DETAIL_BATCH", "200"))
+BATCH = int(os.getenv("DETAIL_BATCH", "50"))
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
 MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "1"))
 
@@ -76,12 +76,15 @@ def md_get(
     retries = 0
 
     while True:
+        LOG.debug("detail: md_get -> GET %s params=%s", url, base_params)
         resp = SESSION.get(url, params=base_params, timeout=60)
+        LOG.debug("detail: md_get <- status=%s", resp.status_code)
 
         if resp.status_code == 200:
             return resp.json() or {}
 
         if ok_404 and resp.status_code == 404:
+            LOG.info("detail: md_get -> 404 em %s (ok_404=True)", url)
             return None
 
         if resp.status_code == 429:
@@ -96,6 +99,10 @@ def md_get(
                 wait,
             )
             if retries >= MAX_429_RETRIES:
+                try:
+                    LOG.error("detail: 429 final em %s: %s", url, resp.text[:500])
+                except Exception:
+                    pass
                 resp.raise_for_status()
             time.sleep(wait)
             continue
@@ -112,6 +119,10 @@ def md_get(
                 backoff,
             )
             if retries >= MAX_429_RETRIES:
+                try:
+                    LOG.error("detail: 5xx final em %s: %s", url, resp.text[:500])
+                except Exception:
+                    pass
                 resp.raise_for_status()
             time.sleep(backoff)
             continue
@@ -130,7 +141,12 @@ def md_get(
 
 SQL_GET_PENDING = """
 SELECT arm.ticket_id,
-       COALESCE(tr.last_resolved_at, tr.last_cancelled_at, tr.last_closed_at, tr.last_update) AS ref_date
+       COALESCE(
+           tr.last_update,
+           tr.last_resolved_at,
+           tr.last_cancelled_at,
+           tr.last_closed_at
+       ) AS ref_date
   FROM visualizacao_resolvidos.audit_recent_missing AS arm
   LEFT JOIN visualizacao_resolvidos.tickets_resolvidos AS tr
          ON tr.ticket_id = arm.ticket_id
@@ -357,7 +373,21 @@ def fetch_ticket_with_fallback(
     first_endpoint = "tickets/past" if prefer_past else "tickets"
     second_endpoint = "tickets" if prefer_past else "tickets/past"
 
+    LOG.info(
+        "detail: fetch_ticket_with_fallback ticket_id=%s ref_date=%s prefer_past=%s first=%s second=%s",
+        ticket_id,
+        ref_date,
+        prefer_past,
+        first_endpoint,
+        second_endpoint,
+    )
+
     for endpoint in (first_endpoint, second_endpoint):
+        LOG.info(
+            "detail: consultando endpoint=%s para ticket_id=%s",
+            endpoint,
+            ticket_id,
+        )
         try:
             data = md_get(
                 endpoint,
@@ -366,10 +396,26 @@ def fetch_ticket_with_fallback(
             )
             ticket = _first_ticket_from_response(data)
             if ticket is not None:
+                LOG.info(
+                    "detail: ticket_id=%s encontrado em endpoint=%s",
+                    ticket_id,
+                    endpoint,
+                )
                 return ticket, None
             last_reason = "not_found_404"
+            LOG.info(
+                "detail: ticket_id=%s não encontrado em endpoint=%s (data vazia)",
+                ticket_id,
+                endpoint,
+            )
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
+            LOG.warning(
+                "detail: HTTPError status=%s em endpoint=%s para ticket_id=%s",
+                status,
+                endpoint,
+                ticket_id,
+            )
             if status == 404:
                 last_reason = "not_found_404"
             elif status == 429:
@@ -378,7 +424,13 @@ def fetch_ticket_with_fallback(
                 last_reason = "http_error_400"
             else:
                 last_reason = f"http_error_{status or 'unknown'}"
-        except Exception:
+        except Exception as e:
+            LOG.error(
+                "detail: exceção em endpoint=%s para ticket_id=%s: %s",
+                endpoint,
+                ticket_id,
+                e,
+            )
             last_reason = "exception_api"
 
     return None, last_reason or "unknown"
@@ -401,12 +453,31 @@ def main() -> None:
             BATCH,
         )
 
+        debug_preview = []
+        for idx, (tid, ref_date) in enumerate(pending[:5], start=1):
+            debug_preview.append(
+                f"{idx}) id={tid}, ref_date={ref_date}, prefer_past={_should_use_past_first(ref_date)}"
+            )
+        if debug_preview:
+            LOG.info(
+                "detail: primeiros pendentes (até 5): %s",
+                " | ".join(debug_preview),
+            )
+
         detalhes: List[Tuple[Any, ...]] = []
         ok_ids: List[int] = []
         fail_reasons: Dict[str, int] = {}
         fail_samples: Dict[str, int] = {}
 
-        for tid, ref_date in pending:
+        for idx, (tid, ref_date) in enumerate(pending, start=1):
+            LOG.info(
+                "detail: processando ticket %d/%d (ticket_id=%s, ref_date=%s)",
+                idx,
+                total_pendentes,
+                tid,
+                ref_date,
+            )
+
             ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
 
             if ticket is None:
@@ -420,8 +491,13 @@ def main() -> None:
 
             try:
                 row = build_detail_row(ticket)
-            except Exception:
+            except Exception as e:
                 reason = "build_row_error"
+                LOG.error(
+                    "detail: erro em build_detail_row para ticket_id=%s: %s",
+                    tid,
+                    e,
+                )
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
