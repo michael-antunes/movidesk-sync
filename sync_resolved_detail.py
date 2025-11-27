@@ -264,6 +264,8 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
     if not org and isinstance(client, dict):
         org = client.get("organization") or {}
 
+    adicionado_em_tabela = datetime.utcnow()
+
     return (
         int(ticket["id"]),
         final_status or None,
@@ -284,6 +286,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
         org.get("businessName"),
         ticket.get("subject"),
         client.get("businessName"),
+        adicionado_em_tabela,
     )
 
 
@@ -311,7 +314,8 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
       organization_id,
       organization_name,
       subject,
-      adicional_nome
+      adicional_nome,
+      adicionado_em_tabela
     )
     VALUES %s
     ON CONFLICT (ticket_id) DO UPDATE SET
@@ -332,7 +336,11 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
       organization_id      = EXCLUDED.organization_id,
       organization_name    = EXCLUDED.organization_name,
       subject              = EXCLUDED.subject,
-      adicional_nome       = EXCLUDED.adicional_nome
+      adicional_nome       = EXCLUDED.adicional_nome,
+      adicionado_em_tabela = COALESCE(
+          visualizacao_resolvidos.tickets_resolvidos.adicionado_em_tabela,
+          EXCLUDED.adicionado_em_tabela
+      )
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=200)
