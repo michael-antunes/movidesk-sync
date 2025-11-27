@@ -24,11 +24,10 @@ logging.basicConfig(
 logger = logging.getLogger("detail")
 
 
-# =========================
-# Helpers de API
-# =========================
+# ---------------------------
+# Função genérica da API
+# ---------------------------
 def md_get(path: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = False) -> Any:
-    """Wrapper da API do Movidesk."""
     if not API_TOKEN:
         raise RuntimeError("MOVIDESK_TOKEN não definido no ambiente")
 
@@ -43,136 +42,128 @@ def md_get(path: str, params: Optional[Dict[str, Any]] = None, ok_404: bool = Fa
     return resp.json()
 
 
-# =========================
-# Helpers de banco
-# =========================
-def ensure_search_path(conn) -> None:
-    """Garante que o search_path inclui main e public."""
-    with conn.cursor() as cur:
-        cur.execute("SET search_path TO main, public")
-
-
-def table_exists(conn, table_name: str) -> bool:
-    """
-    Verifica se a tabela existe, sem levantar erro.
-    Tenta primeiro no search_path atual e depois como main.<tabela>.
-    """
-    with conn.cursor() as cur:
-        # tenta direto
-        cur.execute("SELECT to_regclass(%s)", (table_name,))
-        row = cur.fetchone()
-        if row and row[0]:
-            return True
-
-        # tenta main.<tabela>
-        cur.execute("SELECT to_regclass(%s)", (f"main.{table_name}",))
-        row = cur.fetchone()
-        return bool(row and row[0])
-
-
-def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
-    """
-    Busca tickets na audit_recent_missing que estão faltando
-    last_resolved_at / last_closed_at / adicional_137641_avaliado_csat.
-    """
-    sql = """
-        SELECT DISTINCT m.ticket_id
-        FROM audit_recent_missing m
-        WHERE m.table_name = 'tickets_resolvidos'
-          AND m.column_name IN (
-                'last_resolved_at',
-                'last_closed_at',
-                'adicional_137641_avaliado_csat'
-          )
-        ORDER BY m.ticket_id DESC
-        LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
-
-
-def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
-    """
-    Fallback: busca direto em tickets_resolvidos
-    todos que ainda têm campos de tempo/CSAT nulos.
-    """
-    sql = """
-        SELECT t.ticket_id
-        FROM tickets_resolvidos t
-        WHERE
-            t.last_resolved_at IS NULL
-         OR (t.status = 'Fechado' AND t.last_closed_at IS NULL)
-         OR t.adicional_137641_avaliado_csat IS NULL
-        ORDER BY t.ticket_id DESC
-        LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    return [r[0] for r in rows]
-
-
+# ---------------------------
+# Pendências
+# ---------------------------
 def get_pending_ids(conn, limit: int) -> List[int]:
     """
-    Decide de onde buscar pendências:
-    - Se existir audit_recent_missing -> usa ela;
-    - Senão, cai para tickets_resolvidos.
+    Prioridade:
+      1) audit_recent_missing (se existir e tiver dados)
+      2) tickets_resolvidos (fallback)
     """
-    if table_exists(conn, "audit_recent_missing"):
-        logger.info("detail: buscando pendentes via audit_recent_missing…")
-        return get_pending_ids_from_missing(conn, limit)
+    # 1) tenta via audit_recent_missing
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ticket_id
+                FROM audit_recent_missing
+                WHERE table_name = 'tickets_resolvidos'
+                  AND column_name IN (
+                        'last_resolved_at',
+                        'last_closed_at',
+                        'adicional_137641_avaliado_csat'
+                  )
+                ORDER BY ticket_id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        if rows:
+            logger.info(
+                "detail: %s tickets pendentes em audit_recent_missing (limite=%s).",
+                len(rows),
+                limit,
+            )
+            return [r[0] for r in rows]
+        else:
+            logger.info(
+                "detail: nenhum registro pendente em audit_recent_missing para tickets_resolvidos."
+            )
+    except psycopg2.errors.UndefinedTable:
+        logger.error(
+            "detail: tabela audit_recent_missing não existe neste banco. "
+            "Caindo para busca direta em tickets_resolvidos."
+        )
+    except Exception as e:
+        logger.error(
+            "detail: erro ao consultar audit_recent_missing (%s). "
+            "Caindo para busca direta em tickets_resolvidos.",
+            e,
+        )
 
-    logger.error(
-        "detail: tabela audit_recent_missing não existe neste banco. "
-        "Caindo para busca direta em tickets_resolvidos."
-    )
+    # 2) fallback: tickets_resolvidos
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticket_id
+                FROM tickets_resolvidos
+                WHERE last_resolved_at IS NULL
+                   OR (status = 'Fechado' AND last_closed_at IS NULL)
+                   OR adicional_137641_avaliado_csat IS NULL
+                ORDER BY ticket_id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+        if rows:
+            logger.info(
+                "detail: %s tickets pendentes em tickets_resolvidos (limite=%s).",
+                len(rows),
+                limit,
+            )
+            return [r[0] for r in rows]
+        else:
+            logger.info(
+                "detail: nenhum ticket pendente em tickets_resolvidos para atualização de detalhes."
+            )
+    except psycopg2.errors.UndefinedTable:
+        logger.error(
+            "detail: tabela tickets_resolvidos não existe neste banco. Nada para processar."
+        )
+    except Exception as e:
+        logger.error(
+            "detail: erro ao consultar tickets_resolvidos (%s). Nada para processar.",
+            e,
+        )
 
-    if table_exists(conn, "tickets_resolvidos"):
-        return get_pending_ids_from_tickets(conn, limit)
-
-    logger.error(
-        "detail: tabela tickets_resolvidos não existe neste banco. Nada para processar."
-    )
     return []
 
 
 def delete_processed_from_missing(conn, ids: List[int]) -> None:
-    """Remove da audit_recent_missing os tickets já processados."""
-    if not ids or not table_exists(conn, "audit_recent_missing"):
+    if not ids:
         return
-
-    sql = """
-        DELETE FROM audit_recent_missing
-        WHERE table_name = 'tickets_resolvidos'
-          AND ticket_id = ANY(%s)
-          AND column_name IN (
-                'last_resolved_at',
-                'last_closed_at',
-                'adicional_137641_avaliado_csat'
-          )
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ids,))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM audit_recent_missing
+                WHERE table_name = 'tickets_resolvidos'
+                  AND ticket_id = ANY(%s)
+                  AND column_name IN (
+                        'last_resolved_at',
+                        'last_closed_at',
+                        'adicional_137641_avaliado_csat'
+                  )
+                """,
+                (ids,),
+            )
+    except psycopg2.errors.UndefinedTable:
+        logger.error(
+            "detail: tabela audit_recent_missing não existe ao tentar limpar pendências. "
+            "Ignorando limpeza."
+        )
+    except Exception as e:
+        logger.error(
+            "detail: erro ao limpar audit_recent_missing (%s).", e
+        )
 
 
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
-    """
-    Registra falha em audit_ticket_watch.
-
-    Para evitar problemas de schema, só garantimos o INSERT do ticket_id
-    com ON CONFLICT DO NOTHING; o motivo fica apenas no log.
-    """
     logger.warning("detail: ticket %s falhou: %s", ticket_id, reason)
-
-    if not table_exists(conn, "audit_ticket_watch"):
-        # se não existir, só loga mesmo
-        logger.error(
-            "detail: tabela audit_ticket_watch não existe; não será possível registrar falhas."
-        )
-        return
-
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -183,18 +174,19 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
                 """,
                 (ticket_id,),
             )
-    except psycopg2.Error as e:
+    except psycopg2.errors.UndefinedTable:
         logger.error(
-            "detail: erro ao registrar falha do ticket %s em audit_ticket_watch: %s",
-            ticket_id,
-            e,
+            "detail: tabela audit_ticket_watch não existe; não será possível registrar falhas."
         )
-        conn.rollback()
+    except Exception as e:
+        logger.error(
+            "detail: erro ao registrar falha em audit_ticket_watch (%s).", e
+        )
 
 
-# =========================
+# ---------------------------
 # Helpers de parsing
-# =========================
+# ---------------------------
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -208,13 +200,9 @@ def _norm(text: Optional[str]) -> str:
     return (text or "").strip().lower()
 
 
-def _find_last_action_time(actions: List[Dict[str, Any]], keywords: List[str]) -> Optional[datetime]:
-    """
-    Procura a última ação cujo status/descrição contenha algum dos keywords.
-    """
+def _find_last_action_time(actions, keywords) -> Optional[datetime]:
     keywords = [k.lower() for k in keywords]
-    last: Optional[datetime] = None
-
+    last = None
     for a in actions or []:
         desc = _norm(a.get("description"))
         status_txt = _norm(a.get("status"))
@@ -227,20 +215,15 @@ def _find_last_action_time(actions: List[Dict[str, Any]], keywords: List[str]) -
         ts = _parse_dt(created)
         if not ts:
             continue
-
         haystack = f"{desc} {status_txt}"
         if any(k in haystack for k in keywords):
             if last is None or ts > last:
                 last = ts
-
     return last
 
 
-def _extract_csat(ticket: Dict[str, Any]) -> Optional[str]:
-    """
-    Tenta extrair o campo adicional_137641_avaliado_csat.
-    """
-    # customFields expandidos
+def _extract_csat(ticket) -> Optional[str]:
+    # customFields
     for cf in ticket.get("customFields") or []:
         fid = cf.get("id") or cf.get("fieldId") or cf.get("customFieldId")
         name = _norm(cf.get("name") or cf.get("fieldName"))
@@ -250,7 +233,7 @@ def _extract_csat(ticket: Dict[str, Any]) -> Optional[str]:
                 val = val.get("label") or val.get("id")
             return str(val) if val is not None else None
 
-    # fallback: campo flatten no ticket
+    # campo direto no ticket, se existir
     for k, v in ticket.items():
         if _norm(k) == "adicional_137641_avaliado_csat":
             return str(v) if v is not None else None
@@ -258,23 +241,24 @@ def _extract_csat(ticket: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calcula last_resolved_at / last_closed_at / csat para um ticket.
-    """
+# ---------------------------
+# Montagem do detalhe
+# ---------------------------
+def build_detail_row(ticket):
     ticket_id = int(ticket["id"])
     status_txt = _norm(ticket.get("status"))
     actions = ticket.get("actions") or []
 
+    # pega os tempos olhando o histórico de ações
     resolved_time = _find_last_action_time(actions, ["resolvido"])
     closed_time = _find_last_action_time(actions, ["fechado"])
     cancelled_time = _find_last_action_time(actions, ["cancelado"])
 
-    last_resolved_at: Optional[datetime] = None
-    last_closed_at: Optional[datetime] = None
+    last_resolved_at = None
+    last_closed_at = None
 
     if "fechado" in status_txt:
-        # ticket fechado: resolução + fechamento
+        # ticket atualmente Fechado → precisa ter resolvido + fechado
         last_resolved_at = resolved_time or cancelled_time
         last_closed_at = closed_time
     elif "resolvido" in status_txt:
@@ -284,7 +268,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
         last_resolved_at = cancelled_time
         last_closed_at = None
     else:
-        # fallback genérico
+        # fallback pra algum caso estranho
         last_resolved_at = resolved_time or cancelled_time
         last_closed_at = closed_time
 
@@ -298,39 +282,44 @@ def build_detail_row(ticket: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def upsert_details(conn, details: List[Dict[str, Any]]) -> None:
-    """
-    Atualiza os campos de detalhe em tickets_resolvidos.
-    Apenas UPDATE (ticket já existe criado por outro processo).
-    """
-    if not details or not table_exists(conn, "tickets_resolvidos"):
+# ---------------------------
+# Persistência em tickets_resolvidos
+# ---------------------------
+def upsert_details(conn, details):
+    if not details:
         return
+    try:
+        with conn.cursor() as cur:
+            for row in details:
+                cur.execute(
+                    """
+                    UPDATE tickets_resolvidos
+                       SET last_resolved_at = COALESCE(%(last_resolved_at)s, last_resolved_at),
+                           last_closed_at  = COALESCE(%(last_closed_at)s,  last_closed_at),
+                           adicional_137641_avaliado_csat =
+                               COALESCE(%(csat)s, adicional_137641_avaliado_csat)
+                     WHERE ticket_id = %(ticket_id)s
+                    """,
+                    row,
+                )
+    except psycopg2.errors.UndefinedTable:
+        logger.error(
+            "detail: tabela tickets_resolvidos não existe ao tentar atualizar detalhes."
+        )
+    except Exception as e:
+        logger.error(
+            "detail: erro ao atualizar tickets_resolvidos (%s).", e
+        )
 
-    with conn.cursor() as cur:
-        for row in details:
-            cur.execute(
-                """
-                UPDATE tickets_resolvidos
-                   SET last_resolved_at = COALESCE(%(last_resolved_at)s, last_resolved_at),
-                       last_closed_at  = COALESCE(%(last_closed_at)s,  last_closed_at),
-                       adicional_137641_avaliado_csat =
-                           COALESCE(%(csat)s, adicional_137641_avaliado_csat)
-                 WHERE ticket_id = %(ticket_id)s
-                """,
-                row,
-            )
 
-
-# =========================
+# ---------------------------
 # Main
-# =========================
-def main() -> None:
+# ---------------------------
+def main():
     if not DSN:
-        raise RuntimeError("NEON_DSN (ou DATABASE_URL) não definido no ambiente")
+        raise RuntimeError("NEON_DSN ou DATABASE_URL não definido no ambiente")
 
     with psycopg2.connect(DSN) as conn:
-        ensure_search_path(conn)
-
         pending = get_pending_ids(conn, BATCH_SIZE)
         total_pendentes = len(pending)
 
@@ -339,7 +328,7 @@ def main() -> None:
             return
 
         logger.info(
-            "detail: %s tickets pendentes (limite=%s).",
+            "detail: %s tickets pendentes para atualização de detalhes (limite=%s).",
             total_pendentes,
             BATCH_SIZE,
         )
@@ -350,8 +339,7 @@ def main() -> None:
         fail_samples: Dict[str, int] = {}
 
         for tid in pending:
-            reason: Optional[str] = None
-
+            reason = None
             try:
                 data = md_get(
                     f"tickets/{tid}",
@@ -404,8 +392,7 @@ def main() -> None:
 
             try:
                 row = build_detail_row(ticket)
-            except Exception as e:
-                logger.exception("detail: erro ao montar row para ticket %s: %s", tid, e)
+            except Exception:
                 reason = "build_row_error"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
