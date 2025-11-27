@@ -66,86 +66,56 @@ def md_get(path_or_full: str, params: Optional[Dict[str, Any]] = None, ok_404: b
     r.raise_for_status()
 
 
-# -------------------------------------------------------------------
-# Busca de pendentes
-# -------------------------------------------------------------------
+            # --------------------------------------------------------------------
+            # Busca do ticket com fallback igual ao sync_tickets.py
+            # --------------------------------------------------------------------
+            data = None
+            reason = None
 
-def get_pending_ids_from_missing(conn, limit: int) -> List[int]:
-    """
-    Lê IDs em falta a partir de audit_recent_missing,
-    sempre pegando o registro mais recente de cada ticket_id.
-    Usa DISTINCT ON para evitar o erro de ORDER BY com DISTINCT.
-    """
-    sql = """
-        SELECT DISTINCT ON (m.ticket_id) m.ticket_id
-          FROM visualizacao_resolvidos.audit_recent_missing m
-          JOIN visualizacao_resolvidos.audit_recent_run   r ON r.id = m.run_id
-         WHERE m.table_name = 'tickets_resolvidos'
-         ORDER BY m.ticket_id DESC, r.run_at DESC
-         LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+            try:
+                # 1️⃣ Tentativa direta pelo ID
+                data = md_get(
+                    f"tickets/{tid}",
+                    params={"$expand": "clients,createdBy,owner,actions,customFields"},
+                    ok_404=True,
+                )
 
+                # 2️⃣ Se 404, tenta via filtro
+                if data is None:
+                    data_list = md_get(
+                        "tickets",
+                        params={
+                            "$filter": f"id eq {tid}",
+                            "$expand": "clients,createdBy,owner,actions,customFields",
+                        },
+                        ok_404=True,
+                    )
+                    if isinstance(data_list, list) and data_list:
+                        data = data_list[0]
+                    else:
+                        data = data_list
 
-def get_pending_ids_from_tickets(conn, limit: int) -> List[int]:
-    """
-    Fallback caso audit_recent_missing dê erro: busca direto em tickets_resolvidos.
-    """
-    sql = """
-        SELECT t.ticket_id
-          FROM visualizacao_resolvidos.tickets_resolvidos t
-         WHERE (t.last_resolved_at IS NULL OR t.last_closed_at IS NULL)
-           AND t.status IN ('Resolvido', 'Fechado', 'Cancelado')
-         ORDER BY t.ticket_id DESC
-         LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return [row[0] for row in cur.fetchall()]
+                # 3️⃣ Se ainda nada, tenta expand mínimo (sem customFields)
+                if data is None:
+                    data_list = md_get(
+                        "tickets",
+                        params={
+                            "$filter": f"id eq {tid}",
+                            "$expand": "clients,owner,actions",
+                        },
+                        ok_404=True,
+                    )
+                    if isinstance(data_list, list) and data_list:
+                        data = data_list[0]
+                    else:
+                        data = data_list
 
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                reason = f"http_error_{status or 'unknown'}"
+            except Exception:
+                reason = "exception_api"
 
-def get_pending_ids(conn, limit: int) -> List[int]:
-    """
-    Orquestra a busca de pendentes:
-      1) tenta audit_recent_missing
-      2) se falhar, cai pra tickets_resolvidos
-    """
-    try:
-        return get_pending_ids_from_missing(conn, limit)
-    except errors.UndefinedTable:
-        conn.rollback()
-        LOG.info(
-            "detail: tabela visualizacao_resolvidos.audit_recent_missing não existe neste banco. "
-            "Caindo para busca direta em tickets_resolvidos."
-        )
-    except Exception as e:
-        conn.rollback()
-        LOG.error(
-            "detail: erro ao consultar visualizacao_resolvidos.audit_recent_missing (%s). "
-            "Caindo para tickets_resolvidos.",
-            e,
-        )
-
-    # fallback
-    try:
-        return get_pending_ids_from_tickets(conn, limit)
-    except errors.UndefinedTable:
-        conn.rollback()
-        LOG.info(
-            "detail: tabela visualizacao_resolvidos.tickets_resolvidos não existe neste banco. "
-            "Nada para processar."
-        )
-        return []
-    except Exception as e:
-        conn.rollback()
-        LOG.error(
-            "detail: erro ao consultar visualizacao_resolvidos.tickets_resolvidos (%s). "
-            "Nada para processar.",
-            e,
-        )
-        return []
 
 
 # -------------------------------------------------------------------
