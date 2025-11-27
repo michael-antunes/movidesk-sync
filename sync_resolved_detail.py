@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import psycopg2
@@ -14,8 +14,8 @@ MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN") or os.getenv("PG_DSN")
 
 BATCH = int(os.getenv("DETAIL_BATCH", "200"))
-THROTTLE = float(os.getenv("THROTTLE_SEC", "7.0"))
-MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "3"))
+THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
+MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "1"))
 
 if not MOVIDESK_TOKEN:
     raise RuntimeError("Defina MOVIDESK_TOKEN ou MOVIDESK_API_TOKEN")
@@ -32,22 +32,35 @@ LOG = logging.getLogger("detail")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
 
-SELECT_FIELDS = (
-    "id,status,lastUpdate,origin,category,urgency,"
-    "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
-    "owner,organization,clients,subject,actions,customFields,createdBy"
+DETAIL_SELECT = ",".join(
+    [
+        "id",
+        "subject",
+        "type",
+        "status",
+        "baseStatus",
+        "ownerTeam",
+        "serviceFirstLevel",
+        "serviceSecondLevel",
+        "serviceThirdLevel",
+        "origin",
+        "category",
+        "urgency",
+        "createdDate",
+        "lastUpdate",
+    ]
 )
 
-EXPAND_FULL = "clients,createdBy,owner,actions,customFields"
+DETAIL_EXPAND_FULL = "clients($expand=organization),createdBy,owner,actions,customFieldValues"
 
 
 def _parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
-    retry_after = headers.get("Retry-After") or headers.get("retry-after")
-    if not retry_after:
+    val = headers.get("Retry-After") or headers.get("retry-after")
+    if not val:
         return None
     try:
-        return int(retry_after)
-    except ValueError:
+        return int(val)
+    except (TypeError, ValueError):
         return None
 
 
@@ -103,22 +116,43 @@ def md_get(
             time.sleep(backoff)
             continue
 
+        try:
+            LOG.error(
+                "detail: HTTP %s em %s: %s",
+                resp.status_code,
+                url,
+                resp.text[:500],
+            )
+        except Exception:
+            pass
         resp.raise_for_status()
 
 
-def get_pending_ids(conn, limit: int) -> List[int]:
-    sql = """
-        SELECT ticket_id
-          FROM visualizacao_resolvidos.audit_recent_missing
-         WHERE table_name = 'tickets_resolvidos'
-         GROUP BY ticket_id
-         ORDER BY max(run_id) DESC, ticket_id DESC
-         LIMIT %s
-    """
+SQL_GET_PENDING = """
+SELECT arm.ticket_id,
+       COALESCE(tr.last_resolved_at, tr.last_cancelled_at, tr.last_closed_at, tr.last_update) AS ref_date
+  FROM visualizacao_resolvidos.audit_recent_missing AS arm
+  LEFT JOIN visualizacao_resolvidos.tickets_resolvidos AS tr
+         ON tr.ticket_id = arm.ticket_id
+ WHERE arm.table_name = 'tickets_resolvidos'
+ GROUP BY arm.ticket_id, ref_date
+ ORDER BY MAX(arm.run_id) DESC, arm.ticket_id DESC
+ LIMIT %s
+"""
+
+
+def get_pending_with_refdate(conn, limit: int) -> List[Tuple[int, Optional[datetime]]]:
+    if not limit or limit <= 0:
+        limit = BATCH
+
     with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
+        cur.execute(SQL_GET_PENDING, (limit,))
         rows = cur.fetchall()
-    return [r[0] for r in rows]
+
+    result: List[Tuple[int, Optional[datetime]]] = []
+    for tid, ref_date in rows:
+        result.append((int(tid), ref_date))
+    return result
 
 
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
@@ -211,6 +245,8 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
     org = ticket.get("organization") or {}
     clients = ticket.get("clients") or []
     client = clients[0] if clients else {}
+    if not org and isinstance(client, dict):
+        org = client.get("organization") or {}
 
     return (
         int(ticket["id"]),
@@ -297,69 +333,60 @@ def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def fetch_ticket_with_fallback(ticket_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _should_use_past_first(ref_date: Optional[datetime]) -> bool:
+    if ref_date is None:
+        return False
+    now = datetime.utcnow()
+    return ref_date < now - timedelta(days=90)
+
+
+def fetch_ticket_with_fallback(
+    ticket_id: int,
+    ref_date: Optional[datetime],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     last_reason: Optional[str] = None
 
-    try:
-        data = md_get(
-            "tickets",
-            params={
-                "$filter": f"id eq {ticket_id}",
-                "$select": SELECT_FIELDS,
-                "$expand": EXPAND_FULL,
-            },
-            ok_404=True,
-        )
-        ticket = _first_ticket_from_response(data)
-        if ticket is not None:
-            return ticket, None
-        last_reason = "not_found_404"
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", None)
-        if status == 404:
-            last_reason = "not_found_404"
-        elif status == 429:
-            last_reason = "http_error_429"
-        elif status == 400:
-            last_reason = "http_error_400"
-        else:
-            last_reason = f"http_error_{status or 'unknown'}"
-    except Exception:
-        last_reason = "exception_api"
+    params_base = {
+        "$filter": f"id eq {ticket_id}",
+        "$select": DETAIL_SELECT,
+        "$top": 1,
+        "$skip": 0,
+    }
 
-    try:
-        data = md_get(
-            "tickets/past",
-            params={
-                "$filter": f"id eq {ticket_id}",
-                "$select": SELECT_FIELDS,
-                "$expand": EXPAND_FULL,
-            },
-            ok_404=True,
-        )
-        ticket = _first_ticket_from_response(data)
-        if ticket is not None:
-            return ticket, None
-        last_reason = last_reason or "not_found_404"
-    except requests.HTTPError as e:
-        status = getattr(e.response, "status_code", None)
-        if status == 404:
+    prefer_past = _should_use_past_first(ref_date)
+    first_endpoint = "tickets/past" if prefer_past else "tickets"
+    second_endpoint = "tickets" if prefer_past else "tickets/past"
+
+    for endpoint in (first_endpoint, second_endpoint):
+        try:
+            data = md_get(
+                endpoint,
+                params={**params_base, "$expand": DETAIL_EXPAND_FULL},
+                ok_404=True,
+            )
+            ticket = _first_ticket_from_response(data)
+            if ticket is not None:
+                return ticket, None
             last_reason = "not_found_404"
-        elif status == 429:
-            last_reason = "http_error_429"
-        elif status == 400:
-            last_reason = "http_error_400"
-        else:
-            last_reason = f"http_error_{status or 'unknown'}"
-    except Exception:
-        last_reason = "exception_api"
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 404:
+                last_reason = "not_found_404"
+            elif status == 429:
+                last_reason = "http_error_429"
+            elif status == 400:
+                last_reason = "http_error_400"
+            else:
+                last_reason = f"http_error_{status or 'unknown'}"
+        except Exception:
+            last_reason = "exception_api"
 
     return None, last_reason or "unknown"
 
 
 def main() -> None:
     with psycopg2.connect(DSN) as conn:
-        pending = get_pending_ids(conn, BATCH)
+        pending = get_pending_with_refdate(conn, BATCH)
         total_pendentes = len(pending)
 
         if not pending:
@@ -379,8 +406,8 @@ def main() -> None:
         fail_reasons: Dict[str, int] = {}
         fail_samples: Dict[str, int] = {}
 
-        for tid in pending:
-            ticket, reason = fetch_ticket_with_fallback(tid)
+        for tid, ref_date in pending:
+            ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
 
             if ticket is None:
                 reason = reason or "unknown"
@@ -429,7 +456,7 @@ def main() -> None:
             LOG.info(
                 "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
             )
-            delete_from_missing(conn, pending)
+            delete_from_missing(conn, [tid for (tid, _d) in pending])
             LOG.info(
                 "detail: %d tickets removidos de visualizacao_resolvidos.audit_recent_missing (ok + falhas).",
                 len(pending),
@@ -437,7 +464,7 @@ def main() -> None:
             return
 
         upsert_details(conn, detalhes)
-        delete_from_missing(conn, pending)
+        delete_from_missing(conn, [tid for (tid, _d) in pending])
         LOG.info(
             "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos "
             "e removidos de visualizacao_resolvidos.audit_recent_missing (ok + falhas).",
