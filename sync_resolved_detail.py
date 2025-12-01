@@ -8,14 +8,24 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
+
+# -------------------------------------------------------------------
+# Config / ambiente
+# -------------------------------------------------------------------
+
 API_BASE = "https://api.movidesk.com/public/v1"
 
 MOVIDESK_TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN") or os.getenv("PG_DSN")
 
-BATCH = int(os.getenv("DETAIL_BATCH", "50"))
+# Lote de tickets a processar por execução
+BATCH = int(os.getenv("DETAIL_BATCH") or os.getenv("PAGES_UPSERT", "200"))
+
+# Intervalo entre tickets (para não espancar a API)
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
-MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "1"))
+
+# Tentativas máximas para tratar HTTP 429 respeitando Retry-After
+MAX_429_RETRIES = int(os.getenv("MAX_429_RETRIES", "3"))
 
 if not MOVIDESK_TOKEN:
     raise RuntimeError("Defina MOVIDESK_TOKEN ou MOVIDESK_API_TOKEN")
@@ -32,39 +42,19 @@ LOG = logging.getLogger("detail")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "movidesk-sync/detail"})
 
-DETAIL_SELECT = ",".join(
-    [
-        "id",
-        "subject",
-        "type",
-        "status",
-        "baseStatus",
-        "ownerTeam",
-        "serviceFirstLevel",
-        "serviceSecondLevel",
-        "serviceThirdLevel",
-        "origin",
-        "category",
-        "urgency",
-        "createdDate",
-        "lastUpdate",
-    ]
-)
-
-DETAIL_EXPAND_FULL = "clients($expand=organization),createdBy,owner,actions,customFieldValues"
-
 
 # -------------------------------------------------------------------
-# HTTP helper Movidesk (com tratamento de 429/5xx)
+# Helpers de API
 # -------------------------------------------------------------------
 
 def _parse_retry_after(headers: Dict[str, str]) -> Optional[int]:
-    val = headers.get("Retry-After") or headers.get("retry-after")
-    if not val:
+    """Lê o header Retry-After (segundos)."""
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if not retry_after:
         return None
     try:
-        return int(val)
-    except (TypeError, ValueError):
+        return int(retry_after)
+    except ValueError:
         return None
 
 
@@ -73,113 +63,131 @@ def md_get(
     params: Optional[Dict[str, Any]] = None,
     ok_404: bool = False,
 ) -> Any:
+    """
+    GET na API do Movidesk com tratamento de erros transitórios,
+    respeitando o header Retry-After para 429 (Too Many Requests).
+
+    Se ok_404=True, retorna None em caso de 404 ao invés de levantar erro.
+    """
     url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
     base_params = dict(params or {})
     base_params["token"] = MOVIDESK_TOKEN
 
-    retries = 0
+    last_exc: Optional[requests.HTTPError] = None
 
-    while True:
-        LOG.debug("detail: md_get -> GET %s params=%s", url, base_params)
+    for attempt in range(1, MAX_429_RETRIES + 1):
         resp = SESSION.get(url, params=base_params, timeout=60)
-        LOG.debug("detail: md_get <- status=%s", resp.status_code)
 
+        # Sucesso
         if resp.status_code == 200:
             return resp.json() or {}
 
+        # 404 "controlado"
         if ok_404 and resp.status_code == 404:
-            LOG.info("detail: md_get -> 404 em %s (ok_404=True)", url)
             return None
 
+        # 429 => respeita Retry-After
         if resp.status_code == 429:
-            retries += 1
-            wait = _parse_retry_after(resp.headers) or 60
+            wait = _parse_retry_after(resp.headers)
+            if wait is None:
+                # Manual: 60 / 120 / 300; fallback conservador crescente
+                wait = 60 * attempt
             LOG.warning(
-                "detail: HTTP 429 em %s (tentativa %d/%d, Retry-After=%s). Aguardando %s segundos...",
+                "HTTP 429 em %s (tentativa %d/%d, Retry-After=%s). Aguardando %s segundos...",
                 url,
-                retries,
+                attempt,
                 MAX_429_RETRIES,
                 resp.headers.get("Retry-After"),
                 wait,
             )
-            if retries >= MAX_429_RETRIES:
-                try:
-                    LOG.error("detail: 429 final em %s: %s", url, resp.text[:500])
-                except Exception:
-                    pass
-                resp.raise_for_status()
             time.sleep(wait)
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:  # guarda exceção mais recente
+                last_exc = exc
             continue
 
+        # Erros 5xx => tenta de novo com backoff simples
         if resp.status_code in (500, 502, 503, 504):
-            retries += 1
-            backoff = 2 * retries
+            backoff = 2 * attempt
             LOG.warning(
-                "detail: HTTP %s em %s (tentativa %d/%d). Aguardando %s segundos...",
+                "HTTP %s em %s (tentativa %d/%d). Aguardando %s segundos...",
                 resp.status_code,
                 url,
-                retries,
+                attempt,
                 MAX_429_RETRIES,
                 backoff,
             )
-            if retries >= MAX_429_RETRIES:
-                try:
-                    LOG.error("detail: 5xx final em %s: %s", url, resp.text[:500])
-                except Exception:
-                    pass
-                resp.raise_for_status()
             time.sleep(backoff)
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                last_exc = exc
             continue
 
+        # Demais códigos: 400, 401 etc -> erro "definitivo"
         try:
-            LOG.error(
-                "detail: HTTP %s em %s: %s",
-                resp.status_code,
-                url,
-                resp.text[:500],
-            )
-        except Exception:
-            pass
-        resp.raise_for_status()
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            last_exc = exc
+        break
+
+    # Se chegou aqui é porque não retornou 200/404 controlado
+    if last_exc is not None:
+        raise last_exc
+    resp.raise_for_status()
 
 
 # -------------------------------------------------------------------
-# Pending + auditoria (sem deletar de audit_recent_missing)
+# Banco de dados
 # -------------------------------------------------------------------
 
-SQL_GET_PENDING = """
-SELECT arm.ticket_id,
-       COALESCE(
-           tr.last_update,
-           tr.last_resolved_at,
-           tr.last_cancelled_at,
-           tr.last_closed_at
-       ) AS ref_date
-  FROM visualizacao_resolvidos.audit_recent_missing AS arm
-  LEFT JOIN visualizacao_resolvidos.tickets_resolvidos AS tr
-         ON tr.ticket_id = arm.ticket_id
- WHERE arm.table_name = 'tickets_resolvidos'
- GROUP BY arm.ticket_id, ref_date
- ORDER BY MAX(arm.run_id) DESC, arm.ticket_id DESC
- LIMIT %s
-"""
+def get_pending_tickets(conn, limit: int) -> List[Tuple[int, Optional[datetime]]]:
+    """
+    Busca os tickets pendentes em visualizacao_resolvidos.audit_recent_missing
+    para a tabela 'tickets_resolvidos', junto com uma data de referência
+    (ref_date) para decidir se preferimos /tickets ou /tickets/past.
 
-
-def get_pending_with_refdate(conn, limit: int) -> List[Tuple[int, Optional[datetime]]]:
-    if not limit or limit <= 0:
-        limit = BATCH
-
+    ref_date = COALESCE(
+        last_resolved_at,
+        last_cancelled_at,
+        last_closed_at,
+        last_update
+    ) da tabela de destino, quando existir.
+    """
+    sql = """
+        SELECT DISTINCT ON (m.ticket_id)
+               m.ticket_id,
+               COALESCE(
+                   t.last_resolved_at,
+                   t.last_cancelled_at,
+                   t.last_closed_at,
+                   t.last_update
+               ) AS ref_date
+          FROM visualizacao_resolvidos.audit_recent_missing AS m
+          LEFT JOIN visualizacao_resolvidos.tickets_resolvidos AS t
+            ON t.ticket_id = m.ticket_id
+         WHERE m.table_name = 'tickets_resolvidos'
+         ORDER BY m.ticket_id DESC, m.run_id DESC
+         LIMIT %s
+    """
     with conn.cursor() as cur:
-        cur.execute(SQL_GET_PENDING, (limit,))
+        cur.execute(sql, (limit,))
         rows = cur.fetchall()
 
     result: List[Tuple[int, Optional[datetime]]] = []
-    for tid, ref_date in rows:
-        result.append((int(tid), ref_date))
+    for ticket_id, ref_date in rows:
+        result.append((int(ticket_id), ref_date))
     return result
 
 
 def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
+    """
+    Registra/atualiza falhas em audit_ticket_watch, sem estourar chave primária.
+    PK conhecida: (ticket_id).
+
+    A coluna de motivo não é usada aqui; o motivo fica apenas no log.
+    """
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -196,15 +204,21 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
                 (ticket_id,),
             )
         conn.commit()
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         LOG.error("detail: erro ao registrar falha em audit_ticket_watch (%s)", e)
 
 
 # -------------------------------------------------------------------
-# Datas Movidesk + montagem da linha
+# Transformação de dados do ticket
 # -------------------------------------------------------------------
 
 def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
+    """
+    Converte string de data/hora da Movidesk em datetime do Python
+    usando apenas a stdlib (sem dateutil).
+
+    Aceita formatos ISO, com ou sem 'Z' no final.
+    """
     if not value:
         return None
     try:
@@ -215,6 +229,10 @@ def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
 
 
 def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
+    """
+    Monta a tupla na ordem exata das colunas de
+    visualizacao_resolvidos.tickets_resolvidos usadas hoje.
+    """
     actions = ticket.get("actions") or []
 
     last_resolved_at = None
@@ -242,6 +260,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
 
     final_status = (ticket.get("status") or "").strip()
 
+    # Regras de preenchimento para as colunas de resolved/closed/cancelled
     if final_status == "Cancelado":
         last_resolved_at_db = None
         last_closed_at_db = None
@@ -259,10 +278,9 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
     org = ticket.get("organization") or {}
     clients = ticket.get("clients") or []
     client = clients[0] if clients else {}
-    if not org and isinstance(client, dict):
-        org = client.get("organization") or {}
 
-    adicionado_em_tabela = datetime.utcnow()
+    # timestamp de quando esse registro foi inserido pela primeira vez
+    adicionado_em_tabela = datetime.now(timezone.utc)
 
     return (
         int(ticket["id"]),
@@ -289,7 +307,7 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
 
 
 # -------------------------------------------------------------------
-# Upsert em tickets_resolvidos (sem mexer em audit_recent_missing)
+# Upsert no banco
 # -------------------------------------------------------------------
 
 def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
@@ -339,8 +357,9 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
       organization_name    = EXCLUDED.organization_name,
       subject              = EXCLUDED.subject,
       adicional_nome       = EXCLUDED.adicional_nome,
+      -- mantém o timestamp original, só preenchendo quando ainda está NULL
       adicionado_em_tabela = COALESCE(
-          adicionado_em_tabela,
+          visualizacao_resolvidos.tickets_resolvidos.adicionado_em_tabela,
           EXCLUDED.adicionado_em_tabela
       )
     """
@@ -349,74 +368,90 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
     conn.commit()
 
 
-def debug_log_adicionado_sample(conn, sample_ids: List[int]) -> None:
-    if not sample_ids:
-        return
-    ids = sample_ids[:5]
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT ticket_id, adicionado_em_tabela
-              FROM visualizacao_resolvidos.tickets_resolvidos
-             WHERE ticket_id = ANY(%s)
-             ORDER BY ticket_id DESC
-            """,
-            (ids,),
-        )
-        rows = cur.fetchall()
-    LOG.info(
-        "detail: debug adicionado_em_tabela (até 5 ids=%s): %s",
-        ids,
-        rows,
-    )
-
-
 # -------------------------------------------------------------------
-# Estratégia de endpoint (tickets vs tickets/past)
+# Busca com múltiplas estratégias (/tickets e /tickets/past)
 # -------------------------------------------------------------------
 
-def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(data, dict) and data.get("id"):
-        return data
-    if isinstance(data, list) and data:
-        item = data[0]
-        if isinstance(item, dict):
-            return item
-    return None
+SELECT_FIELDS = (
+    "id,status,lastUpdate,origin,category,urgency,"
+    "serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,"
+    "owner,organization,clients,subject,actions,customFields,createdBy"
+)
+
+EXPAND_FULL = "clients,createdBy,owner,actions,customFields"
 
 
 def _should_use_past_first(ref_date: Optional[datetime]) -> bool:
+    """
+    Decide se devemos tentar /tickets/past primeiro.
+
+    Regra: se tivermos uma ref_date e ela for mais antiga que 90 dias atrás,
+    então preferimos buscar em /tickets/past.
+    """
     if ref_date is None:
         return False
 
-    if ref_date.tzinfo is not None:
-        ref_date_naive_utc = ref_date.astimezone(timezone.utc).replace(tzinfo=None)
+    # Normaliza para UTC e garante timezone-aware para evitar
+    # "can't compare offset-naive and offset-aware datetimes".
+    if ref_date.tzinfo is None:
+        ref_date = ref_date.replace(tzinfo=timezone.utc)
     else:
-        ref_date_naive_utc = ref_date
+        ref_date = ref_date.astimezone(timezone.utc)
 
-    now_utc = datetime.utcnow()
-    return ref_date_naive_utc < now_utc - timedelta(days=90)
+    now_utc = datetime.now(timezone.utc)
+    return ref_date < now_utc - timedelta(days=90)
+
+
+def _fetch_from_list_endpoint(endpoint: str, ticket_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Consulta um endpoint de lista ('tickets' ou 'tickets/past') usando
+    $filter=id eq {id}. Retorna o primeiro item ou None.
+    """
+    LOG.info(
+        "detail: consultando endpoint=%s para ticket_id=%s",
+        endpoint,
+        ticket_id,
+    )
+    data = md_get(
+        endpoint,
+        params={
+            "$filter": f"id eq {ticket_id}",
+            "$select": SELECT_FIELDS,
+            "$expand": EXPAND_FULL,
+        },
+        ok_404=True,
+    )
+    if not data:
+        return None
+    if isinstance(data, list):
+        return data[0]
+    return data
 
 
 def fetch_ticket_with_fallback(
     ticket_id: int,
     ref_date: Optional[datetime],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    last_reason: Optional[str] = None
+    """
+    Tenta buscar detalhes do ticket usando duas estratégias, escolhendo a ordem
+    com base em ref_date (regra de 90 dias):
 
-    params_base = {
-        "$filter": f"id eq {ticket_id}",
-        "$select": DETAIL_SELECT,
-        "$top": 1,
-        "$skip": 0,
-    }
+      - /tickets
+      - /tickets/past
 
+    Se prefer_past=True, tenta primeiro /tickets/past, depois /tickets.
+    Caso contrário, faz o inverso.
+
+    Retorna (ticket_dict, reason). Se reason for None, a busca foi bem-sucedida.
+    """
     prefer_past = _should_use_past_first(ref_date)
-    first_endpoint = "tickets/past" if prefer_past else "tickets"
-    second_endpoint = "tickets" if prefer_past else "tickets/past"
+    first_endpoint, second_endpoint = (
+        ("tickets/past", "tickets") if prefer_past else ("tickets", "tickets/past")
+    )
 
     LOG.info(
-        "detail: fetch_ticket_with_fallback ticket_id=%s ref_date=%s prefer_past=%s first=%s second=%s",
+        "detail: fetch_ticket_with_fallback ticket_id=%s ref_date=%s "
+        "prefer_past=%s first=%s second=%s",
         ticket_id,
         ref_date,
         prefer_past,
@@ -424,56 +459,41 @@ def fetch_ticket_with_fallback(
         second_endpoint,
     )
 
-    for endpoint in (first_endpoint, second_endpoint):
-        LOG.info(
-            "detail: consultando endpoint=%s para ticket_id=%s",
-            endpoint,
-            ticket_id,
-        )
-        try:
-            data = md_get(
-                endpoint,
-                params={**params_base, "$expand": DETAIL_EXPAND_FULL},
-                ok_404=True,
-            )
-            ticket = _first_ticket_from_response(data)
-            if ticket is not None:
-                LOG.info(
-                    "detail: ticket_id=%s encontrado em endpoint=%s",
-                    ticket_id,
-                    endpoint,
-                )
-                return ticket, None
-            last_reason = "not_found_404"
+    last_reason: Optional[str] = None
+
+    # 1) endpoint preferencial
+    try:
+        ticket = _fetch_from_list_endpoint(first_endpoint, ticket_id)
+        if ticket is not None:
             LOG.info(
-                "detail: ticket_id=%s não encontrado em endpoint=%s (data vazia)",
+                "detail: ticket_id=%s encontrado em endpoint=%s",
                 ticket_id,
-                endpoint,
+                first_endpoint,
             )
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            LOG.warning(
-                "detail: HTTPError status=%s em endpoint=%s para ticket_id=%s",
-                status,
-                endpoint,
+            return ticket, None
+        last_reason = "not_found_first"
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        last_reason = f"http_error_{status or 'unknown'}"
+    except Exception:
+        last_reason = "exception_api_first"
+
+    # 2) endpoint alternativo
+    try:
+        ticket = _fetch_from_list_endpoint(second_endpoint, ticket_id)
+        if ticket is not None:
+            LOG.info(
+                "detail: ticket_id=%s encontrado em endpoint=%s",
                 ticket_id,
+                second_endpoint,
             )
-            if status == 404:
-                last_reason = "not_found_404"
-            elif status == 429:
-                last_reason = "http_error_429"
-            elif status == 400:
-                last_reason = "http_error_400"
-            else:
-                last_reason = f"http_error_{status or 'unknown'}"
-        except Exception as e:
-            LOG.error(
-                "detail: exceção em endpoint=%s para ticket_id=%s: %s",
-                endpoint,
-                ticket_id,
-                e,
-            )
-            last_reason = "exception_api"
+            return ticket, None
+        last_reason = last_reason or "not_found_second"
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        last_reason = f"http_error_{status or 'unknown'}"
+    except Exception:
+        last_reason = "exception_api_second"
 
     return None, last_reason or "unknown"
 
@@ -484,7 +504,7 @@ def fetch_ticket_with_fallback(
 
 def main() -> None:
     with psycopg2.connect(DSN) as conn:
-        pending = get_pending_with_refdate(conn, BATCH)
+        pending = get_pending_tickets(conn, BATCH)
         total_pendentes = len(pending)
 
         if not pending:
@@ -499,21 +519,22 @@ def main() -> None:
             BATCH,
         )
 
-        debug_preview = []
+        # Loga os primeiros pendentes para debug
+        preview_items: List[str] = []
         for idx, (tid, ref_date) in enumerate(pending[:5], start=1):
-            debug_preview.append(
-                f"{idx}) id={tid}, ref_date={ref_date}, prefer_past={_should_use_past_first(ref_date)}"
+            prefer_past = _should_use_past_first(ref_date)
+            preview_items.append(
+                f"{idx}) id={tid}, ref_date={ref_date}, prefer_past={prefer_past}"
             )
-        if debug_preview:
+        if preview_items:
             LOG.info(
                 "detail: primeiros pendentes (até 5): %s",
-                " | ".join(debug_preview),
+                " | ".join(preview_items),
             )
 
         detalhes: List[Tuple[Any, ...]] = []
-        ok_ids: List[int] = []
         fail_reasons: Dict[str, int] = {}
-        fail_samples: Dict[str, int] = {}
+        fail_samples: Dict[str, int] = []
 
         for idx, (tid, ref_date) in enumerate(pending, start=1):
             LOG.info(
@@ -524,35 +545,23 @@ def main() -> None:
                 ref_date,
             )
 
-            try:
-                ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
-            except Exception as e:
-                LOG.error(
-                    "detail: exceção inesperada ao buscar ticket_id=%s: %s",
-                    tid,
-                    e,
-                )
-                ticket = None
-                reason = "exception_fetch"
+            ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
 
             if ticket is None:
+                # Falha em todas as estratégias
                 reason = reason or "unknown"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
+                # pequena pausa entre erros para não acumular "failed requests"
                 time.sleep(THROTTLE)
                 continue
 
             try:
                 row = build_detail_row(ticket)
-            except Exception as e:
+            except Exception:
                 reason = "build_row_error"
-                LOG.error(
-                    "detail: erro em build_detail_row para ticket_id=%s: %s",
-                    tid,
-                    e,
-                )
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
@@ -561,10 +570,9 @@ def main() -> None:
                 continue
 
             detalhes.append(row)
-            ok_ids.append(tid)
             time.sleep(THROTTLE)
 
-        total_ok = len(ok_ids)
+        total_ok = len(detalhes)
         total_fail = sum(fail_reasons.values())
         LOG.info(
             "detail: processados neste ciclo: ok=%d, falhas=%d.",
@@ -587,15 +595,14 @@ def main() -> None:
             LOG.info(
                 "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
             )
+            # Nessa abordagem, a trigger no banco é quem cuida do audit_recent_missing.
             return
 
+        # Upsert; trigger no DB cuida de remover de audit_recent_missing
         upsert_details(conn, detalhes)
-        debug_log_adicionado_sample(conn, ok_ids)
-
         LOG.info(
-            "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos "
-            "(limpeza de audit_recent_missing feita via trigger fn_clear_audit_on_ticket_upsert).",
-            len(ok_ids),
+            "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos.",
+            len(detalhes),
         )
 
 
