@@ -1,178 +1,219 @@
+#!/usr/bin/env python3
+"""
+detail.py – debug de um único ticket Movidesk (ID fixo 295896)
+
+Objetivo: confirmar qual combinação de endpoint/parâmetros retorna o ticket
+e ver o JSON bruto que a API devolve.
+"""
+
 import os
-import time
-import requests
-import psycopg2
-import psycopg2.extras
-import datetime
+import sys
+import json
 import logging
+from typing import Any, Dict, Optional
 
-# === CONFIGURAÇÕES ===
-API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
-TOKEN = os.getenv("MOVIDESK_TOKEN")
-DSN = os.getenv("NEON_DSN")
-LIMIT = int(os.getenv("PAGES_UPSERT", "10"))
-THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+import requests
 
-# === LOGGING ===
+# ---------------------------------------------------------------------------
+# Configuração básica
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://api.movidesk.com/public/v1"
+TICKET_ID = int(os.environ.get("TICKET_ID", "295896"))  # permite sobrescrever se quiser
+LOGGER_NAME = "detail"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] detail: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+log = logging.getLogger(LOGGER_NAME)
 
-# === REQUISIÇÕES COM RE-TENTATIVAS ===
-def req(url, params=None, timeout=90):
-    while True:
-        r = requests.get(url, params=params, timeout=timeout)
-        if r.status_code in (429, 503):
-            retry = r.headers.get("retry-after")
-            wait = int(retry) if str(retry).isdigit() else 60
-            logging.warning(f"Rate limit, aguardando {wait}s...")
-            time.sleep(wait)
-            continue
-        if r.status_code in (404, 400):
+
+def get_token() -> str:
+    token = os.environ.get("MOVIDESK_TOKEN")
+    if not token:
+        log.error("Variável de ambiente MOVIDESK_TOKEN não encontrada.")
+        sys.exit(1)
+    return token
+
+
+# ---------------------------------------------------------------------------
+# Chamadas à API
+# ---------------------------------------------------------------------------
+
+def call_api(url: str, params: Dict[str, Any]) -> requests.Response:
+    """Faz uma chamada GET logando a URL final e o status."""
+    resp = requests.get(url, params=params, timeout=30)
+    log.info("GET %s -> %s", resp.url, resp.status_code)
+    return resp
+
+
+def fetch_single_ticket_from_tickets(token: str, ticket_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Tenta buscar o ticket como UM ÚNICO TICKET na rota /tickets,
+    usando exatamente o formato do manual:
+
+      GET /tickets?token=...&id=1
+
+    includeDeletedItems=true é só pra garantir que não sumiu porque foi deletado.
+    """
+    url = f"{BASE_URL}/tickets"
+    params = {
+        "token": token,
+        "id": ticket_id,
+        "includeDeletedItems": "true",
+    }
+
+    resp = call_api(url, params)
+
+    if resp.status_code == 404:
+        log.warning("Ticket %s não encontrado em /tickets (404).", ticket_id)
+        return None
+
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        log.error("Erro HTTP em /tickets: %s – corpo: %s", e, resp.text[:500])
+        return None
+
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        log.error("Resposta de /tickets não é JSON válido: %s", resp.text[:500])
+        return None
+
+    # A API pode devolver um objeto ou uma lista com 1 item.
+    if isinstance(data, list):
+        if not data:
+            log.warning("Lista vazia em /tickets para id=%s.", ticket_id)
             return None
-        r.raise_for_status()
-        return r.json() if r.text else None
+        ticket = data[0]
+    elif isinstance(data, dict):
+        ticket = data
+    else:
+        log.error("Formato inesperado em /tickets: %r", type(data))
+        return None
 
-# === CONSULTA MISSING ===
-def fetch_pending_from_audit(conn, limit):
-    sql = """
-        select distinct ticket_id
-        from visualizacao_resolvidos.audit_recent_missing
-        where table_name = 'tickets_resolvidos'
-        order by ticket_id desc
-        limit %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = [r[0] for r in cur.fetchall()]
-    return rows
+    if str(ticket.get("id")) != str(ticket_id):
+        log.warning(
+            "Ticket retornado por /tickets tem id=%s (esperado=%s).",
+            ticket.get("id"),
+            ticket_id,
+        )
 
-# === CONSULTA API ===
-def fetch_ticket_with_fallback(ticket_id):
+    return ticket
+
+
+def fetch_single_ticket_from_tickets_past(token: str, ticket_id: int) -> Optional[Dict[str, Any]]:
     """
-    Tenta primeiro /tickets?id=...
-    Se der 404/400, tenta /tickets/past?id=...
+    Tenta buscar o ticket na rota /tickets/past usando OData:
+
+      GET /tickets/past?token=...&$select=...&$filter=id eq 295896
+
+    Isso segue o padrão do manual de Tickets/Past (token + $select + filtros).
     """
-    common_select = (
-        "id,subject,type,status,baseStatus,ownerTeam,serviceFirstLevel,"
-        "serviceSecondLevel,serviceThirdLevel,origin,category,urgency,"
-        "createdDate,lastUpdate,resolvedIn,closedIn,cancelledIn,owner,clients"
-    )
-    expand = "createdBy,owner,clients($expand=organization)"
-    base_params = {
-        "token": TOKEN,
-        "$select": common_select,
-        "$expand": expand,
-        "$top": 1,
-        "$filter": f"id eq {ticket_id}"
+    url = f"{BASE_URL}/tickets/past"
+    # seleciono alguns campos principais; se precisar de todos, pode por "*"
+    select_fields = [
+        "id",
+        "protocol",
+        "status",
+        "type",
+        "origin",
+        "createdDate",
+        "lastUpdate",
+        "resolvedIn",
+        "closedIn",
+    ]
+    params = {
+        "token": token,
+        "$select": ",".join(select_fields),
+        "$filter": f"id eq {ticket_id}",
     }
 
-    # Tentativa 1: /tickets
-    url_main = f"{API_BASE}/tickets"
-    r = req(url_main, base_params)
-    if r and isinstance(r, list) and len(r) > 0:
-        return r[0], "tickets"
+    resp = call_api(url, params)
 
-    # Tentativa 2: /tickets/past
-    url_past = f"{API_BASE}/tickets/past"
-    r = req(url_past, base_params)
-    if r and isinstance(r, list) and len(r) > 0:
-        return r[0], "tickets/past"
+    if resp.status_code == 404:
+        log.warning("Ticket %s não encontrado em /tickets/past (404).", ticket_id)
+        return None
 
-    # Tentativa 3: /tickets/merged (fallback final)
-    url_merged = f"{API_BASE}/tickets/merged"
-    merged_params = {"token": TOKEN, "$filter": f"id eq {ticket_id}", "$top": 1}
-    r = req(url_merged, merged_params)
-    if r and isinstance(r, list) and len(r) > 0:
-        return r[0], "tickets/merged"
+    # 400 costuma ser "filtro ou parâmetro inválido"
+    if resp.status_code == 400:
+        log.error("Erro 400 em /tickets/past – verifique se os parâmetros batem com o manual.")
+        log.error("Corpo da resposta: %s", resp.text[:500])
+        return None
 
-    return None, None
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        log.error("Erro HTTP em /tickets/past: %s – corpo: %s", e, resp.text[:500])
+        return None
 
-# === TRANSFORMAÇÃO ===
-def normalize_ticket(t, endpoint):
-    owner = t.get("owner") or {}
-    clients = t.get("clients") or []
-    c0 = clients[0] if clients else {}
-    org = c0.get("organization") or {}
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        log.error("Resposta de /tickets/past não é JSON válido: %s", resp.text[:500])
+        return None
 
-    last_resolved = t.get("resolvedIn") or None
-    last_closed = t.get("closedIn") or None
-    last_cancelled = t.get("cancelledIn") or None
+    if not isinstance(data, list):
+        log.error("Formato inesperado em /tickets/past (esperado lista): %r", type(data))
+        return None
 
-    return {
-        "ticket_id": int(t.get("id")),
-        "owner_name": owner.get("businessName") or owner.get("name"),
-        "owner_team_name": t.get("ownerTeam"),
-        "origin": t.get("origin"),
-        "status": t.get("status"),
-        "last_resolved_at": last_resolved,
-        "last_closed_at": last_closed,
-        "last_cancelled_at": last_cancelled,
-        "raw_payload": t,
-        "imported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "endpoint": endpoint,
-    }
+    if not data:
+        log.warning("Lista vazia em /tickets/past para id=%s.", ticket_id)
+        return None
 
-# === INSERÇÃO GENÉRICA ===
-def upsert_in_table(conn, row, table):
-    sql = f"""
-        insert into visualizacao_resolvidos.{table}
-        (ticket_id, owner_name, owner_team_name, origin, status,
-         last_resolved_at, last_closed_at, last_cancelled_at,
-         raw_payload, imported_at)
-        values (%(ticket_id)s, %(owner_name)s, %(owner_team_name)s, %(origin)s, %(status)s,
-                %(last_resolved_at)s, %(last_closed_at)s, %(last_cancelled_at)s,
-                %(raw_payload)s, %(imported_at)s)
-        on conflict (ticket_id) do update set
-          owner_name = excluded.owner_name,
-          owner_team_name = excluded.owner_team_name,
-          origin = excluded.origin,
-          status = excluded.status,
-          last_resolved_at = excluded.last_resolved_at,
-          last_closed_at = excluded.last_closed_at,
-          last_cancelled_at = excluded.last_cancelled_at,
-          raw_payload = excluded.raw_payload,
-          imported_at = excluded.imported_at
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, row)
-    conn.commit()
+    ticket = data[0]
+    if str(ticket.get("id")) != str(ticket_id):
+        log.warning(
+            "Ticket retornado por /tickets/past tem id=%s (esperado=%s).",
+            ticket.get("id"),
+            ticket_id,
+        )
 
-# === PROCESSAMENTO ===
-def main():
-    if not TOKEN or not DSN:
-        raise RuntimeError("Defina MOVIDESK_TOKEN e NEON_DSN nos secrets.")
+    return ticket
 
-    with psycopg2.connect(DSN) as conn:
-        pending = fetch_pending_from_audit(conn, LIMIT)
-        logging.info(f"{len(pending)} tickets pendentes para atualização (limite={LIMIT}).")
 
-        for idx, ticket_id in enumerate(pending, 1):
-            logging.info(f"Processando ticket {idx}/{len(pending)} (ID={ticket_id})")
-            try:
-                data, endpoint = fetch_ticket_with_fallback(ticket_id)
-                if not data:
-                    logging.warning(f"Ticket {ticket_id} não encontrado em nenhum endpoint.")
-                    continue
+# ---------------------------------------------------------------------------
+# Programa principal
+# ---------------------------------------------------------------------------
 
-                row = normalize_ticket(data, endpoint)
+def main() -> None:
+    token = get_token()
+    log.info("Iniciando debug de detalhe para ticket_id=%s", TICKET_ID)
 
-                # Decide a tabela de destino
-                if endpoint == "tickets/merged":
-                    upsert_in_table(conn, row, "tickets_mesclados")
-                else:
-                    upsert_in_table(conn, row, "tickets_resolvidos")
+    # 1) Tenta pelo /tickets (modo 'único ticket' do manual)
+    log.info("Tentando buscar ticket %s em /tickets (id=...)", TICKET_ID)
+    ticket = fetch_single_ticket_from_tickets(token, TICKET_ID)
 
-                logging.info(f"Ticket {ticket_id} atualizado com sucesso ({endpoint}).")
+    # 2) Se não achar, tenta /tickets/past com $filter
+    if ticket is None:
+        log.info("Não achou em /tickets. Tentando em /tickets/past com $filter=id eq ...")
+        ticket = fetch_single_ticket_from_tickets_past(token, TICKET_ID)
 
-            except Exception as e:
-                logging.error(f"Erro ao processar ticket_id={ticket_id}: {e}")
-            time.sleep(THROTTLE)
+    if ticket is None:
+        log.error("Ticket %s não foi encontrado em nenhum método testado.", TICKET_ID)
+        sys.exit(1)
 
-        logging.info("Processamento concluído.")
+    # 3) Se achou, imprime alguns campos-chave e o JSON completo.
+    log.info("Ticket %s encontrado. Campos principais:", TICKET_ID)
+    for field in [
+        "id",
+        "protocol",
+        "status",
+        "type",
+        "origin",
+        "createdDate",
+        "lastUpdate",
+        "resolvedIn",
+        "closedIn",
+    ]:
+        if field in ticket:
+            log.info("  %s = %r", field, ticket[field])
 
-# === EXECUÇÃO ===
+    print("\n======= JSON COMPLETO DO TICKET =======")
+    print(json.dumps(ticket, ensure_ascii=False, indent=2))
+
+
 if __name__ == "__main__":
     main()
