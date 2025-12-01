@@ -90,7 +90,6 @@ def md_get(
         if resp.status_code == 429:
             wait = _parse_retry_after(resp.headers)
             if wait is None:
-                # Manual: 60 / 120 / 300; fallback conservador crescente
                 wait = 60 * attempt
             LOG.warning(
                 "HTTP 429 em %s (tentativa %d/%d, Retry-After=%s). Aguardando %s segundos...",
@@ -103,7 +102,7 @@ def md_get(
             time.sleep(wait)
             try:
                 resp.raise_for_status()
-            except requests.HTTPError as exc:  # guarda exceção mais recente
+            except requests.HTTPError as exc:
                 last_exc = exc
             continue
 
@@ -132,7 +131,6 @@ def md_get(
             last_exc = exc
         break
 
-    # Se chegou aqui é porque não retornou 200/404 controlado
     if last_exc is not None:
         raise last_exc
     resp.raise_for_status()
@@ -185,8 +183,6 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
     """
     Registra/atualiza falhas em audit_ticket_watch, sem estourar chave primária.
     PK conhecida: (ticket_id).
-
-    A coluna de motivo não é usada aqui; o motivo fica apenas no log.
     """
     try:
         with conn.cursor() as cur:
@@ -214,10 +210,7 @@ def register_ticket_failure(conn, ticket_id: int, reason: str) -> None:
 
 def parse_movidesk_datetime(value: Optional[str]) -> Optional[datetime]:
     """
-    Converte string de data/hora da Movidesk em datetime do Python
-    usando apenas a stdlib (sem dateutil).
-
-    Aceita formatos ISO, com ou sem 'Z' no final.
+    Converte string de data/hora da Movidesk em datetime do Python.
     """
     if not value:
         return None
@@ -279,7 +272,6 @@ def build_detail_row(ticket: Dict[str, Any]) -> Tuple[Any, ...]:
     clients = ticket.get("clients") or []
     client = clients[0] if clients else {}
 
-    # timestamp de quando esse registro foi inserido pela primeira vez
     adicionado_em_tabela = datetime.now(timezone.utc)
 
     return (
@@ -357,7 +349,6 @@ def upsert_details(conn, rows: List[Tuple[Any, ...]]) -> None:
       organization_name    = EXCLUDED.organization_name,
       subject              = EXCLUDED.subject,
       adicional_nome       = EXCLUDED.adicional_nome,
-      -- mantém o timestamp original, só preenchendo quando ainda está NULL
       adicionado_em_tabela = COALESCE(
           visualizacao_resolvidos.tickets_resolvidos.adicionado_em_tabela,
           EXCLUDED.adicionado_em_tabela
@@ -391,8 +382,6 @@ def _should_use_past_first(ref_date: Optional[datetime]) -> bool:
     if ref_date is None:
         return False
 
-    # Normaliza para UTC e garante timezone-aware para evitar
-    # "can't compare offset-naive and offset-aware datetimes".
     if ref_date.tzinfo is None:
         ref_date = ref_date.replace(tzinfo=timezone.utc)
     else:
@@ -433,16 +422,8 @@ def fetch_ticket_with_fallback(
     ref_date: Optional[datetime],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Tenta buscar detalhes do ticket usando duas estratégias, escolhendo a ordem
-    com base em ref_date (regra de 90 dias):
-
-      - /tickets
-      - /tickets/past
-
-    Se prefer_past=True, tenta primeiro /tickets/past, depois /tickets.
-    Caso contrário, faz o inverso.
-
-    Retorna (ticket_dict, reason). Se reason for None, a busca foi bem-sucedida.
+    Tenta buscar detalhes do ticket usando /tickets e /tickets/past, escolhendo
+    a ordem com base em ref_date (regra de 90 dias).
     """
     prefer_past = _should_use_past_first(ref_date)
     first_endpoint, second_endpoint = (
@@ -519,7 +500,6 @@ def main() -> None:
             BATCH,
         )
 
-        # Loga os primeiros pendentes para debug
         preview_items: List[str] = []
         for idx, (tid, ref_date) in enumerate(pending[:5], start=1):
             prefer_past = _should_use_past_first(ref_date)
@@ -534,7 +514,7 @@ def main() -> None:
 
         detalhes: List[Tuple[Any, ...]] = []
         fail_reasons: Dict[str, int] = {}
-        fail_samples: Dict[str, int] = []
+        fail_samples: Dict[str, int] = {}   # <<< CORRIGIDO (era lista)
 
         for idx, (tid, ref_date) in enumerate(pending, start=1):
             LOG.info(
@@ -548,13 +528,11 @@ def main() -> None:
             ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
 
             if ticket is None:
-                # Falha em todas as estratégias
                 reason = reason or "unknown"
                 register_ticket_failure(conn, tid, reason)
                 fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 if reason not in fail_samples:
                     fail_samples[reason] = tid
-                # pequena pausa entre erros para não acumular "failed requests"
                 time.sleep(THROTTLE)
                 continue
 
@@ -595,10 +573,9 @@ def main() -> None:
             LOG.info(
                 "detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
             )
-            # Nessa abordagem, a trigger no banco é quem cuida do audit_recent_missing.
             return
 
-        # Upsert; trigger no DB cuida de remover de audit_recent_missing
+        # Upsert; a trigger no banco remove de audit_recent_missing
         upsert_details(conn, detalhes)
         LOG.info(
             "detail: %d tickets upsertados em visualizacao_resolvidos.tickets_resolvidos.",
