@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import psycopg2
@@ -388,8 +388,14 @@ def _first_ticket_from_response(data: Any) -> Optional[Dict[str, Any]]:
 def _should_use_past_first(ref_date: Optional[datetime]) -> bool:
     if ref_date is None:
         return False
-    now = datetime.utcnow()
-    return ref_date < now - timedelta(days=90)
+
+    if ref_date.tzinfo is not None:
+        ref_date_naive_utc = ref_date.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        ref_date_naive_utc = ref_date
+
+    now_utc = datetime.utcnow()
+    return ref_date_naive_utc < now_utc - timedelta(days=90)
 
 
 def fetch_ticket_with_fallback(
@@ -518,7 +524,16 @@ def main() -> None:
                 ref_date,
             )
 
-            ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
+            try:
+                ticket, reason = fetch_ticket_with_fallback(tid, ref_date)
+            except Exception as e:
+                LOG.error(
+                    "detail: exceção inesperada ao buscar ticket_id=%s: %s",
+                    tid,
+                    e,
+                )
+                ticket = None
+                reason = "exception_fetch"
 
             if ticket is None:
                 reason = reason or "unknown"
