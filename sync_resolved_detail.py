@@ -1,202 +1,244 @@
+#!/usr/bin/env python
+"""
+Sincroniza detalhes de tickets Movidesk para a tabela
+visualizacao_resolvidos.tickets_resolvidos.
+
+- Busca IDs pendentes em visualizacao_resolvidos.audit_recent_missing
+  (apenas para table_name = 'tickets_resolvidos').
+- Para cada ticket, tenta consultar o endpoint /tickets; se não encontrar
+  ou der erro 4xx/5xx, tenta /tickets/past.
+- Monta o "detalhe" (status + datas principais) e faz upsert na tabela
+  de destino.
+- NÃO remove da audit_recent_missing: há trigger no banco que cuida disso
+  quando a linha é inserida/atualizada em tickets_resolvidos.
+"""
+
+from __future__ import annotations
+
 import os
+import sys
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
+
+# ---------------------------------------------------------------------------
+# Config / logging
+# ---------------------------------------------------------------------------
+
+LOG_NAME = "detail"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("detail")
+logger = logging.getLogger(LOG_NAME)
+
+DSN = os.environ.get("NEON_DSN")
+if not DSN:
+    logger.error("%s: variável de ambiente NEON_DSN não configurada.", LOG_NAME)
+    sys.exit(1)
+
+API_TOKEN = (
+    os.environ.get("MOVIDESK_TOKEN")
+    or os.environ.get("MOVIDESK_API_TOKEN")
+)
+if not API_TOKEN:
+    logger.error(
+        "%s: variável de ambiente MOVIDESK_TOKEN ou MOVIDESK_API_TOKEN não configurada.",
+        LOG_NAME,
+    )
+    sys.exit(1)
 
 BASE_URL = "https://api.movidesk.com/public/v1"
-API_TOKEN = os.environ.get("MOVIDESK_TOKEN") or os.environ.get("MOVIDESK_API_TOKEN")
-DSN = os.environ.get("NEON_DSN")
-PAGE_LIMIT = int(os.environ.get("PAGES_UPSERT", "50"))
-REQUEST_TIMEOUT = 20
+DEFAULT_LIMIT = 50
+
+try:
+    LIMIT = int(os.environ.get("PAGES_UPSERT", str(DEFAULT_LIMIT)))
+except ValueError:
+    LIMIT = DEFAULT_LIMIT
 
 
-def _should_use_past_first(ref_date: Optional[datetime]) -> bool:
-    """Decide se deve tentar /tickets/past primeiro (tickets com mais de 90 dias)."""
-    if ref_date is None:
-        return False
-
-    if ref_date.tzinfo is None:
-        ref_date = ref_date.replace(tzinfo=timezone.utc)
-
-    now = datetime.now(timezone.utc)
-    return ref_date < now - timedelta(days=90)
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 
-def _fetch_ticket_once(
-    ticket_id: int, endpoint: str, ref_date: Optional[datetime]
-) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
+@dataclass
+class PendingTicket:
+    ticket_id: int
+
+
+@dataclass
+class TicketDetail:
+    ticket_id: int
+    status: Optional[str]
+    last_update: Optional[datetime]
+    last_resolved_at: Optional[datetime]
+    last_closed_at: Optional[datetime]
+    last_cancelled_at: Optional[datetime]
+    adicionado_em_tabela: datetime
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    """Tenta converter string ISO 8601 em datetime aware (UTC)."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            # assume UTC se vier sem timezone
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _http_get_ticket(
+    endpoint: str, ticket_id: int
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
     """
-    Faz uma chamada única para um endpoint (tickets ou tickets/past).
+    Faz GET no endpoint indicado.
 
-    Retorna (ticket_dict_ou_None, reason, meta)
-    - reason: "ok", "not_found", "http_error_400", "timeout", etc.
-    - meta: infos extras (endpoint, status_code, body_snippet)
+    Retorna (json, reason, meta):
+      - json: dict com o ticket em caso de sucesso, senão None
+      - reason: string explicando o erro, ou None se sucesso
+      - meta: infos auxiliares (endpoint, status_code, etc.)
     """
-    if endpoint not in ("tickets", "tickets/past"):
-        raise ValueError(f"endpoint inválido: {endpoint}")
-
-    if endpoint == "tickets/past" and ref_date is None:
-        # Evita chamar /tickets/past sem ter uma referência de data
-        logger.info(
-            "detail: ignorando endpoint=tickets/past para ticket_id=%s porque ref_date é None",
-            ticket_id,
-        )
-        return None, "past_without_ref_date", {
-            "endpoint": endpoint,
-            "status_code": None,
-            "body": None,
-        }
-
     url = f"{BASE_URL}/{endpoint}/{ticket_id}"
-    logger.info("detail: consultando endpoint=%s para ticket_id=%s", endpoint, ticket_id)
-
-    params = {"token": API_TOKEN}
+    params = {
+        "token": API_TOKEN,
+    }
 
     try:
-        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    except requests.Timeout:
-        logger.warning(
-            "detail: timeout ao chamar endpoint=%s para ticket_id=%s",
-            endpoint,
-            ticket_id,
-        )
-        return None, "timeout", {
-            "endpoint": endpoint,
-            "status_code": None,
-            "body": None,
-        }
+        resp = requests.get(url, params=params, timeout=30)
     except requests.RequestException as exc:
-        logger.warning(
-            "detail: erro de request ao chamar endpoint=%s para ticket_id=%s: %s",
-            endpoint,
-            ticket_id,
-            exc,
-        )
-        return None, "request_exception", {
+        return None, "http_exception", {
             "endpoint": endpoint,
-            "status_code": None,
-            "body": str(exc),
+            "exception": str(exc),
         }
 
-    status = resp.status_code
-    body_snippet = resp.text[:500] if status != 200 else ""
-
-    if status == 200:
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.warning(
-                "detail: resposta 200 inválida (JSON) para ticket_id=%s em endpoint=%s",
-                ticket_id,
-                endpoint,
-            )
-            return None, "invalid_json", {
-                "endpoint": endpoint,
-                "status_code": status,
-                "body": body_snippet,
-            }
-
-        if isinstance(data, list):
-            ticket = data[0] if data else None
-        else:
-            ticket = data
-
-        if not ticket:
-            logger.info(
-                "detail: endpoint=%s ticket_id=%s retornou 200 mas corpo vazio",
-                endpoint,
-                ticket_id,
-            )
-            return None, "empty_200", {
-                "endpoint": endpoint,
-                "status_code": status,
-                "body": body_snippet,
-            }
-
-        return ticket, "ok", {"endpoint": endpoint, "status_code": status, "body": ""}
-
-    if status == 404:
-        logger.info(
-            "detail: ticket_id=%s não encontrado (404) em endpoint=%s",
-            ticket_id,
-            endpoint,
-        )
-        return None, "not_found", {
-            "endpoint": endpoint,
-            "status_code": status,
-            "body": body_snippet,
-        }
-
-    reason = f"http_error_{status}"
-    logger.warning(
-        "detail: chamada endpoint=%s para ticket_id=%s retornou %s. Corpo (trecho): %s",
-        endpoint,
-        ticket_id,
-        status,
-        body_snippet,
-    )
-    return None, reason, {
+    meta: Dict[str, Any] = {
         "endpoint": endpoint,
-        "status_code": status,
-        "body": body_snippet,
+        "status_code": resp.status_code,
     }
+
+    if resp.status_code == 404:
+        return None, "http_error_404", meta
+    if resp.status_code >= 400:
+        meta["body"] = resp.text[:500]
+        return None, "http_error_400", meta
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        meta["body"] = resp.text[:500]
+        meta["exception"] = str(exc)
+        return None, "json_decode_error", meta
+
+    return data, None, meta
+
+
+def build_ticket_detail(ticket_id: int, raw: Dict[str, Any]) -> TicketDetail:
+    """
+    Extrai os campos relevantes do JSON do Movidesk.
+
+    Usamos vários possíveis nomes de campos para ser mais resiliente
+    a mudanças na API.
+    """
+    status = raw.get("status")
+
+    # nomes possíveis para datas na API do Movidesk
+    last_update = (
+        raw.get("lastUpdate")
+        or raw.get("lastUpdateDate")
+        or raw.get("lastUpdatedDate")
+        or raw.get("lastUpdateDateTime")
+    )
+    last_resolved = raw.get("resolvedDate") or raw.get("resolvedAt")
+    last_closed = raw.get("closedDate") or raw.get("closedAt")
+    last_cancelled = (
+        raw.get("canceledDate")
+        or raw.get("cancelledDate")
+        or raw.get("canceledAt")
+        or raw.get("cancelledAt")
+    )
+
+    now_utc = datetime.now(timezone.utc)
+
+    return TicketDetail(
+        ticket_id=ticket_id,
+        status=status,
+        last_update=_parse_datetime(last_update),
+        last_resolved_at=_parse_datetime(last_resolved),
+        last_closed_at=_parse_datetime(last_closed),
+        last_cancelled_at=_parse_datetime(last_cancelled),
+        adicionado_em_tabela=now_utc,
+    )
 
 
 def fetch_ticket_with_fallback(
-    ticket_id: int, ref_date: Optional[datetime]
-) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any]]:
+    ticket_id: int,
+) -> Tuple[Optional[TicketDetail], str, Dict[str, Any]]:
     """
-    Busca detalhe do ticket usando /tickets e /tickets/past.
+    Tenta buscar o ticket primeiro em /tickets, depois em /tickets/past.
 
-    - Se ref_date for mais antiga que 90 dias, tenta /tickets/past primeiro.
-    - Só tenta o segundo endpoint se o primeiro retornar "not_found".
+    Retorna (TicketDetail|None, reason, meta). Se o ticket for encontrado
+    em algum dos endpoints, reason será "ok".
     """
-    prefer_past = _should_use_past_first(ref_date)
-    first, second = ("tickets/past", "tickets") if prefer_past else ("tickets", "tickets/past")
+    last_reason: str = "unknown_error"
+    last_meta: Dict[str, Any] = {}
 
-    logger.info(
-        "detail: fetch_ticket_with_fallback ticket_id=%s ref_date=%s prefer_past=%s first=%s second=%s",
-        ticket_id,
-        ref_date,
-        prefer_past,
-        first,
-        second,
-    )
+    for endpoint in ("tickets", "tickets/past"):
+        logger.info(
+            "%s: consultando endpoint=%s para ticket_id=%s",
+            LOG_NAME,
+            endpoint,
+            ticket_id,
+        )
+        data, reason, meta = _http_get_ticket(endpoint, ticket_id)
+        if data is not None:
+            logger.info(
+                "%s: ticket_id=%s encontrado em endpoint=%s",
+                LOG_NAME,
+                ticket_id,
+                endpoint,
+            )
+            detail = build_ticket_detail(ticket_id, data)
+            return detail, "ok", {"endpoint": endpoint}
 
-    # 1ª tentativa
-    ticket, reason, meta = _fetch_ticket_once(ticket_id, first, ref_date)
-    if ticket is not None or reason != "not_found":
-        # Achou ou falhou de um jeito que não faz sentido tentar o outro endpoint
-        return ticket, reason, meta
+        # guarda último erro e tenta o próximo endpoint
+        last_reason = reason or "unknown_error"
+        last_meta = meta
 
-    # Só cai aqui se reason == "not_found"
-    ticket2, reason2, meta2 = _fetch_ticket_once(ticket_id, second, ref_date)
-    if ticket2 is not None:
-        return ticket2, "ok", meta2
-
-    if reason2 != "not_found":
-        return None, reason2, meta2
-
-    return None, "not_found_both", meta2
+    # se chegou aqui, falhou em todos os endpoints
+    return None, last_reason, last_meta
 
 
-def fetch_pending_from_audit(conn, limit: int) -> List[Tuple[int, Optional[datetime]]]:
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+
+def fetch_pending_from_audit(conn, limit: int) -> List[PendingTicket]:
     """
-    Busca na audit_recent_missing os tickets da tabela tickets_resolvidos
-    que ainda precisam ter o detalhe sincronizado.
+    Busca IDs pendentes na audit_recent_missing.
+
+    Importante: não usamos nenhuma coluna além de table_name e ticket_id
+    para evitar problemas com alterações de schema.
     """
     sql = """
-        select ticket_id, ref_date
+        select ticket_id
         from visualizacao_resolvidos.audit_recent_missing
         where table_name = 'tickets_resolvidos'
         order by ticket_id desc
@@ -206,183 +248,169 @@ def fetch_pending_from_audit(conn, limit: int) -> List[Tuple[int, Optional[datet
         cur.execute(sql, (limit,))
         rows = cur.fetchall()
 
-    return rows
+    pending = [PendingTicket(ticket_id=row[0]) for row in rows]
+    return pending
 
 
-def build_detail_row(ticket: Dict[str, Any]) -> Tuple[
-    int,
-    Optional[str],
-    Optional[str],
-    Optional[str],
-    Optional[str],
-    Optional[str],
-]:
-    """Extrai os campos relevantes do JSON do ticket."""
-    ticket_id = int(ticket.get("id") or ticket.get("ticketId"))
+def upsert_details(conn, detalhes: Sequence[TicketDetail]) -> None:
+    """
+    Faz upsert dos detalhes na tabela de destino.
 
-    status = ticket.get("status")
-    last_update = ticket.get("lastUpdate")
-    last_resolved_at = ticket.get("resolvedIn")
-    last_closed_at = ticket.get("closedIn")
-    last_cancelled_at = ticket.get("canceledIn") or ticket.get("cancelledIn")
-
-    return (
-        ticket_id,
-        status,
-        last_update,
-        last_resolved_at,
-        last_closed_at,
-        last_cancelled_at,
-    )
-
-
-def upsert_details(conn, tickets: List[Dict[str, Any]]) -> None:
-    """Faz upsert dos detalhes na visualizacao_resolvidos.tickets_resolvidos."""
-    if not tickets:
+    NÃO remove nada da audit_recent_missing: isso é responsabilidade
+    de trigger no banco.
+    """
+    if not detalhes:
         return
 
-    rows = [build_detail_row(t) for t in tickets]
+    rows = [
+        (
+            d.ticket_id,
+            d.status,
+            d.last_update,
+            d.last_resolved_at,
+            d.last_closed_at,
+            d.last_cancelled_at,
+            d.adicionado_em_tabela,
+        )
+        for d in detalhes
+    ]
 
     sql = """
-        insert into visualizacao_resolvidos.tickets_resolvidos (
+        insert into visualizacao_resolvidos.tickets_resolvidos as t (
             ticket_id,
             status,
             last_update,
             last_resolved_at,
             last_closed_at,
-            last_cancelled_at
-        ) values %s
+            last_cancelled_at,
+            adicionado_em_tabela
+        )
+        values %s
         on conflict (ticket_id) do update set
             status = excluded.status,
             last_update = excluded.last_update,
             last_resolved_at = excluded.last_resolved_at,
             last_closed_at = excluded.last_closed_at,
-            last_cancelled_at = excluded.last_cancelled_at
+            last_cancelled_at = excluded.last_cancelled_at,
+            adicionado_em_tabela = excluded.adicionado_em_tabela
     """
 
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=200)
 
+
+def register_failure(ticket_id: int, reason: str, meta: Dict[str, Any]) -> None:
+    """
+    Registra falhas apenas no log.
+
+    Se quiser persistir em tabela (visualizacao_resolvidos.audit_ticket_watch),
+    dá pra adicionar o insert aqui depois.
+    """
     logger.info(
-        "detail: detail: %s tickets upsertados em visualizacao_resolvidos.tickets_resolvidos.",
-        len(rows),
+        "%s: falha ao buscar ticket_id=%s reason=%s meta=%s",
+        LOG_NAME,
+        ticket_id,
+        reason,
+        meta,
     )
 
 
-def register_failure(conn, ticket_id: int, reason: str, meta: Dict[str, Any]) -> None:
-    """
-    Tenta registrar a falha em visualizacao_resolvidos.audit_ticket_watch.
-
-    Se o insert der erro (diferença de estrutura, etc.), só loga um warning
-    para não derrubar o job.
-    """
-    endpoint = meta.get("endpoint")
-    status_code = meta.get("status_code")
-    body = meta.get("body") or ""
-    snippet = body[:900]
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into visualizacao_resolvidos.audit_ticket_watch
-                    (ticket_id, endpoint, status_code, reason, body)
-                values (%s, %s, %s, %s, %s)
-                """,
-                (ticket_id, endpoint, status_code, reason, snippet),
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "detail: falha ao registrar em audit_ticket_watch (ticket_id=%s, reason=%s): %s",
-            ticket_id,
-            reason,
-            exc,
-        )
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    if not DSN:
-        raise RuntimeError("Variável de ambiente NEON_DSN não configurada.")
-    if not API_TOKEN:
-        raise RuntimeError("Variável de ambiente MOVIDESK_TOKEN (ou MOVIDESK_API_TOKEN) não configurada.")
+    logger.info(
+        "%s: iniciando sincronização de detalhes de tickets (limite=%s).",
+        LOG_NAME,
+        LIMIT,
+    )
 
-    limit = PAGE_LIMIT
+    try:
+        with psycopg2.connect(DSN) as conn:
+            pending = fetch_pending_from_audit(conn, LIMIT)
+            total = len(pending)
+            if not total:
+                logger.info("%s: nenhum ticket pendente em audit_recent_missing.", LOG_NAME)
+                return
 
-    with psycopg2.connect(DSN) as conn:
-        pending = fetch_pending_from_audit(conn, limit)
-        total = len(pending)
-
-        if total == 0:
-            logger.info("detail: detail: nenhum ticket pendente para atualização de detalhes.")
-            return
-
-        logger.info(
-            "detail: detail: %s tickets pendentes para atualização de detalhes (limite=%s).",
-            total,
-            limit,
-        )
-
-        preview_parts = []
-        for i, (tid, ref_date) in enumerate(pending[:5], start=1):
-            preview_parts.append(
-                f"{i}) id={tid}, ref_date={ref_date}, prefer_past={_should_use_past_first(ref_date)}"
+            preview = " | ".join(
+                f"{i+1}) id={p.ticket_id}"
+                for i, p in enumerate(pending[:5])
             )
-        if preview_parts:
-            logger.info("detail: detail: primeiros pendentes (até 5): %s", " | ".join(preview_parts))
-
-        detalhes_ok: List[Dict[str, Any]] = []
-        fail_counts: Dict[str, int] = {}
-        fail_samples: Dict[str, int] = {}
-
-        for idx, (ticket_id, ref_date) in enumerate(pending, start=1):
             logger.info(
-                "detail: detail: processando ticket %s/%s (ticket_id=%s, ref_date=%s)",
-                idx,
+                "%s: %s tickets pendentes para atualização de detalhes (limite=%s).",
+                LOG_NAME,
                 total,
-                ticket_id,
-                ref_date,
+                LIMIT,
             )
+            logger.info("%s: primeiros pendentes (até 5): %s", LOG_NAME, preview)
 
-            ticket, reason, meta = fetch_ticket_with_fallback(ticket_id, ref_date)
+            detalhes_ok: List[TicketDetail] = []
+            fail_counts: Dict[str, int] = {}
+            fail_samples: Dict[str, int] = {}
 
-            if ticket is not None:
-                detalhes_ok.append(ticket)
-            else:
-                fail_counts[reason] = fail_counts.get(reason, 0) + 1
-                fail_samples.setdefault(reason, ticket_id)
-                register_failure(conn, ticket_id, reason, meta)
-
-        ok = len(detalhes_ok)
-        fails = sum(fail_counts.values())
-
-        logger.info(
-            "detail: detail: processados neste ciclo: ok=%s, falhas=%s.",
-            ok,
-            fails,
-        )
-
-        if fail_counts:
-            logger.info("detail: detail: razões de falha neste ciclo:")
-            for reason, count in fail_counts.items():
-                sample = fail_samples.get(reason)
+            for idx, p in enumerate(pending, start=1):
+                ticket_id = p.ticket_id
                 logger.info(
-                    "detail: detail:   - %s: %s tickets (exemplo ticket_id=%s)",
-                    reason,
-                    count,
-                    sample,
+                    "%s: processando ticket %s/%s (ticket_id=%s)",
+                    LOG_NAME,
+                    idx,
+                    total,
+                    ticket_id,
                 )
 
-        if ok:
-            upsert_details(conn, detalhes_ok)
-        else:
+                detail, reason, meta = fetch_ticket_with_fallback(ticket_id)
+
+                if detail is not None:
+                    detalhes_ok.append(detail)
+                else:
+                    # registra falha
+                    register_failure(ticket_id, reason, meta)
+                    fail_counts[reason] = fail_counts.get(reason, 0) + 1
+                    fail_samples.setdefault(reason, ticket_id)
+
+            ok_count = len(detalhes_ok)
+            fail_total = sum(fail_counts.values())
+
+            if detalhes_ok:
+                upsert_details(conn, detalhes_ok)
+
             logger.info(
-                "detail: detail: nenhum ticket com detalhe válido; apenas falhas registradas em audit_ticket_watch."
+                "%s: processados neste ciclo: ok=%s, falhas=%s.",
+                LOG_NAME,
+                ok_count,
+                fail_total,
             )
+
+            if fail_counts:
+                logger.info("%s: razões de falha neste ciclo:", LOG_NAME)
+                for reason, count in fail_counts.items():
+                    sample = fail_samples.get(reason)
+                    logger.info(
+                        "%s:   - %s: %s tickets (exemplo ticket_id=%s)",
+                        LOG_NAME,
+                        reason,
+                        count,
+                        sample,
+                    )
+
+            if ok_count == 0:
+                logger.info(
+                    "%s: nenhum ticket com detalhe válido; apenas falhas registradas em log.",
+                    LOG_NAME,
+                )
+
+    except Exception as exc:
+        logger.error(
+            "%s: erro inesperado no processamento de detalhes: %s",
+            LOG_NAME,
+            exc,
+            exc_info=True,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("detail: erro inesperado no processamento de detalhes: %s", exc)
-        raise
+    main()
