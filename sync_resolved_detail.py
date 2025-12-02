@@ -67,7 +67,7 @@ def fetch_pending_from_audit(conn, limit: int) -> List[int]:
         SELECT arm.ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing AS arm
         WHERE arm.table_name = 'tickets_resolvidos'
-        ORDER BY arm.ticket_id
+        ORDER BY arm.ticket_id DESC
         LIMIT %s;
     """
     with conn.cursor() as cur:
