@@ -1,9 +1,9 @@
-name: Movidesk - Tickets abertos (detail)
+name: Movidesk - Tickets abertos (index + raw)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # a cada 5 minutos (UTC)
+    - cron: "*/5 * * * *"
 
 concurrency:
   group: movidesk-abertos-${{ github.ref }}
@@ -28,9 +28,16 @@ jobs:
 
       - run: pip install requests psycopg2-binary
 
-      - name: Sync open tickets detail
+      - name: Sync open tickets index (id + updated_at)
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           DETAIL_OPEN_PAGE_SIZE: "100"
         run: python sync_tickets_abertos.py
+
+      - name: Sync open tickets raw
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          DETAIL_OPEN_RAW_LIMIT: "20"
+        run: python sync_tickets_abertos_raw.py
