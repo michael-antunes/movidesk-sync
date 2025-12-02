@@ -40,10 +40,13 @@ def ensure_open_table(conn) -> None:
 
     CREATE TABLE IF NOT EXISTS visualizacao_atual.tickets_abertos (
         ticket_id       BIGINT PRIMARY KEY,
-        updated_at      TIMESTAMPTZ NOT NULL,
         raw             JSONB,
+        updated_at      TIMESTAMPTZ NOT NULL,
         raw_last_update TIMESTAMPTZ
     );
+
+    ALTER TABLE visualizacao_atual.tickets_abertos
+        ALTER COLUMN raw DROP NOT NULL;
 
     ALTER TABLE visualizacao_atual.tickets_abertos
         ADD COLUMN IF NOT EXISTS raw_last_update TIMESTAMPTZ;
@@ -62,14 +65,11 @@ class MovideskClient:
         params = dict(params)
         params["token"] = self.token
         url = BASE_URL + path
-
         resp = requests.get(url, params=params, timeout=self.timeout)
         logger.info("GET %s -> %s", resp.url, resp.status_code)
-
         if resp.status_code == 404:
             logger.warning("Endpoint %s retornou 404 (não encontrado).", path)
             return None
-
         if resp.status_code >= 400:
             body_short = resp.text.replace("\n", " ")[:500]
             logger.error(
@@ -79,11 +79,9 @@ class MovideskClient:
                 body_short,
             )
             return None
-
         if not resp.text.strip():
             logger.warning("Resposta vazia em %s", path)
             return None
-
         try:
             return resp.json()
         except Exception:
@@ -97,37 +95,30 @@ class MovideskClient:
         }
         logger.info("Tentando buscar ticket %s em /tickets (id=...)", ticket_id)
         data = self._request("/tickets", params)
-
         if isinstance(data, list):
             data = data[0] if data else None
-
         if isinstance(data, dict) and data.get("id"):
             return data
-
         logger.info(
             "Ticket %s não encontrado em /tickets; tentando /tickets/past",
             ticket_id,
         )
-
         params_past = {
             "$filter": f"id eq {ticket_id}",
         }
         data_past = self._request("/tickets/past", params_past)
-
         if isinstance(data_past, list):
             data_past = data_past[0] if data_past else None
-
         if isinstance(data_past, dict) and data_past.get("id"):
             return data_past
-
         return None
 
 
-def fetch_pending_for_raw(conn, limit: int) -> List[Tuple[int, str, Optional[str]]]:
+def fetch_pending_for_raw(conn, limit: int) -> List[Tuple[int, Any, Optional[Any]]]:
     sql = """
         SELECT ticket_id,
-               updated_at::text,
-               raw_last_update::text
+               updated_at,
+               raw_last_update
         FROM visualizacao_atual.tickets_abertos
         WHERE raw IS NULL
            OR raw_last_update IS NULL
@@ -138,16 +129,16 @@ def fetch_pending_for_raw(conn, limit: int) -> List[Tuple[int, str, Optional[str
     with conn.cursor() as cur:
         cur.execute(sql, (limit,))
         rows = cur.fetchall()
-    result: List[Tuple[int, str, Optional[str]]] = []
+    result: List[Tuple[int, Any, Optional[Any]]] = []
     for r in rows:
         ticket_id = int(r[0])
-        updated_at = str(r[1])
-        raw_last = str(r[2]) if r[2] is not None else None
+        updated_at = r[1]
+        raw_last = r[2]
         result.append((ticket_id, updated_at, raw_last))
     return result
 
 
-def update_raw(conn, ticket_id: int, ticket_json: Dict[str, Any], updated_at: str) -> None:
+def update_raw(conn, ticket_id: int, ticket_json: Dict[str, Any], updated_at: Any) -> None:
     sql = """
         UPDATE visualizacao_atual.tickets_abertos
         SET raw             = %s,
@@ -160,14 +151,11 @@ def update_raw(conn, ticket_id: int, ticket_json: Dict[str, Any], updated_at: st
 
 def sync_open_raw(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
     pending = fetch_pending_for_raw(conn, limit)
-
     if not pending:
         logger.info("Nenhum ticket aberto pendente de atualização de raw.")
         return 0, 0
-
     ok = 0
     fail = 0
-
     for idx, (ticket_id, updated_at, raw_last) in enumerate(pending, start=1):
         logger.info(
             "Processando raw de ticket aberto %s/%s (ID=%s, updated_at=%s, raw_last_update=%s)",
@@ -177,7 +165,6 @@ def sync_open_raw(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
             updated_at,
             raw_last,
         )
-
         try:
             ticket = client.get_ticket(ticket_id)
         except Exception as exc:
@@ -189,7 +176,6 @@ def sync_open_raw(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
             conn.rollback()
             fail += 1
             continue
-
         if ticket is None:
             logger.warning(
                 "Ticket %s não encontrado em nenhum endpoint. Mantendo pendente.",
@@ -197,7 +183,6 @@ def sync_open_raw(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
             )
             fail += 1
             continue
-
         try:
             update_raw(conn, ticket_id, ticket, updated_at)
             conn.commit()
@@ -214,7 +199,6 @@ def sync_open_raw(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
             )
             conn.rollback()
             fail += 1
-
     return ok, fail
 
 
@@ -223,27 +207,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         raw_limit = int(get_env("DETAIL_OPEN_RAW_LIMIT", "20"))
     except ValueError:
         raw_limit = 20
-
     token = get_env("MOVIDESK_TOKEN", required=True)
-
     logger.info(
         "Iniciando sync de raw de tickets abertos (limit=%s).",
         raw_limit,
     )
-
     conn = get_db_connection()
     ensure_open_table(conn)
-
     client = MovideskClient(token=token)
-
     ok, fail = sync_open_raw(conn, client, raw_limit)
-
     logger.info(
         "Sync raw concluído. Sucesso=%s, Falhas=%s.",
         ok,
         fail,
     )
-
     conn.close()
 
 
