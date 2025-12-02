@@ -3,13 +3,13 @@
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import psycopg2
 from psycopg2.extras import Json
 import requests
 
-LOG_NAME = "abertos_detail"
+LOG_NAME = "abertos_index"
 BASE_URL = "https://api.movidesk.com/public/v1"
 
 logging.basicConfig(
@@ -34,26 +34,49 @@ def get_db_connection():
     return conn
 
 
-def ensure_detail_table_exists(conn) -> None:
+def ensure_open_table(conn) -> None:
     sql = """
     CREATE SCHEMA IF NOT EXISTS visualizacao_atual;
 
     CREATE TABLE IF NOT EXISTS visualizacao_atual.tickets_abertos (
-        ticket_id   BIGINT PRIMARY KEY,
-        raw         JSONB NOT NULL,
-        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        ticket_id       BIGINT PRIMARY KEY,
+        updated_at      TIMESTAMPTZ NOT NULL,
+        raw             JSONB,
+        raw_last_update TIMESTAMPTZ
     );
+
+    ALTER TABLE visualizacao_atual.tickets_abertos
+        ADD COLUMN IF NOT EXISTS raw_last_update TIMESTAMPTZ;
     """
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
 
 
-def truncate_open_table(conn) -> None:
-    sql = "TRUNCATE TABLE visualizacao_atual.tickets_abertos;"
+def fetch_existing_open_ids(conn) -> Set[int]:
+    sql = "SELECT ticket_id FROM visualizacao_atual.tickets_abertos;"
     with conn.cursor() as cur:
         cur.execute(sql)
+        rows = cur.fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def delete_closed_from_open(conn, still_open_ids: Set[int]) -> int:
+    existing_ids = fetch_existing_open_ids(conn)
+    to_delete = existing_ids - still_open_ids
+    if not to_delete:
+        logger.info("Nenhum ticket a remover de tickets_abertos.")
+        return 0
+
+    logger.info("Removendo %s tickets que não estão mais abertos.", len(to_delete))
+    sql = """
+        DELETE FROM visualizacao_atual.tickets_abertos
+        WHERE ticket_id = ANY(%s);
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (list(to_delete),))
     conn.commit()
+    return len(to_delete)
 
 
 class MovideskClient:
@@ -94,24 +117,7 @@ class MovideskClient:
             return None
 
     def list_open_tickets_page(self, skip: int, top: int) -> List[Dict[str, Any]]:
-        full_select = (
-            "id,protocol,type,subject,category,urgency,status,baseStatus,"
-            "justification,origin,createdDate,isDeleted,originEmailAccount,"
-            "owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
-            "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,"
-            "resolvedIn,closedIn,canceledIn,actionCount,lifeTimeWorkingTime,"
-            "stoppedTime,stoppedTimeWorkingTime,resolvedInFirstCall,"
-            "chatWidget,chatGroup,chatTalkTime,chatWaitingTime,sequence,"
-            "slaAgreement,slaAgreementRule,slaSolutionTime,slaResponseTime,"
-            "slaSolutionChangedByUser,slaSolutionChangedBy,slaSolutionDate,"
-            "slaSolutionDateIsPaused,jiraIssueKey,redmineIssueId,"
-            "movideskTicketNumber,linkedToIntegratedTicketNumber,"
-            "reopenedIn,lastActionDate,lastUpdate,slaResponseDate,"
-            "slaRealResponseDate,clients,actions,parentTickets,"
-            "childrenTickets,ownerHistories,statusHistories,"
-            "satisfactionSurveyResponses,customFieldValues,assets,"
-            "webhookEvents"
-        )
+        full_select = "id,lastUpdate,baseStatus"
 
         base_status_filter = (
             "(baseStatus ne 'Resolved' and "
@@ -145,70 +151,74 @@ class MovideskClient:
         return result
 
 
-def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any]) -> None:
+def upsert_open_index(conn, ticket_id: int, last_update: str) -> None:
     sql = """
         INSERT INTO visualizacao_atual.tickets_abertos (
             ticket_id,
-            raw,
             updated_at
         )
-        VALUES (%s, %s, now())
+        VALUES (%s, %s)
         ON CONFLICT (ticket_id) DO UPDATE
-        SET raw        = EXCLUDED.raw,
-            updated_at = EXCLUDED.updated_at;
+        SET updated_at = EXCLUDED.updated_at;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (ticket_id, Json(ticket_json)))
+        cur.execute(sql, (ticket_id, last_update))
 
 
-def sync_open_tickets(conn, client: MovideskClient, page_size: int) -> Tuple[int, int]:
-    truncate_open_table(conn)
-
+def sync_open_index(conn, client: MovideskClient, page_size: int) -> Tuple[int, int, int]:
     ok = 0
     fail = 0
     skip = 0
+    still_open_ids: Set[int] = set()
 
     while True:
         tickets = client.list_open_tickets_page(skip, page_size)
         if not tickets:
             break
 
-        for idx, ticket in enumerate(tickets, start=1):
-            try:
-                ticket_id = int(ticket["id"])
-            except Exception:
-                logger.warning(
-                    "Ticket sem id numérico na página skip=%s posição=%s: ignorando.",
-                    skip,
-                    idx,
-                )
-                fail += 1
-                continue
+        try:
+            for idx, ticket in enumerate(tickets, start=1):
+                try:
+                    ticket_id = int(ticket["id"])
+                    last_update = ticket.get("lastUpdate")
+                    if not last_update:
+                        logger.warning(
+                            "Ticket ID=%s sem lastUpdate na página skip=%s posição=%s: ignorando.",
+                            ticket_id,
+                            skip,
+                            idx,
+                        )
+                        fail += 1
+                        continue
+                except Exception:
+                    logger.warning(
+                        "Ticket inválido na página skip=%s posição=%s: ignorando.",
+                        skip,
+                        idx,
+                    )
+                    fail += 1
+                    continue
 
-            logger.info(
-                "Processando ticket aberto (ID=%s) na página skip=%s",
-                ticket_id,
-                skip,
-            )
-
-            try:
-                upsert_ticket_detail_json(conn, ticket_id, ticket)
-                conn.commit()
+                upsert_open_index(conn, ticket_id, last_update)
+                still_open_ids.add(ticket_id)
                 ok += 1
-            except Exception as exc:
-                logger.exception(
-                    "Erro ao gravar ticket aberto ticket_id=%s no Neon: %s",
-                    ticket_id,
-                    exc,
-                )
-                conn.rollback()
-                fail += 1
+
+            conn.commit()
+        except Exception as exc:
+            logger.exception(
+                "Erro ao gravar página de tickets abertos (skip=%s) no Neon: %s",
+                skip,
+                exc,
+            )
+            conn.rollback()
+            fail += len(tickets)
 
         skip += len(tickets)
         if len(tickets) < page_size:
             break
 
-    return ok, fail
+    removed = delete_closed_from_open(conn, still_open_ids)
+    return ok, fail, removed
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -220,21 +230,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     token = get_env("MOVIDESK_TOKEN", required=True)
 
     logger.info(
-        "Iniciando sincronização de tickets abertos (page_size=%s).",
+        "Iniciando sync de índice de tickets abertos (page_size=%s).",
         page_size,
     )
 
     conn = get_db_connection()
-    ensure_detail_table_exists(conn)
+    ensure_open_table(conn)
 
     client = MovideskClient(token=token)
 
-    ok, fail = sync_open_tickets(conn, client, page_size)
+    ok, fail, removed = sync_open_index(conn, client, page_size)
 
     logger.info(
-        "Processamento concluído. Sucesso=%s, Falhas=%s.",
+        "Sync índice concluído. Sucesso=%s, Falhas=%s, Removidos(fecharam)=%s.",
         ok,
         fail,
+        removed,
     )
 
     conn.close()
