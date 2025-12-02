@@ -1,0 +1,36 @@
+name: Movidesk - Tickets abertos (detail)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"   # a cada 5 minutos (UTC)
+
+concurrency:
+  group: movidesk-abertos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tickets-abertos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - run: date -u && echo "Branch=$GITHUB_REF"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests psycopg2-binary
+
+      - name: Sync open tickets detail
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          DETAIL_OPEN_PAGE_SIZE: "100"
+        run: python sync_tickets_abertos.py
