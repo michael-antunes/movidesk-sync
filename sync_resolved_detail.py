@@ -1,24 +1,4 @@
 #!/usr/bin/env python
-"""
-Sincroniza detalhes de tickets resolvidos/fechados/cancelados.
-
-Fluxo:
-
-1. Busca em /tickets até DETAIL_BULK_LIMIT tickets após o último ticket_id
-   gravado em visualizacao_resolvidos.tickets_resolvidos_detail.
-
-2. Em seguida lê até DETAIL_MISSING_LIMIT itens da fila
-   visualizacao_resolvidos.audit_recent_missing (table_name = 'tickets_resolvidos').
-
-3. A exclusão da fila audit_recent_missing é feita por TRIGGER no banco
-   ao inserir/atualizar em tickets_resolvidos_detail.
-
-Configuração por variáveis de ambiente:
-- NEON_DSN            : string de conexão para o PostgreSQL (Neon)
-- MOVIDESK_TOKEN      : token da API do Movidesk
-- DETAIL_BULK_LIMIT   : quantidade de tickets novos por execução (default = 200)
-- DETAIL_MISSING_LIMIT: quantidade de tickets da fila missing por execução (default = 10)
-"""
 
 import logging
 import os
@@ -192,27 +172,76 @@ class MovideskClient:
         return None
 
     def list_tickets_after(self, last_id: int, limit: int) -> List[Dict[str, Any]]:
-        params = {
-            "$filter": f"id gt {last_id}",
-            "$orderby": "id",
-            "$top": str(limit),
-            "includeDeletedItems": "true",
-        }
-        logger.info(
-            "Listando até %s tickets em /tickets com id > %s",
-            limit,
-            last_id,
+        results: List[Dict[str, Any]] = []
+        remaining = max(limit, 0)
+        current_last_id = last_id
+
+        full_select = (
+            "id,protocol,type,subject,category,urgency,status,baseStatus,"
+            "justification,origin,createdDate,isDeleted,originEmailAccount,"
+            "owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
+            "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,"
+            "resolvedIn,closedIn,canceledIn,actionCount,lifeTimeWorkingTime,"
+            "stoppedTime,stoppedTimeWorkingTime,resolvedInFirstCall,"
+            "chatWidget,chatGroup,chatTalkTime,chatWaitingTime,sequence,"
+            "slaAgreement,slaAgreementRule,slaSolutionTime,slaResponseTime,"
+            "slaSolutionChangedByUser,slaSolutionChangedBy,slaSolutionDate,"
+            "slaSolutionDateIsPaused,jiraIssueKey,redmineIssueId,"
+            "movideskTicketNumber,linkedToIntegratedTicketNumber,"
+            "reopenedIn,lastActionDate,lastUpdate,slaResponseDate,"
+            "slaRealResponseDate,clients,actions,parentTickets,"
+            "childrenTickets,ownerHistories,statusHistories,"
+            "satisfactionSurveyResponses,customFieldValues,assets,"
+            "webhookEvents"
         )
-        data = self._request("/tickets", params)
 
-        if not isinstance(data, list):
-            return []
+        while remaining > 0:
+            per_page = min(remaining, 100)
+            params = {
+                "$filter": f"id gt {current_last_id}",
+                "$orderby": "id",
+                "$top": str(per_page),
+                "$select": full_select,
+                "includeDeletedItems": "true",
+            }
 
-        result: List[Dict[str, Any]] = []
-        for item in data:
-            if isinstance(item, dict) and item.get("id"):
-                result.append(item)
-        return result
+            logger.info(
+                "Listando até %s tickets em /tickets com id > %s",
+                per_page,
+                current_last_id,
+            )
+            data = self._request("/tickets", params)
+
+            if not isinstance(data, list) or not data:
+                break
+
+            page_items: List[Dict[str, Any]] = []
+            max_id_in_page = current_last_id
+
+            for item in data:
+                if not isinstance(item, dict) or "id" not in item:
+                    continue
+                try:
+                    tid = int(item["id"])
+                except Exception:
+                    continue
+                if tid <= current_last_id:
+                    continue
+                page_items.append(item)
+                if tid > max_id_in_page:
+                    max_id_in_page = tid
+
+            if not page_items:
+                break
+
+            results.extend(page_items)
+            remaining -= len(page_items)
+            current_last_id = max_id_in_page
+
+            if len(page_items) < per_page:
+                break
+
+        return results
 
 
 def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any]) -> None:
