@@ -2,12 +2,10 @@ name: Movidesk - Tickets resolvidos (detail)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"   # UTC
 
 concurrency:
   group: movidesk-detail-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -32,7 +30,7 @@ jobs:
           DETAIL_MISSING_LIMIT: "10"
         run: python sync_resolved_detail.py
 
-  dispatch-acoes:
+  rerun:
     needs: detail
     if: ${{ needs.detail.result == 'success' }}
     runs-on: ubuntu-latest
@@ -43,6 +41,6 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'sync_resolvidos_acoes.yml',
+              workflow_id: 'sync_resolved_detail.yml',
               ref: 'main'
             })
