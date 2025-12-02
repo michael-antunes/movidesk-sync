@@ -4,40 +4,30 @@ Sincroniza detalhes de tickets resolvidos/fechados/cancelados.
 
 Fluxo:
 
-1. Lê da fila visualizacao_resolvidos.audit_recent_missing
-   (apenas registros com table_name = 'tickets_resolvidos').
+1. Busca em /tickets até DETAIL_BULK_LIMIT tickets após o último ticket_id
+   gravado em visualizacao_resolvidos.tickets_resolvidos_detail.
 
-2. Para cada ticket_id:
-   - Tenta buscar em /tickets?id={ticket_id}&includeDeletedItems=true
-     (JSON completo do ticket).
-   - Se algum dia /tickets não retornar (404/vazio), tenta /tickets/past
-     com um filtro simples por id.
+2. Em seguida lê até DETAIL_MISSING_LIMIT itens da fila
+   visualizacao_resolvidos.audit_recent_missing (table_name = 'tickets_resolvidos').
 
-3. Salva o JSON completo em visualizacao_resolvidos.tickets_resolvidos_detail
-   (colunas: ticket_id, raw, updated_at).
-
-4. Em caso de sucesso, remove o ticket_id da audit_recent_missing.
-   Em caso de erro, mantém na fila para tentar de novo no próximo ciclo.
+3. A exclusão da fila audit_recent_missing é feita por TRIGGER no banco
+   ao inserir/atualizar em tickets_resolvidos_detail.
 
 Configuração por variáveis de ambiente:
-- NEON_DSN         : string de conexão para o PostgreSQL (Neon)
-- MOVIDESK_TOKEN   : token da API do Movidesk
-- PAGES_UPSERT     : limite de tickets por execução (default = 7)
+- NEON_DSN            : string de conexão para o PostgreSQL (Neon)
+- MOVIDESK_TOKEN      : token da API do Movidesk
+- DETAIL_BULK_LIMIT   : quantidade de tickets novos por execução (default = 200)
+- DETAIL_MISSING_LIMIT: quantidade de tickets da fila missing por execução (default = 10)
 """
 
-import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import Json
 import requests
-
-# ---------------------------------------------------------------------------
-# Configuração básica
-# ---------------------------------------------------------------------------
 
 LOG_NAME = "detail"
 BASE_URL = "https://api.movidesk.com/public/v1"
@@ -48,10 +38,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(LOG_NAME)
 
-
-# ---------------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------------
 
 def get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
     value = os.getenv(name, default)
@@ -69,12 +55,6 @@ def get_db_connection():
 
 
 def ensure_detail_table_exists(conn) -> None:
-    """
-    Garante a existência da tabela que armazena o JSON completo dos tickets.
-
-    Obs.: se você já tiver criado uma tabela diferente, pode adaptar este
-    trecho (nome da tabela/colunas) conforme sua estrutura.
-    """
     sql = """
     CREATE SCHEMA IF NOT EXISTS visualizacao_resolvidos;
 
@@ -89,15 +69,20 @@ def ensure_detail_table_exists(conn) -> None:
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# Leitura da fila audit_recent_missing
-# ---------------------------------------------------------------------------
+def get_last_ticket_id(conn) -> int:
+    sql = """
+        SELECT COALESCE(MAX(ticket_id), 0)
+        FROM visualizacao_resolvidos.tickets_resolvidos_detail;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return 0
+    return int(row[0])
+
 
 def fetch_pending_from_audit(conn, limit: int) -> List[int]:
-    """
-    Busca ticket_ids pendentes na fila audit_recent_missing
-    para a tabela 'tickets_resolvidos'.
-    """
     sql = """
         SELECT arm.ticket_id
         FROM visualizacao_resolvidos.audit_recent_missing AS arm
@@ -108,23 +93,8 @@ def fetch_pending_from_audit(conn, limit: int) -> List[int]:
     with conn.cursor() as cur:
         cur.execute(sql, (limit,))
         rows = cur.fetchall()
-
     return [int(r[0]) for r in rows]
 
-
-def remove_from_audit(conn, ticket_id: int) -> None:
-    sql = """
-        DELETE FROM visualizacao_resolvidos.audit_recent_missing
-        WHERE table_name = 'tickets_resolvidos'
-          AND ticket_id   = %s;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ticket_id,))
-
-
-# ---------------------------------------------------------------------------
-# Cliente Movidesk
-# ---------------------------------------------------------------------------
 
 class MovideskClient:
     def __init__(self, token: str, timeout: int = 30) -> None:
@@ -139,14 +109,10 @@ class MovideskClient:
         resp = requests.get(url, params=params, timeout=self.timeout)
         logger.info("GET %s -> %s", resp.url, resp.status_code)
 
-        # 404 = não encontrado; tratamos como None
         if resp.status_code == 404:
-            logger.warning(
-                "Endpoint %s retornou 404 (não encontrado).", path
-            )
+            logger.warning("Endpoint %s retornou 404 (não encontrado).", path)
             return None
 
-        # Outros erros HTTP
         if resp.status_code >= 400:
             body_short = resp.text.replace("\n", " ")[:500]
             logger.error(
@@ -155,7 +121,6 @@ class MovideskClient:
                 resp.status_code,
                 body_short,
             )
-            # Deixa o chamador decidir o que fazer
             return None
 
         if not resp.text.strip():
@@ -169,42 +134,30 @@ class MovideskClient:
             return None
 
     def get_ticket(self, ticket_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Tenta obter o ticket primeiro em /tickets?id=...
-        Se algum dia não vier, tenta /tickets/past com filtro por id.
-        Retorna o JSON do ticket (dict) ou None.
-        """
-        # 1) /tickets?id=...
         params = {
             "id": str(ticket_id),
             "includeDeletedItems": "true",
         }
-        logger.info(
-            "Tentando buscar ticket %s em /tickets (id=...)", ticket_id
-        )
+        logger.info("Tentando buscar ticket %s em /tickets (id=...)", ticket_id)
         data = self._request("/tickets", params)
 
         if isinstance(data, list):
-            # Por garantia, se a API devolver lista, pega o primeiro
             data = data[0] if data else None
 
         if isinstance(data, dict) and data.get("id"):
-            return data  # sucesso
+            return data
 
-        # 2) Fallback: /tickets/past com filtro por id
         logger.info(
             "Ticket %s não encontrado em /tickets; tentando /tickets/past",
             ticket_id,
         )
 
-        # Primeiro, tentamos SEM $select (pra ver se a API aceita e devolve tudo)
         params_past = {
             "$filter": f"id eq {ticket_id}",
         }
         data_past = self._request("/tickets/past", params_past)
 
         if data_past is None:
-            # Se der erro ou nada, tenta de novo com $select explícito
             full_select = (
                 "id,protocol,type,subject,category,urgency,status,baseStatus,"
                 "justification,origin,createdDate,isDeleted,originEmailAccount,"
@@ -236,18 +189,33 @@ class MovideskClient:
         if isinstance(data_past, dict) and data_past.get("id"):
             return data_past
 
-        # Não encontrou em nenhum endpoint
         return None
 
+    def list_tickets_after(self, last_id: int, limit: int) -> List[Dict[str, Any]]:
+        params = {
+            "$filter": f"id gt {last_id}",
+            "$orderby": "id",
+            "$top": str(limit),
+            "includeDeletedItems": "true",
+        }
+        logger.info(
+            "Listando até %s tickets em /tickets com id > %s",
+            limit,
+            last_id,
+        )
+        data = self._request("/tickets", params)
 
-# ---------------------------------------------------------------------------
-# Upsert de detalhes no Neon
-# ---------------------------------------------------------------------------
+        if not isinstance(data, list):
+            return []
+
+        result: List[Dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, dict) and item.get("id"):
+                result.append(item)
+        return result
+
 
 def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any]) -> None:
-    """
-    Salva (ou atualiza) o JSON completo do ticket na tabela de detalhes.
-    """
     sql = """
         INSERT INTO visualizacao_resolvidos.tickets_resolvidos_detail (
             ticket_id,
@@ -263,50 +231,78 @@ def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any])
         cur.execute(sql, (ticket_id, Json(ticket_json)))
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main(argv: Optional[List[str]] = None) -> None:
-    # Limite de tickets por execução
-    try:
-        limit = int(get_env("PAGES_UPSERT", "7"))
-    except ValueError:
-        limit = 7
-
-    token = get_env("MOVIDESK_TOKEN", required=True)
-
+def sync_new_tickets(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
+    last_id = get_last_ticket_id(conn)
     logger.info(
-        "Iniciando sincronização de detalhes de tickets (limite=%s).", limit
+        "Último ticket_id em tickets_resolvidos_detail: %s",
+        last_id,
     )
 
-    conn = get_db_connection()
-    ensure_detail_table_exists(conn)
+    tickets = client.list_tickets_after(last_id, limit)
 
+    if not tickets:
+        logger.info("Nenhum ticket novo encontrado após id=%s.", last_id)
+        return 0, 0
+
+    ok = 0
+    fail = 0
+
+    for idx, ticket in enumerate(tickets, start=1):
+        try:
+            ticket_id = int(ticket["id"])
+        except Exception:
+            logger.warning("Ticket sem id numérico na posição %s: ignorando.", idx)
+            fail += 1
+            continue
+
+        logger.info(
+            "Processando ticket novo %s/%s (ID=%s)",
+            idx,
+            len(tickets),
+            ticket_id,
+        )
+
+        try:
+            upsert_ticket_detail_json(conn, ticket_id, ticket)
+            conn.commit()
+            ok += 1
+            logger.info(
+                "Ticket novo %s gravado em tickets_resolvidos_detail.",
+                ticket_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Erro ao gravar ticket novo ticket_id=%s no Neon: %s",
+                ticket_id,
+                exc,
+            )
+            conn.rollback()
+            fail += 1
+
+    return ok, fail
+
+
+def sync_missing_tickets(conn, client: MovideskClient, limit: int) -> Tuple[int, int]:
     pending_ids = fetch_pending_from_audit(conn, limit)
 
     if not pending_ids:
         logger.info("Nenhum ticket pendente na audit_recent_missing.")
-        conn.close()
-        return
+        return 0, 0
 
     logger.info(
-        "%s tickets pendentes para atualização de detalhes (limite=%s).",
+        "%s tickets pendentes na fila audit_recent_missing (limite=%s).",
         len(pending_ids),
         limit,
     )
-    if pending_ids:
-        sample = ", ".join(str(i) for i in pending_ids[:5])
-        logger.info("Primeiros pendentes (até 5): %s", sample)
-
-    client = MovideskClient(token=token)
+    sample = ", ".join(str(i) for i in pending_ids[:5])
+    logger.info("Primeiros pendentes (até 5): %s", sample)
 
     ok = 0
     fail = 0
 
     for idx, ticket_id in enumerate(pending_ids, start=1):
         logger.info(
-            "Processando ticket %s/%s (ID=%s)",
+            "Processando ticket pendente %s/%s (ID=%s)",
             idx,
             len(pending_ids),
             ticket_id,
@@ -314,7 +310,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         try:
             ticket = client.get_ticket(ticket_id)
-        except Exception as exc:  # erro inesperado de rede etc.
+        except Exception as exc:
             logger.exception(
                 "Erro inesperado ao buscar ticket_id=%s: %s",
                 ticket_id,
@@ -326,37 +322,70 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         if ticket is None:
             logger.warning(
-                "Ticket %s não encontrado em nenhum endpoint. "
-                "Mantendo na fila para nova tentativa.",
+                "Ticket %s não encontrado em nenhum endpoint. Mantendo na fila.",
                 ticket_id,
             )
             fail += 1
-            # não remove da audit_recent_missing
             continue
 
-        # Temos o JSON completo do ticket: salva e remove da fila
         try:
             upsert_ticket_detail_json(conn, ticket_id, ticket)
-            remove_from_audit(conn, ticket_id)
             conn.commit()
             ok += 1
             logger.info(
-                "Ticket %s processado com sucesso (JSON salvo e removido da fila).",
+                "Ticket pendente %s gravado em tickets_resolvidos_detail.",
                 ticket_id,
             )
         except Exception as exc:
             logger.exception(
-                "Erro ao gravar detalhes do ticket_id=%s no Neon: %s",
+                "Erro ao gravar ticket pendente ticket_id=%s no Neon: %s",
                 ticket_id,
                 exc,
             )
             conn.rollback()
             fail += 1
 
+    return ok, fail
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    try:
+        bulk_limit = int(get_env("DETAIL_BULK_LIMIT", "200"))
+    except ValueError:
+        bulk_limit = 200
+
+    try:
+        missing_limit = int(get_env("DETAIL_MISSING_LIMIT", "10"))
+    except ValueError:
+        missing_limit = 10
+
+    token = get_env("MOVIDESK_TOKEN", required=True)
+
     logger.info(
-        "Processamento concluído. Sucesso=%s, Falhas=%s.",
-        ok,
-        fail,
+        "Iniciando sincronização de detalhes de tickets (bulk=%s, missing=%s).",
+        bulk_limit,
+        missing_limit,
+    )
+
+    conn = get_db_connection()
+    ensure_detail_table_exists(conn)
+
+    client = MovideskClient(token=token)
+
+    ok_new, fail_new = sync_new_tickets(conn, client, bulk_limit)
+    ok_missing, fail_missing = sync_missing_tickets(conn, client, missing_limit)
+
+    ok_total = ok_new + ok_missing
+    fail_total = fail_new + fail_missing
+
+    logger.info(
+        "Processamento concluído. Sucesso=%s (novos=%s, missing=%s), Falhas=%s (novos=%s, missing=%s).",
+        ok_total,
+        ok_new,
+        ok_missing,
+        fail_total,
+        fail_new,
+        fail_missing,
     )
 
     conn.close()
