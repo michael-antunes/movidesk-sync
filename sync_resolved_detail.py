@@ -195,10 +195,16 @@ class MovideskClient:
             "webhookEvents"
         )
 
+        base_status_filter = (
+            "(baseStatus eq 'Resolved' or "
+            "baseStatus eq 'Closed' or "
+            "baseStatus eq 'Canceled')"
+        )
+
         while remaining > 0:
             per_page = min(remaining, 100)
             params = {
-                "$filter": f"id gt {current_last_id}",
+                "$filter": f"id gt {current_last_id} and {base_status_filter}",
                 "$orderby": "id",
                 "$top": str(per_page),
                 "$select": full_select,
@@ -206,7 +212,7 @@ class MovideskClient:
             }
 
             logger.info(
-                "Listando até %s tickets em /tickets com id > %s",
+                "Listando até %s tickets em /tickets com id > %s (apenas Resolved/Closed/Canceled)",
                 per_page,
                 current_last_id,
             )
@@ -270,7 +276,7 @@ def sync_new_tickets(conn, client: MovideskClient, limit: int) -> Tuple[int, int
     tickets = client.list_tickets_after(last_id, limit)
 
     if not tickets:
-        logger.info("Nenhum ticket novo encontrado após id=%s.", last_id)
+        logger.info("Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id=%s.", last_id)
         return 0, 0
 
     ok = 0
