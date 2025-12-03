@@ -1,26 +1,17 @@
 import os
 import time
-import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import psycopg2
-from psycopg2.extras import Json
-
-# -------------------------
-# Configuração básica
-# -------------------------
+from psycopg2.extras import execute_values
 
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
-# Quantos tickets de cada vez
-BATCH_SIZE = int(os.getenv("DETAIL_OPEN_RAW_LIMIT", "20"))
-# Timeout de cada chamada ao Movidesk
-HTTP_TIMEOUT = int(os.getenv("MOVIDESK_TIMEOUT", "30"))
-# Pausa entre chamadas pra não agredir a API
+PAGE_SIZE = int(os.getenv("ABERTOS_PAGE_SIZE", "100"))
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
 
 if not TOKEN or not DSN:
@@ -28,249 +19,232 @@ if not TOKEN or not DSN:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] abertos_raw: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("abertos_raw")
+logger = logging.getLogger("abertos_index")
 
 
-# -------------------------
-# Cliente Movidesk
-# -------------------------
+def md_get(path_or_full, params=None):
+    """Chamada básica para a API Movidesk, com retry para 429/5xx."""
+    url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full.lstrip('/')}"
+    p = dict(params or {})
+    p["token"] = TOKEN
 
-class MovideskClient:
-    def __init__(self, token: str, timeout: int = 30):
-        self.token = token
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "movidesk-sync/tickets_abertos_raw"})
+    resp = requests.get(url, params=p, timeout=60)
+    if resp.status_code in (429, 500, 502, 503, 504):
+        logger.warning("Retry em %s por status %s", url, resp.status_code)
+        time.sleep(1.5)
+        resp = requests.get(url, params=p, timeout=60)
 
-    def _request(self, path: str, params: dict | None = None):
-        url = f"{API_BASE}{path}"
-        p = dict(params or {})
-        p["token"] = self.token
-
-        resp = requests.get(url, params=p, timeout=self.timeout)
-
-        # pequenos retries pra 429/5xx se quiser, mas por enquanto 1 tentativa
-        if resp.status_code == 200:
-            data = resp.json()
-            return data
-
-        # Se for algo crítico, deixa levantar HTTPError
-        resp.raise_for_status()
-
-    def get_ticket(self, ticket_id: int) -> dict | None:
-        """
-        Busca um ticket específico pelo ID em /tickets?id=...
-        """
-        params = {
-            "id": ticket_id,
-            "includeDeletedItems": "true",
-        }
-        data = self._request("/tickets", params)
-
-        # Movidesk às vezes devolve lista, às vezes objeto
-        if isinstance(data, list):
-            return data[0] if data else None
-        return data
+    resp.raise_for_status()
+    data = resp.json()
+    return data or []
 
 
-# -------------------------
-# Funções de banco
-# -------------------------
-
-def ensure_error_columns(conn):
-    """
-    Garante que a tabela visualizacao_atual.tickets_abertos
-    tenha colunas para registrar erro de raw.
-    """
+def ensure_table(conn):
+    """Garante estrutura de visualizacao_atual.tickets_abertos e remove colunas antigas de erro."""
     with conn.cursor() as cur:
+        cur.execute("create schema if not exists visualizacao_atual")
+
         cur.execute(
             """
-            alter table visualizacao_atual.tickets_abertos
-            add column if not exists raw_error_at timestamptz
-            """
-        )
-        cur.execute(
-            """
-            alter table visualizacao_atual.tickets_abertos
-            add column if not exists raw_error_msg text
-            """
-        )
-    conn.commit()
-
-
-def get_pending_open_tickets_for_raw(conn, limit: int):
-    """
-    Seleciona tickets abertos que precisam ter o RAW atualizado.
-
-    Critérios:
-      - raw é NULL OU updated_at > raw_last_update
-      - não estão na tabela de tickets mesclados
-      - NÃO possuem raw_error_at (ou seja, ainda não falharam)
-    """
-    sql = """
-    select
-        t.ticket_id,
-        t.updated_at,
-        t.raw_last_update
-    from visualizacao_atual.tickets_abertos t
-    left join visualizacao_resolvidos.tickets_mesclados m
-           on m.ticket_id = t.ticket_id
-    where
-        -- precisa de raw ou foi atualizado depois do último raw
-        (
-            t.raw is null
-            or t.updated_at > coalesce(t.raw_last_update, timestamp '1970-01-01')
-        )
-        -- não é ticket mesclado
-        and m.ticket_id is null
-        -- não está marcado com erro de raw
-        and (t.raw_error_at is null)
-    order by
-        t.raw_last_update nulls first,
-        t.updated_at,
-        t.ticket_id
-    limit %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    return rows
-
-
-def update_ticket_raw(conn, ticket_id: int, ticket_payload: dict):
-    """
-    Atualiza o raw e a data do último update de raw para o ticket.
-    Também zera qualquer flag de erro anterior.
-    """
-    sql = """
-    update visualizacao_atual.tickets_abertos
-       set raw            = %s,
-           raw_last_update = now(),
-           raw_error_at    = null,
-           raw_error_msg   = null
-     where ticket_id = %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (Json(ticket_payload), ticket_id))
-    conn.commit()
-
-
-def mark_raw_error(conn, ticket_id: int, err_msg: str):
-    """
-    Marca que houve erro ao tentar buscar/atualizar o RAW desse ticket.
-
-    Assim ele sai da fila de pendentes de raw e o job não fica
-    tentando infinitamente o mesmo ticket.
-    """
-    sql = """
-    update visualizacao_atual.tickets_abertos
-       set raw_error_at  = now(),
-           raw_error_msg = %s
-     where ticket_id = %s
-    """
-    msg = (err_msg or "")[:800]
-    with conn.cursor() as cur:
-        cur.execute(sql, (msg, ticket_id))
-    conn.commit()
-
-
-# -------------------------
-# Loop principal
-# -------------------------
-
-def sync_open_raw():
-    log.info("Iniciando sync de raw de tickets abertos (batch_size=%s).", BATCH_SIZE)
-
-    client = MovideskClient(TOKEN, timeout=HTTP_TIMEOUT)
-    total_ok = 0
-    total_fail = 0
-
-    with psycopg2.connect(DSN) as conn:
-        ensure_error_columns(conn)
-
-        while True:
-            pending = get_pending_open_tickets_for_raw(conn, BATCH_SIZE)
-            if not pending:
-                log.info("Nenhum ticket aberto pendente de raw nesta rodada.")
-                break
-
-            log.info(
-                "Encontrados %d tickets pendentes de raw nesta rodada.",
-                len(pending),
+            create table if not exists visualizacao_atual.tickets_abertos(
+              ticket_id       bigint primary key,
+              last_update     timestamptz,
+              base_status     text,
+              updated_at      timestamptz default now(),
+              raw             jsonb,
+              raw_last_update timestamptz
             )
+            """
+        )
 
-            for idx, (ticket_id, updated_at, raw_last_update) in enumerate(
-                pending, start=1
-            ):
-                log.info(
-                    "Processando raw de ticket aberto %d/%d "
-                    "(ID=%s, updated_at=%s, raw_last_update=%s)",
-                    idx,
-                    len(pending),
-                    ticket_id,
-                    updated_at,
-                    raw_last_update,
-                )
+        # Garantir colunas (idempotente)
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists last_update timestamptz"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists base_status text"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists updated_at timestamptz default now()"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists raw jsonb"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists raw_last_update timestamptz"
+        )
 
-                try:
-                    log.info(
-                        "Tentando buscar ticket %s em /tickets (id=...)",
-                        ticket_id,
-                    )
-                    ticket = client.get_ticket(ticket_id)
+        # Remover colunas de erro que você não quer mais
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "drop column if exists raw_error_at"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "drop column if exists raw_error_msg"
+        )
 
-                    if not ticket:
-                        # Não faz sentido ficar tentando infinito num ticket que vem vazio
-                        msg = "Ticket vazio ou não encontrado na API Movidesk"
-                        log.error(
-                            "Ticket %s retornou vazio na API. Marcando erro e seguindo. (%s)",
-                            ticket_id,
-                            msg,
-                        )
-                        mark_raw_error(conn, ticket_id, msg)
-                        total_fail += 1
-                        continue
+    conn.commit()
 
-                    # Atualiza RAW no banco
-                    update_ticket_raw(conn, ticket_id, ticket)
-                    total_ok += 1
-                    log.info(
-                        "Raw do ticket aberto %s atualizado com sucesso.",
-                        ticket_id,
-                    )
 
-                except requests.HTTPError as e:
-                    # Erro HTTP específico (404, 500, etc)
-                    log.error(
-                        "Erro HTTP ao buscar ticket_id=%s: %s",
-                        ticket_id,
-                        e,
-                        exc_info=True,
-                    )
-                    mark_raw_error(conn, ticket_id, f"HTTPError: {e}")
-                    total_fail += 1
+def upsert_page(conn, rows):
+    if not rows:
+        return 0
 
-                except Exception as e:
-                    # Timeout (que é o caso do 266909) cai aqui também
-                    log.error(
-                        "Erro inesperado ao buscar ticket_id=%s: %s",
-                        ticket_id,
-                        e,
-                        exc_info=True,
-                    )
-                    mark_raw_error(conn, ticket_id, f"Exception: {e}")
-                    total_fail += 1
+    sql = """
+        insert into visualizacao_atual.tickets_abertos
+          (ticket_id, last_update, base_status, updated_at)
+        values %s
+        on conflict (ticket_id) do update set
+          last_update = excluded.last_update,
+          base_status = excluded.base_status,
+          updated_at  = excluded.updated_at
+    """
+    with conn.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=len(rows))
+    conn.commit()
+    return len(rows)
 
-                time.sleep(THROTTLE)
 
-    log.info(
-        "Sync raw concluído. Sucesso=%d, Falhas=%d.",
-        total_ok,
-        total_fail,
+def cleanup_not_open(conn, open_ids):
+    """
+    Remove da tabela qualquer ticket que NÃO esteja na lista de abertos
+    retornada agora pela API.
+    """
+    if not open_ids:
+        # Nenhum ticket aberto -> limpa tudo
+        with conn.cursor() as cur:
+            cur.execute("delete from visualizacao_atual.tickets_abertos")
+            removed = cur.rowcount
+        conn.commit()
+        if removed:
+            logger.info("Removendo %s tickets (nenhum aberto na API).", removed)
+        return removed
+
+    with conn.cursor() as cur:
+        cur.execute("create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop")
+
+        # Inserir todos os IDs abertos da rodada atual
+        unique_ids = list({i for i in open_ids if i is not None})
+        execute_values(
+            cur,
+            "insert into tmp_open_ids(ticket_id) values %s",
+            [(i,) for i in unique_ids],
+            page_size=1000,
+        )
+
+        # Delete de qualquer ticket que não apareceu agora como aberto
+        cur.execute(
+            """
+            delete from visualizacao_atual.tickets_abertos ta
+             where not exists (
+               select 1 from tmp_open_ids t
+                where t.ticket_id = ta.ticket_id
+             )
+            """
+        )
+        removed = cur.rowcount
+
+    conn.commit()
+    if removed:
+        logger.info("Removendo %s tickets que não estão mais abertos.", removed)
+    return removed
+
+
+def cleanup_merged(conn):
+    """
+    Remove da tabela de abertos qualquer ticket que esteja marcado como mesclado.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            delete from visualizacao_atual.tickets_abertos ta
+             using visualizacao_resolvidos.tickets_mesclados tm
+             where ta.ticket_id = tm.ticket_id
+            """
+        )
+        removed = cur.rowcount
+    conn.commit()
+    if removed:
+        logger.info("Removendo %s tickets que estão marcados como mesclados.", removed)
+    return removed
+
+
+def sync_index(conn):
+    logger.info("Iniciando sync de índice de tickets abertos (page_size=%s).", PAGE_SIZE)
+
+    open_ids = []
+    total_upserted = 0
+    skip = 0
+
+    while True:
+        logger.info("Listando tickets abertos em /tickets com skip=%s, top=%s", skip, PAGE_SIZE)
+        params = {
+            # Apenas tickets cujo baseStatus NÃO é resolvido/fechado/cancelado
+            "$filter": "(baseStatus ne 'Resolved' and baseStatus ne 'Closed' and baseStatus ne 'Canceled')",
+            "$orderby": "id",
+            "$top": PAGE_SIZE,
+            "$skip": skip,
+            "$select": "id,lastUpdate,baseStatus",
+            # NÃO passamos includeDeletedItems=true aqui justamente pra não trazer apagados
+        }
+
+        data = md_get("tickets", params)
+        if not data:
+            break
+
+        rows = []
+        now_utc = datetime.now(timezone.utc)
+        for item in data:
+            tid = item.get("id")
+            if tid is None:
+                continue
+            try:
+                tid_int = int(tid)
+            except Exception:
+                continue
+
+            last_update = item.get("lastUpdate")
+            base_status = item.get("baseStatus")
+
+            rows.append((tid_int, last_update, base_status, now_utc))
+            open_ids.append(tid_int)
+
+        upserted = upsert_page(conn, rows)
+        total_upserted += upserted
+
+        if len(data) < PAGE_SIZE:
+            break
+
+        skip += PAGE_SIZE
+        time.sleep(THROTTLE)
+
+    logger.info("Sync de índice: %s registros upsertados. Limpando fechados/apagados/mesclados…", total_upserted)
+    removed_closed = cleanup_not_open(conn, open_ids)
+    removed_merged = cleanup_merged(conn)
+
+    logger.info(
+        "Sync índice concluído. Sucesso=%s, Removidos(fecharam/apagados)=%s, Removidos(mesclados)=%s.",
+        total_upserted,
+        removed_closed,
+        removed_merged,
     )
+
+    return open_ids
+
+
+def main():
+    with psycopg2.connect(DSN) as conn:
+        ensure_table(conn)
+        sync_index(conn)
 
 
 if __name__ == "__main__":
-    sync_open_raw()
+    main()
