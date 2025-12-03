@@ -40,6 +40,7 @@ def md_get(path_or_full, params=None, ok_404=False):
 
 def ensure_table(conn):
     with conn.cursor() as cur:
+        cur.execute("create schema if not exists visualizacao_resolvidos")
         cur.execute(
             """
             create table if not exists visualizacao_resolvidos.tickets_mesclados(
@@ -180,6 +181,8 @@ def try_fetch_dedicated(conn):
     total_inserted = 0
     processed = 0
     max_dt_val = None
+
+    print(f"tickets_mesclados: chamada dedicada /tickets/merged base_params={base_params}")
 
     while True:
         params = dict(base_params)
@@ -394,7 +397,10 @@ def main():
             print(f"[WARN] fallback(missing) por histories falhou: {e}")
         except Exception as e:
             print(f"[WARN] erro inesperado no fallback(missing): {e}")
-        print("tickets_mesclados: sincronização concluída.")
+        with conn.cursor() as cur:
+            cur.execute("select count(*) from visualizacao_resolvidos.tickets_mesclados")
+            total = cur.fetchone()[0]
+        print(f"tickets_mesclados: sincronização concluída. Total na tabela: {total}.")
 
 
 if __name__ == "__main__":
