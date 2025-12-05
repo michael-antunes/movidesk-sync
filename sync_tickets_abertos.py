@@ -11,347 +11,286 @@ API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
-PAGE_SIZE = int(os.getenv("ABERTOS_PAGE_SIZE", "100"))
-THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
+TOP = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 
 if not TOKEN or not DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
+    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN nos secrets.")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("abertos_index")
+logger = logging.getLogger("tickets_abertos_index")
+
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
 
-def md_get(path_or_full, params=None):
-    """Chamada básica para a API Movidesk, com retry para 429/5xx."""
-    url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full.lstrip('/')}"
+def req(path_or_url, params=None, timeout=90):
+    """GET com retry simples para 429/503."""
+    url = path_or_url if path_or_url.startswith("http") else f"{API_BASE}/{path_or_url.lstrip('/')}"
     p = dict(params or {})
     p["token"] = TOKEN
 
-    resp = requests.get(url, params=p, timeout=60)
-    if resp.status_code in (429, 500, 502, 503, 504):
-        logger.warning("Retry em %s por status %s", url, resp.status_code)
-        time.sleep(1.5)
-        resp = requests.get(url, params=p, timeout=60)
+    while True:
+        r = http.get(url, params=p, timeout=timeout)
+        if r.status_code in (429, 503):
+            ra = r.headers.get("retry-after")
+            wait = int(ra) if ra and str(ra).isdigit() else 60
+            logger.warning("HTTP %s em %s, retry em %ss", r.status_code, url, wait)
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json() if r.text else []
 
-    resp.raise_for_status()
-    data = resp.json()
-    return data or []
+
+def iint(x):
+    try:
+        s = str(x)
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
+
+
+def norm_ts(x):
+    if not x:
+        return None
+    s = str(x).strip()
+    if not s or s.startswith("0001-01-01"):
+        return None
+    return s
+
+
+def get_cf_value(ticket, cf_id):
+    """Pega valor de customFieldId == cf_id."""
+    cfs = ticket.get("customFieldValues") or []
+    for cf in cfs:
+        try:
+            cid = cf.get("customFieldId")
+            if int(cid) == int(cf_id):
+                v = cf.get("value")
+                if isinstance(v, str) or v is None:
+                    return v
+                return str(v)
+        except Exception:
+            continue
+    return None
+
+
+def fetch_open_tickets():
+    """
+    Busca todos os tickets abertos (baseStatus New / InAttendance / Stopped)
+    já com clients, owner etc. Não usamos $select pra simplificar
+    e garantir que venham os customFieldValues.
+    """
+    url = "tickets"
+    skip = 0
+    filtro = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
+    items = []
+
+    while True:
+        page = req(
+            url,
+            {
+                "$filter": filtro,
+                "$orderby": "lastUpdate asc",
+                "$top": TOP,
+                "$skip": skip,
+                "includeDeletedItems": "false",
+            },
+        ) or []
+
+        if not page:
+            break
+
+        items.extend(page)
+        logger.info("Página com %s tickets (acumulado %s)", len(page), len(items))
+
+        if len(page) < TOP:
+            break
+
+        skip += len(page)
+        time.sleep(THROTTLE)
+
+    return items
+
+
+def map_row(t):
+    """
+    Mapeia um ticket bruto da API pra o formato da tabela
+    visualizacao_atual.movidesk_tickets_abertos.
+    """
+    # Empresa: pego o primeiro client com organization
+    clients = t.get("clients") or []
+    org = {}
+    for c in clients:
+        o = (c or {}).get("organization") or {}
+        if o:
+            org = o
+            break
+
+    owner = t.get("owner") or {}
+
+    created_val = norm_ts(t.get("createdDate"))
+    last_update_val = norm_ts(t.get("lastUpdate"))
+
+    return {
+        "id": iint(t.get("id")),
+        "subject": t.get("subject"),
+        "type": t.get("type"),
+        "status": t.get("status"),
+        "base_status": t.get("baseStatus"),
+        "owner_team": t.get("ownerTeam"),
+        # Você falou que aqui deveria ser o serviço de 3º nível
+        "service_first_level": t.get("serviceThirdLevel"),
+        "created_date": created_val,
+        "last_update": last_update_val,
+        "contagem": 1,
+        "responsavel": owner.get("businessName"),
+        "empresa_cod_ref_adicional": org.get("codeReferenceAdditional"),
+        "agent_id": iint(owner.get("id")),
+        "empresa_id": org.get("id"),
+        "empresa_nome": org.get("businessName"),
+        "adicional_137641_avaliado_csat": get_cf_value(t, 137641),
+        "origin": t.get("origin"),
+    }
 
 
 def ensure_table(conn):
-    """Garante estrutura de visualizacao_atual.tickets_abertos e remove colunas antigas de erro."""
+    """
+    Cria/ajusta a tabela visualizacao_atual.movidesk_tickets_abertos
+    com todos os campos necessários.
+    """
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_atual")
 
         cur.execute(
             """
-            create table if not exists visualizacao_atual.tickets_abertos(
-              ticket_id       bigint primary key,
-              last_update     timestamptz,
-              base_status     text,
-              updated_at      timestamptz default now(),
-              raw             jsonb,
-              raw_last_update timestamptz
+            create table if not exists visualizacao_atual.movidesk_tickets_abertos (
+                id                             integer primary key,
+                subject                        varchar(350),
+                type                           smallint,
+                status                         varchar(128),
+                base_status                    varchar(128),
+                owner_team                     varchar(128),
+                service_first_level            varchar(102),
+                created_date                   timestamptz,
+                last_update                    timestamptz,
+                contagem                       integer default 1,
+                responsavel                    varchar(255),
+                empresa_cod_ref_adicional      varchar(64),
+                agent_id                       bigint,
+                empresa_id                     text,
+                empresa_nome                   text,
+                adicional_137641_avaliado_csat text,
+                origin                         smallint
             )
             """
         )
 
-        # Garantir colunas (idempotente)
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists last_update timestamptz"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists base_status text"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists updated_at timestamptz default now()"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists raw jsonb"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists raw_last_update timestamptz"
-        )
-
-        # Novas colunas para empresa
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists id_empresa text"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "add column if not exists nome_empresa text"
-        )
-
-        # Remover colunas de erro que você não quer mais
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "drop column if exists raw_error_at"
-        )
-        cur.execute(
-            "alter table visualizacao_atual.tickets_abertos "
-            "drop column if exists raw_error_msg"
-        )
+        # Garante colunas (idempotente, caso a estrutura já exista)
+        cols_alter = [
+            ("subject", "varchar(350)"),
+            ("type", "smallint"),
+            ("status", "varchar(128)"),
+            ("base_status", "varchar(128)"),
+            ("owner_team", "varchar(128)"),
+            ("service_first_level", "varchar(102)"),
+            ("created_date", "timestamptz"),
+            ("last_update", "timestamptz"),
+            ("contagem", "integer default 1"),
+            ("responsavel", "varchar(255)"),
+            ("empresa_cod_ref_adicional", "varchar(64)"),
+            ("agent_id", "bigint"),
+            ("empresa_id", "text"),
+            ("empresa_nome", "text"),
+            ("adicional_137641_avaliado_csat", "text"),
+            ("origin", "smallint"),
+        ]
+        for col, coltype in cols_alter:
+            cur.execute(
+                f"""
+                alter table visualizacao_atual.movidesk_tickets_abertos
+                add column if not exists {col} {coltype}
+                """
+            )
 
     conn.commit()
 
 
-def upsert_page(conn, rows):
+def upsert_rows(conn, rows):
+    """
+    Estratégia simples e rápida:
+    - TRUNCATE na tabela
+    - INSERT de todos os tickets abertos atuais
+    """
     if not rows:
+        logger.info("Nenhum ticket aberto retornado da API.")
+        with conn.cursor() as cur:
+            cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
+        conn.commit()
         return 0
 
-    sql = """
-        insert into visualizacao_atual.tickets_abertos
-          (ticket_id, last_update, base_status, updated_at)
+    cols = [
+        "id",
+        "subject",
+        "type",
+        "status",
+        "base_status",
+        "owner_team",
+        "service_first_level",
+        "created_date",
+        "last_update",
+        "contagem",
+        "responsavel",
+        "empresa_cod_ref_adicional",
+        "agent_id",
+        "empresa_id",
+        "empresa_nome",
+        "adicional_137641_avaliado_csat",
+        "origin",
+    ]
+
+    values = [
+        tuple(row.get(c) for c in cols)
+        for row in rows
+    ]
+
+    sql = f"""
+        insert into visualizacao_atual.movidesk_tickets_abertos
+        ({", ".join(cols)})
         values %s
-        on conflict (ticket_id) do update set
-          last_update = excluded.last_update,
-          base_status = excluded.base_status,
-          updated_at  = excluded.updated_at
     """
+
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=len(rows))
+        cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
+        execute_values(cur, sql, values, page_size=200)
+
     conn.commit()
+    logger.info("Inseridos %s tickets na tabela movidesk_tickets_abertos.", len(rows))
     return len(rows)
 
 
-def cleanup_not_open(conn, open_ids):
-    """
-    Remove da tabela qualquer ticket que NÃO esteja na lista de abertos
-    retornada agora pela API.
-    """
-    if not open_ids:
-        # Nenhum ticket aberto -> limpa tudo
-        with conn.cursor() as cur:
-            cur.execute("delete from visualizacao_atual.tickets_abertos")
-            removed = cur.rowcount
-        conn.commit()
-        if removed:
-            logger.info("Removendo %s tickets (nenhum aberto na API).", removed)
-        return removed
-
-    with conn.cursor() as cur:
-        cur.execute("create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop")
-
-        # Inserir todos os IDs abertos da rodada atual
-        unique_ids = list({i for i in open_ids if i is not None})
-        execute_values(
-            cur,
-            "insert into tmp_open_ids(ticket_id) values %s",
-            [(i,) for i in unique_ids],
-            page_size=1000,
-        )
-
-        # Delete de qualquer ticket que não apareceu agora como aberto
-        cur.execute(
-            """
-            delete from visualizacao_atual.tickets_abertos ta
-             where not exists (
-               select 1 from tmp_open_ids t
-                where t.ticket_id = ta.ticket_id
-             )
-            """
-        )
-        removed = cur.rowcount
-
-    conn.commit()
-    if removed:
-        logger.info("Removendo %s tickets que não estão mais abertos.", removed)
-    return removed
-
-
-def cleanup_merged(conn):
-    """
-    Remove da tabela de abertos qualquer ticket que esteja marcado como mesclado.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            delete from visualizacao_atual.tickets_abertos ta
-             using visualizacao_resolvidos.tickets_mesclados tm
-             where ta.ticket_id = tm.ticket_id
-            """
-        )
-        removed = cur.rowcount
-    conn.commit()
-    if removed:
-        logger.info("Removendo %s tickets que estão marcados como mesclados.", removed)
-    return removed
-
-
-def sync_index(conn):
-    logger.info("Iniciando sync de índice de tickets abertos (page_size=%s).", PAGE_SIZE)
-
-    open_ids = []
-    total_upserted = 0
-    skip = 0
-
-    while True:
-        logger.info("Listando tickets abertos em /tickets com skip=%s, top=%s", skip, PAGE_SIZE)
-        params = {
-            # Apenas tickets cujo baseStatus NÃO é resolvido/fechado/cancelado
-            "$filter": "(baseStatus ne 'Resolved' and baseStatus ne 'Closed' and baseStatus ne 'Canceled')",
-            "$orderby": "id",
-            "$top": PAGE_SIZE,
-            "$skip": skip,
-            "$select": "id,lastUpdate,baseStatus",
-        }
-
-        data = md_get("tickets", params)
-        if not data:
-            break
-
-        rows = []
-        now_utc = datetime.now(timezone.utc)
-        for item in data:
-            tid = item.get("id")
-            if tid is None:
-                continue
-            try:
-                tid_int = int(tid)
-            except Exception:
-                continue
-
-            last_update = item.get("lastUpdate")
-            base_status = item.get("baseStatus")
-
-            rows.append((tid_int, last_update, base_status, now_utc))
-            open_ids.append(tid_int)
-
-        upserted = upsert_page(conn, rows)
-        total_upserted += upserted
-
-        if len(data) < PAGE_SIZE:
-            break
-
-        skip += PAGE_SIZE
-        time.sleep(THROTTLE)
-
-    logger.info("Sync de índice: %s registros upsertados. Limpando fechados/apagados/mesclados…", total_upserted)
-    removed_closed = cleanup_not_open(conn, open_ids)
-    removed_merged = cleanup_merged(conn)
-
-    logger.info(
-        "Sync índice concluído. Sucesso=%s, Removidos(fecharam/apagados)=%s, Removidos(mesclados)=%s.",
-        total_upserted,
-        removed_closed,
-        removed_merged,
-    )
-
-    # retornamos IDs únicos
-    return list({i for i in open_ids if i is not None})
-
-
-# ----------------------------------------------------------------------
-#  PARTE NOVA: BUSCA LEVE DA EMPRESA PARA CADA TICKET ABERTO
-# ----------------------------------------------------------------------
-def get_empresa_light(ticket_id):
-    """
-    Busca somente id e organização (empresa) do ticket de forma leve.
-    Usa /tickets?ids=...&$select=id,clients
-
-    Retorna (id_empresa, nome_empresa) ou (None, None) se não encontrar.
-    """
-    try:
-        data = md_get("tickets", {
-            "ids": ticket_id,
-            "$select": "id,clients",
-        })
-
-        if isinstance(data, list):
-            data = data[0] if data else None
-
-        if not data:
-            return None, None
-
-        clients = data.get("clients") or []
-        if not clients:
-            return None, None
-
-        # pega o primeiro client que tiver organization
-        org_id = None
-        org_name = None
-        for c in clients:
-            org = (c or {}).get("organization") or {}
-            if org.get("id"):
-                org_id = org.get("id")
-                org_name = org.get("businessName")
-                break
-
-        return org_id, org_name
-    except Exception as e:
-        logger.warning("Falha ao buscar empresa leve do ticket %s: %s", ticket_id, e)
-        return None, None
-
-
-def sync_empresas(conn, ticket_ids):
-    """
-    Preenche id_empresa e nome_empresa para tickets abertos.
-    Só faz chamada na API para tickets que ainda estão sem empresa.
-    """
-    if not ticket_ids:
-        return 0
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select ticket_id
-              from visualizacao_atual.tickets_abertos
-             where ticket_id = any(%s)
-               and (id_empresa is null or nome_empresa is null)
-            """,
-            (ticket_ids,),
-        )
-        rows = cur.fetchall()
-
-    to_process = [r[0] for r in rows]
-    if not to_process:
-        logger.info("Nenhum ticket aberto pendente de empresa nesta rodada.")
-        return 0
-
-    logger.info("Sincronizando empresa para %s tickets abertos…", len(to_process))
-    updated = 0
-
-    with conn.cursor() as cur:
-        for idx, tid in enumerate(to_process, start=1):
-            logger.info("(%s/%s) Buscando empresa do ticket %s…", idx, len(to_process), tid)
-            id_emp, nome_emp = get_empresa_light(tid)
-
-            # Se não retornou nada, não sobrescreve o que eventualmente já tiver
-            if id_emp is None and nome_emp is None:
-                time.sleep(THROTTLE)
-                continue
-
-            cur.execute(
-                """
-                update visualizacao_atual.tickets_abertos
-                   set id_empresa   = %s,
-                       nome_empresa = %s
-                 where ticket_id    = %s
-                """,
-                (id_emp, nome_emp, tid),
-            )
-            updated += 1
-            time.sleep(THROTTLE)
-
-    conn.commit()
-    logger.info("Empresa sincronizada para %s tickets abertos.", updated)
-    return updated
-
-
 def main():
+    logger.info("Iniciando sync rápido de tickets abertos (index enriquecido).")
+
+    tickets = fetch_open_tickets()
+    logger.info("Total de tickets abertos retornados: %s", len(tickets))
+
+    rows = [
+        map_row(t)
+        for t in tickets
+        if isinstance(t, dict) and t.get("id") is not None
+    ]
+
     with psycopg2.connect(DSN) as conn:
         ensure_table(conn)
-        open_ids = sync_index(conn)
-        sync_empresas(conn, open_ids)
+        upsert_rows(conn, rows)
+
+    logger.info("Sync de tickets abertos (index) finalizado com sucesso.")
 
 
 if __name__ == "__main__":
