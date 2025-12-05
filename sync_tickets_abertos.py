@@ -1,11 +1,11 @@
 import os
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
 import requests
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import execute_values
 
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
@@ -14,11 +14,10 @@ DSN = os.getenv("NEON_DSN")
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 
-# ID do campo adicional no Movidesk para "avaliado CSAT"
-CSAT_FIELD_ID = 137641
+CSAT_CUSTOM_FIELD_ID = 137641  # adicional_137641_avaliado_csat
 
 if not TOKEN or not DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN nos secrets.")
+    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,84 +25,63 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tickets_abertos_index")
 
-session = requests.Session()
-session.headers.update({"Accept": "application/json"})
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# Helpers HTTP
 # ---------------------------------------------------------------------------
 
-def req(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 90) -> Any:
-    """Request simples com retry para 429/503/5xx básicos."""
-    p = dict(params or {})
-    # token SEMPRE no querystring
-    p["token"] = TOKEN
-
+def req(url, params=None, timeout=90):
+    """Requisição básica com retry para 429/503."""
     while True:
-        r = session.get(url, params=p, timeout=timeout)
-
-        # Retry para limites / instabilidades
-        if r.status_code in (429, 500, 502, 503, 504):
+        r = http.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if ra and str(ra).isdigit() else 60
-            logger.warning("HTTP %s em %s, aguardando %ss e tentando de novo…", r.status_code, url, wait)
+            logger.warning("Throttle HTTP %s, aguardando %ss…", r.status_code, wait)
             time.sleep(wait)
             continue
-
         if r.status_code == 404:
             return []
-
         r.raise_for_status()
-        if not r.text:
-            return []
-        try:
-            return r.json()
-        except ValueError:
-            logger.error("Resposta não é JSON. Status=%s, texto=%r", r.status_code, r.text[:200])
-            raise
+        return r.json() if r.text else []
 
 
-# ---------------------------------------------------------------------------
-# Helpers de normalização
-# ---------------------------------------------------------------------------
-
-def norm_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
+def iint(x):
     try:
-        return int(s)
+        s = str(x)
+        return int(s) if s.isdigit() else None
     except Exception:
         return None
 
 
-def norm_ts(value: Any) -> Optional[str]:
-    if not value:
+def norm_ts(x):
+    if not x:
         return None
-    s = str(value).strip()
+    s = str(x).strip()
     if not s or s.startswith("0001-01-01"):
         return None
     return s
 
 
 # ---------------------------------------------------------------------------
-# Fetch de tickets abertos na API Movidesk
+# Fetch tickets abertos (index enriquecido)
 # ---------------------------------------------------------------------------
 
-def fetch_open_tickets() -> List[Dict[str, Any]]:
+def fetch_open_tickets():
     """
-    Busca todos os tickets com baseStatus em ('New','InAttendance','Stopped').
-    Retorna a lista crua vinda da API.
+    Busca tickets cujo baseStatus está em New/InAttendance/Stopped
+    e traz os campos necessários para o índice enriquecido.
     """
-    url = f"{API_BASE}/tickets"
+    logger.info("Iniciando fetch de tickets abertos em /tickets…")
 
-    # baseStatus aberto
+    url = f"{API_BASE}/tickets"
+    skip = 0
+
     fil = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
 
-    # campos simples
     select_fields = [
         "id",
         "subject",
@@ -118,19 +96,14 @@ def fetch_open_tickets() -> List[Dict[str, Any]]:
     ]
     sel = ",".join(select_fields)
 
-    # nav properties / objetos complexos
-    # - clients + organization (empresa)
-    # - owner (agente responsável)
-    # - customFieldValues (para CSAT)
-    expand = "clients($expand=organization),owner,customFieldValues"
+    # precisamos de owner, clients(organization) e customFieldValues
+    expand = "owner,clients($expand=organization),customFieldValues"
 
-    items: List[Dict[str, Any]] = []
-    skip = 0
-
-    logger.info("Iniciando sync rápido de tickets abertos (index enriquecido).")
+    items = []
 
     while True:
         params = {
+            "token": TOKEN,
             "$select": sel,
             "$expand": expand,
             "$filter": fil,
@@ -140,12 +113,11 @@ def fetch_open_tickets() -> List[Dict[str, Any]]:
         }
 
         page = req(url, params=params) or []
-        if not isinstance(page, list):
-            logger.warning("Resposta inesperada da API (não é lista): %r", type(page))
+        if not page:
             break
 
-        logger.info("Página com %s tickets (acumulado %s)", len(page), len(items) + len(page))
         items.extend(page)
+        logger.info("Página com %s tickets (acumulado %s)", len(page), len(items))
 
         if len(page) < PAGE_SIZE:
             break
@@ -157,231 +129,338 @@ def fetch_open_tickets() -> List[Dict[str, Any]]:
     return items
 
 
-# ---------------------------------------------------------------------------
-# Mapeamento API -> colunas da tabela
-# ---------------------------------------------------------------------------
-
-def extract_empresa_from_clients(ticket: Dict[str, Any]) -> (Optional[str], Optional[str]):
-    clients = ticket.get("clients") or []
-    if not isinstance(clients, list) or not clients:
-        return None, None
-
-    # prioriza quem tem organization
-    for c in clients:
-        org = (c or {}).get("organization") or {}
-        if org.get("id") is not None:
-            return str(org.get("id")), org.get("businessName")
-
-    return None, None
-
-
-def extract_owner(ticket: Dict[str, Any]) -> (Optional[int], Optional[str]):
-    owner = ticket.get("owner") or {}
-    if not isinstance(owner, dict):
-        return None, None
-
-    agent_id = norm_int(owner.get("id"))
-    responsavel = owner.get("businessName")
-    return agent_id, responsavel
-
-
-def extract_csat(ticket: Dict[str, Any]) -> Optional[str]:
-    """Procura o customFieldValues com customFieldId = CSAT_FIELD_ID e retorna o value (ou None)."""
-    cfs = ticket.get("customFieldValues") or []
-    if not isinstance(cfs, list):
+def extract_csat(custom_fields):
+    """
+    Procura o customFieldId = CSAT_CUSTOM_FIELD_ID e devolve o value/item.
+    """
+    if not custom_fields or not isinstance(custom_fields, list):
         return None
 
-    for cf in cfs:
-        if not isinstance(cf, dict):
-            continue
-        # alguns ambientes usam 'customFieldId', outros 'customField' com id aninhado.
-        cf_id = cf.get("customFieldId")
+    for cf in custom_fields:
         try:
-            cf_id = int(cf_id) if cf_id is not None else None
+            if int(cf.get("customFieldId")) != CSAT_CUSTOM_FIELD_ID:
+                continue
         except Exception:
-            cf_id = None
+            continue
 
-        if cf_id == CSAT_FIELD_ID:
-            # prioridade para 'value'; se não tiver, tenta pegar primeiro item.
-            if cf.get("value") not in (None, ""):
-                return str(cf["value"])
-            items = cf.get("items") or []
-            if isinstance(items, list) and items:
-                item0 = items[0] or {}
-                # o nome pode estar em 'customFieldItem'
-                val = item0.get("customFieldItem") or item0.get("value")
-                if val not in (None, ""):
-                    return str(val)
+        # alguns campos usam 'value', outros usam 'items' com customFieldItem
+        if cf.get("value") is not None:
+            return str(cf.get("value"))
+        items = cf.get("items") or []
+        if items and isinstance(items, list):
+            first = items[0] or {}
+            if first.get("customFieldItem") is not None:
+                return str(first.get("customFieldItem"))
+        return None
+
     return None
 
 
-def map_ticket(ticket: Dict[str, Any]) -> Dict[str, Any]:
-    empresa_id, empresa_nome = extract_empresa_from_clients(ticket)
-    agent_id, responsavel = extract_owner(ticket)
-    csat_val = extract_csat(ticket)
+def map_row(t):
+    """
+    Mapeia o JSON do ticket da API para o dicionário com as colunas da tabela.
+    """
+    clients = t.get("clients") or []
+    org_id = None
+    org_name = None
+    if isinstance(clients, list) and clients:
+        # pega o primeiro client que tiver organization
+        for c in clients:
+            org = (c or {}).get("organization") or {}
+            if org.get("id"):
+                org_id = org.get("id")
+                org_name = org.get("businessName")
+                break
+
+    owner = t.get("owner") or {}
+    custom_fields = t.get("customFieldValues") or []
+
+    ticket_id = iint(t.get("id"))
+    created_val = norm_ts(t.get("createdDate"))
+    last_update_val = norm_ts(t.get("lastUpdate"))
 
     return {
-        "id": norm_int(ticket.get("id")),
-        "subject": ticket.get("subject"),
-        "type": ticket.get("type"),
-        "status": ticket.get("status"),
-        "base_status": ticket.get("baseStatus"),
-        "owner_team": ticket.get("ownerTeam"),
-        "service_first_level": ticket.get("serviceFirstLevel"),
-        "created_date": norm_ts(ticket.get("createdDate")),
-        "last_update": norm_ts(ticket.get("lastUpdate")),
-        # contagem fica com default 1 no banco
-        "responsavel": responsavel,
-        "empresa_cod_ref_adicional": None,  # será preenchido via JOIN com visualizacao_empresa.empresas
-        "agent_id": agent_id,
-        "empresa_id": empresa_id,
-        "empresa_nome": empresa_nome,
-        "adicional_137641_avaliado_csat": csat_val,
-        "origin": ticket.get("origin"),
+        "ticket_id": ticket_id,
+        "subject": t.get("subject"),
+        "type": iint(t.get("type")),
+        "status": t.get("status"),
+        "base_status": t.get("baseStatus"),
+        "owner_team": t.get("ownerTeam"),
+        "service_first_level": t.get("serviceFirstLevel"),
+        "created_date": created_val,
+        "last_update": last_update_val,
+        "origin": iint(t.get("origin")),
+        "contagem": 1,
+        "responsavel": owner.get("businessName"),
+        "agent_id": iint(owner.get("id")),
+        "empresa_id": org_id,
+        "empresa_nome": org_name,
+        "empresa_cod_ref_adicional": None,  # será preenchido depois via UPDATE
+        "adicional_137641_avaliado_csat": extract_csat(custom_fields),
     }
 
 
 # ---------------------------------------------------------------------------
-# Banco de dados
+# Banco: garantir tabela e colunas
 # ---------------------------------------------------------------------------
 
-def ensure_table(conn) -> None:
-    """Garante schema, tabela e colunas necessárias."""
+def ensure_table(conn):
+    """
+    Garante que visualizacao_atual.tickets_abertos existe e
+    possui todas as colunas necessárias, sem mexer nas que já existem.
+    """
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_atual")
 
+        # tabela básica (mantém compatibilidade com o script de RAW)
         cur.execute(
             """
-            create table if not exists visualizacao_atual.movidesk_tickets_abertos (
-                id integer primary key
+            create table if not exists visualizacao_atual.tickets_abertos(
+              ticket_id       bigint primary key,
+              raw             jsonb,
+              updated_at      timestamptz default now(),
+              raw_last_update timestamptz,
+              last_update     timestamptz,
+              base_status     text
             )
             """
         )
 
+        # adiciona/garante as colunas desejadas (idempotente)
         cur.execute(
             """
-            alter table visualizacao_atual.movidesk_tickets_abertos
-                add column if not exists subject                     varchar(350),
-                add column if not exists type                        smallint,
-                add column if not exists status                      varchar(128),
-                add column if not exists base_status                 varchar(128),
-                add column if not exists owner_team                  varchar(128),
-                add column if not exists service_first_level         varchar(102),
-                add column if not exists created_date                timestamptz,
-                add column if not exists last_update                 timestamptz,
-                add column if not exists contagem                    integer default 1,
-                add column if not exists responsavel                 varchar(255),
-                add column if not exists empresa_cod_ref_adicional   varchar(64),
-                add column if not exists agent_id                    bigint,
-                add column if not exists empresa_id                  text,
-                add column if not exists empresa_nome                text,
-                add column if not exists adicional_137641_avaliado_csat text,
-                add column if not exists origin                      smallint
+            alter table visualizacao_atual.tickets_abertos
+              add column if not exists subject                      varchar(350),
+              add column if not exists type                         smallint,
+              add column if not exists status                       varchar(128),
+              add column if not exists owner_team                   varchar(128),
+              add column if not exists service_first_level          varchar(102),
+              add column if not exists created_date                 timestamptz,
+              add column if not exists contagem                     integer default 1,
+              add column if not exists responsavel                  varchar(255),
+              add column if not exists empresa_cod_ref_adicional    varchar(64),
+              add column if not exists agent_id                     bigint,
+              add column if not exists empresa_id                   text,
+              add column if not exists empresa_nome                 text,
+              add column if not exists adicional_137641_avaliado_csat text,
+              add column if not exists origin                       smallint
             """
         )
 
     conn.commit()
 
 
-def upsert_open_tickets(conn, rows: List[Dict[str, Any]]) -> int:
+# ---------------------------------------------------------------------------
+# Upsert + limpeza
+# ---------------------------------------------------------------------------
+
+def upsert_tickets(conn, rows):
     """
-    Trunca a tabela e insere todos os tickets abertos.
-    Usa INSERT .. ON CONFLICT só por segurança/idempotência.
+    Faz upsert (insert/update) dos tickets na tabela visualizacao_atual.tickets_abertos
+    sem mexer em raw / raw_last_update.
     """
     if not rows:
-        logger.info("Nenhum ticket para inserir.")
+        return 0
+
+    now_utc = datetime.now(timezone.utc)
+
+    # montamos os valores na mesma ordem do INSERT
+    values = []
+    for r in rows:
+        if r.get("ticket_id") is None:
+            continue
+        values.append(
+            (
+                r.get("ticket_id"),
+                r.get("subject"),
+                r.get("type"),
+                r.get("status"),
+                r.get("base_status"),
+                r.get("owner_team"),
+                r.get("service_first_level"),
+                r.get("created_date"),
+                r.get("last_update"),
+                r.get("origin"),
+                r.get("contagem", 1),
+                r.get("responsavel"),
+                r.get("empresa_cod_ref_adicional"),
+                r.get("agent_id"),
+                r.get("empresa_id"),
+                r.get("empresa_nome"),
+                r.get("adicional_137641_avaliado_csat"),
+                now_utc,  # updated_at
+            )
+        )
+
+    if not values:
+        return 0
+
+    sql = """
+        insert into visualizacao_atual.tickets_abertos (
+            ticket_id,
+            subject,
+            type,
+            status,
+            base_status,
+            owner_team,
+            service_first_level,
+            created_date,
+            last_update,
+            origin,
+            contagem,
+            responsavel,
+            empresa_cod_ref_adicional,
+            agent_id,
+            empresa_id,
+            empresa_nome,
+            adicional_137641_avaliado_csat,
+            updated_at
+        ) values %s
+        on conflict (ticket_id) do update set
+            subject                      = excluded.subject,
+            type                         = excluded.type,
+            status                       = excluded.status,
+            base_status                  = excluded.base_status,
+            owner_team                   = excluded.owner_team,
+            service_first_level          = excluded.service_first_level,
+            created_date                 = excluded.created_date,
+            last_update                  = excluded.last_update,
+            origin                       = excluded.origin,
+            contagem                     = excluded.contagem,
+            responsavel                  = excluded.responsavel,
+            empresa_cod_ref_adicional    = excluded.empresa_cod_ref_adicional,
+            agent_id                     = excluded.agent_id,
+            empresa_id                   = excluded.empresa_id,
+            empresa_nome                 = excluded.empresa_nome,
+            adicional_137641_avaliado_csat = excluded.adicional_137641_avaliado_csat,
+            updated_at                   = excluded.updated_at
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, values, page_size=200)
+
+    conn.commit()
+    return len(values)
+
+
+def cleanup_not_open(conn, open_ids):
+    """
+    Remove da tabela qualquer ticket que NÃO esteja na lista de abertos.
+    (mantém consistência com a API)
+    """
+    if not open_ids:
         with conn.cursor() as cur:
-            cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
+            cur.execute("delete from visualizacao_atual.tickets_abertos")
+            removed = cur.rowcount
         conn.commit()
+        if removed:
+            logger.info("Removendo %s tickets (nenhum aberto na API).", removed)
+        return removed
+
+    unique_ids = sorted({i for i in open_ids if i is not None})
+    if not unique_ids:
         return 0
 
-    # ordem das colunas para insert
-    cols = [
-        "id",
-        "subject",
-        "type",
-        "status",
-        "base_status",
-        "owner_team",
-        "service_first_level",
-        "created_date",
-        "last_update",
-        # contagem fica de fora (default 1)
-        "responsavel",
-        "empresa_cod_ref_adicional",
-        "agent_id",
-        "empresa_id",
-        "empresa_nome",
-        "adicional_137641_avaliado_csat",
-        "origin",
-    ]
-
-    # filtra só tickets com id não-nulo
-    payload = [ {c: r.get(c) for c in cols} for r in rows if r.get("id") is not None ]
-    if not payload:
-        logger.warning("Todos os tickets retornaram id nulo. Nada será inserido.")
-        return 0
-
-    insert_cols = ", ".join(cols)
-    placeholders = ", ".join([f"%({c})s" for c in cols])
-    update_set = ", ".join([f"{c} = excluded.{c}" for c in cols if c != "id"])
-
-    sql = f"""
-        insert into visualizacao_atual.movidesk_tickets_abertos ({insert_cols})
-        values ({placeholders})
-        on conflict (id) do update set
-            {update_set}
-    """
-
     with conn.cursor() as cur:
-        # Zera a tabela antes de recarregar os abertos
-        cur.execute("truncate table visualizacao_atual.movidesk_tickets_abertos")
-        psycopg2.extras.execute_batch(cur, sql, payload, page_size=200)
+        cur.execute(
+            "create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop"
+        )
+        execute_values(
+            cur,
+            "insert into tmp_open_ids(ticket_id) values %s",
+            [(i,) for i in unique_ids],
+            page_size=1000,
+        )
+
+        cur.execute(
+            """
+            delete from visualizacao_atual.tickets_abertos ta
+             where not exists (
+               select 1 from tmp_open_ids t
+                where t.ticket_id = ta.ticket_id
+             )
+            """
+        )
+        removed = cur.rowcount
 
     conn.commit()
-    logger.info("Inseridos %s tickets na tabela movidesk_tickets_abertos.", len(payload))
-    return len(payload)
+    if removed:
+        logger.info("Removendo %s tickets que não estão mais abertos.", removed)
+    return removed
 
 
-def enrich_coderef_from_empresas(conn) -> None:
+def cleanup_merged(conn):
     """
-    Preenche empresa_cod_ref_adicional via join com visualizacao_empresa.empresas.codereferenceadditional.
-    Se o schema/tabela não existir, só loga um aviso e segue.
+    Remove tickets abertos que estejam marcados como mesclados.
     """
     with conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                update visualizacao_atual.movidesk_tickets_abertos t
-                   set empresa_cod_ref_adicional = e.codereferenceadditional
-                  from visualizacao_empresa.empresas e
-                 where e.id = t.empresa_id
-                """
-            )
-            logger.info("Atualização de empresa_cod_ref_adicional concluída (linhas afetadas: %s).", cur.rowcount)
-        except psycopg2.Error as e:
-            # se schema/tabela não existir, não queremos quebrar o job
-            logger.warning(
-                "Não foi possível atualizar empresa_cod_ref_adicional (schema visualizacao_empresa.empresas?). Erro: %s",
-                e,
-            )
+        cur.execute(
+            """
+            delete from visualizacao_atual.tickets_abertos ta
+             using visualizacao_resolvidos.tickets_mesclados tm
+             where ta.ticket_id = tm.ticket_id
+            """
+        )
+        removed = cur.rowcount
+
     conn.commit()
+    if removed:
+        logger.info("Removendo %s tickets marcados como mesclados.", removed)
+    return removed
+
+
+def update_empresa_cod_ref(conn):
+    """
+    Atualiza empresa_cod_ref_adicional a partir de visualizacao_empresa.empresas.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update visualizacao_atual.tickets_abertos ta
+               set empresa_cod_ref_adicional = e.codereferenceadditional
+              from visualizacao_empresa.empresas e
+             where ta.empresa_id = e.id
+               and (ta.empresa_cod_ref_adicional is distinct from e.codereferenceadditional)
+            """
+        )
+        affected = cur.rowcount
+
+    conn.commit()
+    logger.info(
+        "Atualização de empresa_cod_ref_adicional concluída (linhas afetadas: %s).",
+        affected,
+    )
+    return affected
 
 
 # ---------------------------------------------------------------------------
-# main
+# Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    tickets_raw = fetch_open_tickets()
-    mapped_rows = [map_ticket(t) for t in tickets_raw if isinstance(t, dict)]
+def main():
+    logger.info("Iniciando sync rápido de tickets abertos (index enriquecido).")
+
+    items = fetch_open_tickets()
+    rows = [map_row(t) for t in items if isinstance(t, dict) and t.get("id") is not None]
+    open_ids = [r.get("ticket_id") for r in rows if r.get("ticket_id") is not None]
 
     with psycopg2.connect(DSN) as conn:
         ensure_table(conn)
-        upsert_open_tickets(conn, mapped_rows)
-        enrich_coderef_from_empresas(conn)
 
-    logger.info("Sync de tickets abertos (index) finalizado com sucesso.")
+        inserted = upsert_tickets(conn, rows)
+        logger.info("Inseridos/atualizados %s tickets na tabela tickets_abertos.", inserted)
+
+        removed_closed = cleanup_not_open(conn, open_ids)
+        removed_merged = cleanup_merged(conn)
+        update_empresa_cod_ref(conn)
+
+    logger.info(
+        "Sync de tickets abertos (index) finalizado com sucesso. "
+        "Inseridos/atualizados=%s, removidos(fechados/apagados)=%s, removidos(mesclados)=%s.",
+        inserted,
+        removed_closed,
+        removed_merged,
+    )
 
 
 if __name__ == "__main__":
