@@ -3,7 +3,7 @@ name: Movidesk - Tickets abertos (index + raw)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "* * * * *"
 
 concurrency:
   group: movidesk-abertos-${{ github.ref }}
