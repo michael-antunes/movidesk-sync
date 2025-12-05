@@ -1,7 +1,6 @@
 import os
 import time
 import logging
-from datetime import datetime, timezone
 
 import requests
 import psycopg2
@@ -27,9 +26,12 @@ http = requests.Session()
 http.headers.update({"Accept": "application/json"})
 
 
-def req(path_or_url, params=None, timeout=90):
-    """GET com retry simples para 429/503."""
-    url = path_or_url if path_or_url.startswith("http") else f"{API_BASE}/{path_or_url.lstrip('/')}"
+def req(url_or_path, params=None, timeout=90):
+    """
+    GET básico com retry para 429/503.
+    Sempre injeta o token nos parâmetros.
+    """
+    url = url_or_path if url_or_path.startswith("http") else f"{API_BASE}/{url_or_path.lstrip('/')}"
     p = dict(params or {})
     p["token"] = TOKEN
 
@@ -65,7 +67,9 @@ def norm_ts(x):
 
 
 def get_cf_value(ticket, cf_id):
-    """Pega valor de customFieldId == cf_id."""
+    """
+    Pega valor de customFieldId == cf_id em customFieldValues.
+    """
     cfs = ticket.get("customFieldValues") or []
     for cf in cfs:
         try:
@@ -82,24 +86,48 @@ def get_cf_value(ticket, cf_id):
 
 def fetch_open_tickets():
     """
-    Busca todos os tickets abertos (baseStatus New / InAttendance / Stopped)
-    já com clients, owner etc. Não usamos $select pra simplificar
-    e garantir que venham os customFieldValues.
+    Busca todos os tickets abertos (baseStatus New / InAttendance / Stopped),
+    usando o mesmo padrão do script rápido que você já tinha.
     """
     url = "tickets"
     skip = 0
+
     filtro = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
+
+    select_fields = [
+        "id",
+        "subject",
+        "type",
+        "status",
+        "baseStatus",
+        "ownerTeam",
+        "serviceFirstLevel",
+        "serviceSecondLevel",
+        "serviceThirdLevel",
+        "origin",
+        "category",
+        "urgency",
+        "createdDate",
+        "lastUpdate",
+        "customFieldValues",
+    ]
+    sel = ",".join(select_fields)
+
+    # Precisamos de empresa (clients.organization) e do owner (responsável)
+    expand = "clients($expand=organization),owner"
+
     items = []
 
     while True:
         page = req(
             url,
             {
+                "$select": sel,
+                "$expand": expand,
                 "$filter": filtro,
                 "$orderby": "lastUpdate asc",
                 "$top": TOP,
                 "$skip": skip,
-                "includeDeletedItems": "false",
             },
         ) or []
 
@@ -120,9 +148,10 @@ def fetch_open_tickets():
 
 def map_row(t):
     """
-    Mapeia um ticket bruto da API pra o formato da tabela
+    Mapeia um ticket bruto da API para o formato da tabela
     visualizacao_atual.movidesk_tickets_abertos.
     """
+
     # Empresa: pego o primeiro client com organization
     clients = t.get("clients") or []
     org = {}
@@ -137,23 +166,33 @@ def map_row(t):
     created_val = norm_ts(t.get("createdDate"))
     last_update_val = norm_ts(t.get("lastUpdate"))
 
+    # Movidesk não manda codeReferenceAdditional diretamente no organization,
+    # então se não vier, fica None (a coluna existe, mesmo que vazia).
+    empresa_cod_ref_adicional = org.get("codeReferenceAdditional")
+
     return {
+        # id do ticket
         "id": iint(t.get("id")),
         "subject": t.get("subject"),
         "type": t.get("type"),
         "status": t.get("status"),
         "base_status": t.get("baseStatus"),
         "owner_team": t.get("ownerTeam"),
-        # Você falou que aqui deveria ser o serviço de 3º nível
+
+        # você pediu que service_first_level seja o serviço de 3º nível
         "service_first_level": t.get("serviceThirdLevel"),
+
         "created_date": created_val,
         "last_update": last_update_val,
         "contagem": 1,
+
         "responsavel": owner.get("businessName"),
-        "empresa_cod_ref_adicional": org.get("codeReferenceAdditional"),
+        "empresa_cod_ref_adicional": empresa_cod_ref_adicional,
+
         "agent_id": iint(owner.get("id")),
         "empresa_id": org.get("id"),
         "empresa_nome": org.get("businessName"),
+
         "adicional_137641_avaliado_csat": get_cf_value(t, 137641),
         "origin": t.get("origin"),
     }
@@ -191,7 +230,7 @@ def ensure_table(conn):
             """
         )
 
-        # Garante colunas (idempotente, caso a estrutura já exista)
+        # Garante colunas (idempotente caso a tabela já exista)
         cols_alter = [
             ("subject", "varchar(350)"),
             ("type", "smallint"),
@@ -254,10 +293,7 @@ def upsert_rows(conn, rows):
         "origin",
     ]
 
-    values = [
-        tuple(row.get(c) for c in cols)
-        for row in rows
-    ]
+    values = [tuple(row.get(c) for c in cols) for row in rows]
 
     sql = f"""
         insert into visualizacao_atual.movidesk_tickets_abertos
