@@ -1,9 +1,10 @@
-name: Movidesk - Tickets abertos (index + empresa)
+name: Movidesk - Tickets abertos (index)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "* * * * *"   # a cada 1 minuto
+    # roda a cada minuto; ajuste se quiser menos frequência
+    - cron: "* * * * *"
 
 concurrency:
   group: movidesk-abertos-index-${{ github.ref }}
@@ -15,7 +16,7 @@ permissions:
 jobs:
   tickets-abertos-index:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - run: date -u && echo "Branch=$GITHUB_REF"
@@ -26,11 +27,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install requests psycopg2-binary
+      - name: Instalar dependências
+        run: pip install requests psycopg2-binary
 
-      - name: Sync open tickets index (id + status + empresa)
+      - name: Sync open tickets index enriquecido
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          ABERTOS_PAGE_SIZE: "100"
+          MOVIDESK_PAGE_SIZE: "500"
+          MOVIDESK_THROTTLE: "0.25"
         run: python sync_tickets_abertos.py
