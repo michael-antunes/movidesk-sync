@@ -42,7 +42,10 @@ def md_get(path_or_full, params=None):
 
 
 def ensure_table(conn):
-    """Garante estrutura de visualizacao_atual.tickets_abertos e remove colunas antigas de erro."""
+    """
+    Garante estrutura de visualizacao_atual.tickets_abertos e remove colunas antigas de erro.
+    Agora inclui também id_empresa e nome_empresa.
+    """
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_atual")
 
@@ -54,7 +57,9 @@ def ensure_table(conn):
               base_status     text,
               updated_at      timestamptz default now(),
               raw             jsonb,
-              raw_last_update timestamptz
+              raw_last_update timestamptz,
+              id_empresa      text,
+              nome_empresa    text
             )
             """
         )
@@ -80,6 +85,14 @@ def ensure_table(conn):
             "alter table visualizacao_atual.tickets_abertos "
             "add column if not exists raw_last_update timestamptz"
         )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists id_empresa text"
+        )
+        cur.execute(
+            "alter table visualizacao_atual.tickets_abertos "
+            "add column if not exists nome_empresa text"
+        )
 
         # Remover colunas de erro que você não quer mais
         cur.execute(
@@ -100,12 +113,14 @@ def upsert_page(conn, rows):
 
     sql = """
         insert into visualizacao_atual.tickets_abertos
-          (ticket_id, last_update, base_status, updated_at)
+          (ticket_id, last_update, base_status, updated_at, id_empresa, nome_empresa)
         values %s
         on conflict (ticket_id) do update set
-          last_update = excluded.last_update,
-          base_status = excluded.base_status,
-          updated_at  = excluded.updated_at
+          last_update  = excluded.last_update,
+          base_status  = excluded.base_status,
+          updated_at   = excluded.updated_at,
+          id_empresa   = excluded.id_empresa,
+          nome_empresa = excluded.nome_empresa
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=len(rows))
@@ -129,7 +144,9 @@ def cleanup_not_open(conn, open_ids):
         return removed
 
     with conn.cursor() as cur:
-        cur.execute("create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop")
+        cur.execute(
+            "create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop"
+        )
 
         # Inserir todos os IDs abertos da rodada atual
         unique_ids = list({i for i in open_ids if i is not None})
@@ -177,6 +194,27 @@ def cleanup_merged(conn):
     return removed
 
 
+def extract_empresa_from_item(item):
+    """
+    Lê o JSON simplificado de /tickets (com campo clients)
+    e devolve (id_empresa, nome_empresa) da primeira organization encontrada.
+    """
+    empresa_id = None
+    empresa_nome = None
+
+    clients = item.get("clients") or []
+    for cli in clients:
+        org = cli.get("organization") or {}
+        org_id = org.get("id")
+        org_name = org.get("businessName")
+        if org_id:
+            empresa_id = str(org_id)
+            empresa_nome = org_name
+            break
+
+    return empresa_id, empresa_nome
+
+
 def sync_index(conn):
     logger.info("Iniciando sync de índice de tickets abertos (page_size=%s).", PAGE_SIZE)
 
@@ -192,8 +230,8 @@ def sync_index(conn):
             "$orderby": "id",
             "$top": PAGE_SIZE,
             "$skip": skip,
-            "$select": "id,lastUpdate,baseStatus",
-            # NÃO passamos includeDeletedItems=true aqui justamente pra não trazer apagados
+            # Agora traz também clients para extrair empresa
+            "$select": "id,lastUpdate,baseStatus,clients",
         }
 
         data = md_get("tickets", params)
@@ -214,7 +252,9 @@ def sync_index(conn):
             last_update = item.get("lastUpdate")
             base_status = item.get("baseStatus")
 
-            rows.append((tid_int, last_update, base_status, now_utc))
+            id_emp, nome_emp = extract_empresa_from_item(item)
+
+            rows.append((tid_int, last_update, base_status, now_utc, id_emp, nome_emp))
             open_ids.append(tid_int)
 
         upserted = upsert_page(conn, rows)
@@ -226,7 +266,10 @@ def sync_index(conn):
         skip += PAGE_SIZE
         time.sleep(THROTTLE)
 
-    logger.info("Sync de índice: %s registros upsertados. Limpando fechados/apagados/mesclados…", total_upserted)
+    logger.info(
+        "Sync de índice: %s registros upsertados. Limpando fechados/apagados/mesclados…",
+        total_upserted,
+    )
     removed_closed = cleanup_not_open(conn, open_ids)
     removed_merged = cleanup_merged(conn)
 
