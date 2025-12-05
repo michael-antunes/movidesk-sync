@@ -3,7 +3,6 @@ name: Movidesk - Tickets abertos (index)
 on:
   workflow_dispatch:
   schedule:
-    # roda a cada minuto; ajuste se quiser menos frequência
     - cron: "* * * * *"
 
 concurrency:
