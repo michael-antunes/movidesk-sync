@@ -197,6 +197,7 @@ def map_row(t):
         "empresa_nome": org_name,
         "empresa_cod_ref_adicional": None,  # será preenchido depois via UPDATE
         "adicional_137641_avaliado_csat": extract_csat(custom_fields),
+        # reaberturas fica na tabela com default 0 e pode ser calculado depois
     }
 
 
@@ -243,7 +244,8 @@ def ensure_table(conn):
               add column if not exists empresa_id                   text,
               add column if not exists empresa_nome                 text,
               add column if not exists adicional_137641_avaliado_csat text,
-              add column if not exists origin                       smallint
+              add column if not exists origin                       smallint,
+              add column if not exists reaberturas                  integer default 0
             """
         )
 
@@ -257,7 +259,7 @@ def ensure_table(conn):
 def upsert_tickets(conn, rows):
     """
     Faz upsert (insert/update) dos tickets na tabela visualizacao_atual.tickets_abertos
-    sem mexer em raw / raw_last_update.
+    sem mexer em raw / raw_last_update / reaberturas.
     """
     if not rows:
         return 0
