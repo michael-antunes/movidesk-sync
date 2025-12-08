@@ -82,6 +82,7 @@ def fetch_open_tickets():
 
     fil = "(baseStatus eq 'New' or baseStatus eq 'InAttendance' or baseStatus eq 'Stopped')"
 
+    # >>> ADICIONAMOS reopenedIn AQUI <<<
     select_fields = [
         "id",
         "subject",
@@ -93,6 +94,7 @@ def fetch_open_tickets():
         "origin",
         "createdDate",
         "lastUpdate",
+        "reopenedIn",
     ]
     sel = ",".join(select_fields)
 
@@ -179,6 +181,10 @@ def map_row(t):
     created_val = norm_ts(t.get("createdDate"))
     last_update_val = norm_ts(t.get("lastUpdate"))
 
+    # >>> NOVO: usa reopenedIn para marcar se já houve reabertura (0/1) <<<
+    reopened_val = norm_ts(t.get("reopenedIn"))
+    reaberturas = 1 if reopened_val else 0
+
     return {
         "ticket_id": ticket_id,
         "subject": t.get("subject"),
@@ -197,7 +203,7 @@ def map_row(t):
         "empresa_nome": org_name,
         "empresa_cod_ref_adicional": None,  # será preenchido depois via UPDATE
         "adicional_137641_avaliado_csat": extract_csat(custom_fields),
-        # reaberturas fica na tabela com default 0 e pode ser calculado depois
+        "reaberturas": reaberturas,
     }
 
 
@@ -259,14 +265,13 @@ def ensure_table(conn):
 def upsert_tickets(conn, rows):
     """
     Faz upsert (insert/update) dos tickets na tabela visualizacao_atual.tickets_abertos
-    sem mexer em raw / raw_last_update / reaberturas.
+    sem mexer em raw / raw_last_update.
     """
     if not rows:
         return 0
 
     now_utc = datetime.now(timezone.utc)
 
-    # montamos os valores na mesma ordem do INSERT
     values = []
     for r in rows:
         if r.get("ticket_id") is None:
@@ -290,6 +295,7 @@ def upsert_tickets(conn, rows):
                 r.get("empresa_id"),
                 r.get("empresa_nome"),
                 r.get("adicional_137641_avaliado_csat"),
+                r.get("reaberturas", 0),
                 now_utc,  # updated_at
             )
         )
@@ -316,6 +322,7 @@ def upsert_tickets(conn, rows):
             empresa_id,
             empresa_nome,
             adicional_137641_avaliado_csat,
+            reaberturas,
             updated_at
         ) values %s
         on conflict (ticket_id) do update set
@@ -335,6 +342,7 @@ def upsert_tickets(conn, rows):
             empresa_id                   = excluded.empresa_id,
             empresa_nome                 = excluded.empresa_nome,
             adicional_137641_avaliado_csat = excluded.adicional_137641_avaliado_csat,
+            reaberturas                  = excluded.reaberturas,
             updated_at                   = excluded.updated_at
     """
 
