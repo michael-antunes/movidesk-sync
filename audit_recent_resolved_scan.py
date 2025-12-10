@@ -63,7 +63,7 @@ def main():
     f_start = iso_odata_z(win_start)
     f_end   = iso_odata_z(win_end)
 
-    # IMPORTANTe: SEM aspas – DateTimeOffset literal
+    # IMPORTANTE: SEM aspas – DateTimeOffset literal
     resolved = f"(resolvedIn ge {f_start} and resolvedIn le {f_end})"
     closed   = f"(closedIn  ge {f_start} and closedIn  le {f_end})"
     odata_filter = f"({resolved} or {closed})"
@@ -85,59 +85,68 @@ def main():
     # 2) Abre RUN e registra pendências
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
         cur.execute("""
-            insert into visualizacao_resolvidos.audit_recent_run
+            INSERT INTO visualizacao_resolvidos.audit_recent_run
               (window_start, window_end, total_api, missing_total, run_at, window_from, window_to,
                total_local, notes)
-            values (%s, %s, %s, 0, now(), %s, %s,
-                    (select count(*) from visualizacao_resolvidos.tickets_resolvidos
-                      where coalesce(last_resolved_at,last_closed_at) between %s and %s),
+            VALUES (%s, %s, %s, 0, now(), %s, %s,
+                    (
+                        SELECT count(*)
+                        FROM visualizacao_resolvidos.tickets_resolvidos_detail d
+                        WHERE COALESCE(
+                                NULLIF(d.raw ->> 'resolvedIn', '')::timestamptz,
+                                NULLIF(d.raw ->> 'closedIn',   '')::timestamptz
+                              ) BETWEEN %s AND %s
+                    ),
                     'scan resolved+closed')
-            returning id
+            RETURNING id
         """, (win_start, win_end, len(ids), win_start, win_end, win_start, win_end))
         run_id = cur.fetchone()[0]
 
         missing_total = 0
 
-        # pendências em tickets_resolvidos dentro da janela
+        # pendências em tickets_resolvidos_detail dentro da janela
         cur.execute("""
-            select ticket_id
-              from visualizacao_resolvidos.tickets_resolvidos
-             where coalesce(last_resolved_at,last_closed_at) between %s and %s
+            SELECT d.ticket_id
+              FROM visualizacao_resolvidos.tickets_resolvidos_detail d
+             WHERE COALESCE(
+                     NULLIF(d.raw ->> 'resolvedIn', '')::timestamptz,
+                     NULLIF(d.raw ->> 'closedIn',   '')::timestamptz
+                   ) BETWEEN %s AND %s
         """, (win_start, win_end))
         local_ids = {r[0] for r in cur.fetchall()}
         miss_tk = sorted(ids - local_ids)
         if miss_tk:
             execute_values(cur, """
-                insert into visualizacao_resolvidos.audit_recent_missing
+                INSERT INTO visualizacao_resolvidos.audit_recent_missing
                     (run_id, table_name, ticket_id)
-                values %s
-                on conflict do nothing
-            """, [(run_id, "tickets_resolvidos", i) for i in miss_tk])
+                VALUES %s
+                ON CONFLICT DO NOTHING
+            """, [(run_id, "tickets_resolvidos_detail", i) for i in miss_tk])
             missing_total += len(miss_tk)
 
         # pendências em resolvidos_acoes para os IDs encontrados
         if ids:
             cur.execute("""
-                select ticket_id
-                  from visualizacao_resolvidos.resolvidos_acoes
-                 where ticket_id = any(%s)
+                SELECT ticket_id
+                  FROM visualizacao_resolvidos.resolvidos_acoes
+                 WHERE ticket_id = ANY(%s)
             """, (list(ids),))
             ja_tem = {r[0] for r in cur.fetchall()}
             miss_acoes = sorted(ids - ja_tem)
             if miss_acoes:
                 execute_values(cur, """
-                    insert into visualizacao_resolvidos.audit_recent_missing
+                    INSERT INTO visualizacao_resolvidos.audit_recent_missing
                         (run_id, table_name, ticket_id)
-                    values %s
-                    on conflict do nothing
+                    VALUES %s
+                    ON CONFLICT DO NOTHING
                 """, [(run_id, "resolvidos_acoes", i) for i in miss_acoes])
-                missing_total += len(miss_acoes)
+            missing_total += len(miss_acoes)
 
         # fecha RUN
         cur.execute("""
-            update visualizacao_resolvidos.audit_recent_run
-               set missing_total = %s
-             where id = %s
+            UPDATE visualizacao_resolvidos.audit_recent_run
+               SET missing_total = %s
+             WHERE id = %s
         """, (missing_total, run_id))
         conn.commit()
 
