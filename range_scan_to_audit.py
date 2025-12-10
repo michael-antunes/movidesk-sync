@@ -7,10 +7,7 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)7s  %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
 
 BASE = "https://api.movidesk.com/public/v1"
 
@@ -20,6 +17,11 @@ DSN   = os.environ["NEON_DSN"]
 THROTTLE     = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 PAGE_SIZE    = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
 WINDOW_HOURS = int(os.getenv("AUDIT_WINDOW_HOURS", "48"))
+
+# Tabela REAL usada para conferência local
+TICKETS_TABLE = "visualizacao_resolvidos.tickets_resolvidos_detail"
+# Nome que vai para audit_recent_missing.table_name (mantido para compatibilidade)
+TICKETS_LABEL = "tickets_resolvidos"
 
 
 def od_get(path: str, params: dict):
@@ -55,7 +57,9 @@ def page_iter(filter_expr: str, select_fields: str):
 
 
 def iso_odata_z(d: dt.datetime) -> str:
-    """DateTimeOffset em UTC sem aspas, no formato aceito pelo OData: YYYY-MM-DDTHH:MM:SSZ."""
+    """
+    DateTimeOffset em UTC sem aspas, no formato aceito pelo OData: YYYY-MM-DDTHH:MM:SSZ.
+    """
     if d.tzinfo is None:
         d = d.replace(tzinfo=dt.timezone.utc)
     d = d.astimezone(dt.timezone.utc).replace(microsecond=0)
@@ -78,7 +82,7 @@ def main():
 
     logging.info("Janela: %s -> %s", f_start, f_end)
 
-    # 1) IDs únicos no período (API)
+    # 1) IDs únicos no período vindos da API
     ids = set()
     for page in page_iter(odata_filter, select_fields):
         for row in page:
@@ -89,52 +93,47 @@ def main():
 
     logging.info("Total API (únicos): %d", len(ids))
 
-    # 2) Abre RUN e registra pendências
+    # 2) Abrir conexão e registrar RUN + pendências
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
-        # total_local agora olhando para tickets_resolvidos_detail
+        # total_local baseado em tickets_resolvidos_detail
         cur.execute(
-            """
+            f"""
             insert into visualizacao_resolvidos.audit_recent_run
-              (window_start,
-               window_end,
-               total_api,
-               missing_total,
-               run_at,
-               window_from,
-               window_to,
-               total_local,
-               notes)
-            values (%s, %s, %s, 0, now(), %s, %s,
-                    (
-                      select count(*)
-                        from visualizacao_resolvidos.tickets_resolvidos_detail
-                       where coalesce(
-                               nullif(raw->>'resolvedIn','')::timestamptz,
-                               nullif(raw->>'closedIn','')::timestamptz
-                             ) between %s and %s
-                    ),
-                    'scan resolved+closed')
+              (window_start, window_end, total_api, missing_total, run_at, window_from, window_to,
+               total_local, notes)
+            values (
+                %s, %s, %s, 0, now(), %s, %s,
+                (
+                    select count(*)
+                      from {TICKETS_TABLE} r
+                     where coalesce(
+                               nullif(r.raw ->> 'resolvedIn', '')::timestamptz,
+                               nullif(r.raw ->> 'closedIn',   '')::timestamptz
+                           )
+                           between %s and %s
+                ),
+                'scan resolved+closed'
+            )
             returning id
-            """,
-            (win_start, win_end, len(ids),
-             win_start, win_end,
-             win_start, win_end)
+        """,
+            (win_start, win_end, len(ids), win_start, win_end, win_start, win_end),
         )
         run_id = cur.fetchone()[0]
 
         missing_total = 0
 
-        # pendências em tickets_resolvidos_detail dentro da janela
+        # Pendências em tickets_resolvidos_detail dentro da janela
         cur.execute(
-            """
-            select ticket_id
-              from visualizacao_resolvidos.tickets_resolvidos_detail
+            f"""
+            select r.ticket_id
+              from {TICKETS_TABLE} r
              where coalesce(
-                     nullif(raw->>'resolvedIn','')::timestamptz,
-                     nullif(raw->>'closedIn','')::timestamptz
-                   ) between %s and %s
-            """,
-            (win_start, win_end)
+                       nullif(r.raw ->> 'resolvedIn', '')::timestamptz,
+                       nullif(r.raw ->> 'closedIn',   '')::timestamptz
+                   )
+                   between %s and %s
+        """,
+            (win_start, win_end),
         )
         local_ids = {r[0] for r in cur.fetchall()}
 
@@ -147,19 +146,21 @@ def main():
                     (run_id, table_name, ticket_id)
                 values %s
                 on conflict do nothing
-                """,
-                [(run_id, "tickets_resolvidos_detail", i) for i in miss_tk],
+            """,
+                [(run_id, TICKETS_LABEL, i) for i in miss_tk],
             )
             missing_total += len(miss_tk)
 
-        # fecha RUN atualizando o total de pendências
+        # Não existe mais resolvidos_acoes, então não há segundo bloco aqui.
+
+        # Fecha RUN
         cur.execute(
             """
             update visualizacao_resolvidos.audit_recent_run
                set missing_total = %s
              where id = %s
-            """,
-            (missing_total, run_id)
+        """,
+            (missing_total, run_id),
         )
         conn.commit()
 
