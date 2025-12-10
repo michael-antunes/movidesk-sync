@@ -1,207 +1,195 @@
 # -*- coding: utf-8 -*-
-import os, time, requests, psycopg2
+import os
+import time
+import logging
+import datetime as dt
+import requests
+import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime, timezone
 
-API = "https://api.movidesk.com/public/v1/tickets"
-TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-DSN   = os.getenv("NEON_DSN")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)7s  %(message)s"
+)
 
-PAGE_TOP  = 100
-LIMIT     = int(os.getenv("RANGE_SCAN_LIMIT", "400"))
-THROTTLE  = float(os.getenv("RANGE_SCAN_THROTTLE", "0.25"))
-# limite de execução (ex.: 240s) e pausa entre ciclos (deixe 0 p/ não dormir)
-MAX_RUNTIME_SEC = int(os.getenv("RANGE_SCAN_MAX_RUNTIME_SEC", "240"))
-SLEEP_SEC       = float(os.getenv("RANGE_SCAN_SLEEP_SEC", "0"))
+BASE = "https://api.movidesk.com/public/v1"
 
-if not TOKEN or not DSN:
-    raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN são obrigatórios")
+TOKEN = os.environ["MOVIDESK_TOKEN"]
+DSN   = os.environ["NEON_DSN"]
 
-def z(dt):
-    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+THROTTLE     = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+PAGE_SIZE    = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
+WINDOW_HOURS = int(os.getenv("AUDIT_WINDOW_HOURS", "48"))
 
-def to_dt(x):
-    if not x:
-        return None
-    try:
-        return datetime.fromisoformat(str(x).replace("Z","+00:00")).astimezone(timezone.utc)
-    except Exception:
-        return None
 
-def conn():
-    return psycopg2.connect(DSN)
-
-def ensure_table():
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-            create table if not exists visualizacao_resolvidos.range_scan_control(
-              data_fim timestamptz not null,
-              data_inicio timestamptz not null,
-              ultima_data_validada timestamptz,
-              constraint ck_range_scan_bounds check (
-                (data_inicio is not null) and (data_fim is not null) and (data_inicio <> data_fim) and
-                (ultima_data_validada is null or (
-                  ultima_data_validada >= least(data_inicio, data_fim) and
-                  ultima_data_validada <= greatest(data_inicio, data_fim)
-                ))
-              )
-            )
-        """)
-        cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
-        if cur.fetchone()[0] == 0:
-            # inicializa com seu default “semanal reverso”
-            cur.execute("""
-                insert into visualizacao_resolvidos.range_scan_control
-                  (data_inicio, data_fim, ultima_data_validada)
-                values (now(), timestamptz '2018-01-01 00:00:00+00', now())
-            """)
-
-def fetch(params):
-    r = requests.get(API, params=params, timeout=60)
+def od_get(path: str, params: dict):
+    """Chamada OData usando params= (requests monta a querystring)."""
+    url = f"{BASE}/{path}"
+    r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
-        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:300]}")
-    return r.json() or []
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
+    return r.json()
 
-def do_one_cycle():
-    """
-    Executa UM ciclo de varredura (respeita LIMIT e paginação) e
-    avança ultima_data_validada até o evento mais antigo encontrado no ciclo.
-    Retorna (atingiu_fim: bool, qtd_ids_encontrados: int).
-    """
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-            select data_inicio, data_fim, coalesce(ultima_data_validada, data_inicio)
-            from visualizacao_resolvidos.range_scan_control
-            limit 1
-        """)
-        data_inicio, data_fim, ultima = cur.fetchone()
 
-    # Se já chegou no limite inferior, nada a fazer
-    if ultima <= data_fim:
-        return True, 0
-
-    ids = []
-    min_evt = None
+def page_iter(filter_expr: str, select_fields: str):
+    """Paginação com $top/$skip (Movidesk não suporta $take)."""
+    top = PAGE_SIZE
     skip = 0
-    while len(ids) < LIMIT:
+    while True:
         params = {
             "token": TOKEN,
-            "$select": "id,baseStatus,resolvedIn,closedIn,canceledIn,lastUpdate",
-            "$filter": f"lastUpdate ge {z(data_fim)} and lastUpdate le {z(ultima)}",
-            "$orderby": "lastUpdate desc",
-            "$top": PAGE_TOP,
-            "$skip": skip
+            "$filter": filter_expr,
+            "$select": select_fields,
+            "$orderby": "id desc",
+            "$skip": skip,
+            "$top": top,
         }
-        page = fetch(params)
-        if not page:
+        data = od_get("tickets", params)
+        if not data:
             break
-
-        for t in page:
-            bs = (t.get("baseStatus") or "").strip()
-            ev = None
-            if bs in ("Resolved","Closed"):
-                ev = to_dt(t.get("resolvedIn")) or to_dt(t.get("closedIn"))
-            elif bs == "Canceled":
-                ev = to_dt(t.get("canceledIn"))
-            if not ev:
-                continue
-            # garante que o evento está dentro da janela alvo
-            if ev < data_fim or ev > ultima:
-                continue
-            try:
-                tid = int(t.get("id"))
-            except Exception:
-                continue
-
-            if tid not in ids:
-                ids.append(tid)
-            if min_evt is None or ev < min_evt:
-                min_evt = ev
-
-            if len(ids) >= LIMIT:
-                break
-
-        if len(page) < PAGE_TOP:
+        yield data
+        if len(data) < top:
             break
-
-        skip += PAGE_TOP
+        skip += top
         time.sleep(THROTTLE)
 
-    missing = []
-    with conn() as c, c.cursor() as cur:
-        if ids:
-            # filtra os que ainda não existem na tabela final
-            cur.execute("""
-                select ticket_id
-                from visualizacao_resolvidos.tickets_resolvidos
-                where ticket_id = any(%s)
-            """, (ids,))
-            have = {r[0] for r in cur.fetchall()}
-            missing = [i for i in ids if i not in have]
 
-            # garante um run_id para auditar a inserção
-            cur.execute("select max(id) from visualizacao_resolvidos.audit_recent_run")
-            rid = cur.fetchone()[0]
-            if rid is None:
-                cur.execute("""
-                    insert into visualizacao_resolvidos.audit_recent_run
-                      (window_start, window_end, total_api, missing_total, run_at, window_from, window_to, total_local, notes)
-                    values (now(), now(), 0, 0, now(), %s, %s, 0, 'range-scan-semanal') returning id
-                """, (data_fim, ultima))
-                rid = cur.fetchone()[0]
+def iso_odata_z(d: dt.datetime) -> str:
+    """DateTimeOffset em UTC sem aspas, no formato aceito pelo OData: YYYY-MM-DDTHH:MM:SSZ."""
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    d = d.astimezone(dt.timezone.utc).replace(microsecond=0)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            if missing:
-                execute_values(cur, """
-                    insert into visualizacao_resolvidos.audit_recent_missing (run_id, table_name, ticket_id)
-                    values %s
-                    on conflict do nothing
-                """, [(rid, "tickets_resolvidos", m) for m in missing])
-
-        # avança o ponteiro de progresso
-        if min_evt:
-            nv = min_evt
-        else:
-            nv = data_fim  # se não achou nada novo, crava no fim para encerrar no próximo teste
-
-        cur.execute("""
-            update visualizacao_resolvidos.range_scan_control
-               set ultima_data_validada = %s
-        """, (nv,))
-        c.commit()
-
-    # atingiu limite?
-    with conn() as c, c.cursor() as cur:
-        cur.execute("""
-            select (coalesce(ultima_data_validada, data_inicio) <= data_fim)
-            from visualizacao_resolvidos.range_scan_control
-            limit 1
-        """)
-        hit_end = bool(cur.fetchone()[0])
-
-    return hit_end, len(ids)
 
 def main():
-    ensure_table()
-    start = time.time()
+    now = dt.datetime.now(dt.timezone.utc)
+    win_end = now
+    win_start = now - dt.timedelta(hours=WINDOW_HOURS)
 
-    while True:
-        hit_end, got = do_one_cycle()
-        print(f"[range-scan] ciclo: inseriu {got} em audit; hit_end={hit_end}")
+    f_start = iso_odata_z(win_start)
+    f_end   = iso_odata_z(win_end)
 
-        # encerra se já chegou ao fim da janela
-        if hit_end:
-            print("[range-scan] FIM: ultima_data_validada já alcançou data_fim.")
-            break
+    # IMPORTANTE: SEM aspas – DateTimeOffset literal
+    resolved = f"(resolvedIn ge {f_start} and resolvedIn le {f_end})"
+    closed   = f"(closedIn  ge {f_start} and closedIn  le {f_end})"
+    odata_filter = f"({resolved} or {closed})"
+    select_fields = "id,baseStatus,resolvedIn,closedIn"
 
-        # respeita o teto de runtime do job
-        elapsed = time.time() - start
-        if elapsed >= MAX_RUNTIME_SEC:
-            print(f"[range-scan] tempo esgotado ({elapsed:.1f}s >= {MAX_RUNTIME_SEC}s). Encerrando este job.")
-            break
+    logging.info("Janela: %s -> %s", f_start, f_end)
 
-        # pequena pausa opcional entre ciclos
-        if SLEEP_SEC > 0:
-            time.sleep(min(SLEEP_SEC, max(0, MAX_RUNTIME_SEC - (time.time() - start))))
+    # 1) IDs únicos no período (API)
+    ids = set()
+    for page in page_iter(odata_filter, select_fields):
+        for row in page:
+            try:
+                ids.add(int(row["id"]))
+            except Exception:
+                pass
+
+    logging.info("Total API (únicos): %d", len(ids))
+
+    # 2) Abre RUN e registra pendências
+    with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
+        # total_local agora olhando para tickets_resolvidos_detail
+        cur.execute(
+            """
+            insert into visualizacao_resolvidos.audit_recent_run
+              (window_start,
+               window_end,
+               total_api,
+               missing_total,
+               run_at,
+               window_from,
+               window_to,
+               total_local,
+               notes)
+            values (%s, %s, %s, 0, now(), %s, %s,
+                    (
+                      select count(*)
+                        from visualizacao_resolvidos.tickets_resolvidos_detail
+                       where coalesce(
+                               nullif(raw->>'resolvedIn','')::timestamptz,
+                               nullif(raw->>'closedIn','')::timestamptz
+                             ) between %s and %s
+                    ),
+                    'scan resolved+closed')
+            returning id
+            """,
+            (win_start, win_end, len(ids),
+             win_start, win_end,
+             win_start, win_end)
+        )
+        run_id = cur.fetchone()[0]
+
+        missing_total = 0
+
+        # pendências em tickets_resolvidos_detail dentro da janela
+        cur.execute(
+            """
+            select ticket_id
+              from visualizacao_resolvidos.tickets_resolvidos_detail
+             where coalesce(
+                     nullif(raw->>'resolvedIn','')::timestamptz,
+                     nullif(raw->>'closedIn','')::timestamptz
+                   ) between %s and %s
+            """,
+            (win_start, win_end)
+        )
+        local_ids = {r[0] for r in cur.fetchall()}
+
+        miss_tk = sorted(ids - local_ids)
+        if miss_tk:
+            execute_values(
+                cur,
+                """
+                insert into visualizacao_resolvidos.audit_recent_missing
+                    (run_id, table_name, ticket_id)
+                values %s
+                on conflict do nothing
+                """,
+                [(run_id, "tickets_resolvidos_detail", i) for i in miss_tk],
+            )
+            missing_total += len(miss_tk)
+
+        # pendências em resolvidos_acoes para os IDs encontrados pela API
+        if ids:
+            cur.execute(
+                """
+                select ticket_id
+                  from visualizacao_resolvidos.resolvidos_acoes
+                 where ticket_id = any(%s)
+                """,
+                (list(ids),)
+            )
+            ja_tem = {r[0] for r in cur.fetchall()}
+            miss_acoes = sorted(ids - ja_tem)
+            if miss_acoes:
+                execute_values(
+                    cur,
+                    """
+                    insert into visualizacao_resolvidos.audit_recent_missing
+                        (run_id, table_name, ticket_id)
+                    values %s
+                    on conflict do nothing
+                    """,
+                    [(run_id, "resolvidos_acoes", i) for i in miss_acoes],
+                )
+                missing_total += len(miss_acoes)
+
+        # fecha RUN atualizando o total de pendências
+        cur.execute(
+            """
+            update visualizacao_resolvidos.audit_recent_run
+               set missing_total = %s
+             where id = %s
+            """,
+            (missing_total, run_id)
+        )
+        conn.commit()
+
+        logging.info("Run %s finalizado. missing_total=%d", run_id, missing_total)
+
 
 if __name__ == "__main__":
     main()
