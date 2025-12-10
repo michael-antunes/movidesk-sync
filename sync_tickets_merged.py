@@ -191,14 +191,14 @@ def try_fetch_dedicated(conn):
             raw = md_get("tickets/merged", params=params, ok_404=True)
         except requests.HTTPError as e:
             print(f"[WARN] dedicated endpoint not available ({e}). Using fallback by histories.")
-            return False
+            break
         except Exception as e:
             print(f"[WARN] erro ao chamar /tickets/merged: {e}. Usando fallback por histories.")
-            return False
+            break
 
         if raw is None:
             print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
-            return False
+            break
 
         data = normalize_merged_response(raw)
         if not data:
@@ -263,12 +263,13 @@ def try_fetch_dedicated(conn):
 
     if max_dt_val:
         register_sync_run(conn, max_dt_val)
+    else:
+        register_sync_run(conn, now_dt)
 
     if total_inserted == 0:
         print("tickets_mesclados: nenhum novo registro via /tickets/merged.")
-        return True
-
-    print(f"tickets_mesclados: {total_inserted} registros inseridos via /tickets/merged.")
+    else:
+        print(f"tickets_mesclados: {total_inserted} registros inseridos via /tickets/merged.")
     return True
 
 
@@ -311,14 +312,21 @@ def fetch_histories_for(ids):
     if not ids:
         return []
     all_data = []
-    for chunk in chunked(ids, 40):
+    for chunk in chunked(ids, 10):
         filtro = " or ".join([f"id eq {i}" for i in chunk])
         params = {
             "$select": "id",
             "$filter": filtro,
             "$expand": "statusHistories($select=status,justification,changedDate)",
         }
-        data = md_get("tickets", params)
+        try:
+            data = md_get("tickets", params)
+        except requests.HTTPError as e:
+            print(f"[WARN] erro HTTP ao buscar histories para chunk {chunk}: {e}")
+            continue
+        except Exception as e:
+            print(f"[WARN] erro inesperado ao buscar histories para chunk {chunk}: {e}")
+            continue
         all_data.extend(data or [])
         time.sleep(THROTTLE)
     return all_data
