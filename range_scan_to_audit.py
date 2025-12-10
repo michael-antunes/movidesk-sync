@@ -152,31 +152,6 @@ def main():
             )
             missing_total += len(miss_tk)
 
-        # pendências em resolvidos_acoes para os IDs encontrados pela API
-        if ids:
-            cur.execute(
-                """
-                select ticket_id
-                  from visualizacao_resolvidos.resolvidos_acoes
-                 where ticket_id = any(%s)
-                """,
-                (list(ids),)
-            )
-            ja_tem = {r[0] for r in cur.fetchall()}
-            miss_acoes = sorted(ids - ja_tem)
-            if miss_acoes:
-                execute_values(
-                    cur,
-                    """
-                    insert into visualizacao_resolvidos.audit_recent_missing
-                        (run_id, table_name, ticket_id)
-                    values %s
-                    on conflict do nothing
-                    """,
-                    [(run_id, "resolvidos_acoes", i) for i in miss_acoes],
-                )
-                missing_total += len(miss_acoes)
-
         # fecha RUN atualizando o total de pendências
         cur.execute(
             """
