@@ -1,6 +1,8 @@
 name: Movidesk - Tickets resolvidos (detail)
 
 on:
+  workflow_call:
+    secrets: inherit
   workflow_dispatch:
 
 concurrency:
