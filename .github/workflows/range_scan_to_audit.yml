@@ -1,8 +1,6 @@
-name: Movidesk - Range scan worker (*/5m até completar)
+name: Movidesk - Range scan worker
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -12,7 +10,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # o script limita a ~4min; 10min dá folga de setup/pip
     timeout-minutes: 10
 
     steps:
@@ -26,13 +23,13 @@ jobs:
 
       - run: pip install requests psycopg2-binary
 
-      - name: Range scan (curto; avança janela e para quando terminar)
+      - name: Range scan
         env:
-          NEON_DSN:                   ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN:             ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_API_TOKEN:         ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT:           "400"
-          RANGE_SCAN_THROTTLE:        "0.25"
-          RANGE_SCAN_MAX_RUNTIME_SEC: "240"   # ~4 min por execução
-          RANGE_SCAN_SLEEP_SEC:       "0"     # sem dormir dentro do run
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_LIMIT: "400"
+          RANGE_SCAN_THROTTLE: "0.25"
+          RANGE_SCAN_MAX_RUNTIME_SEC: "240"
+          RANGE_SCAN_SLEEP_SEC: "0"
         run: python range_scan_to_audit.py
