@@ -5,6 +5,10 @@ on:
     - cron: "*/20 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   call-sync-resolved-detail:
     uses: ./.github/workflows/sync_resolved_detail.yml
