@@ -1,41 +1,11 @@
 name: Força resolvidos (detail_watchdog)
 
 on:
-  # roda automaticamente a cada 20 minutos
   schedule:
     - cron: "*/20 * * * *"
-  # permite disparar manualmente pelo GitHub Actions
   workflow_dispatch:
 
 jobs:
-  detail:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15  # se passar disso, o job é cancelado
-
-    steps:
-      - name: Show time and branch
-        run: date -u && echo "Branch=$GITHUB_REF"
-
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          pip install requests psycopg2-binary
-
-      - name: Run sync_resolved_detail.py
-        env:
-          # Ajuste os nomes das secrets conforme você já usa no projeto
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          PGHOST: ${{ secrets.PGHOST }}
-          PGPORT: ${{ secrets.PGPORT }}
-          PGDATABASE: ${{ secrets.PGDATABASE }}
-          PGUSER: ${{ secrets.PGUSER }}
-          PGPASSWORD: ${{ secrets.PGPASSWORD }}
-        run: |
-          python sync_resolved_detail.py
+  call-sync-resolved-detail:
+    uses: ./.github/workflows/sync_resolved_detail.yml
+    secrets: inherit
