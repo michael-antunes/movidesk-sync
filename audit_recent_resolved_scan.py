@@ -1,9 +1,9 @@
-@@ -1,145 +1,147 @@
 # -*- coding: utf-8 -*-
 import os
 import time
 import logging
 import datetime as dt
+
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
@@ -13,23 +13,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(me
 BASE = "https://api.movidesk.com/public/v1"
 
 TOKEN = os.environ["MOVIDESK_TOKEN"]
-DSN   = os.environ["NEON_DSN"]
+DSN = os.environ["NEON_DSN"]
 
-THROTTLE     = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-PAGE_SIZE    = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "1000"))
 WINDOW_HOURS = int(os.getenv("AUDIT_WINDOW_HOURS", "48"))
 
-def od_get(path: str, params: dict):
-    """Chamada OData usando params= (deixa o requests fazer a querystring)."""
-    """Chamada OData usando params= (requests monta a querystring)."""
+
+def od_get(path, params):
     url = f"{BASE}/{path}"
     r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
         raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text}")
     return r.json()
 
-def page_iter(filter_expr: str, select_fields: str):
-    """Paginação com $top/$skip (Movidesk não suporta $take)."""
+
+def page_iter(filter_expr, select_fields):
     top = PAGE_SIZE
     skip = 0
     while True:
@@ -50,40 +49,29 @@ def page_iter(filter_expr: str, select_fields: str):
         skip += top
         time.sleep(THROTTLE)
 
-def iso_odata_z(d: dt.datetime) -> str:
-    """DateTimeOffset em UTC sem aspas, no formato aceito pelo OData: YYYY-MM-DDTHH:MM:SSZ."""
+
+def iso_odata_z(d):
     if d.tzinfo is None:
         d = d.replace(tzinfo=dt.timezone.utc)
     d = d.astimezone(dt.timezone.utc).replace(microsecond=0)
     return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 def main():
     now = dt.datetime.now(dt.timezone.utc)
     win_end = now
     win_start = now - dt.timedelta(hours=WINDOW_HOURS)
 
-    def iso_z(d: dt.datetime) -> str:
-        # sem micros + timezone explícito
-        return d.replace(microsecond=0).isoformat()
-
-    f_start = iso_z(win_start)
-    f_end   = iso_z(win_end)
     f_start = iso_odata_z(win_start)
-    f_end   = iso_odata_z(win_end)
+    f_end = iso_odata_z(win_end)
 
-    # datas em ASPAS SIMPLES no filtro OData
-    resolved = f"(resolvedIn ge '{f_start}' and resolvedIn le '{f_end}')"
-    closed   = f"(closedIn  ge '{f_start}' and closedIn  le '{f_end}')"
-    # IMPORTANTe: SEM aspas – DateTimeOffset literal
     resolved = f"(resolvedIn ge {f_start} and resolvedIn le {f_end})"
-    closed   = f"(closedIn  ge {f_start} and closedIn  le {f_end})"
+    closed = f"(closedIn ge {f_start} and closedIn le {f_end})"
     odata_filter = f"({resolved} or {closed})"
     select_fields = "id,baseStatus,resolvedIn,closedIn"
 
     logging.info("Janela: %s -> %s", f_start, f_end)
 
-    # 1) coleto os IDs únicos na janela
-    # 1) IDs únicos no período
     ids = set()
     for page in page_iter(odata_filter, select_fields):
         for row in page:
@@ -94,70 +82,82 @@ def main():
 
     logging.info("Total API (únicos): %d", len(ids))
 
-    # 2) registro o RUN e aponto pendências
-    # 2) Abre RUN e registra pendências
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
-        # abre RUN
-        cur.execute("""
+        cur.execute(
+            """
             insert into visualizacao_resolvidos.audit_recent_run
-              (window_start, window_end, total_api, missing_total, run_at, window_from, window_to,
-               total_local, notes)
+              (window_start, window_end, total_api, missing_total, run_at,
+               window_from, window_to, total_local, notes)
             values (%s, %s, %s, 0, now(), %s, %s,
                     (select count(*) from visualizacao_resolvidos.tickets_resolvidos
-                      where coalesce(last_resolved_at,last_closed_at) between %s and %s),
+                       where coalesce(last_resolved_at,last_closed_at) between %s and %s),
                     'scan resolved+closed')
             returning id
-        """, (win_start, win_end, len(ids), win_start, win_end, win_start, win_end))
+            """,
+            (win_start, win_end, len(ids), win_start, win_end, win_start, win_end),
+        )
         run_id = cur.fetchone()[0]
-
         missing_total = 0
 
-        # pendência em tickets_resolvidos (pela janela)
-        # pendências em tickets_resolvidos dentro da janela
-        cur.execute("""
+        cur.execute(
+            """
             select ticket_id
               from visualizacao_resolvidos.tickets_resolvidos
              where coalesce(last_resolved_at,last_closed_at) between %s and %s
-        """, (win_start, win_end))
+            """,
+            (win_start, win_end),
+        )
         local_ids = {r[0] for r in cur.fetchall()}
         miss_tk = sorted(ids - local_ids)
         if miss_tk:
-            execute_values(cur, """
+            execute_values(
+                cur,
+                """
                 insert into visualizacao_resolvidos.audit_recent_missing
                     (run_id, table_name, ticket_id)
                 values %s
                 on conflict do nothing
-            """, [(run_id, "tickets_resolvidos", i) for i in miss_tk])
+                """,
+                [(run_id, "tickets_resolvidos", i) for i in miss_tk],
+            )
             missing_total += len(miss_tk)
 
-        # pendência em resolvidos_acoes (para qualquer id da janela)
-        # pendências em resolvidos_acoes para os IDs encontrados
         if ids:
-            cur.execute("""
+            cur.execute(
+                """
                 select ticket_id
                   from visualizacao_resolvidos.resolvidos_acoes
                  where ticket_id = any(%s)
-            """, (list(ids),))
+                """,
+                (list(ids),),
+            )
             ja_tem = {r[0] for r in cur.fetchall()}
             miss_acoes = sorted(ids - ja_tem)
             if miss_acoes:
-                execute_values(cur, """
+                execute_values(
+                    cur,
+                    """
                     insert into visualizacao_resolvidos.audit_recent_missing
                         (run_id, table_name, ticket_id)
                     values %s
                     on conflict do nothing
-                """, [(run_id, "resolvidos_acoes", i) for i in miss_acoes])
+                    """,
+                    [(run_id, "resolvidos_acoes", i) for i in miss_acoes],
+                )
                 missing_total += len(miss_acoes)
 
-        # fecha RUN
-        cur.execute("""
+        cur.execute(
+            """
             update visualizacao_resolvidos.audit_recent_run
                set missing_total = %s
              where id = %s
-        """, (missing_total, run_id))
+            """,
+            (missing_total, run_id),
+        )
         conn.commit()
 
         logging.info("Run %s finalizado. missing_total=%d", run_id, missing_total)
+
 
 if __name__ == "__main__":
     main()
