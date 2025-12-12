@@ -10,7 +10,7 @@ API = "https://api.movidesk.com/public/v1/tickets"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
-PAGE_TOP = 100
+PAGE_TOP = int(os.getenv("RANGE_SCAN_PAGE_TOP", "100"))
 LIMIT = int(os.getenv("RANGE_SCAN_LIMIT", "400"))
 THROTTLE = float(os.getenv("RANGE_SCAN_THROTTLE", "0.25"))
 MAX_RUNTIME_SEC = int(os.getenv("RANGE_SCAN_MAX_RUNTIME_SEC", "240"))
@@ -20,15 +20,23 @@ if not TOKEN or not DSN:
     raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN são obrigatórios")
 
 
-def z(dt):
-    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+def to_utc(d):
+    if d is None:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).replace(microsecond=0)
 
 
-def to_dt(x):
-    if not x:
+def iso_z(d):
+    return to_utc(d).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_dt(s):
+    if not s:
         return None
     try:
-        return datetime.fromisoformat(str(x).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -45,12 +53,15 @@ def ensure_table():
               data_fim timestamptz not null,
               data_inicio timestamptz not null,
               ultima_data_validada timestamptz,
-              constraint ck_range_scan_bounds check (
-                (data_inicio is not null) and (data_fim is not null) and (data_inicio <> data_fim) and
-                (ultima_data_validada is null or (
-                  ultima_data_validada >= least(data_inicio, data_fim) and
-                  ultima_data_validada <= greatest(data_inicio, data_fim)
-                ))
+              constraint ck_range_scan_bounds check(
+                data_inicio is not null and data_fim is not null and data_inicio <> data_fim
+                and (
+                  ultima_data_validada is null
+                  or (
+                    ultima_data_validada >= least(data_inicio,data_fim)
+                    and ultima_data_validada <= greatest(data_inicio,data_fim)
+                  )
+                )
               )
             )
             """
@@ -64,13 +75,15 @@ def ensure_table():
                 values (now(), timestamptz '2018-01-01 00:00:00+00', now())
                 """
             )
+        c.commit()
 
 
-def fetch(params):
+def fetch_page(params):
     r = requests.get(API, params=params, timeout=60)
     if r.status_code != 200:
-        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:300]}")
-    return r.json() or []
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    return data or []
 
 
 def do_one_cycle():
@@ -88,32 +101,29 @@ def do_one_cycle():
         return True, 0
 
     ids = []
-    api_last_update = {}
-    min_last_update = None
+    api_last = {}
+    min_lu = None
     skip = 0
 
-    while len(ids) < LIMIT:
+    while True:
         params = {
             "token": TOKEN,
-            "$select": "id,baseStatus,resolvedIn,closedIn,canceledIn,lastUpdate",
-            "$filter": f"lastUpdate ge {z(data_fim)} and lastUpdate le {z(ultima)}",
+            "$select": "id,baseStatus,lastUpdate",
+            "$filter": "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled') "
+            f"and lastUpdate ge {iso_z(data_fim)} and lastUpdate le {iso_z(ultima)}",
             "$orderby": "lastUpdate desc",
             "$top": PAGE_TOP,
             "$skip": skip,
         }
-        page = fetch(params)
+        page = fetch_page(params)
         if not page:
             break
 
         for t in page:
-            bs = (t.get("baseStatus") or "").strip()
-            if bs not in ("Resolved", "Closed", "Canceled"):
+            lu = parse_dt(t.get("lastUpdate"))
+            if not lu:
                 continue
-            lu_str = t.get("lastUpdate")
-            lu_dt = to_dt(lu_str)
-            if not lu_dt:
-                continue
-            if lu_dt < data_fim or lu_dt > ultima:
+            if lu < data_fim or lu > ultima:
                 continue
             try:
                 tid = int(t.get("id"))
@@ -121,12 +131,14 @@ def do_one_cycle():
                 continue
             if tid not in ids:
                 ids.append(tid)
-            api_last_update[tid] = lu_str
-            if min_last_update is None or lu_dt < min_last_update:
-                min_last_update = lu_dt
+                api_last[tid] = lu
+                if min_lu is None or lu < min_lu:
+                    min_lu = lu
             if len(ids) >= LIMIT:
                 break
 
+        if len(ids) >= LIMIT:
+            break
         if len(page) < PAGE_TOP:
             break
 
@@ -139,22 +151,22 @@ def do_one_cycle():
         if ids:
             cur.execute(
                 """
-                select ticket_id, raw->>'lastUpdate' as last_update
+                select ticket_id, last_update
                 from visualizacao_resolvidos.tickets_resolvidos_detail
                 where ticket_id = any(%s)
                 """,
                 (ids,),
             )
-            db_rows = cur.fetchall()
-            db_last_update = {int(r[0]): (r[1] or "") for r in db_rows}
+            rows = cur.fetchall()
+            db_last = {int(r[0]): r[1] for r in rows}
 
             for tid in ids:
-                api_lu = api_last_update.get(tid) or ""
-                db_lu = db_last_update.get(tid)
-                if db_lu is None:
+                api_dt = to_utc(api_last.get(tid))
+                db_dt = db_last.get(tid)
+                if db_dt is None:
                     missing.append(tid)
                 else:
-                    if api_lu and db_lu and api_lu != db_lu:
+                    if to_utc(db_dt) != api_dt:
                         missing.append(tid)
 
             cur.execute("select max(id) from visualizacao_resolvidos.audit_recent_run")
@@ -163,8 +175,10 @@ def do_one_cycle():
                 cur.execute(
                     """
                     insert into visualizacao_resolvidos.audit_recent_run
-                      (window_start, window_end, total_api, missing_total, run_at, window_from, window_to, total_local, notes)
-                    values (now(), now(), 0, 0, now(), %s, %s, 0, 'range-scan-semanal') returning id
+                      (window_start, window_end, total_api, missing_total, run_at,
+                       window_from, window_to, total_local, notes)
+                    values (now(), now(), 0, 0, now(), %s, %s, 0, 'range-scan-semanal')
+                    returning id
                     """,
                     (data_fim, ultima),
                 )
@@ -174,15 +188,16 @@ def do_one_cycle():
                 execute_values(
                     cur,
                     """
-                    insert into visualizacao_resolvidos.audit_recent_missing (run_id, table_name, ticket_id)
+                    insert into visualizacao_resolvidos.audit_recent_missing
+                      (run_id, table_name, ticket_id)
                     values %s
                     on conflict do nothing
                     """,
                     [(rid, "tickets_resolvidos", m) for m in missing],
                 )
 
-        if min_last_update:
-            nv = min_last_update
+        if min_lu is not None:
+            nv = min_lu
         else:
             nv = data_fim
 
@@ -213,7 +228,7 @@ def main():
     start = time.time()
     while True:
         hit_end, got = do_one_cycle()
-        print(f"[range-scan] ciclo: inseriu {got} em audit; hit_end={hit_end}")
+        print(f"[range-scan] ciclo: tickets_api={got} hit_end={hit_end}")
         if hit_end:
             print("[range-scan] FIM: ultima_data_validada já alcançou data_fim.")
             break
