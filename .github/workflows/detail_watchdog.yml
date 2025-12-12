@@ -3,13 +3,32 @@ name: Força resolvidos (detail_watchdog)
 on:
   schedule:
     - cron: "*/20 * * * *"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
-  call-sync-resolved-detail:
-    uses: ./.github/workflows/sync_resolved_detail.yml
-    secrets: inherit
+  detail_watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - run: date -u && echo "Branch=$GITHUB_REF"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Sync resolved/closed/cancelled detail (watchdog)
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          DETAIL_BULK_LIMIT: "200"
+          DETAIL_MISSING_LIMIT: "10"
+        run: python sync_resolved_detail.py
