@@ -7,6 +7,9 @@ concurrency:
   group: range-scan-worker
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -21,7 +24,8 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install requests psycopg2-binary
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
 
       - name: Range scan
         env:
