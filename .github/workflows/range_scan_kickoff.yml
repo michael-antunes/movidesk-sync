@@ -2,7 +2,6 @@ name: Movidesk - Range scan KICKOFF (quinta 20h BRT)
 
 on:
   schedule:
-    # 20:00 America/Sao_Paulo ~ 23:00 UTC
     - cron: "0 23 * * 4"
   workflow_dispatch: {}
 
@@ -12,33 +11,35 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write   # <-- necessário para acionar outro workflow
 
 jobs:
   kickoff:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install psycopg2-binary
+      - name: Install dependencies
+        run: pip install psycopg2-binary
 
-      - name: Kickoff (reset da janela)
+      - name: Kickoff range scan
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python range_scan_kickoff.py
 
-      - name: Disparar o worker agora (workflow_dispatch)
+      - name: Disparar worker de range scan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
             -d '{"ref":"main"}'
