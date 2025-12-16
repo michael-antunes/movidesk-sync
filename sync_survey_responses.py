@@ -79,12 +79,17 @@ def parse_dt(x):
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        return datetime.datetime.fromisoformat(s)
+        dt = datetime.datetime.fromisoformat(s)
     except Exception:
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
 
 
 def to_iso_z(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -112,14 +117,41 @@ def pick_person(v):
     return {"id": pid, "name": name}
 
 
+def merged_table_info(conn):
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('visualizacao_resolvidos.tickets_mesclados')")
+        ok = cur.fetchone()[0] is not None
+        if not ok:
+            return None
+
+        cur.execute(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = 'visualizacao_resolvidos'
+              and table_name = 'tickets_mesclados'
+            """
+        )
+        cols = {r[0] for r in cur.fetchall()}
+
+    src = "ticket_id" if "ticket_id" in cols else None
+    dst_candidates = ["merged_into_id", "mergedIntoId", "merged_into", "mergedInto", "merged_ticket_id", "mergedTicketId"]
+    dst = next((c for c in dst_candidates if c in cols), None)
+
+    if not src or not dst:
+        return None
+    return {"schema": "visualizacao_resolvidos", "table": "tickets_mesclados", "src": src, "dst": dst}
+
+
 def ensure_table(conn):
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_satisfacao")
+
         cur.execute(
             """
             create table if not exists visualizacao_satisfacao.tickets_satisfacao(
-              ticket_id           bigint primary key,
-              response_id         text,
+              id                 text,
+              ticket_id           bigint,
               type                integer,
               value               integer,
               question_id         text,
@@ -129,79 +161,74 @@ def ensure_table(conn):
               support_agent_name  text,
               support_team        text,
               support_rule        text,
-              raw                 jsonb not null,
-              updated_at          timestamptz not null default now()
+              raw                 jsonb,
+              updated_at          timestamptz default now()
             )
             """
         )
-        cur.execute("create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)")
-        cur.execute("create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)")
-    conn.commit()
 
-
-def ensure_merged_table_exists(conn):
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass('visualizacao_resolvidos.tickets_mesclados')")
-        return cur.fetchone()[0] is not None
-
-
-def normalize_merged_rows(conn):
-    if not ensure_merged_table_exists(conn):
-        return 0
-    with conn.cursor() as cur:
-        cur.execute("set local synchronous_commit=off")
         cur.execute(
             """
-            insert into visualizacao_satisfacao.tickets_satisfacao(
-              ticket_id, response_id, type, value, question_id, client_id, response_date,
-              support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at
+            alter table visualizacao_satisfacao.tickets_satisfacao
+              add column if not exists id text,
+              add column if not exists ticket_id bigint,
+              add column if not exists type integer,
+              add column if not exists value integer,
+              add column if not exists question_id text,
+              add column if not exists client_id text,
+              add column if not exists response_date timestamptz,
+              add column if not exists support_agent_id bigint,
+              add column if not exists support_agent_name text,
+              add column if not exists support_team text,
+              add column if not exists support_rule text,
+              add column if not exists raw jsonb,
+              add column if not exists updated_at timestamptz
+            """
+        )
+
+        cur.execute(
+            """
+            update visualizacao_satisfacao.tickets_satisfacao
+               set updated_at = now()
+             where updated_at is null
+            """
+        )
+
+        cur.execute(
+            """
+            with r as (
+              select
+                ctid,
+                ticket_id,
+                row_number() over (
+                  partition by ticket_id
+                  order by response_date desc nulls last, updated_at desc nulls last
+                ) as rn
+              from visualizacao_satisfacao.tickets_satisfacao
+              where ticket_id is not null
             )
-            select
-              tm.merged_into_id::bigint,
-              ts.response_id,
-              ts.type,
-              ts.value,
-              ts.question_id,
-              ts.client_id,
-              ts.response_date,
-              ts.support_agent_id,
-              ts.support_agent_name,
-              ts.support_team,
-              ts.support_rule,
-              ts.raw,
-              now()
-            from visualizacao_satisfacao.tickets_satisfacao ts
-            join visualizacao_resolvidos.tickets_mesclados tm
-              on tm.ticket_id = ts.ticket_id
-            where tm.merged_into_id is not null
-            on conflict (ticket_id) do update set
-              response_id = excluded.response_id,
-              type = excluded.type,
-              value = excluded.value,
-              question_id = excluded.question_id,
-              client_id = excluded.client_id,
-              response_date = excluded.response_date,
-              support_agent_id = excluded.support_agent_id,
-              support_agent_name = excluded.support_agent_name,
-              support_team = excluded.support_team,
-              support_rule = excluded.support_rule,
-              raw = excluded.raw,
-              updated_at = excluded.updated_at
-            where visualizacao_satisfacao.tickets_satisfacao.response_date is null
-               or excluded.response_date >= visualizacao_satisfacao.tickets_satisfacao.response_date
+            delete from visualizacao_satisfacao.tickets_satisfacao t
+            using r
+            where t.ctid = r.ctid
+              and r.rn > 1
+            """
+        )
+
+        cur.execute(
+            """
+            create unique index if not exists ux_tickets_satisfacao_ticket_id
+            on visualizacao_satisfacao.tickets_satisfacao(ticket_id)
+            where ticket_id is not null
             """
         )
         cur.execute(
-            """
-            delete from visualizacao_satisfacao.tickets_satisfacao ts
-            using visualizacao_resolvidos.tickets_mesclados tm
-            where tm.ticket_id = ts.ticket_id
-              and tm.merged_into_id is not null
-            """
+            "create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)"
         )
-        moved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        cur.execute(
+            "create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)"
+        )
+
     conn.commit()
-    return moved
 
 
 def get_since_from_db(conn):
@@ -239,31 +266,36 @@ def fetch_survey_responses(since_iso):
     return items
 
 
+def fetch_merge_map(conn, ids, mi):
+    if not mi or not ids:
+        return {}
+    with conn.cursor() as cur:
+        q = f"""
+        select {mi["src"]}::bigint as src, {mi["dst"]}::bigint as dst
+        from {mi["schema"]}.{mi["table"]}
+        where {mi["src"]} = any(%s)
+          and {mi["dst"]} is not null
+        """
+        cur.execute(q, (ids,))
+        rows = cur.fetchall()
+    return {int(a): int(b) for a, b in rows if a is not None and b is not None}
+
+
 def resolve_canonical_ticket_ids(conn, ticket_ids):
     ids = sorted({int(x) for x in ticket_ids if str(x).isdigit()})
     if not ids:
         return {}
-    if not ensure_merged_table_exists(conn):
+
+    mi = merged_table_info(conn)
+    if not mi:
         return {i: i for i in ids}
 
     canonical = {i: i for i in ids}
-
-    while True:
+    for _ in range(12):
         current = sorted({canonical[i] for i in canonical})
-        if not current:
+        m = fetch_merge_map(conn, current, mi)
+        if not m:
             break
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                select ticket_id::int, merged_into_id::int
-                from visualizacao_resolvidos.tickets_mesclados
-                where ticket_id = any(%s)
-                  and merged_into_id is not null
-                """,
-                (current,),
-            )
-            rows = cur.fetchall()
-        m = {int(a): int(b) for a, b in rows if a is not None and b is not None}
         changed = False
         for orig in list(canonical.keys()):
             c = canonical[orig]
@@ -274,6 +306,96 @@ def resolve_canonical_ticket_ids(conn, ticket_ids):
             break
 
     return canonical
+
+
+def normalize_merged_rows(conn):
+    mi = merged_table_info(conn)
+    if not mi:
+        return 0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select distinct ts.ticket_id::bigint
+            from visualizacao_satisfacao.tickets_satisfacao ts
+            join {mi["schema"]}.{mi["table"]} tm
+              on tm.{mi["src"]} = ts.ticket_id
+            where tm.{mi["dst"]} is not null
+              and ts.ticket_id is not null
+            """
+        )
+        ids = [int(r[0]) for r in cur.fetchall() if r[0] is not None]
+
+    if not ids:
+        return 0
+
+    canonical = resolve_canonical_ticket_ids(conn, ids)
+    pairs = [(old, canonical.get(old, old)) for old in ids if canonical.get(old, old) != old]
+    if not pairs:
+        return 0
+
+    moved = 0
+    with conn.cursor() as cur:
+        cur.execute("set local synchronous_commit=off")
+        execute_values(
+            cur,
+            "create temporary table tmp_merge_pairs(old_id bigint, new_id bigint) on commit drop; "
+            "insert into tmp_merge_pairs(old_id, new_id) values %s",
+            pairs,
+            page_size=1000,
+        )
+
+        cur.execute(
+            """
+            insert into visualizacao_satisfacao.tickets_satisfacao(
+              id, ticket_id, type, value, question_id, client_id, response_date,
+              support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at
+            )
+            select
+              ts.id,
+              p.new_id,
+              ts.type,
+              ts.value,
+              ts.question_id,
+              ts.client_id,
+              ts.response_date,
+              ts.support_agent_id,
+              ts.support_agent_name,
+              ts.support_team,
+              ts.support_rule,
+              ts.raw,
+              now()
+            from visualizacao_satisfacao.tickets_satisfacao ts
+            join tmp_merge_pairs p on p.old_id = ts.ticket_id
+            on conflict (ticket_id) do update set
+              id = excluded.id,
+              type = excluded.type,
+              value = excluded.value,
+              question_id = excluded.question_id,
+              client_id = excluded.client_id,
+              response_date = excluded.response_date,
+              support_agent_id = excluded.support_agent_id,
+              support_agent_name = excluded.support_agent_name,
+              support_team = excluded.support_team,
+              support_rule = excluded.support_rule,
+              raw = excluded.raw,
+              updated_at = excluded.updated_at
+            where visualizacao_satisfacao.tickets_satisfacao.response_date is null
+               or excluded.response_date >= visualizacao_satisfacao.tickets_satisfacao.response_date
+            """
+        )
+
+        cur.execute(
+            """
+            delete from visualizacao_satisfacao.tickets_satisfacao ts
+            using tmp_merge_pairs p
+            where ts.ticket_id = p.old_id
+            """
+        )
+        moved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+    conn.commit()
+    return moved
 
 
 def fetch_tickets_batch(ids):
@@ -389,7 +511,12 @@ def enrich_items(items, ticket_map, canonical_map):
         orig_tid = iint(it.get("ticketId"))
         canon_tid = canonical_map.get(orig_tid, orig_tid) if orig_tid is not None else None
 
-        t = ticket_map.get(orig_tid) or ticket_map.get(canon_tid) if canon_tid is not None else None
+        t = None
+        if orig_tid is not None:
+            t = ticket_map.get(orig_tid)
+        if t is None and canon_tid is not None:
+            t = ticket_map.get(canon_tid)
+
         support = compute_support_responsible(t or {}, it.get("responseDate")) if orig_tid is not None else None
 
         enriched = dict(it)
@@ -413,12 +540,12 @@ def upsert_rows(conn, items):
         if canon_tid is None:
             continue
 
-        resp_id = str(it.get("id") or "").strip() or None
+        rid = str(it.get("id") or "").strip() or None
         rtype = iint(it.get("type"))
         val = iint(it.get("value"))
         qid = str(it.get("questionId") or "").strip() or None
         cid = str(it.get("clientId") or "").strip() or None
-        rdate = it.get("responseDate")
+        rdate = parse_dt(it.get("responseDate"))
 
         support = it.get("supportResponsible") if isinstance(it.get("supportResponsible"), dict) else None
         s_agent_id = iint(support.get("agentId")) if support else None
@@ -429,7 +556,7 @@ def upsert_rows(conn, items):
         values.append(
             (
                 canon_tid,
-                resp_id,
+                rid,
                 rtype,
                 val,
                 qid,
@@ -449,11 +576,11 @@ def upsert_rows(conn, items):
 
     sql = """
     insert into visualizacao_satisfacao.tickets_satisfacao
-      (ticket_id, response_id, type, value, question_id, client_id, response_date,
+      (ticket_id, id, type, value, question_id, client_id, response_date,
        support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at)
     values %s
     on conflict (ticket_id) do update set
-      response_id = excluded.response_id,
+      id = excluded.id,
       type = excluded.type,
       value = excluded.value,
       question_id = excluded.question_id,
@@ -472,6 +599,7 @@ def upsert_rows(conn, items):
     with conn.cursor() as cur:
         cur.execute("set local synchronous_commit=off")
         execute_values(cur, sql, values, page_size=200)
+
     conn.commit()
     return len(values)
 
@@ -481,7 +609,8 @@ def main():
 
     with psycopg2.connect(NEON_DSN) as conn:
         ensure_table(conn)
-        moved = normalize_merged_rows(conn)
+
+        moved_pre = normalize_merged_rows(conn)
 
         since_dt = get_since_from_db(conn)
         since_iso = to_iso_z(since_dt)
@@ -499,11 +628,12 @@ def main():
         tickets_map = safe_fetch_tickets(fetch_ids) if fetch_ids else {}
 
         enriched = enrich_items(items, tickets_map, canonical_map)
+
         n = upsert_rows(conn, enriched)
 
-        moved2 = normalize_merged_rows(conn)
+        moved_post = normalize_merged_rows(conn)
 
-    logger.info("Finalizado. DESDE=%s | upsert=%s | moved_pre=%s | moved_post=%s", since_iso, n, moved, moved2)
+    logger.info("Finalizado. DESDE=%s | upsert=%s | moved_pre=%s | moved_post=%s", since_iso, n, moved_pre, moved_post)
 
 
 if __name__ == "__main__":
