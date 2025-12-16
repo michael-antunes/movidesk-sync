@@ -180,13 +180,7 @@ def ensure_table(conn):
               add column if not exists updated_at timestamptz
             """
         )
-        cur.execute(
-            """
-            update visualizacao_satisfacao.tickets_satisfacao
-               set updated_at = now()
-             where updated_at is null
-            """
-        )
+        cur.execute("update visualizacao_satisfacao.tickets_satisfacao set updated_at = now() where updated_at is null")
         cur.execute(
             """
             with r as (
@@ -206,7 +200,9 @@ def ensure_table(conn):
               and r.rn > 1
             """
         )
-        cur.execute("create unique index if not exists ux_tickets_satisfacao_ticket_id on visualizacao_satisfacao.tickets_satisfacao(ticket_id)")
+        cur.execute("drop index if exists visualizacao_satisfacao.ux_tickets_satisfacao_ticket_id")
+        cur.execute("drop index if exists ux_tickets_satisfacao_ticket_id")
+        cur.execute("create unique index ux_tickets_satisfacao_ticket_id on visualizacao_satisfacao.tickets_satisfacao(ticket_id)")
         cur.execute("create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)")
         cur.execute("create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)")
     conn.commit()
@@ -284,91 +280,6 @@ def resolve_canonical_ticket_ids(conn, ticket_ids):
         if not changed:
             break
     return canonical
-
-
-def normalize_merged_rows(conn):
-    mi = merged_table_info(conn)
-    if not mi:
-        return 0
-
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            select distinct ts.ticket_id::bigint
-            from visualizacao_satisfacao.tickets_satisfacao ts
-            join {mi["schema"]}.{mi["table"]} tm
-              on tm.{mi["src"]} = ts.ticket_id
-            where tm.{mi["dst"]} is not null
-              and ts.ticket_id is not null
-            """
-        )
-        ids = [int(r[0]) for r in cur.fetchall() if r[0] is not None]
-
-    if not ids:
-        return 0
-
-    canonical = resolve_canonical_ticket_ids(conn, ids)
-    pairs = [(old, canonical.get(old, old)) for old in ids if canonical.get(old, old) != old]
-    if not pairs:
-        return 0
-
-    moved = 0
-    with conn.cursor() as cur:
-        cur.execute("set local synchronous_commit=off")
-        cur.execute("create temporary table tmp_merge_pairs(old_id bigint primary key, new_id bigint) on commit drop")
-        execute_values(cur, "insert into tmp_merge_pairs(old_id, new_id) values %s", pairs, page_size=1000)
-
-        cur.execute(
-            """
-            insert into visualizacao_satisfacao.tickets_satisfacao(
-              id, ticket_id, type, value, question_id, client_id, response_date,
-              support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at
-            )
-            select
-              ts.id,
-              p.new_id,
-              ts.type,
-              ts.value,
-              ts.question_id,
-              ts.client_id,
-              ts.response_date,
-              ts.support_agent_id,
-              ts.support_agent_name,
-              ts.support_team,
-              ts.support_rule,
-              ts.raw,
-              now()
-            from visualizacao_satisfacao.tickets_satisfacao ts
-            join tmp_merge_pairs p on p.old_id = ts.ticket_id
-            on conflict (ticket_id) do update set
-              id = excluded.id,
-              type = excluded.type,
-              value = excluded.value,
-              question_id = excluded.question_id,
-              client_id = excluded.client_id,
-              response_date = excluded.response_date,
-              support_agent_id = excluded.support_agent_id,
-              support_agent_name = excluded.support_agent_name,
-              support_team = excluded.support_team,
-              support_rule = excluded.support_rule,
-              raw = excluded.raw,
-              updated_at = excluded.updated_at
-            where visualizacao_satisfacao.tickets_satisfacao.response_date is null
-               or excluded.response_date >= visualizacao_satisfacao.tickets_satisfacao.response_date
-            """
-        )
-
-        cur.execute(
-            """
-            delete from visualizacao_satisfacao.tickets_satisfacao ts
-            using tmp_merge_pairs p
-            where ts.ticket_id = p.old_id
-            """
-        )
-        moved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-
-    conn.commit()
-    return moved
 
 
 def fetch_tickets_batch(ids):
@@ -505,7 +416,7 @@ def upsert_rows(conn, items):
     if not items:
         return 0
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     values = []
     for it in items:
@@ -518,7 +429,7 @@ def upsert_rows(conn, items):
         val = iint(it.get("value"))
         qid = str(it.get("questionId") or "").strip() or None
         cid = str(it.get("clientId") or "").strip() or None
-        rdate = parse_dt(it.get("responseDate"))
+        rdate = it.get("responseDate")
 
         support = it.get("supportResponsible") if isinstance(it.get("supportResponsible"), dict) else None
         s_agent_id = iint(support.get("agentId")) if support else None
@@ -540,7 +451,7 @@ def upsert_rows(conn, items):
                 s_team,
                 s_rule,
                 Json(it),
-                now_utc,
+                now_iso,
             )
         )
 
@@ -583,8 +494,6 @@ def main():
     with psycopg2.connect(NEON_DSN) as conn:
         ensure_table(conn)
 
-        moved_pre = normalize_merged_rows(conn)
-
         since_dt = get_since_from_db(conn)
         since_iso = to_iso_z(since_dt)
 
@@ -601,12 +510,9 @@ def main():
         tickets_map = safe_fetch_tickets(fetch_ids) if fetch_ids else {}
 
         enriched = enrich_items(items, tickets_map, canonical_map)
-
         n = upsert_rows(conn, enriched)
 
-        moved_post = normalize_merged_rows(conn)
-
-    logger.info("Finalizado. DESDE=%s | upsert=%s | moved_pre=%s | moved_post=%s", since_iso, n, moved_pre, moved_post)
+    logger.info("Finalizado. DESDE=%s | upsert=%s", since_iso, n)
 
 
 if __name__ == "__main__":
