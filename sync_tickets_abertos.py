@@ -64,6 +64,11 @@ def norm_ts(x):
     return s
 
 
+def set_fast_commit(cur):
+    if PG_SYNC_COMMIT_OFF:
+        cur.execute("set local synchronous_commit=off")
+
+
 def fetch_open_tickets():
     logger.info("Iniciando fetch de tickets abertos em /tickets…")
 
@@ -219,6 +224,7 @@ def ensure_table(conn):
               add column if not exists reaberturas                   integer default 0
             """
         )
+    conn.commit()
 
 
 def upsert_tickets(conn, rows):
@@ -303,16 +309,20 @@ def upsert_tickets(conn, rows):
     """
 
     with conn.cursor() as cur:
+        set_fast_commit(cur)
         execute_values(cur, sql, values, page_size=200)
 
+    conn.commit()
     return len(values)
 
 
 def cleanup_not_open(conn, open_ids):
     if not open_ids:
         with conn.cursor() as cur:
+            set_fast_commit(cur)
             cur.execute("delete from visualizacao_atual.tickets_abertos")
             removed = cur.rowcount
+        conn.commit()
         if removed:
             logger.info("Removendo %s tickets (nenhum aberto na API).", removed)
         return removed
@@ -322,6 +332,7 @@ def cleanup_not_open(conn, open_ids):
         return 0
 
     with conn.cursor() as cur:
+        set_fast_commit(cur)
         cur.execute(
             "create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop"
         )
@@ -343,6 +354,7 @@ def cleanup_not_open(conn, open_ids):
         )
         removed = cur.rowcount
 
+    conn.commit()
     if removed:
         logger.info("Removendo %s tickets que não estão mais abertos.", removed)
     return removed
@@ -350,6 +362,7 @@ def cleanup_not_open(conn, open_ids):
 
 def cleanup_merged(conn):
     with conn.cursor() as cur:
+        set_fast_commit(cur)
         cur.execute(
             """
             delete from visualizacao_atual.tickets_abertos ta
@@ -359,6 +372,7 @@ def cleanup_merged(conn):
         )
         removed = cur.rowcount
 
+    conn.commit()
     if removed:
         logger.info("Removendo %s tickets marcados como mesclados.", removed)
     return removed
@@ -366,6 +380,7 @@ def cleanup_merged(conn):
 
 def update_empresa_cod_ref(conn):
     with conn.cursor() as cur:
+        set_fast_commit(cur)
         cur.execute(
             """
             update visualizacao_atual.tickets_abertos ta
@@ -377,6 +392,7 @@ def update_empresa_cod_ref(conn):
         )
         affected = cur.rowcount
 
+    conn.commit()
     logger.info(
         "Atualização de empresa_cod_ref_adicional concluída (linhas afetadas: %s).",
         affected,
@@ -391,11 +407,7 @@ def main():
     rows = [map_row(t) for t in items if isinstance(t, dict) and t.get("id") is not None]
     open_ids = [r.get("ticket_id") for r in rows if r.get("ticket_id") is not None]
 
-    conn_kwargs = {}
-    if PG_SYNC_COMMIT_OFF:
-        conn_kwargs["options"] = "-c synchronous_commit=off"
-
-    with psycopg2.connect(DSN, **conn_kwargs) as conn:
+    with psycopg2.connect(DSN) as conn:
         if RUN_DDL:
             ensure_table(conn)
 
