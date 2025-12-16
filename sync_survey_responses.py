@@ -13,7 +13,8 @@ NEON_DSN = os.getenv("NEON_DSN")
 
 PAGE_SIZE = max(1, min(100, int(os.getenv("MOVIDESK_PAGE_SIZE", "100"))))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
-TICKET_THROTTLE = float(os.getenv("MOVIDESK_TICKET_THROTTLE", "0.25"))
+TICKET_THROTTLE = float(os.getenv("MOVIDESK_TICKET_THROTTLE", "0.15"))
+TICKETS_CHUNK = max(1, min(25, int(os.getenv("MOVIDESK_TICKETS_CHUNK", "10"))))
 
 SURVEY_TYPE = int(os.getenv("MOVIDESK_SURVEY_TYPE", "2"))
 DAYS_BACK = int(os.getenv("MOVIDESK_SURVEY_DAYS", "120"))
@@ -46,6 +47,21 @@ def req_json(url, params=None, timeout=90):
         return r.json() if r.text else None
 
 
+def req_list(url, params=None, timeout=90):
+    while True:
+        r = http.get(url, params=params, timeout=timeout)
+        if r.status_code in (429, 503):
+            ra = r.headers.get("retry-after")
+            wait = int(ra) if ra and str(ra).isdigit() else 60
+            logger.warning("Throttle HTTP %s, aguardando %ss…", r.status_code, wait)
+            time.sleep(wait)
+            continue
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json() if r.text else []
+
+
 def iint(x):
     try:
         s = str(x)
@@ -72,17 +88,27 @@ def to_iso_z(dt):
     return dt.replace(microsecond=0).astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def is_support_team(team_name):
-    if not team_name:
-        return False
-    return SUPPORT_TEAM_MATCH in str(team_name).strip().lower()
-
-
-def pick_person(person_obj):
-    if not isinstance(person_obj, dict):
+def team_name(v):
+    if not v:
         return None
-    pid = iint(person_obj.get("id"))
-    name = person_obj.get("businessName") or person_obj.get("name") or person_obj.get("email")
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        return v.get("name") or v.get("businessName") or v.get("title") or str(v)
+    return str(v)
+
+
+def is_support_team(name):
+    if not name:
+        return False
+    return SUPPORT_TEAM_MATCH in str(name).strip().lower()
+
+
+def pick_person(v):
+    if not isinstance(v, dict):
+        return None
+    pid = iint(v.get("id"))
+    name = v.get("businessName") or v.get("name") or v.get("email")
     return {"id": pid, "name": name}
 
 
@@ -96,13 +122,18 @@ def ensure_table(conn):
               ticket_id           bigint,
               type                integer,
               response_date       timestamptz,
-              support_agent_id    bigint,
-              support_agent_name  text,
-              support_team        text,
-              support_rule        text,
-              raw                 jsonb not null,
+              raw                jsonb not null,
               updated_at          timestamptz not null default now()
             )
+            """
+        )
+        cur.execute(
+            """
+            alter table visualizacao_satisfacao.tickets_satisfacao
+              add column if not exists support_agent_id bigint,
+              add column if not exists support_agent_name text,
+              add column if not exists support_team text,
+              add column if not exists support_rule text
             """
         )
         cur.execute("create index if not exists idx_tickets_satisfacao_ticket on visualizacao_satisfacao.tickets_satisfacao(ticket_id)")
@@ -145,19 +176,55 @@ def fetch_survey_responses(since_iso):
     return items
 
 
-def fetch_ticket_full(ticket_id):
+def fetch_tickets_batch(ids):
     url = f"{API_BASE}/tickets"
-    params = {"token": API_TOKEN, "id": int(ticket_id)}
-    return req_json(url, params=params)
+    filt = " or ".join([f"id eq {int(i)}" for i in ids])
+    params = {
+        "token": API_TOKEN,
+        "$select": "id,ownerTeam,owner",
+        "$expand": "owner,ownerHistories",
+        "$filter": filt,
+        "$top": max(1, len(ids)),
+        "$skip": 0,
+    }
+    return req_list(url, params=params) or []
 
 
-def get_owner_histories(ticket):
-    if not isinstance(ticket, dict):
-        return []
-    v = ticket.get("ownerHistories")
+def safe_fetch_tickets(ids):
+    out = {}
+    def do(batch):
+        items = fetch_tickets_batch(batch)
+        for t in items:
+            tid = iint((t or {}).get("id"))
+            if tid is not None:
+                out[tid] = t
+    def rec(batch):
+        try:
+            do(batch)
+        except requests.HTTPError as e:
+            sc = getattr(getattr(e, "response", None), "status_code", None)
+            if sc == 400 and len(batch) > 1:
+                mid = len(batch) // 2
+                rec(batch[:mid])
+                rec(batch[mid:])
+            elif sc == 400 and len(batch) == 1:
+                try:
+                    do(batch)
+                except Exception:
+                    pass
+            else:
+                raise
+    for i in range(0, len(ids), TICKETS_CHUNK):
+        rec(ids[i:i + TICKETS_CHUNK])
+        time.sleep(TICKET_THROTTLE)
+    return out
+
+
+def owner_histories(ticket):
+    v = (ticket or {}).get("ownerHistories")
     if isinstance(v, list):
         return v
-    v = ticket.get("owner_histories")
+    v = (ticket or {}).get("owner_histories")
     if isinstance(v, list):
         return v
     return []
@@ -165,99 +232,58 @@ def get_owner_histories(ticket):
 
 def compute_support_responsible(ticket, response_date_iso):
     resp_dt = parse_dt(response_date_iso)
-    owner_team_now = ticket.get("ownerTeam")
-    owner_now = pick_person(ticket.get("owner"))
-
     histories = []
-    for h in get_owner_histories(ticket):
+    for h in owner_histories(ticket):
         if not isinstance(h, dict):
             continue
         cdt = parse_dt(h.get("changedDate"))
-        histories.append(
-            {
-                "changedDate": cdt,
-                "ownerTeam": h.get("ownerTeam"),
-                "owner": pick_person(h.get("owner")),
-            }
-        )
-    histories = [h for h in histories if h["changedDate"] is not None]
+        oteam = team_name(h.get("ownerTeam"))
+        own = pick_person(h.get("owner"))
+        if cdt is not None and own:
+            histories.append({"changedDate": cdt, "ownerTeam": oteam, "owner": own})
     histories.sort(key=lambda x: x["changedDate"])
-
-    def last_support_before(dt):
-        best = None
-        for h in histories:
-            if h["changedDate"] <= dt and is_support_team(h.get("ownerTeam")) and h.get("owner"):
-                best = h
-        return best
 
     def owner_at(dt):
         cur = None
         for h in histories:
-            if h["changedDate"] <= dt and h.get("owner"):
+            if h["changedDate"] <= dt:
                 cur = h
         return cur
 
+    def last_support_before(dt):
+        best = None
+        for h in histories:
+            if h["changedDate"] <= dt and is_support_team(h.get("ownerTeam")):
+                best = h
+        return best
+
     if resp_dt:
         at = owner_at(resp_dt)
-        if at and is_support_team(at.get("ownerTeam")) and at.get("owner"):
+        if at and is_support_team(at.get("ownerTeam")):
             o = at["owner"]
-            return {
-                "agentId": o.get("id"),
-                "agentName": o.get("name"),
-                "team": at.get("ownerTeam"),
-                "rule": "at_response_support",
-            }
+            return {"agentId": o.get("id"), "agentName": o.get("name"), "team": at.get("ownerTeam"), "rule": "at_response_support"}
 
         last_sup = last_support_before(resp_dt)
-        if last_sup and last_sup.get("owner"):
+        if last_sup:
             o = last_sup["owner"]
-            return {
-                "agentId": o.get("id"),
-                "agentName": o.get("name"),
-                "team": last_sup.get("ownerTeam"),
-                "rule": "last_support_before_response",
-            }
+            return {"agentId": o.get("id"), "agentName": o.get("name"), "team": last_sup.get("ownerTeam"), "rule": "last_support_before_response"}
 
     for h in reversed(histories):
-        if is_support_team(h.get("ownerTeam")) and h.get("owner"):
+        if is_support_team(h.get("ownerTeam")):
             o = h["owner"]
-            return {
-                "agentId": o.get("id"),
-                "agentName": o.get("name"),
-                "team": h.get("ownerTeam"),
-                "rule": "last_support_any",
-            }
+            return {"agentId": o.get("id"), "agentName": o.get("name"), "team": h.get("ownerTeam"), "rule": "last_support_any"}
 
-    if is_support_team(owner_team_now) and owner_now:
-        return {
-            "agentId": owner_now.get("id"),
-            "agentName": owner_now.get("name"),
-            "team": owner_team_now,
-            "rule": "current_owner_support",
-        }
-
-    return None
+    return {"agentId": None, "agentName": None, "team": None, "rule": "no_support_found"}
 
 
-def enrich_items_with_support(items):
-    ticket_cache = {}
+def enrich_items_with_support(items, tickets_map):
     out = []
     for it in items:
         if not isinstance(it, dict):
             continue
         tid = iint(it.get("ticketId"))
-        if tid is None:
-            out.append(it)
-            continue
-
-        if tid not in ticket_cache:
-            t = fetch_ticket_full(tid)
-            ticket_cache[tid] = t if isinstance(t, dict) else {}
-            time.sleep(TICKET_THROTTLE)
-
-        ticket = ticket_cache.get(tid) or {}
-        support = compute_support_responsible(ticket, it.get("responseDate"))
-
+        t = tickets_map.get(tid) if tid is not None else None
+        support = compute_support_responsible(t or {}, it.get("responseDate")) if tid is not None else None
         enriched = dict(it)
         if support:
             enriched["supportResponsible"] = support
@@ -276,7 +302,6 @@ def upsert_rows(conn, items):
         rid = str(it.get("id") or "").strip()
         if not rid:
             continue
-
         support = it.get("supportResponsible") if isinstance(it.get("supportResponsible"), dict) else None
         values.append(
             (
@@ -330,11 +355,19 @@ def main():
         items = fetch_survey_responses(since_iso)
         logger.info("Survey retornou %s respostas desde %s", len(items), since_iso)
 
-        enriched = enrich_items_with_support(items)
-        n = upsert_rows(conn, enriched)
+        tids = sorted({iint(x.get("ticketId")) for x in items if isinstance(x, dict) and iint(x.get("ticketId")) is not None})
+        logger.info("Tickets únicos para enriquecer: %s", len(tids))
 
-    logger.info("Finalizado. DESDE=%s | upsert=%s", since_iso, n)
+        tickets_map = safe_fetch_tickets(tids) if tids else {}
+        enriched = enrich_items_with_support(items, tickets_map)
+
+        n = upsert_rows(conn, enriched)
+        logger.info("Finalizado. DESDE=%s | upsert=%s", since_iso, n)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Falha no sync_survey_responses")
+        raise
