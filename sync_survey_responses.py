@@ -123,7 +123,6 @@ def merged_table_info(conn):
         ok = cur.fetchone()[0] is not None
         if not ok:
             return None
-
         cur.execute(
             """
             select column_name
@@ -133,11 +132,9 @@ def merged_table_info(conn):
             """
         )
         cols = {r[0] for r in cur.fetchall()}
-
     src = "ticket_id" if "ticket_id" in cols else None
     dst_candidates = ["merged_into_id", "mergedIntoId", "merged_into", "mergedInto", "merged_ticket_id", "mergedTicketId"]
     dst = next((c for c in dst_candidates if c in cols), None)
-
     if not src or not dst:
         return None
     return {"schema": "visualizacao_resolvidos", "table": "tickets_mesclados", "src": src, "dst": dst}
@@ -146,7 +143,6 @@ def merged_table_info(conn):
 def ensure_table(conn):
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_satisfacao")
-
         cur.execute(
             """
             create table if not exists visualizacao_satisfacao.tickets_satisfacao(
@@ -166,7 +162,6 @@ def ensure_table(conn):
             )
             """
         )
-
         cur.execute(
             """
             alter table visualizacao_satisfacao.tickets_satisfacao
@@ -185,7 +180,6 @@ def ensure_table(conn):
               add column if not exists updated_at timestamptz
             """
         )
-
         cur.execute(
             """
             update visualizacao_satisfacao.tickets_satisfacao
@@ -193,7 +187,6 @@ def ensure_table(conn):
              where updated_at is null
             """
         )
-
         cur.execute(
             """
             with r as (
@@ -203,7 +196,7 @@ def ensure_table(conn):
                 row_number() over (
                   partition by ticket_id
                   order by response_date desc nulls last, updated_at desc nulls last
-                ) as rn
+                ) rn
               from visualizacao_satisfacao.tickets_satisfacao
               where ticket_id is not null
             )
@@ -213,21 +206,9 @@ def ensure_table(conn):
               and r.rn > 1
             """
         )
-
-        cur.execute(
-            """
-            create unique index if not exists ux_tickets_satisfacao_ticket_id
-            on visualizacao_satisfacao.tickets_satisfacao(ticket_id)
-            where ticket_id is not null
-            """
-        )
-        cur.execute(
-            "create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)"
-        )
-        cur.execute(
-            "create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)"
-        )
-
+        cur.execute("create unique index if not exists ux_tickets_satisfacao_ticket_id on visualizacao_satisfacao.tickets_satisfacao(ticket_id)")
+        cur.execute("create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)")
+        cur.execute("create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)")
     conn.commit()
 
 
@@ -285,11 +266,9 @@ def resolve_canonical_ticket_ids(conn, ticket_ids):
     ids = sorted({int(x) for x in ticket_ids if str(x).isdigit()})
     if not ids:
         return {}
-
     mi = merged_table_info(conn)
     if not mi:
         return {i: i for i in ids}
-
     canonical = {i: i for i in ids}
     for _ in range(12):
         current = sorted({canonical[i] for i in canonical})
@@ -304,7 +283,6 @@ def resolve_canonical_ticket_ids(conn, ticket_ids):
                 changed = True
         if not changed:
             break
-
     return canonical
 
 
@@ -337,13 +315,8 @@ def normalize_merged_rows(conn):
     moved = 0
     with conn.cursor() as cur:
         cur.execute("set local synchronous_commit=off")
-        execute_values(
-            cur,
-            "create temporary table tmp_merge_pairs(old_id bigint, new_id bigint) on commit drop; "
-            "insert into tmp_merge_pairs(old_id, new_id) values %s",
-            pairs,
-            page_size=1000,
-        )
+        cur.execute("create temporary table tmp_merge_pairs(old_id bigint primary key, new_id bigint) on commit drop")
+        execute_values(cur, "insert into tmp_merge_pairs(old_id, new_id) values %s", pairs, page_size=1000)
 
         cur.execute(
             """
