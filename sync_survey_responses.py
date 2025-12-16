@@ -28,13 +28,13 @@ if not API_TOKEN or not NEON_DSN:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("tickets_satisfacao")
 
-http = requests.Session()
-http.headers.update({"Accept": "application/json"})
+S = requests.Session()
+S.headers.update({"Accept": "application/json"})
 
 
 def req_json(url, params=None, timeout=90):
     while True:
-        r = http.get(url, params=params, timeout=timeout)
+        r = S.get(url, params=params, timeout=timeout)
         if r.status_code in (429, 503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if ra and str(ra).isdigit() else 60
@@ -49,7 +49,7 @@ def req_json(url, params=None, timeout=90):
 
 def req_list(url, params=None, timeout=90):
     while True:
-        r = http.get(url, params=params, timeout=timeout)
+        r = S.get(url, params=params, timeout=timeout)
         if r.status_code in (429, 503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if ra and str(ra).isdigit() else 60
@@ -64,7 +64,7 @@ def req_list(url, params=None, timeout=90):
 
 def iint(x):
     try:
-        s = str(x)
+        s = str(x).strip()
         return int(s) if s.isdigit() else None
     except Exception:
         return None
@@ -118,27 +118,90 @@ def ensure_table(conn):
         cur.execute(
             """
             create table if not exists visualizacao_satisfacao.tickets_satisfacao(
-              id                 text primary key,
-              ticket_id           bigint,
+              ticket_id           bigint primary key,
+              response_id         text,
               type                integer,
+              value               integer,
+              question_id         text,
+              client_id           text,
               response_date       timestamptz,
-              raw                jsonb not null,
+              support_agent_id    bigint,
+              support_agent_name  text,
+              support_team        text,
+              support_rule        text,
+              raw                 jsonb not null,
               updated_at          timestamptz not null default now()
             )
             """
         )
+        cur.execute("create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)")
+        cur.execute("create index if not exists idx_tickets_satisfacao_support_agent on visualizacao_satisfacao.tickets_satisfacao(support_agent_id)")
+    conn.commit()
+
+
+def ensure_merged_table_exists(conn):
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('visualizacao_resolvidos.tickets_mesclados')")
+        return cur.fetchone()[0] is not None
+
+
+def normalize_merged_rows(conn):
+    if not ensure_merged_table_exists(conn):
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("set local synchronous_commit=off")
         cur.execute(
             """
-            alter table visualizacao_satisfacao.tickets_satisfacao
-              add column if not exists support_agent_id bigint,
-              add column if not exists support_agent_name text,
-              add column if not exists support_team text,
-              add column if not exists support_rule text
+            insert into visualizacao_satisfacao.tickets_satisfacao(
+              ticket_id, response_id, type, value, question_id, client_id, response_date,
+              support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at
+            )
+            select
+              tm.merged_into_id::bigint,
+              ts.response_id,
+              ts.type,
+              ts.value,
+              ts.question_id,
+              ts.client_id,
+              ts.response_date,
+              ts.support_agent_id,
+              ts.support_agent_name,
+              ts.support_team,
+              ts.support_rule,
+              ts.raw,
+              now()
+            from visualizacao_satisfacao.tickets_satisfacao ts
+            join visualizacao_resolvidos.tickets_mesclados tm
+              on tm.ticket_id = ts.ticket_id
+            where tm.merged_into_id is not null
+            on conflict (ticket_id) do update set
+              response_id = excluded.response_id,
+              type = excluded.type,
+              value = excluded.value,
+              question_id = excluded.question_id,
+              client_id = excluded.client_id,
+              response_date = excluded.response_date,
+              support_agent_id = excluded.support_agent_id,
+              support_agent_name = excluded.support_agent_name,
+              support_team = excluded.support_team,
+              support_rule = excluded.support_rule,
+              raw = excluded.raw,
+              updated_at = excluded.updated_at
+            where visualizacao_satisfacao.tickets_satisfacao.response_date is null
+               or excluded.response_date >= visualizacao_satisfacao.tickets_satisfacao.response_date
             """
         )
-        cur.execute("create index if not exists idx_tickets_satisfacao_ticket on visualizacao_satisfacao.tickets_satisfacao(ticket_id)")
-        cur.execute("create index if not exists idx_tickets_satisfacao_response_date on visualizacao_satisfacao.tickets_satisfacao(response_date)")
+        cur.execute(
+            """
+            delete from visualizacao_satisfacao.tickets_satisfacao ts
+            using visualizacao_resolvidos.tickets_mesclados tm
+            where tm.ticket_id = ts.ticket_id
+              and tm.merged_into_id is not null
+            """
+        )
+        moved = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     conn.commit()
+    return moved
 
 
 def get_since_from_db(conn):
@@ -176,6 +239,43 @@ def fetch_survey_responses(since_iso):
     return items
 
 
+def resolve_canonical_ticket_ids(conn, ticket_ids):
+    ids = sorted({int(x) for x in ticket_ids if str(x).isdigit()})
+    if not ids:
+        return {}
+    if not ensure_merged_table_exists(conn):
+        return {i: i for i in ids}
+
+    canonical = {i: i for i in ids}
+
+    while True:
+        current = sorted({canonical[i] for i in canonical})
+        if not current:
+            break
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select ticket_id::int, merged_into_id::int
+                from visualizacao_resolvidos.tickets_mesclados
+                where ticket_id = any(%s)
+                  and merged_into_id is not null
+                """,
+                (current,),
+            )
+            rows = cur.fetchall()
+        m = {int(a): int(b) for a, b in rows if a is not None and b is not None}
+        changed = False
+        for orig in list(canonical.keys()):
+            c = canonical[orig]
+            if c in m and m[c] != c:
+                canonical[orig] = m[c]
+                changed = True
+        if not changed:
+            break
+
+    return canonical
+
+
 def fetch_tickets_batch(ids):
     url = f"{API_BASE}/tickets"
     filt = " or ".join([f"id eq {int(i)}" for i in ids])
@@ -191,13 +291,16 @@ def fetch_tickets_batch(ids):
 
 
 def safe_fetch_tickets(ids):
+    ids = [int(x) for x in ids if str(x).isdigit()]
     out = {}
+
     def do(batch):
         items = fetch_tickets_batch(batch)
         for t in items:
             tid = iint((t or {}).get("id"))
             if tid is not None:
                 out[tid] = t
+
     def rec(batch):
         try:
             do(batch)
@@ -214,9 +317,11 @@ def safe_fetch_tickets(ids):
                     pass
             else:
                 raise
+
     for i in range(0, len(ids), TICKETS_CHUNK):
-        rec(ids[i:i + TICKETS_CHUNK])
+        rec(ids[i : i + TICKETS_CHUNK])
         time.sleep(TICKET_THROTTLE)
+
     return out
 
 
@@ -276,15 +381,20 @@ def compute_support_responsible(ticket, response_date_iso):
     return {"agentId": None, "agentName": None, "team": None, "rule": "no_support_found"}
 
 
-def enrich_items_with_support(items, tickets_map):
+def enrich_items(items, ticket_map, canonical_map):
     out = []
     for it in items:
         if not isinstance(it, dict):
             continue
-        tid = iint(it.get("ticketId"))
-        t = tickets_map.get(tid) if tid is not None else None
-        support = compute_support_responsible(t or {}, it.get("responseDate")) if tid is not None else None
+        orig_tid = iint(it.get("ticketId"))
+        canon_tid = canonical_map.get(orig_tid, orig_tid) if orig_tid is not None else None
+
+        t = ticket_map.get(orig_tid) or ticket_map.get(canon_tid) if canon_tid is not None else None
+        support = compute_support_responsible(t or {}, it.get("responseDate")) if orig_tid is not None else None
+
         enriched = dict(it)
+        enriched["originalTicketId"] = orig_tid
+        enriched["canonicalTicketId"] = canon_tid
         if support:
             enriched["supportResponsible"] = support
         out.append(enriched)
@@ -299,20 +409,36 @@ def upsert_rows(conn, items):
 
     values = []
     for it in items:
-        rid = str(it.get("id") or "").strip()
-        if not rid:
+        canon_tid = iint(it.get("canonicalTicketId"))
+        if canon_tid is None:
             continue
+
+        resp_id = str(it.get("id") or "").strip() or None
+        rtype = iint(it.get("type"))
+        val = iint(it.get("value"))
+        qid = str(it.get("questionId") or "").strip() or None
+        cid = str(it.get("clientId") or "").strip() or None
+        rdate = it.get("responseDate")
+
         support = it.get("supportResponsible") if isinstance(it.get("supportResponsible"), dict) else None
+        s_agent_id = iint(support.get("agentId")) if support else None
+        s_agent_name = support.get("agentName") if support else None
+        s_team = support.get("team") if support else None
+        s_rule = support.get("rule") if support else None
+
         values.append(
             (
-                rid,
-                iint(it.get("ticketId")),
-                iint(it.get("type")),
-                it.get("responseDate"),
-                iint(support.get("agentId")) if support else None,
-                support.get("agentName") if support else None,
-                support.get("team") if support else None,
-                support.get("rule") if support else None,
+                canon_tid,
+                resp_id,
+                rtype,
+                val,
+                qid,
+                cid,
+                rdate,
+                s_agent_id,
+                s_agent_name,
+                s_team,
+                s_rule,
                 Json(it),
                 now_utc,
             )
@@ -323,11 +449,15 @@ def upsert_rows(conn, items):
 
     sql = """
     insert into visualizacao_satisfacao.tickets_satisfacao
-      (id, ticket_id, type, response_date, support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at)
+      (ticket_id, response_id, type, value, question_id, client_id, response_date,
+       support_agent_id, support_agent_name, support_team, support_rule, raw, updated_at)
     values %s
-    on conflict (id) do update set
-      ticket_id = excluded.ticket_id,
+    on conflict (ticket_id) do update set
+      response_id = excluded.response_id,
       type = excluded.type,
+      value = excluded.value,
+      question_id = excluded.question_id,
+      client_id = excluded.client_id,
       response_date = excluded.response_date,
       support_agent_id = excluded.support_agent_id,
       support_agent_name = excluded.support_agent_name,
@@ -335,6 +465,8 @@ def upsert_rows(conn, items):
       support_rule = excluded.support_rule,
       raw = excluded.raw,
       updated_at = excluded.updated_at
+    where visualizacao_satisfacao.tickets_satisfacao.response_date is null
+       or excluded.response_date >= visualizacao_satisfacao.tickets_satisfacao.response_date
     """
 
     with conn.cursor() as cur:
@@ -345,24 +477,33 @@ def upsert_rows(conn, items):
 
 
 def main():
-    logger.info("Iniciando sync de tickets_satisfacao (survey + responsavel suporte).")
+    logger.info("Iniciando sync de tickets_satisfacao (1 nota por ticket + merge + responsavel suporte).")
 
     with psycopg2.connect(NEON_DSN) as conn:
         ensure_table(conn)
+        moved = normalize_merged_rows(conn)
+
         since_dt = get_since_from_db(conn)
         since_iso = to_iso_z(since_dt)
 
         items = fetch_survey_responses(since_iso)
         logger.info("Survey retornou %s respostas desde %s", len(items), since_iso)
 
-        tids = sorted({iint(x.get("ticketId")) for x in items if isinstance(x, dict) and iint(x.get("ticketId")) is not None})
-        logger.info("Tickets únicos para enriquecer: %s", len(tids))
+        orig_ids = sorted({iint(x.get("ticketId")) for x in items if isinstance(x, dict) and iint(x.get("ticketId")) is not None})
+        canonical_map = resolve_canonical_ticket_ids(conn, orig_ids)
 
-        tickets_map = safe_fetch_tickets(tids) if tids else {}
-        enriched = enrich_items_with_support(items, tickets_map)
+        canon_ids = sorted({canonical_map.get(i, i) for i in orig_ids if i is not None})
+        fetch_ids = sorted(set(orig_ids).union(set(canon_ids)))
 
+        logger.info("Tickets únicos para enriquecer: %s", len(fetch_ids))
+        tickets_map = safe_fetch_tickets(fetch_ids) if fetch_ids else {}
+
+        enriched = enrich_items(items, tickets_map, canonical_map)
         n = upsert_rows(conn, enriched)
-        logger.info("Finalizado. DESDE=%s | upsert=%s", since_iso, n)
+
+        moved2 = normalize_merged_rows(conn)
+
+    logger.info("Finalizado. DESDE=%s | upsert=%s | moved_pre=%s | moved_post=%s", since_iso, n, moved, moved2)
 
 
 if __name__ == "__main__":
