@@ -1,23 +1,35 @@
-name: Sync Movidesk -> Pesquisa de satisfação (Faces) incremental
+name: Movidesk - Survey responses (raw)
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
-      - env:
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - run: python sync_survey_responses.py
+        env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_PAGE_SIZE: "100"
-          MOVIDESK_THROTTLE: "0.3"
-          MOVIDESK_TICKETS_CHUNK: "12"
-          FORCE_BACKFILL_DAYS: "1"
-        run: python sync_survey_responses.py
+          MOVIDESK_THROTTLE: "0.2"
+          MOVIDESK_SURVEY_TYPE: "2"
+          MOVIDESK_SURVEY_DAYS: "120"
+          MOVIDESK_OVERLAP_MIN: "10080"
