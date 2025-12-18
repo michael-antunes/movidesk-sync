@@ -80,10 +80,6 @@ def fetch_pending_from_audit(conn, limit: int) -> List[int]:
 
 
 def try_remove_from_audit(conn, ticket_id: int) -> None:
-    """
-    Opcional: remove da fila 'audit_recent_missing' quando conseguir gravar o detalhe.
-    Se a tabela/colunas não existirem, ignora sem quebrar o job.
-    """
     sql = """
         DELETE FROM visualizacao_resolvidos.audit_recent_missing
         WHERE table_name = 'tickets_resolvidos' AND ticket_id = %s;
@@ -92,7 +88,7 @@ def try_remove_from_audit(conn, ticket_id: int) -> None:
         with conn.cursor() as cur:
             cur.execute(sql, (ticket_id,))
     except Exception:
-        conn.rollback()  # volta só esta tentativa, sem derrubar
+        conn.rollback()
         logger.debug("Não foi possível remover ticket %s da audit_recent_missing (ignorando).", ticket_id)
 
 
@@ -110,7 +106,7 @@ class MovideskClient:
 
         self.session = requests.Session()
         retry = Retry(
-            total=0,  # retry “real” fica no nosso loop, aqui deixamos 0 para não duplicar
+            total=0,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET"],
         )
@@ -121,7 +117,6 @@ class MovideskClient:
         params["token"] = self.token
         url = BASE_URL + path
 
-        # backoff base (com jitter)
         base_sleep = 1.5
 
         for attempt in range(1, self.max_attempts + 1):
@@ -129,12 +124,9 @@ class MovideskClient:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
                 logger.info("GET %s -> %s (attempt %s/%s)", resp.url, resp.status_code, attempt, self.max_attempts)
 
-                # 404: não existe
                 if resp.status_code == 404:
-                    logger.warning("Endpoint %s retornou 404.", path)
                     return None
 
-                # 429: respeita retry-after quando vier
                 if resp.status_code == 429:
                     ra = resp.headers.get("Retry-After")
                     sleep_s = float(ra) if ra and ra.isdigit() else (base_sleep * (2 ** (attempt - 1)))
@@ -143,7 +135,6 @@ class MovideskClient:
                     time.sleep(sleep_s)
                     continue
 
-                # 5xx: retry com backoff
                 if 500 <= resp.status_code <= 599:
                     if attempt == self.max_attempts:
                         body_short = (resp.text or "").replace("\n", " ")[:500]
@@ -154,19 +145,15 @@ class MovideskClient:
                     time.sleep(sleep_s)
                     continue
 
-                # 4xx: não adianta retry (exceto 429 que já tratamos)
                 if resp.status_code >= 400:
-                    body_short = (resp.text or "").replace("\n", " ")[:500]
+                    body_short = (resp.text or "").replace("\n", " ")[:800]
                     logger.error("Erro HTTP %s ao chamar %s: %s", resp.status_code, path, body_short)
                     return None
 
-                # resposta vazia
                 if not (resp.text or "").strip():
                     if attempt == self.max_attempts:
-                        logger.warning("Resposta vazia em %s após %s tentativas.", path, self.max_attempts)
                         return None
                     sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                    logger.warning("Resposta vazia. Dormindo %.1fs e tentando novamente...", sleep_s)
                     time.sleep(sleep_s)
                     continue
 
@@ -177,38 +164,33 @@ class MovideskClient:
                         logger.exception("Falha ao parsear JSON de %s.", path)
                         return None
                     sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                    logger.warning("JSON inválido. Dormindo %.1fs e tentando novamente...", sleep_s)
                     time.sleep(sleep_s)
                     continue
 
             except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
                 if attempt == self.max_attempts:
-                    logger.error("Timeout em %s (attempt %s/%s): %s", path, attempt, self.max_attempts, exc)
+                    logger.error("Timeout em %s: %s", path, exc)
                     raise
                 sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                logger.warning("Timeout em %s. Dormindo %.1fs e tentando novamente...", path, sleep_s)
                 time.sleep(sleep_s)
                 continue
+
             except requests.exceptions.RequestException as exc:
-                # erro de rede/conexão genérico
                 if attempt == self.max_attempts:
                     logger.error("Erro de rede em %s: %s", path, exc)
                     raise
                 sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                logger.warning("Erro de rede. Dormindo %.1fs e tentando novamente...", sleep_s)
                 time.sleep(sleep_s)
                 continue
 
         return None
 
     def get_ticket(self, ticket_id: int, select_fields: str) -> Optional[Dict[str, Any]]:
-        # tenta primeiro /tickets?id=...
         params = {
             "id": str(ticket_id),
             "includeDeletedItems": "true",
             "$select": select_fields,
         }
-        logger.info("Buscando ticket %s em /tickets (id=...)", ticket_id)
         data = self._request("/tickets", params)
 
         if isinstance(data, list):
@@ -217,8 +199,6 @@ class MovideskClient:
         if isinstance(data, dict) and data.get("id"):
             return data
 
-        # fallback /tickets/past
-        logger.info("Ticket %s não encontrado em /tickets; tentando /tickets/past", ticket_id)
         params_past = {
             "$filter": f"id eq {ticket_id}",
             "$select": select_fields,
@@ -234,12 +214,11 @@ class MovideskClient:
 
         return None
 
-    def list_tickets_after(self, last_id: int, limit: int, per_page: int, select_fields: str) -> List[Dict[str, Any]]:
+    def list_ticket_ids_after(self, last_id: int, limit: int, per_page: int, select_fields: str) -> List[int]:
         """
-        Lista tickets Resolved/Closed/Canceled com id > last_id.
-        Mantém $select reduzido (crítico para não estourar timeout).
+        Lista SOMENTE IDs (e campos "seguros") para evitar 400 em $select da listagem.
         """
-        results: List[Dict[str, Any]] = []
+        results: List[int] = []
         remaining = max(limit, 0)
         current_last_id = last_id
 
@@ -263,8 +242,8 @@ class MovideskClient:
             if not isinstance(data, list) or not data:
                 break
 
-            page_items: List[Dict[str, Any]] = []
             max_id_in_page = current_last_id
+            page_ids: List[int] = []
 
             for item in data:
                 if not isinstance(item, dict) or "id" not in item:
@@ -275,17 +254,17 @@ class MovideskClient:
                     continue
                 if tid <= current_last_id:
                     continue
-                page_items.append(item)
+                page_ids.append(tid)
                 max_id_in_page = max(max_id_in_page, tid)
 
-            if not page_items:
+            if not page_ids:
                 break
 
-            results.extend(page_items)
-            remaining -= len(page_items)
+            results.extend(page_ids)
+            remaining -= len(page_ids)
             current_last_id = max_id_in_page
 
-            if len(page_items) < top:
+            if len(page_ids) < top:
                 break
 
         return results
@@ -312,34 +291,35 @@ def sync_new_tickets(
     client: MovideskClient,
     limit: int,
     per_page: int,
-    select_bulk: str,
+    select_list: str,
+    select_detail: str,
 ) -> Tuple[int, int]:
     last_id = get_last_ticket_id(conn)
     logger.info("Último ticket_id em tickets_resolvidos_detail: %s", last_id)
 
-    tickets = client.list_tickets_after(last_id, limit, per_page=per_page, select_fields=select_bulk)
+    ids = client.list_ticket_ids_after(last_id, limit, per_page=per_page, select_fields=select_list)
 
-    if not tickets:
+    if not ids:
         logger.info("Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id=%s.", last_id)
         return 0, 0
 
     ok = 0
     fail = 0
 
-    for idx, ticket in enumerate(tickets, start=1):
-        try:
-            ticket_id = int(ticket["id"])
-        except Exception:
-            logger.warning("Ticket sem id numérico na posição %s: ignorando.", idx)
-            fail += 1
-            continue
-
-        logger.info("Processando ticket novo %s/%s (ID=%s)", idx, len(tickets), ticket_id)
+    for idx, ticket_id in enumerate(ids, start=1):
+        logger.info("Processando ticket novo %s/%s (ID=%s)", idx, len(ids), ticket_id)
 
         try:
+            ticket = client.get_ticket(ticket_id, select_fields=select_detail)
+            if ticket is None:
+                logger.warning("Ticket %s não retornou detalhes (mantendo para fila missing se existir).", ticket_id)
+                fail += 1
+                continue
+
             upsert_ticket_detail_json(conn, ticket_id, ticket)
             conn.commit()
             ok += 1
+
         except Exception as exc:
             logger.exception("Erro ao gravar ticket novo ticket_id=%s no Neon: %s", ticket_id, exc)
             conn.rollback()
@@ -348,12 +328,7 @@ def sync_new_tickets(
     return ok, fail
 
 
-def sync_missing_tickets(
-    conn,
-    client: MovideskClient,
-    limit: int,
-    select_detail: str,
-) -> Tuple[int, int]:
+def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail: str) -> Tuple[int, int]:
     pending_ids = fetch_pending_from_audit(conn, limit)
 
     if not pending_ids:
@@ -384,7 +359,6 @@ def sync_missing_tickets(
 
         try:
             upsert_ticket_detail_json(conn, ticket_id, ticket)
-            # opcional: remove da fila de missing
             try_remove_from_audit(conn, ticket_id)
             conn.commit()
             ok += 1
@@ -442,18 +416,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     conn = get_db_connection()
     ensure_detail_table_exists(conn)
 
-    # IMPORTANTE: $select reduzido para não estourar timeout
-    # Mantém o que você usa nos cálculos: serviços, owner/ownerTeam, clients, statusHistories, customFieldValues etc.
-    SELECT_BULK = (
+    # ✅ Select "seguro" para LISTAGEM (evita o 400 do customFields)
+    SELECT_LIST = "id,lastUpdate"
+
+    # ✅ Select para DETALHE (por id) — aqui pode ser mais completo
+    # (se algum campo aqui der 400, removemos também, mas no seu log por id está 200)
+    SELECT_DETAIL = (
         "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
         "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
         "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,resolvedIn,closedIn,"
         "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
-        "customFieldValues,customFields,additionalFields,custom_fields"
+        "customFieldValues,additionalFields,custom_fields"
     )
-
-    # Para missing, usamos o mesmo select (pode ser o mesmo ou mais “completo” se você quiser)
-    SELECT_DETAIL = SELECT_BULK
 
     client = MovideskClient(
         token=token,
@@ -462,15 +436,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_attempts=max_attempts,
     )
 
-    ok_new, fail_new = sync_new_tickets(conn, client, bulk_limit, per_page=page_size, select_bulk=SELECT_BULK)
+    ok_new, fail_new = sync_new_tickets(
+        conn, client, bulk_limit,
+        per_page=page_size,
+        select_list=SELECT_LIST,
+        select_detail=SELECT_DETAIL,
+    )
     ok_missing, fail_missing = sync_missing_tickets(conn, client, missing_limit, select_detail=SELECT_DETAIL)
-
-    ok_total = ok_new + ok_missing
-    fail_total = fail_new + fail_missing
 
     logger.info(
         "Processamento concluído. Sucesso=%s (novos=%s, missing=%s), Falhas=%s (novos=%s, missing=%s).",
-        ok_total, ok_new, ok_missing, fail_total, fail_new, fail_missing
+        ok_new + ok_missing, ok_new, ok_missing, fail_new + fail_missing, fail_new, fail_missing
     )
 
     conn.close()
