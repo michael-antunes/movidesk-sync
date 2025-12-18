@@ -4,7 +4,7 @@ import os
 import sys
 import time
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import psycopg2
 from psycopg2.extras import Json
@@ -90,6 +90,18 @@ def try_remove_from_audit(conn, ticket_id: int) -> None:
     except Exception:
         conn.rollback()
         logger.debug("Não foi possível remover ticket %s da audit_recent_missing (ignorando).", ticket_id)
+
+
+def get_existing_ids_in_range(conn, low_id: int, high_id: int) -> Set[int]:
+    sql = """
+        SELECT ticket_id
+        FROM visualizacao_resolvidos.tickets_resolvidos_detail
+        WHERE ticket_id BETWEEN %s AND %s;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (low_id, high_id))
+        rows = cur.fetchall()
+    return {int(r[0]) for r in rows}
 
 
 class MovideskClient:
@@ -214,9 +226,17 @@ class MovideskClient:
 
         return None
 
-    def list_ticket_ids_after(self, last_id: int, limit: int, per_page: int, select_fields: str) -> List[int]:
+    def list_ticket_ids_after(
+        self,
+        last_id: int,
+        limit: int,
+        per_page: int,
+        select_fields: str,
+        upper_id: Optional[int] = None,
+    ) -> List[int]:
         """
-        Lista SOMENTE IDs (e campos "seguros") para evitar 400 em $select da listagem.
+        Lista IDs usando /tickets com $filter. (select precisa ser "seguro")
+        Se upper_id for informado, limita: id <= upper_id.
         """
         results: List[int] = []
         remaining = max(limit, 0)
@@ -228,15 +248,18 @@ class MovideskClient:
 
         while remaining > 0:
             top = min(remaining, per_page)
+
+            upper_clause = f" and id le {upper_id}" if upper_id is not None else ""
             params = {
-                "$filter": f"id gt {current_last_id} and {base_status_filter}",
+                "$filter": f"id gt {current_last_id}{upper_clause} and {base_status_filter}",
                 "$orderby": "id",
                 "$top": str(top),
                 "$select": select_fields,
                 "includeDeletedItems": "true",
             }
 
-            logger.info("Listando até %s tickets em /tickets com id > %s (Resolved/Closed/Canceled)", top, current_last_id)
+            logger.info("Listando até %s tickets em /tickets com id > %s%s (Resolved/Closed/Canceled)",
+                        top, current_last_id, f" e <= {upper_id}" if upper_id is not None else "")
             data = self._request("/tickets", params)
 
             if not isinstance(data, list) or not data:
@@ -286,6 +309,64 @@ def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any])
         cur.execute(sql, (ticket_id, Json(ticket_json)))
 
 
+def sync_window_tickets(
+    conn,
+    client: MovideskClient,
+    window: int,
+    per_page: int,
+    select_list: str,
+    select_detail: str,
+) -> Tuple[int, int]:
+    """
+    Varre (last_id - window) .. (last_id + window) e busca detalhes dos IDs que NÃO existem no Neon.
+    """
+    if window <= 0:
+        return 0, 0
+
+    center = get_last_ticket_id(conn)
+    low = max(0, center - window)
+    high = center + window
+
+    existing = get_existing_ids_in_range(conn, low, high)
+
+    # pega IDs resolvidos dentro da janela (usando listagem com upper bound)
+    ids = client.list_ticket_ids_after(
+        last_id=low - 1,
+        limit=(2 * window + 1) + 50,  # folga (se houver buracos)
+        per_page=per_page,
+        select_fields=select_list,
+        upper_id=high,
+    )
+
+    # só os que não existem ainda
+    ids_to_fetch = [tid for tid in ids if tid not in existing]
+
+    logger.info(
+        "Varredura janela [%s..%s] (center=%s): encontrados=%s, já_existiam=%s, para_buscar=%s",
+        low, high, center, len(ids), len(existing), len(ids_to_fetch)
+    )
+
+    ok = 0
+    fail = 0
+
+    for idx, ticket_id in enumerate(ids_to_fetch, start=1):
+        logger.info("Janela: buscando detalhe %s/%s (ID=%s)", idx, len(ids_to_fetch), ticket_id)
+        try:
+            ticket = client.get_ticket(ticket_id, select_fields=select_detail)
+            if ticket is None:
+                fail += 1
+                continue
+            upsert_ticket_detail_json(conn, ticket_id, ticket)
+            conn.commit()
+            ok += 1
+        except Exception as exc:
+            logger.exception("Erro ao gravar ticket janela ticket_id=%s: %s", ticket_id, exc)
+            conn.rollback()
+            fail += 1
+
+    return ok, fail
+
+
 def sync_new_tickets(
     conn,
     client: MovideskClient,
@@ -297,7 +378,13 @@ def sync_new_tickets(
     last_id = get_last_ticket_id(conn)
     logger.info("Último ticket_id em tickets_resolvidos_detail: %s", last_id)
 
-    ids = client.list_ticket_ids_after(last_id, limit, per_page=per_page, select_fields=select_list)
+    ids = client.list_ticket_ids_after(
+        last_id=last_id,
+        limit=limit,
+        per_page=per_page,
+        select_fields=select_list,
+        upper_id=None,
+    )
 
     if not ids:
         logger.info("Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id=%s.", last_id)
@@ -308,20 +395,16 @@ def sync_new_tickets(
 
     for idx, ticket_id in enumerate(ids, start=1):
         logger.info("Processando ticket novo %s/%s (ID=%s)", idx, len(ids), ticket_id)
-
         try:
             ticket = client.get_ticket(ticket_id, select_fields=select_detail)
             if ticket is None:
-                logger.warning("Ticket %s não retornou detalhes (mantendo para fila missing se existir).", ticket_id)
                 fail += 1
                 continue
-
             upsert_ticket_detail_json(conn, ticket_id, ticket)
             conn.commit()
             ok += 1
-
         except Exception as exc:
-            logger.exception("Erro ao gravar ticket novo ticket_id=%s no Neon: %s", ticket_id, exc)
+            logger.exception("Erro ao gravar ticket novo ticket_id=%s: %s", ticket_id, exc)
             conn.rollback()
             fail += 1
 
@@ -343,7 +426,6 @@ def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail
 
     for idx, ticket_id in enumerate(pending_ids, start=1):
         logger.info("Processando ticket pendente %s/%s (ID=%s)", idx, len(pending_ids), ticket_id)
-
         try:
             ticket = client.get_ticket(ticket_id, select_fields=select_detail)
         except Exception as exc:
@@ -353,7 +435,7 @@ def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail
             continue
 
         if ticket is None:
-            logger.warning("Ticket %s não encontrado em nenhum endpoint. Mantendo na fila.", ticket_id)
+            logger.warning("Ticket %s não encontrado. Mantendo na fila.", ticket_id)
             fail += 1
             continue
 
@@ -363,7 +445,7 @@ def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail
             conn.commit()
             ok += 1
         except Exception as exc:
-            logger.exception("Erro ao gravar ticket pendente ticket_id=%s no Neon: %s", ticket_id, exc)
+            logger.exception("Erro ao gravar ticket pendente ticket_id=%s: %s", ticket_id, exc)
             conn.rollback()
             fail += 1
 
@@ -371,56 +453,34 @@ def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    try:
-        bulk_limit = int(get_env("DETAIL_BULK_LIMIT", "200"))
-    except ValueError:
-        bulk_limit = 200
+    def _int_env(name: str, default: str) -> int:
+        try:
+            return int(get_env(name, default))
+        except ValueError:
+            return int(default)
 
-    try:
-        missing_limit = int(get_env("DETAIL_MISSING_LIMIT", "10"))
-    except ValueError:
-        missing_limit = 10
-
-    try:
-        page_size = int(get_env("DETAIL_PAGE_SIZE", "50"))
-    except ValueError:
-        page_size = 50
-
-    try:
-        connect_timeout = int(get_env("MOVIDESK_CONNECT_TIMEOUT", "10"))
-    except ValueError:
-        connect_timeout = 10
-
-    try:
-        read_timeout = int(get_env("MOVIDESK_READ_TIMEOUT", "120"))
-    except ValueError:
-        read_timeout = 120
-
-    try:
-        max_attempts = int(get_env("DETAIL_MAX_ATTEMPTS", "6"))
-    except ValueError:
-        max_attempts = 6
+    bulk_limit = _int_env("DETAIL_BULK_LIMIT", "200")
+    missing_limit = _int_env("DETAIL_MISSING_LIMIT", "10")
+    page_size = _int_env("DETAIL_PAGE_SIZE", "50")
+    connect_timeout = _int_env("MOVIDESK_CONNECT_TIMEOUT", "10")
+    read_timeout = _int_env("MOVIDESK_READ_TIMEOUT", "120")
+    max_attempts = _int_env("DETAIL_MAX_ATTEMPTS", "6")
+    window = _int_env("DETAIL_WINDOW", "50")  # ✅ -50/+50
 
     token = get_env("MOVIDESK_TOKEN", required=True)
 
     logger.info(
-        "Iniciando sincronização detail (bulk=%s, missing=%s, page=%s, timeout=(%ss,%ss), attempts=%s).",
-        bulk_limit,
-        missing_limit,
-        page_size,
-        connect_timeout,
-        read_timeout,
-        max_attempts,
+        "Iniciando sincronização detail (bulk=%s, missing=%s, page=%s, window=%s, timeout=(%ss,%ss), attempts=%s).",
+        bulk_limit, missing_limit, page_size, window, connect_timeout, read_timeout, max_attempts
     )
 
     conn = get_db_connection()
     ensure_detail_table_exists(conn)
 
-    # ✅ Select "seguro" para LISTAGEM (evita o 400 do customFields)
+    # ✅ Select "seguro" para LISTAGEM
     SELECT_LIST = "id,lastUpdate"
 
-    # ✅ Select para DETALHE (por id) — aqui pode ser mais completo
-    # (se algum campo aqui der 400, removemos também, mas no seu log por id está 200)
+    # ✅ Select para DETALHE (por id)
     SELECT_DETAIL = (
         "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
         "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
@@ -436,17 +496,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         max_attempts=max_attempts,
     )
 
-    ok_new, fail_new = sync_new_tickets(
-        conn, client, bulk_limit,
-        per_page=page_size,
-        select_list=SELECT_LIST,
-        select_detail=SELECT_DETAIL,
-    )
-    ok_missing, fail_missing = sync_missing_tickets(conn, client, missing_limit, select_detail=SELECT_DETAIL)
+    ok_win, fail_win = sync_window_tickets(conn, client, window, page_size, SELECT_LIST, SELECT_DETAIL)
+    ok_new, fail_new = sync_new_tickets(conn, client, bulk_limit, page_size, SELECT_LIST, SELECT_DETAIL)
+    ok_missing, fail_missing = sync_missing_tickets(conn, client, missing_limit, SELECT_DETAIL)
 
     logger.info(
-        "Processamento concluído. Sucesso=%s (novos=%s, missing=%s), Falhas=%s (novos=%s, missing=%s).",
-        ok_new + ok_missing, ok_new, ok_missing, fail_new + fail_missing, fail_new, fail_missing
+        "Processamento concluído. Sucesso=%s (janela=%s, novos=%s, missing=%s), Falhas=%s (janela=%s, novos=%s, missing=%s).",
+        ok_win + ok_new + ok_missing,
+        ok_win, ok_new, ok_missing,
+        fail_win + fail_new + fail_missing,
+        fail_win, fail_new, fail_missing
     )
 
     conn.close()
