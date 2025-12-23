@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import json
 import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
@@ -12,7 +11,6 @@ from psycopg2.extras import Json
 
 
 API_BASE = "https://api.movidesk.com/public/v1"
-
 
 SELECT_LIST = "id,baseStatus,lastUpdate,isDeleted"
 SELECT_DETAIL = (
@@ -90,27 +88,8 @@ def pg_all(conn, sql, params=None):
         return cur.fetchall()
 
 
-def find_table_schema(conn, relname: str):
-    row = pg_one(
-        conn,
-        """
-        SELECT n.nspname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind='r' AND c.relname = %s
-        ORDER BY CASE WHEN n.nspname='public' THEN 0 ELSE 1 END, n.nspname
-        LIMIT 1
-        """,
-        [relname],
-    )
-    return row[0] if row else None
-
-
 def ensure_audit_table(conn, logger: logging.Logger):
-    schema = find_table_schema(conn, "audit_recent_missing")
-    if schema:
-        return f"{schema}.audit_recent_missing"
-    schema = "dados_gerais"
+    schema = os.getenv("AUDIT_SCHEMA", "dados_gerais")
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         cur.execute(
@@ -127,8 +106,17 @@ def ensure_audit_table(conn, logger: logging.Logger):
             )
             """
         )
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS first_seen timestamptz NOT NULL DEFAULT now()")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now()")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS last_attempt timestamptz")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS last_status integer")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS last_error text")
+        cur.execute(f"UPDATE {schema}.audit_recent_missing SET attempts=0 WHERE attempts IS NULL")
+        cur.execute(f"UPDATE {schema}.audit_recent_missing SET first_seen=now() WHERE first_seen IS NULL")
+        cur.execute(f"UPDATE {schema}.audit_recent_missing SET last_seen=now() WHERE last_seen IS NULL")
     conn.commit()
-    logger.info(f"detail: audit_recent_missing criada em {schema}.audit_recent_missing")
+    logger.info(f"detail: audit_recent_missing em {schema}.audit_recent_missing")
     return f"{schema}.audit_recent_missing"
 
 
@@ -180,9 +168,7 @@ def upsert_detail(conn, logger: logging.Logger, ticket: dict):
         insert_cols.append("updated_at")
         placeholders.append("now()")
 
-    update_sets = []
-    if raw_col in cols:
-        update_sets.append(f"{raw_col}=EXCLUDED.{raw_col}")
+    update_sets = [f"{raw_col}=EXCLUDED.{raw_col}"]
     if "base_status" in cols:
         update_sets.append("base_status=EXCLUDED.base_status")
     if "last_update" in cols:
@@ -207,7 +193,7 @@ def audit_upsert(conn, audit_fqn: str, ticket_id: int, status_code: int | None, 
     VALUES (%s, now(), now(), 1, now(), %s, %s)
     ON CONFLICT (ticket_id) DO UPDATE SET
       last_seen=now(),
-      attempts={schema}.{table}.attempts + 1,
+      attempts=COALESCE({schema}.{table}.attempts,0) + 1,
       last_attempt=now(),
       last_status=EXCLUDED.last_status,
       last_error=EXCLUDED.last_error
@@ -261,12 +247,7 @@ def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: 
         except Exception:
             return None, resp.status_code, None
 
-    params2 = {
-        "$filter": f"id eq {int(ticket_id)}",
-        "$select": SELECT_DETAIL,
-        "includeDeletedItems": "true",
-        "token": token,
-    }
+    params2 = {"$filter": f"id eq {int(ticket_id)}", "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
     resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
     if resp2.status_code != 200:
         try:
@@ -295,18 +276,13 @@ def main():
 
     bulk_limit = int(os.getenv("DETAIL_BULK_LIMIT", "200"))
     missing_limit = int(os.getenv("DETAIL_MISSING_LIMIT", "10"))
-
-    page = int(os.getenv("DETAIL_PAGE", "50"))
     window = int(os.getenv("DETAIL_WINDOW", "50"))
-
     attempts = int(os.getenv("DETAIL_ATTEMPTS", "6"))
     connect_timeout = int(os.getenv("DETAIL_CONNECT_TIMEOUT", "10"))
     read_timeout = int(os.getenv("DETAIL_READ_TIMEOUT", "120"))
     timeout = (connect_timeout, read_timeout)
 
-    logger.info(
-        f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, page={page}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts})."
-    )
+    logger.info(f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts}).")
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -389,16 +365,11 @@ def main():
     pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY ticket_id DESC LIMIT %s", [missing_limit])
     pend_ids = [int(r[0]) for r in pend]
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
-    if pend_ids:
-        logger.info(f"detail: Primeiros pendentes (até 5): {', '.join(str(x) for x in pend_ids[:5])}")
 
     for idx, tid in enumerate(pend_ids, start=1):
         logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
         ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
         if ticket is None:
-            if sc == 400 and e:
-                logger.error(f"detail: {e[:4000]}")
-            logger.warning(f"detail: Ticket {tid} não encontrado. Mantendo na fila.")
             audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
             total_missing += 1
             continue
@@ -406,9 +377,7 @@ def main():
         audit_delete(conn, audit_fqn, tid)
         total_ok += 1
 
-    logger.info(
-        f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), Falhas={total_missing}."
-    )
+    logger.info(f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), Falhas={total_missing}.")
 
     try:
         conn.close()
