@@ -1,622 +1,542 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import re
+import sys
 import time
 import json
-from datetime import datetime, timezone, timedelta
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import psycopg2
-from psycopg2.extras import execute_values
-
-API_BASE = "https://api.movidesk.com/public/v1"
-TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-DSN = os.getenv("NEON_DSN")
-
-BATCH = int(os.getenv("MERGED_BATCH", "400"))
-THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
-LOOKBACK_HOURS = int(os.getenv("MERGED_LOOKBACK_HOURS", "24"))
-
-S = requests.Session()
-S.headers.update({"User-Agent": "movidesk-sync/merged"})
-
-if not TOKEN or not DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
+import psycopg2.extras
 
 
-def md_get(path, params=None, ok_404=False):
-    url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
-    p = dict(params or {})
-    p["token"] = TOKEN
-    r = S.get(url, params=p, timeout=60)
-    if r.status_code == 200:
-        return r.json() or []
-    if ok_404 and r.status_code == 404:
+# -------------------------
+# Config / Utils
+# -------------------------
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+def warn(msg: str) -> None:
+    print(f"[WARN] {msg}", flush=True)
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[ERROR] {msg}", flush=True)
+    sys.exit(code)
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def parse_iso8601_z(s: str) -> Optional[datetime]:
+    # Ex: 2025-12-23T13:02:44Z
+    try:
+        if s.endswith("Z"):
+            return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(s)
+    except Exception:
         return None
-    if r.status_code in (429, 500, 502, 503, 504):
-        time.sleep(1.5)
-        r2 = S.get(url, params=p, timeout=60)
-        if r2.status_code == 200:
-            return r2.json() or []
-    r.raise_for_status()
+
+def format_iso8601_z(dt: datetime) -> str:
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def format_merged_param(dt: datetime) -> str:
+    # Manual mostra startDate/endDate como "YYYY-MM-DD" (e às vezes aparece datetime em exemplos).
+    # Usar datetime dá granularidade melhor sem quebrar quem aceita; se o endpoint existir e só aceitar data,
+    # ele normalmente ainda aceita "YYYY-MM-DD". Ajuste aqui se quiser forçar só data.
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def chunked(lst: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
 
 
-def to_aware(dt):
-    if dt is None:
-        return None
-    if isinstance(dt, datetime):
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    return dt
+# -------------------------
+# Movidesk Client
+# -------------------------
+
+@dataclass
+class MovideskClient:
+    base_url: str
+    token: str
+    timeout: int = 60
+    max_retries: int = 5
+    backoff_base: float = 1.5
+
+    def get(self, path: str, params: Dict[str, Any]) -> requests.Response:
+        url = self.base_url.rstrip("/") + "/" + path.lstrip("/")
+        params = dict(params)
+        params["token"] = self.token
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                r = requests.get(url, params=params, timeout=self.timeout)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    wait = (self.backoff_base ** (attempt - 1)) + (0.1 * attempt)
+                    warn(f"HTTP {r.status_code} em GET {path}. retry {attempt}/{self.max_retries} em {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                return r
+            except Exception as e:
+                last_exc = e
+                wait = (self.backoff_base ** (attempt - 1)) + (0.1 * attempt)
+                warn(f"exceção em GET {path}: {e}. retry {attempt}/{self.max_retries} em {wait:.1f}s")
+                time.sleep(wait)
+
+        raise RuntimeError(f"falha após retries em GET {path}: {last_exc}")
 
 
-def ensure_schema_tables(conn):
-    with conn.cursor() as cur:
-        cur.execute("create schema if not exists visualizacao_resolvidos")
-        cur.execute(
-            """
-            create table if not exists visualizacao_resolvidos.tickets_mesclados(
-              ticket_id integer primary key,
-              merged_into_id integer,
-              merged_at timestamptz,
-              situacao_mesclado text generated always as ('Sim') stored,
-              raw_payload jsonb,
-              imported_at timestamptz default now()
-            )
-            """
-        )
-        cur.execute(
-            "create index if not exists ix_tk_merged_into on visualizacao_resolvidos.tickets_mesclados(merged_into_id)"
-        )
-        cur.execute(
-            """
-            create table if not exists visualizacao_resolvidos.sync_control(
-              name text primary key,
-              job_name text,
-              last_update timestamptz,
-              run_at timestamptz default now()
-            )
-            """
-        )
-    conn.commit()
+# -------------------------
+# Database
+# -------------------------
+
+def pg_connect():
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if db_url:
+        return psycopg2.connect(db_url)
+
+    host = os.getenv("PGHOST")
+    port = os.getenv("PGPORT", "5432")
+    db = os.getenv("PGDATABASE")
+    user = os.getenv("PGUSER")
+    pwd = os.getenv("PGPASSWORD")
+
+    if not (host and db and user):
+        die("Defina DATABASE_URL ou (PGHOST, PGDATABASE, PGUSER, PGPASSWORD).")
+
+    return psycopg2.connect(host=host, port=port, dbname=db, user=user, password=pwd)
 
 
-def regclass_exists(conn, name):
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass(%s)", (name,))
-        return cur.fetchone()[0] is not None
+def ensure_schema_and_tables(conn, schema: str) -> None:
+    ddl = f"""
+    create schema if not exists {schema};
 
+    create table if not exists {schema}.sync_state (
+        key text primary key,
+        last_run_end timestamptz,
+        updated_at timestamptz not null default now()
+    );
 
-def column_exists(conn, schema, table, column):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select 1
-              from information_schema.columns
-             where table_schema = %s
-               and table_name = %s
-               and column_name = %s
-             limit 1
-            """,
-            (schema, table, column),
-        )
-        return cur.fetchone() is not None
+    create table if not exists {schema}.tickets_mesclados (
+        ticket_id bigint not null,
+        merged_ticket_id bigint not null,
+        source text not null,
+        last_update timestamptz,
+        inserted_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        primary key (ticket_id, merged_ticket_id)
+    );
 
+    create index if not exists idx_tickets_mesclados_ticket_id
+        on {schema}.tickets_mesclados(ticket_id);
 
-def pick_ts_column(conn, schema, table, candidates):
-    for c in candidates:
-        if column_exists(conn, schema, table, c):
-            return c
-    return None
-
-
-def get_last_sync_update(conn):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select max(last_update)
-              from visualizacao_resolvidos.sync_control
-             where job_name = %s
-            """,
-            ("tickets_merged",),
-        )
-        row = cur.fetchone()
-        return to_aware(row[0]) if row and row[0] else None
-
-
-def register_sync_run(conn, last_update):
-    job = "tickets_merged"
-    v = to_aware(last_update) if isinstance(last_update, datetime) else last_update
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into visualizacao_resolvidos.sync_control(name, job_name, last_update, run_at)
-            values (%s, %s, %s, now())
-            on conflict (name) do update set
-              job_name    = excluded.job_name,
-              last_update = excluded.last_update,
-              run_at      = now()
-            """,
-            (job, job, v),
-        )
-    conn.commit()
-
-
-def fmt_dt_for_md(d):
-    if not d:
-        return None
-    if isinstance(d, str):
-        return d
-    if not isinstance(d, datetime):
-        return str(d)
-    d = to_aware(d)
-    return d.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def normalize_merged_response(raw):
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        v = raw.get("mergedTickets")
-        if isinstance(v, list):
-            return v
-        for key in ("value", "items", "data", "tickets", "results"):
-            v = raw.get(key)
-            if isinstance(v, list):
-                return v
-        return []
-    return []
-
-
-def upsert_rows(conn, rows):
-    if not rows:
-        return 0
-    sql = """
-    insert into visualizacao_resolvidos.tickets_mesclados
-      (ticket_id, merged_into_id, merged_at, raw_payload)
-    values %s
-    on conflict (ticket_id) do update set
-      merged_into_id = excluded.merged_into_id,
-      merged_at      = coalesce(excluded.merged_at, visualizacao_resolvidos.tickets_mesclados.merged_at),
-      raw_payload    = excluded.raw_payload,
-      imported_at    = now()
+    create index if not exists idx_tickets_mesclados_merged_ticket_id
+        on {schema}.tickets_mesclados(merged_ticket_id);
     """
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=2000)
+        cur.execute(ddl)
+    conn.commit()
+
+
+def get_last_run_end(conn, schema: str, key: str) -> Optional[datetime]:
+    sql = f"select last_run_end from {schema}.sync_state where key = %s"
+    with conn.cursor() as cur:
+        cur.execute(sql, (key,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return row[0]
+
+
+def set_last_run_end(conn, schema: str, key: str, end_dt: datetime) -> None:
+    sql = f"""
+    insert into {schema}.sync_state(key, last_run_end, updated_at)
+    values (%s, %s, now())
+    on conflict (key) do update
+      set last_run_end = excluded.last_run_end,
+          updated_at = now()
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (key, end_dt))
+    conn.commit()
+
+
+def upsert_relations(
+    conn,
+    schema: str,
+    rows: List[Tuple[int, int, str, Optional[datetime]]],
+) -> int:
+    """
+    rows: (ticket_id, merged_ticket_id, source, last_update)
+    """
+    if not rows:
+        return 0
+
+    sql = f"""
+    insert into {schema}.tickets_mesclados
+      (ticket_id, merged_ticket_id, source, last_update, updated_at)
+    values %s
+    on conflict (ticket_id, merged_ticket_id) do update
+      set source = excluded.source,
+          last_update = (
+            case
+              when excluded.last_update is null then {schema}.tickets_mesclados.last_update
+              when {schema}.tickets_mesclados.last_update is null then excluded.last_update
+              else greatest({schema}.tickets_mesclados.last_update, excluded.last_update)
+            end
+          ),
+          updated_at = now()
+    """
+
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
     conn.commit()
     return len(rows)
 
 
-def try_fetch_dedicated(conn):
-    last_dt = get_last_sync_update(conn)
-    now_dt = datetime.now(timezone.utc)
+def count_total(conn, schema: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"select count(*) from {schema}.tickets_mesclados")
+        return int(cur.fetchone()[0])
 
-    base_params = {}
-    s = fmt_dt_for_md(last_dt)
-    if s:
-        base_params["startDate"] = s
-    base_params["endDate"] = fmt_dt_for_md(now_dt)
+
+# -------------------------
+# Sync Logic
+# -------------------------
+
+def sync_via_tickets_merged(
+    client: MovideskClient,
+    conn,
+    schema: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> Tuple[bool, int]:
+    """
+    Retorna (ok, inserted_count).
+    ok=False se endpoint não existir (404) ou outro erro impeditivo.
+    """
+    inserted = 0
+    start_param = format_merged_param(start_dt)
+    end_param = format_merged_param(end_dt)
+
+    log(f"tickets_mesclados: chamada dedicada /tickets/merged base_params={{'startDate': '{start_param}', 'endDate': '{end_param}'}}")
 
     page = 1
-    processed = 0
-    total_inserted = 0
-
-    print(f"tickets_mesclados: chamada dedicada /tickets/merged base_params={base_params}")
+    total_pages: Optional[int] = None
 
     while True:
-        params = dict(base_params)
-        params["page"] = page
+        params = {
+            "startDate": start_param,
+            "endDate": end_param,
+            "page": page,
+        }
+        r = client.get("/tickets/merged", params=params)
 
-        raw = md_get("tickets/merged", params=params, ok_404=True)
-        if raw is None:
-            print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
-            return False
+        if r.status_code == 404:
+            log("tickets_mesclados: endpoint /tickets/merged retornou 404.")
+            return (False, inserted)
 
-        data = normalize_merged_response(raw)
-        if not data:
-            break
+        if r.status_code >= 400:
+            warn(f"/tickets/merged falhou HTTP {r.status_code}: {r.text[:500]}")
+            return (False, inserted)
 
-        rows = []
-        for it in data:
-            if not isinstance(it, dict):
-                continue
+        try:
+            data = r.json()
+        except Exception:
+            warn(f"/tickets/merged retornou JSON inválido. body[:300]={r.text[:300]}")
+            return (False, inserted)
 
-            principal = it.get("ticketId") or it.get("id")
-            merged_ids_raw = it.get("mergedTicketsIds") or it.get("mergedTicketsId")
-            dt_val = it.get("lastUpdate") or it.get("mergedDate") or it.get("performedAt") or it.get("date")
+        merged_tickets = data.get("mergedTickets") or []
+        page_info = (data.get("pageNumber") or "").strip()
 
+        # pageNumber vem como "1 of 333"
+        m = re.search(r"(\d+)\s+of\s+(\d+)", page_info, flags=re.IGNORECASE)
+        if m:
+            total_pages = int(m.group(2))
+
+        rows: List[Tuple[int, int, str, Optional[datetime]]] = []
+        for item in merged_tickets:
             try:
-                principal = int(str(principal)) if principal is not None else None
+                ticket_id = int(item.get("ticketId"))
             except Exception:
-                principal = None
-
-            if not principal or not merged_ids_raw:
                 continue
 
-            if isinstance(merged_ids_raw, (list, tuple, set)):
-                ids_list = merged_ids_raw
-            else:
-                parts = re.split(r"[,\s;]+", str(merged_ids_raw))
-                ids_list = [p for p in parts if p]
-
-            payload = json.dumps(it, ensure_ascii=False)
-            for sid in ids_list:
-                if processed >= BATCH:
-                    break
+            ids_raw = (item.get("mergedTicketsIds") or "").strip()
+            last_update_str = (item.get("lastUpdate") or "").strip()
+            last_update_dt: Optional[datetime] = None
+            # lastUpdate aqui costuma vir "YYYY-MM-DD HH:MM:SS"
+            if last_update_str:
                 try:
-                    src = int(str(sid))
+                    last_update_dt = datetime.strptime(last_update_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    last_update_dt = None
+
+            if not ids_raw:
+                continue
+
+            # "1;2;3"
+            for part in ids_raw.split(";"):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    merged_id = int(part)
                 except Exception:
                     continue
-                rows.append((src, principal, dt_val, payload))
-                processed += 1
-
-            if processed >= BATCH:
-                break
+                if merged_id == ticket_id:
+                    continue
+                rows.append((ticket_id, merged_id, "tickets/merged", last_update_dt))
 
         if rows:
-            upsert_rows(conn, rows)
-            total_inserted += len(rows)
+            inserted += upsert_relations(conn, schema, rows)
 
-        if processed >= BATCH:
+        # Critério de parada
+        if total_pages is not None:
+            if page >= total_pages:
+                break
+            page += 1
+            continue
+
+        # Se não veio pageNumber confiável, para quando a lista vier vazia
+        if not merged_tickets:
             break
-
         page += 1
-        time.sleep(THROTTLE)
 
-    register_sync_run(conn, now_dt)
-
-    if total_inserted == 0:
-        print("tickets_mesclados: nenhum novo registro via /tickets/merged.")
-    else:
-        print(f"tickets_mesclados: {total_inserted} registros inseridos via /tickets/merged.")
-    return True
+    return (True, inserted)
 
 
-def get_recent_candidate_ids(conn, limit, since_dt):
-    since_dt = to_aware(since_dt)
+def iter_tickets_by_lastupdate(
+    client: MovideskClient,
+    endpoint: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    top: int = 100,
+) -> Iterable[Dict[str, Any]]:
+    """
+    Busca tickets paginando com $top/$skip filtrando por lastUpdate.
+    endpoint: "/tickets" ou "/tickets/past"
+    """
+    skip = 0
+    start_z = format_iso8601_z(start_dt)
+    end_z = format_iso8601_z(end_dt)
 
-    parts = []
-    params = []
+    # Exemplo do material: createdDate ge 2019-04-11T00:00:00Z (sem aspas).
+    odata_filter = f"lastUpdate ge {start_z} and lastUpdate le {end_z}"
 
-    if regclass_exists(conn, "dados_gerais.tickets_suporte"):
-        col = pick_ts_column(
-            conn,
-            "dados_gerais",
-            "tickets_suporte",
-            ["last_update", "lastUpdate", "updated_at", "raw_last_update", "created_at"],
-        )
-        if col:
-            parts.append(
-                f"""
-                select ticket_id
-                  from dados_gerais.tickets_suporte
-                 where {col} >= %s
-                """
-            )
-            params.append(since_dt)
+    select_fields = "id,lastUpdate,parentTickets,childrenTickets"
 
-    if regclass_exists(conn, "visualizacao_atual.tickets_abertos"):
-        cols = []
-        for c in ["last_update", "raw_last_update", "updated_at", "created_at"]:
-            if column_exists(conn, "visualizacao_atual", "tickets_abertos", c):
-                cols.append(c)
-        if cols:
-            expr = "coalesce(" + ",".join(cols) + ")"
-            parts.append(
-                f"""
-                select ticket_id
-                  from visualizacao_atual.tickets_abertos
-                 where {expr} >= %s
-                """
-            )
-            params.append(since_dt)
-
-    if regclass_exists(conn, "visualizacao_resolvidos.tickets_resolvidos_detail"):
-        col = pick_ts_column(
-            conn,
-            "visualizacao_resolvidos",
-            "tickets_resolvidos_detail",
-            ["updated_at", "last_update", "lastUpdate", "created_at"],
-        )
-        if col:
-            parts.append(
-                f"""
-                select ticket_id
-                  from visualizacao_resolvidos.tickets_resolvidos_detail
-                 where {col} >= %s
-                """
-            )
-            params.append(since_dt)
-
-    if not parts:
-        return []
-
-    sql = (
-        "with candidates as ("
-        + " union ".join([p.strip() for p in parts])
-        + ") "
-        + """
-        select c.ticket_id
-          from candidates c
-     left join visualizacao_resolvidos.tickets_mesclados tm
-            on tm.ticket_id = c.ticket_id
-         where tm.ticket_id is null
-      group by c.ticket_id
-      order by c.ticket_id desc
-         limit %s
-        """
-    )
-    params.append(limit)
-
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return [r[0] for r in cur.fetchall()]
-
-
-def get_missing_candidate_ids_from_audit(conn, limit):
-    if not regclass_exists(conn, "visualizacao_resolvidos.audit_recent_missing"):
-        return []
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select a.ticket_id
-              from visualizacao_resolvidos.audit_recent_missing a
-         left join visualizacao_resolvidos.tickets_mesclados tm
-                on tm.ticket_id = a.ticket_id
-             where a.table_name = 'tickets_resolvidos'
-               and tm.ticket_id is null
-          group by a.ticket_id
-          order by max(a.run_id) desc, a.ticket_id desc
-             limit %s
-            """,
-            (limit,),
-        )
-        return [r[0] for r in cur.fetchall()]
-
-
-def chunked(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-
-def fetch_histories_for(ids):
-    if not ids:
-        return []
-    all_data = []
-    for chunk in chunked(ids, 10):
-        filtro = "(" + " or ".join([f"id eq '{int(i)}'" for i in chunk]) + ")"
+    while True:
         params = {
-            "$select": "id,mergedTicketsIds,mergedTicketsId,lastUpdate",
-            "$filter": filtro,
-            "$expand": "statusHistories",
+            "$select": select_fields,
+            "$filter": odata_filter,
+            "$top": str(top),
+            "$skip": str(skip),
         }
+        r = client.get(endpoint, params=params)
+        if r.status_code >= 400:
+            raise requests.HTTPError(f"{r.status_code} {r.text[:300]}", response=r)
 
-        data = []
-        try:
-            data = md_get("tickets", params=params)
-        except requests.HTTPError as e:
-            print(f"[WARN] erro HTTP ao buscar histories(/tickets) para chunk {chunk}: {e}")
-            data = []
-        except Exception as e:
-            print(f"[WARN] erro inesperado ao buscar histories(/tickets) para chunk {chunk}: {e}")
-            data = []
+        data = r.json()
+        if not isinstance(data, list):
+            # Em geral a API retorna lista; se vier objeto, tenta adaptar
+            data = data.get("value") or []
 
         if not data:
-            try:
-                raw = md_get("tickets/past", params=params, ok_404=True)
-                data = [] if raw is None else (raw or [])
-            except requests.HTTPError as e:
-                print(f"[WARN] erro HTTP ao buscar histories(/tickets/past) para chunk {chunk}: {e}")
-                data = []
-            except Exception as e:
-                print(f"[WARN] erro inesperado ao buscar histories(/tickets/past) para chunk {chunk}: {e}")
-                data = []
+            break
 
-        all_data.extend(data or [])
-        time.sleep(THROTTLE)
+        for item in data:
+            if isinstance(item, dict):
+                yield item
 
-    return all_data
+        if len(data) < top:
+            break
+
+        skip += top
 
 
-JUSTIF_RX = re.compile(
-    r"(mescl|merge|unid|duplic|juntad|juntar|junc|anexad|anexar|vinculad|vincul|uni[ãa]o|unificar)",
-    re.I,
-)
-
-TARGET_ID_RX = re.compile(
-    r"(?:#|n[ºo]\s*|id\s*:?|ticket\s*:?|protocolo\s*:?)[^\d]*(\d{3,})",
-    re.I,
-)
-
-
-def extract_merges_from_direct_fields(item):
-    principal = item.get("id")
-    if principal is None:
-        return []
-
-    merged_ids_raw = item.get("mergedTicketsIds") or item.get("mergedTicketsId")
-    if not merged_ids_raw:
-        return []
-
-    if isinstance(merged_ids_raw, (list, tuple, set)):
-        ids_list = merged_ids_raw
-    else:
-        parts = re.split(r"[,\s;]+", str(merged_ids_raw))
-        ids_list = [p for p in parts if p]
-
-    dt_val = item.get("lastUpdate") or item.get("last_update")
-    out = []
-    for sid in ids_list:
-        try:
-            src = int(str(sid))
-            dst = int(str(principal))
-        except Exception:
-            continue
-        out.append((src, dst, dt_val))
-    return out
-
-
-def extract_merge_from_histories(item):
-    tid = item.get("id")
-    if tid is None:
-        return None
-
-    best_dt = None
-    target = None
-
-    for h in item.get("statusHistories") or []:
-        status_txt = (h.get("status") or "")[:200]
-        just = (h.get("justification") or "")[:400]
-
-        has_merge_word = bool(JUSTIF_RX.search(just or "")) or bool(JUSTIF_RX.search(status_txt or ""))
-        m = TARGET_ID_RX.search(just or "")
-
-        if not has_merge_word and not m:
-            continue
-
-        if m:
-            try:
-                target = int(m.group(1))
-            except Exception:
-                pass
-
-        dt = h.get("changedDate") or h.get("date")
-        if dt and (best_dt is None or str(dt) > str(best_dt)):
-            best_dt = dt
-
-    if not best_dt and not target:
-        return None
+def extract_relations_from_ticket(ticket: Dict[str, Any], source: str) -> List[Tuple[int, int, str, Optional[datetime]]]:
+    """
+    Usa parentTickets/childrenTickets para montar relações (ticket_id -> merged_ticket_id).
+    Interpretação prática:
+      - Se o ticket tem childrenTickets, assume que aqueles IDs foram "absorvidos" pelo ticket (ticket = pai)
+      - Se o ticket tem parentTickets, assume que este ticket foi para dentro do(s) pai(s)
+    """
+    rows: List[Tuple[int, int, str, Optional[datetime]]] = []
 
     try:
-        tid_int = int(tid)
+        tid = int(ticket.get("id"))
     except Exception:
-        return None
+        return rows
 
-    return tid_int, target, best_dt
+    last_update_dt: Optional[datetime] = None
+    lu = ticket.get("lastUpdate")
+    if isinstance(lu, str) and lu:
+        # normalmente vem ISO Z
+        parsed = parse_iso8601_z(lu)
+        if parsed:
+            last_update_dt = parsed.astimezone(timezone.utc)
 
-
-def run_fallback_for_recent(conn):
-    try:
-        last_dt = get_last_sync_update(conn)
-        now_dt = datetime.now(timezone.utc)
-
-        since_dt = now_dt - timedelta(hours=LOOKBACK_HOURS)
-        if last_dt:
-            last_dt = to_aware(last_dt)
-            if last_dt < since_dt:
-                since_dt = last_dt
-
-        ids = get_recent_candidate_ids(conn, BATCH, since_dt)
-        if not ids:
-            print("tickets_mesclados: fallback(recent) não encontrou candidatos por timestamps disponíveis.")
-            register_sync_run(conn, now_dt)
-            return
-
-        data = fetch_histories_for(ids)
-
-        rows_map = {}
-        for it in data:
-            if not isinstance(it, dict):
+    children = ticket.get("childrenTickets") or []
+    if isinstance(children, list):
+        for ch in children:
+            if not isinstance(ch, dict):
                 continue
-
-            for src, dst, dt in extract_merges_from_direct_fields(it):
-                key = (int(src), int(dst))
-                if key not in rows_map:
-                    rows_map[key] = (int(src), int(dst), dt, json.dumps(it, ensure_ascii=False))
-
-            got = extract_merge_from_histories(it)
-            if got:
-                src, dst, dt = got
-                key = (int(src), int(dst) if dst is not None else None)
-                if key not in rows_map:
-                    rows_map[key] = (int(src), int(dst) if dst is not None else None, dt, json.dumps(it, ensure_ascii=False))
-
-        rows = list(rows_map.values())
-        if not rows:
-            print(f"tickets_mesclados: fallback(recent) processou {len(ids)} tickets mas não identificou merges.")
-            register_sync_run(conn, now_dt)
-            return
-
-        upsert_rows(conn, rows)
-        register_sync_run(conn, now_dt)
-        print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(recent).")
-
-    except psycopg2.Error as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise e
-
-
-def run_fallback_for_missing(conn):
-    try:
-        ids = get_missing_candidate_ids_from_audit(conn, BATCH)
-        if not ids:
-            print("tickets_mesclados: fallback(missing) não encontrou candidatos em audit_recent_missing.")
-            return
-
-        data = fetch_histories_for(ids)
-        rows = []
-        for it in data:
-            got = extract_merge_from_histories(it)
-            if not got:
-                continue
-            src, dst, dt = got
-            rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
-
-        if not rows:
-            print(f"tickets_mesclados: fallback(missing) processou {len(ids)} tickets mas não identificou merges.")
-            return
-
-        upsert_rows(conn, rows)
-        print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(missing).")
-
-    except psycopg2.Error as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise e
-
-
-def main():
-    with psycopg2.connect(DSN) as conn:
-        ensure_schema_tables(conn)
-
-        ok = try_fetch_dedicated(conn)
-        if not ok:
             try:
-                run_fallback_for_recent(conn)
-            except Exception as e:
-                print(f"[WARN] erro inesperado no fallback(recent): {e}")
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
+                mid = int(ch.get("id"))
+            except Exception:
+                continue
+            if mid == tid:
+                continue
+            rows.append((tid, mid, source, last_update_dt))
 
+    parents = ticket.get("parentTickets") or []
+    if isinstance(parents, list):
+        for p in parents:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pid = int(p.get("id"))
+            except Exception:
+                continue
+            if pid == tid:
+                continue
+            # pai -> este ticket
+            rows.append((pid, tid, source, last_update_dt))
+
+    return rows
+
+
+def sync_fallback_from_tickets(
+    client: MovideskClient,
+    conn,
+    schema: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> int:
+    """
+    Fallback quando /tickets/merged não existe:
+      - varre /tickets e /tickets/past por lastUpdate dentro da janela
+      - extrai relações via parentTickets/childrenTickets
+    """
+    inserted = 0
+
+    for endpoint in ("/tickets", "/tickets/past"):
+        fetched = 0
+        collected: List[Tuple[int, int, str, Optional[datetime]]] = []
         try:
-            run_fallback_for_missing(conn)
+            for t in iter_tickets_by_lastupdate(client, endpoint, start_dt, end_dt, top=100):
+                fetched += 1
+                rows = extract_relations_from_ticket(t, source=endpoint.lstrip("/"))
+                if rows:
+                    collected.extend(rows)
+
+                # flush em lotes
+                if len(collected) >= 2000:
+                    inserted += upsert_relations(conn, schema, collected)
+                    collected.clear()
+
+            if collected:
+                inserted += upsert_relations(conn, schema, collected)
+                collected.clear()
+
+            log(f"tickets_mesclados: fallback({endpoint}) processou {fetched} tickets e gravou {inserted} relações (acumulado).")
+        except requests.HTTPError as e:
+            warn(f"erro HTTP no fallback {endpoint}: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         except Exception as e:
-            print(f"[WARN] erro inesperado no fallback(missing): {e}")
+            warn(f"erro inesperado no fallback {endpoint}: {e}")
             try:
                 conn.rollback()
             except Exception:
                 pass
 
+    return inserted
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def main() -> None:
+    token = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN") or os.getenv("TOKEN")
+    if not token:
+        die("Defina MOVIDESK_TOKEN (ou MOVIDESK_API_TOKEN).")
+
+    base_url = os.getenv("MOVIDESK_BASE_URL", "https://api.movidesk.com/public/v1")
+    schema = os.getenv("PGSCHEMA", "visualizacao_resolvidos").strip()
+    state_key = "tickets_mesclados"
+
+    conn = pg_connect()
+    conn.autocommit = False
+
+    ensure_schema_and_tables(conn, schema)
+
+    # Janela de sync
+    now = utc_now()
+    default_lookback_hours = int(os.getenv("DEFAULT_LOOKBACK_HOURS", "24"))
+    overlap_seconds = int(os.getenv("OVERLAP_SECONDS", "120"))
+
+    last_end = get_last_run_end(conn, schema, state_key)
+
+    # Permite override manual por env
+    env_start = os.getenv("START_DATE", "").strip()  # aceita ISO "2025-12-23T00:00:00Z"
+    env_end = os.getenv("END_DATE", "").strip()
+
+    if env_end:
+        end_dt = parse_iso8601_z(env_end) or now
+    else:
+        end_dt = now
+
+    if env_start:
+        start_dt = parse_iso8601_z(env_start)
+        if not start_dt:
+            die("START_DATE inválido. Use formato tipo 2025-12-23T00:00:00Z")
+    else:
+        if last_end:
+            start_dt = last_end - timedelta(seconds=overlap_seconds)
+        else:
+            start_dt = now - timedelta(hours=default_lookback_hours)
+
+    # sanity
+    if start_dt >= end_dt:
+        warn(f"janela inválida start>=end ({start_dt} >= {end_dt}). ajustando start para end-1h.")
+        start_dt = end_dt - timedelta(hours=1)
+
+    client = MovideskClient(base_url=base_url, token=token)
+
+    # 1) tenta /tickets/merged (manual)
+    ok, inserted = (False, 0)
+    try:
+        ok, inserted = sync_via_tickets_merged(client, conn, schema, start_dt, end_dt)
+    except Exception as e:
+        warn(f"falha inesperada em /tickets/merged: {e}")
         try:
-            with conn.cursor() as cur:
-                cur.execute("select count(*) from visualizacao_resolvidos.tickets_mesclados")
-                total = cur.fetchone()[0]
-            print(f"tickets_mesclados: sincronização concluída. Total na tabela: {total}.")
-        except psycopg2.Error as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise e
+            conn.rollback()
+        except Exception:
+            pass
+        ok = False
+
+    # 2) fallback (quando não existe /tickets/merged)
+    if not ok:
+        inserted += sync_fallback_from_tickets(client, conn, schema, start_dt, end_dt)
+
+    # Atualiza estado
+    set_last_run_end(conn, schema, state_key, end_dt)
+
+    total = count_total(conn, schema)
+    log(f"tickets_mesclados: sincronização concluída. Inseridos/atualizados nesta execução: {inserted}. Total na tabela: {total}.")
+
+    conn.close()
 
 
 if __name__ == "__main__":
