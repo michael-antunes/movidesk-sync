@@ -1,514 +1,419 @@
-#!/usr/bin/env python
-import logging
 import os
 import sys
 import time
-import random
-from typing import Any, Dict, List, Optional, Tuple, Set
+import json
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
+import requests
 import psycopg2
 from psycopg2.extras import Json
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-LOG_NAME = "detail"
-BASE_URL = "https://api.movidesk.com/public/v1"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+API_BASE = "https://api.movidesk.com/public/v1"
+
+
+SELECT_LIST = "id,baseStatus,lastUpdate,isDeleted"
+SELECT_DETAIL = (
+    "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
+    "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
+    "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,resolvedIn,closedIn,"
+    "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
+    "customFieldValues"
 )
-logger = logging.getLogger(LOG_NAME)
+
+BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
 
-def get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
-    value = os.getenv(name, default)
-    if required and not value:
-        logger.error("Variável de ambiente obrigatória não definida: %s", name)
-        sys.exit(1)
-    return value  # type: ignore[return-value]
+def mask_token(url: str) -> str:
+    try:
+        p = urlparse(url)
+        qs = parse_qsl(p.query, keep_blank_values=True)
+        qs2 = []
+        for k, v in qs:
+            if k.lower() == "token":
+                qs2.append((k, "***"))
+            else:
+                qs2.append((k, v))
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(qs2, doseq=True), p.fragment))
+    except Exception:
+        return url
 
 
-def get_db_connection():
-    dsn = get_env("NEON_DSN", required=True)
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = False
-    return conn
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_detail_table_exists(conn) -> None:
-    sql = """
-    CREATE SCHEMA IF NOT EXISTS visualizacao_resolvidos;
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("detail")
+    logger.setLevel(logging.INFO)
+    h = logging.StreamHandler(sys.stdout)
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    h.setFormatter(fmt)
+    if not logger.handlers:
+        logger.addHandler(h)
+    return logger
 
-    CREATE TABLE IF NOT EXISTS visualizacao_resolvidos.tickets_resolvidos_detail (
-        ticket_id   BIGINT PRIMARY KEY,
-        raw         JSONB NOT NULL,
-        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+
+def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
+    last_exc = None
+    for i in range(1, attempts + 1):
+        try:
+            req = requests.Request(method=method, url=url, params=params)
+            prepped = session.prepare_request(req)
+            masked = mask_token(prepped.url)
+            resp = session.send(prepped, timeout=timeout)
+            logger.info(f"GET {masked} -> {resp.status_code} (attempt {i}/{attempts})")
+            if resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(30, 2 ** (i - 1)))
+                continue
+            return resp
+        except Exception as e:
+            last_exc = e
+            logger.info(f"GET {mask_token(url)} -> EXC (attempt {i}/{attempts}): {type(e).__name__}: {e}")
+            time.sleep(min(30, 2 ** (i - 1)))
+            continue
+    raise last_exc if last_exc else RuntimeError("request failed")
+
+
+def pg_one(conn, sql, params=None):
+    with conn.cursor() as cur:
+        cur.execute(sql, params or [])
+        return cur.fetchone()
+
+
+def pg_all(conn, sql, params=None):
+    with conn.cursor() as cur:
+        cur.execute(sql, params or [])
+        return cur.fetchall()
+
+
+def find_table_schema(conn, relname: str):
+    row = pg_one(
+        conn,
+        """
+        SELECT n.nspname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind='r' AND c.relname = %s
+        ORDER BY CASE WHEN n.nspname='public' THEN 0 ELSE 1 END, n.nspname
+        LIMIT 1
+        """,
+        [relname],
+    )
+    return row[0] if row else None
+
+
+def ensure_audit_table(conn, logger: logging.Logger):
+    schema = find_table_schema(conn, "audit_recent_missing")
+    if schema:
+        return f"{schema}.audit_recent_missing"
+    schema = "dados_gerais"
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {schema}.audit_recent_missing
+            (
+              ticket_id bigint PRIMARY KEY,
+              first_seen timestamptz NOT NULL DEFAULT now(),
+              last_seen timestamptz NOT NULL DEFAULT now(),
+              attempts integer NOT NULL DEFAULT 0,
+              last_attempt timestamptz,
+              last_status integer,
+              last_error text
+            )
+            """
+        )
+    conn.commit()
+    logger.info(f"detail: audit_recent_missing criada em {schema}.audit_recent_missing")
+    return f"{schema}.audit_recent_missing"
+
+
+def get_table_columns(conn, schema: str, table: str):
+    rows = pg_all(
+        conn,
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s
+        """,
+        [schema, table],
+    )
+    return {r[0] for r in rows}
+
+
+def upsert_detail(conn, logger: logging.Logger, ticket: dict):
+    schema = "visualizacao_resolvidos"
+    table = "tickets_resolvidos_detail"
+    cols = get_table_columns(conn, schema, table)
+
+    if "ticket_id" not in cols:
+        raise RuntimeError(f"Coluna ticket_id não existe em {schema}.{table}")
+
+    raw_col = None
+    for c in ("raw", "raw_json", "payload", "data"):
+        if c in cols:
+            raw_col = c
+            break
+    if raw_col is None:
+        raise RuntimeError(f"Nenhuma coluna de JSON encontrada em {schema}.{table} (raw/raw_json/payload/data)")
+
+    insert_cols = ["ticket_id", raw_col]
+    placeholders = ["%s", "%s"]
+    values = [int(ticket.get("id")), Json(ticket)]
+
+    base_status = ticket.get("baseStatus")
+    last_update = ticket.get("lastUpdate")
+
+    if "base_status" in cols:
+        insert_cols.append("base_status")
+        placeholders.append("%s")
+        values.append(base_status)
+    if "last_update" in cols:
+        insert_cols.append("last_update")
+        placeholders.append("%s")
+        values.append(last_update)
+    if "updated_at" in cols:
+        insert_cols.append("updated_at")
+        placeholders.append("now()")
+
+    update_sets = []
+    if raw_col in cols:
+        update_sets.append(f"{raw_col}=EXCLUDED.{raw_col}")
+    if "base_status" in cols:
+        update_sets.append("base_status=EXCLUDED.base_status")
+    if "last_update" in cols:
+        update_sets.append("last_update=EXCLUDED.last_update")
+    if "updated_at" in cols:
+        update_sets.append("updated_at=now()")
+
+    sql = f"""
+    INSERT INTO {schema}.{table} ({",".join(insert_cols)})
+    VALUES ({",".join(placeholders)})
+    ON CONFLICT (ticket_id) DO UPDATE SET {",".join(update_sets)}
     """
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, values)
     conn.commit()
 
 
-def get_last_ticket_id(conn) -> int:
-    sql = """
-        SELECT COALESCE(MAX(ticket_id), 0)
-        FROM visualizacao_resolvidos.tickets_resolvidos_detail;
+def audit_upsert(conn, audit_fqn: str, ticket_id: int, status_code: int | None, error_text: str | None):
+    schema, table = audit_fqn.split(".", 1)
+    sql = f"""
+    INSERT INTO {schema}.{table} (ticket_id, first_seen, last_seen, attempts, last_attempt, last_status, last_error)
+    VALUES (%s, now(), now(), 1, now(), %s, %s)
+    ON CONFLICT (ticket_id) DO UPDATE SET
+      last_seen=now(),
+      attempts={schema}.{table}.attempts + 1,
+      last_attempt=now(),
+      last_status=EXCLUDED.last_status,
+      last_error=EXCLUDED.last_error
     """
     with conn.cursor() as cur:
-        cur.execute(sql)
-        row = cur.fetchone()
-    if not row or row[0] is None:
-        return 0
-    return int(row[0])
+        cur.execute(sql, [int(ticket_id), status_code, error_text])
+    conn.commit()
 
 
-def fetch_pending_from_audit(conn, limit: int) -> List[int]:
-    sql = """
-        SELECT arm.ticket_id
-        FROM visualizacao_resolvidos.audit_recent_missing AS arm
-        WHERE arm.table_name = 'tickets_resolvidos'
-        ORDER BY arm.ticket_id DESC
-        LIMIT %s;
-    """
+def audit_delete(conn, audit_fqn: str, ticket_id: int):
+    schema, table = audit_fqn.split(".", 1)
     with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        rows = cur.fetchall()
-    return [int(r[0]) for r in rows]
+        cur.execute(f"DELETE FROM {schema}.{table} WHERE ticket_id=%s", [int(ticket_id)])
+    conn.commit()
 
 
-def try_remove_from_audit(conn, ticket_id: int) -> None:
-    sql = """
-        DELETE FROM visualizacao_resolvidos.audit_recent_missing
-        WHERE table_name = 'tickets_resolvidos' AND ticket_id = %s;
-    """
+def list_tickets(session: requests.Session, logger: logging.Logger, token: str, flt: str, select: str, timeout: tuple, attempts: int, top: int | None = None, orderby: str | None = None):
+    params = {"$filter": flt, "$select": select, "includeDeletedItems": "true", "token": token}
+    if top is not None:
+        params["$top"] = str(top)
+    if orderby:
+        params["$orderby"] = orderby
+    resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    if resp.status_code != 200:
+        try:
+            body = resp.text
+        except Exception:
+            body = ""
+        return [], resp.status_code, body
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (ticket_id,))
+        data = resp.json()
     except Exception:
-        conn.rollback()
-        logger.debug("Não foi possível remover ticket %s da audit_recent_missing (ignorando).", ticket_id)
+        return [], resp.status_code, resp.text
+    if isinstance(data, list):
+        return data, 200, None
+    return [], 200, None
 
 
-def get_existing_ids_in_range(conn, low_id: int, high_id: int) -> Set[int]:
-    sql = """
+def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
+    params = {"id": str(ticket_id), "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
+    resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    if resp.status_code == 200:
+        try:
+            return resp.json(), 200, None
+        except Exception:
+            return None, 200, resp.text
+
+    if resp.status_code != 404:
+        try:
+            return None, resp.status_code, resp.text
+        except Exception:
+            return None, resp.status_code, None
+
+    params2 = {
+        "$filter": f"id eq {int(ticket_id)}",
+        "$select": SELECT_DETAIL,
+        "includeDeletedItems": "true",
+        "token": token,
+    }
+    resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
+    if resp2.status_code != 200:
+        try:
+            return None, resp2.status_code, resp2.text
+        except Exception:
+            return None, resp2.status_code, None
+
+    try:
+        data = resp2.json()
+    except Exception:
+        return None, 200, resp2.text
+
+    if isinstance(data, list) and data:
+        return data[0], 200, None
+
+    return None, 404, None
+
+
+def main():
+    logger = setup_logger()
+
+    dsn = os.getenv("NEON_DSN")
+    token = os.getenv("MOVIDESK_TOKEN")
+    if not dsn or not token:
+        raise SystemExit("NEON_DSN e MOVIDESK_TOKEN são obrigatórios")
+
+    bulk_limit = int(os.getenv("DETAIL_BULK_LIMIT", "200"))
+    missing_limit = int(os.getenv("DETAIL_MISSING_LIMIT", "10"))
+
+    page = int(os.getenv("DETAIL_PAGE", "50"))
+    window = int(os.getenv("DETAIL_WINDOW", "50"))
+
+    attempts = int(os.getenv("DETAIL_ATTEMPTS", "6"))
+    connect_timeout = int(os.getenv("DETAIL_CONNECT_TIMEOUT", "10"))
+    read_timeout = int(os.getenv("DETAIL_READ_TIMEOUT", "120"))
+    timeout = (connect_timeout, read_timeout)
+
+    logger.info(
+        f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, page={page}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts})."
+    )
+
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = False
+
+    audit_fqn = ensure_audit_table(conn, logger)
+
+    last_row = pg_one(conn, "SELECT COALESCE(MAX(ticket_id),0) FROM visualizacao_resolvidos.tickets_resolvidos_detail")
+    last_id = int(last_row[0] if last_row else 0)
+    logger.info(f"detail: Último ticket_id em tickets_resolvidos_detail: {last_id}")
+
+    session = requests.Session()
+
+    total_ok = 0
+    total_new = 0
+    total_window = 0
+    total_missing = 0
+
+    lower = max(0, last_id - window - 1)
+    upper = last_id + window
+
+    flt_window = (
+        f"id gt {lower} and id le {upper} and "
+        f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
+    )
+
+    logger.info(f"detail: Janela: /tickets com id > {lower} e <= {upper} (Resolved/Closed/Canceled)")
+    window_items, code, err = list_tickets(session, logger, token, flt_window, SELECT_LIST, timeout, attempts, top=1000, orderby="id")
+    api_ids = {int(x.get("id")) for x in window_items if isinstance(x, dict) and x.get("id") is not None}
+
+    db_rows = pg_all(
+        conn,
+        """
         SELECT ticket_id
         FROM visualizacao_resolvidos.tickets_resolvidos_detail
-        WHERE ticket_id BETWEEN %s AND %s;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (low_id, high_id))
-        rows = cur.fetchall()
-    return {int(r[0]) for r in rows}
-
-
-class MovideskClient:
-    def __init__(
-        self,
-        token: str,
-        connect_timeout: int = 10,
-        read_timeout: int = 120,
-        max_attempts: int = 6,
-    ) -> None:
-        self.token = token
-        self.timeout = (connect_timeout, read_timeout)
-        self.max_attempts = max_attempts
-
-        self.session = requests.Session()
-        retry = Retry(
-            total=0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-
-    def _request(self, path: str, params: Dict[str, Any]) -> Optional[Any]:
-        params = dict(params)
-        params["token"] = self.token
-        url = BASE_URL + path
-
-        base_sleep = 1.5
-
-        for attempt in range(1, self.max_attempts + 1):
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                logger.info("GET %s -> %s (attempt %s/%s)", resp.url, resp.status_code, attempt, self.max_attempts)
-
-                if resp.status_code == 404:
-                    return None
-
-                if resp.status_code == 429:
-                    ra = resp.headers.get("Retry-After")
-                    sleep_s = float(ra) if ra and ra.isdigit() else (base_sleep * (2 ** (attempt - 1)))
-                    sleep_s += random.uniform(0, 0.8)
-                    logger.warning("429 Rate limit. Dormindo %.1fs e tentando novamente...", sleep_s)
-                    time.sleep(sleep_s)
-                    continue
-
-                if 500 <= resp.status_code <= 599:
-                    if attempt == self.max_attempts:
-                        body_short = (resp.text or "").replace("\n", " ")[:500]
-                        logger.error("Erro HTTP %s em %s: %s", resp.status_code, path, body_short)
-                        return None
-                    sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                    logger.warning("HTTP %s. Dormindo %.1fs e tentando novamente...", resp.status_code, sleep_s)
-                    time.sleep(sleep_s)
-                    continue
-
-                if resp.status_code >= 400:
-                    body_short = (resp.text or "").replace("\n", " ")[:800]
-                    logger.error("Erro HTTP %s ao chamar %s: %s", resp.status_code, path, body_short)
-                    return None
-
-                if not (resp.text or "").strip():
-                    if attempt == self.max_attempts:
-                        return None
-                    sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                    time.sleep(sleep_s)
-                    continue
-
-                try:
-                    return resp.json()
-                except Exception:
-                    if attempt == self.max_attempts:
-                        logger.exception("Falha ao parsear JSON de %s.", path)
-                        return None
-                    sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                    time.sleep(sleep_s)
-                    continue
-
-            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as exc:
-                if attempt == self.max_attempts:
-                    logger.error("Timeout em %s: %s", path, exc)
-                    raise
-                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                time.sleep(sleep_s)
-                continue
-
-            except requests.exceptions.RequestException as exc:
-                if attempt == self.max_attempts:
-                    logger.error("Erro de rede em %s: %s", path, exc)
-                    raise
-                sleep_s = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.8)
-                time.sleep(sleep_s)
-                continue
-
-        return None
-
-    def get_ticket(self, ticket_id: int, select_fields: str) -> Optional[Dict[str, Any]]:
-        params = {
-            "id": str(ticket_id),
-            "includeDeletedItems": "true",
-            "$select": select_fields,
-        }
-        data = self._request("/tickets", params)
-
-        if isinstance(data, list):
-            data = data[0] if data else None
-
-        if isinstance(data, dict) and data.get("id"):
-            return data
-
-        params_past = {
-            "$filter": f"id eq {ticket_id}",
-            "$select": select_fields,
-            "includeDeletedItems": "true",
-        }
-        data_past = self._request("/tickets/past", params_past)
-
-        if isinstance(data_past, list):
-            data_past = data_past[0] if data_past else None
-
-        if isinstance(data_past, dict) and data_past.get("id"):
-            return data_past
-
-        return None
-
-    def list_ticket_ids_after(
-        self,
-        last_id: int,
-        limit: int,
-        per_page: int,
-        select_fields: str,
-        upper_id: Optional[int] = None,
-    ) -> List[int]:
-        """
-        Lista IDs usando /tickets com $filter. (select precisa ser "seguro")
-        Se upper_id for informado, limita: id <= upper_id.
-        """
-        results: List[int] = []
-        remaining = max(limit, 0)
-        current_last_id = last_id
-
-        base_status_filter = (
-            "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')"
-        )
-
-        while remaining > 0:
-            top = min(remaining, per_page)
-
-            upper_clause = f" and id le {upper_id}" if upper_id is not None else ""
-            params = {
-                "$filter": f"id gt {current_last_id}{upper_clause} and {base_status_filter}",
-                "$orderby": "id",
-                "$top": str(top),
-                "$select": select_fields,
-                "includeDeletedItems": "true",
-            }
-
-            logger.info("Listando até %s tickets em /tickets com id > %s%s (Resolved/Closed/Canceled)",
-                        top, current_last_id, f" e <= {upper_id}" if upper_id is not None else "")
-            data = self._request("/tickets", params)
-
-            if not isinstance(data, list) or not data:
-                break
-
-            max_id_in_page = current_last_id
-            page_ids: List[int] = []
-
-            for item in data:
-                if not isinstance(item, dict) or "id" not in item:
-                    continue
-                try:
-                    tid = int(item["id"])
-                except Exception:
-                    continue
-                if tid <= current_last_id:
-                    continue
-                page_ids.append(tid)
-                max_id_in_page = max(max_id_in_page, tid)
-
-            if not page_ids:
-                break
-
-            results.extend(page_ids)
-            remaining -= len(page_ids)
-            current_last_id = max_id_in_page
-
-            if len(page_ids) < top:
-                break
-
-        return results
-
-
-def upsert_ticket_detail_json(conn, ticket_id: int, ticket_json: Dict[str, Any]) -> None:
-    sql = """
-        INSERT INTO visualizacao_resolvidos.tickets_resolvidos_detail (
-            ticket_id,
-            raw,
-            updated_at
-        )
-        VALUES (%s, %s, now())
-        ON CONFLICT (ticket_id) DO UPDATE
-        SET raw        = EXCLUDED.raw,
-            updated_at = EXCLUDED.updated_at;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ticket_id, Json(ticket_json)))
-
-
-def sync_window_tickets(
-    conn,
-    client: MovideskClient,
-    window: int,
-    per_page: int,
-    select_list: str,
-    select_detail: str,
-) -> Tuple[int, int]:
-    """
-    Varre (last_id - window) .. (last_id + window) e busca detalhes dos IDs que NÃO existem no Neon.
-    """
-    if window <= 0:
-        return 0, 0
-
-    center = get_last_ticket_id(conn)
-    low = max(0, center - window)
-    high = center + window
-
-    existing = get_existing_ids_in_range(conn, low, high)
-
-    # pega IDs resolvidos dentro da janela (usando listagem com upper bound)
-    ids = client.list_ticket_ids_after(
-        last_id=low - 1,
-        limit=(2 * window + 1) + 50,  # folga (se houver buracos)
-        per_page=per_page,
-        select_fields=select_list,
-        upper_id=high,
+        WHERE ticket_id > %s AND ticket_id <= %s
+        """,
+        [lower, upper],
     )
+    db_ids = {int(r[0]) for r in db_rows}
 
-    # só os que não existem ainda
-    ids_to_fetch = [tid for tid in ids if tid not in existing]
+    to_fetch = sorted(list(api_ids - db_ids))
+    logger.info(f"detail: Janela (center={last_id}): encontrados={len(api_ids)}, já_existiam={len(db_ids)}, para_buscar={len(to_fetch)}")
 
-    logger.info(
-        "Varredura janela [%s..%s] (center=%s): encontrados=%s, já_existiam=%s, para_buscar=%s",
-        low, high, center, len(ids), len(existing), len(ids_to_fetch)
-    )
-
-    ok = 0
-    fail = 0
-
-    for idx, ticket_id in enumerate(ids_to_fetch, start=1):
-        logger.info("Janela: buscando detalhe %s/%s (ID=%s)", idx, len(ids_to_fetch), ticket_id)
-        try:
-            ticket = client.get_ticket(ticket_id, select_fields=select_detail)
+    if to_fetch:
+        for idx, tid in enumerate(to_fetch[: max(0, bulk_limit)], start=1):
+            logger.info(f"detail: Janela: buscando detalhe {idx}/{min(len(to_fetch), bulk_limit)} (ID={tid})")
+            ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
             if ticket is None:
-                fail += 1
+                audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+                total_missing += 1
                 continue
-            upsert_ticket_detail_json(conn, ticket_id, ticket)
-            conn.commit()
-            ok += 1
-        except Exception as exc:
-            logger.exception("Erro ao gravar ticket janela ticket_id=%s: %s", ticket_id, exc)
-            conn.rollback()
-            fail += 1
+            upsert_detail(conn, logger, ticket)
+            audit_delete(conn, audit_fqn, tid)
+            total_ok += 1
+            total_window += 1
 
-    return ok, fail
-
-
-def sync_new_tickets(
-    conn,
-    client: MovideskClient,
-    limit: int,
-    per_page: int,
-    select_list: str,
-    select_detail: str,
-) -> Tuple[int, int]:
-    last_id = get_last_ticket_id(conn)
-    logger.info("Último ticket_id em tickets_resolvidos_detail: %s", last_id)
-
-    ids = client.list_ticket_ids_after(
-        last_id=last_id,
-        limit=limit,
-        per_page=per_page,
-        select_fields=select_list,
-        upper_id=None,
+    flt_new = (
+        f"id gt {last_id} and "
+        f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
     )
+    new_items, code2, err2 = list_tickets(session, logger, token, flt_new, SELECT_LIST, timeout, attempts, top=bulk_limit, orderby="id")
+    new_ids = [int(x.get("id")) for x in new_items if isinstance(x, dict) and x.get("id") is not None]
 
-    if not ids:
-        logger.info("Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id=%s.", last_id)
-        return 0, 0
-
-    ok = 0
-    fail = 0
-
-    for idx, ticket_id in enumerate(ids, start=1):
-        logger.info("Processando ticket novo %s/%s (ID=%s)", idx, len(ids), ticket_id)
-        try:
-            ticket = client.get_ticket(ticket_id, select_fields=select_detail)
+    logger.info(f"detail: {len(new_ids)} tickets em /tickets com id > {last_id} (Resolved/Closed/Canceled)")
+    if new_ids:
+        for idx, tid in enumerate(new_ids, start=1):
+            logger.info(f"detail: Novo: buscando detalhe {idx}/{len(new_ids)} (ID={tid})")
+            ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
             if ticket is None:
-                fail += 1
+                audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+                total_missing += 1
                 continue
-            upsert_ticket_detail_json(conn, ticket_id, ticket)
-            conn.commit()
-            ok += 1
-        except Exception as exc:
-            logger.exception("Erro ao gravar ticket novo ticket_id=%s: %s", ticket_id, exc)
-            conn.rollback()
-            fail += 1
+            upsert_detail(conn, logger, ticket)
+            audit_delete(conn, audit_fqn, tid)
+            total_ok += 1
+            total_new += 1
+    else:
+        logger.info(f"detail: Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id={last_id}.")
 
-    return ok, fail
+    pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY ticket_id DESC LIMIT %s", [missing_limit])
+    pend_ids = [int(r[0]) for r in pend]
+    logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
+    if pend_ids:
+        logger.info(f"detail: Primeiros pendentes (até 5): {', '.join(str(x) for x in pend_ids[:5])}")
 
-
-def sync_missing_tickets(conn, client: MovideskClient, limit: int, select_detail: str) -> Tuple[int, int]:
-    pending_ids = fetch_pending_from_audit(conn, limit)
-
-    if not pending_ids:
-        logger.info("Nenhum ticket pendente na audit_recent_missing.")
-        return 0, 0
-
-    logger.info("%s tickets pendentes na fila audit_recent_missing (limite=%s).", len(pending_ids), limit)
-    logger.info("Primeiros pendentes (até 5): %s", ", ".join(str(i) for i in pending_ids[:5]))
-
-    ok = 0
-    fail = 0
-
-    for idx, ticket_id in enumerate(pending_ids, start=1):
-        logger.info("Processando ticket pendente %s/%s (ID=%s)", idx, len(pending_ids), ticket_id)
-        try:
-            ticket = client.get_ticket(ticket_id, select_fields=select_detail)
-        except Exception as exc:
-            logger.exception("Erro inesperado ao buscar ticket_id=%s: %s", ticket_id, exc)
-            conn.rollback()
-            fail += 1
-            continue
-
+    for idx, tid in enumerate(pend_ids, start=1):
+        logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
+        ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
         if ticket is None:
-            logger.warning("Ticket %s não encontrado. Mantendo na fila.", ticket_id)
-            fail += 1
+            if sc == 400 and e:
+                logger.error(f"detail: {e[:4000]}")
+            logger.warning(f"detail: Ticket {tid} não encontrado. Mantendo na fila.")
+            audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+            total_missing += 1
             continue
-
-        try:
-            upsert_ticket_detail_json(conn, ticket_id, ticket)
-            try_remove_from_audit(conn, ticket_id)
-            conn.commit()
-            ok += 1
-        except Exception as exc:
-            logger.exception("Erro ao gravar ticket pendente ticket_id=%s: %s", ticket_id, exc)
-            conn.rollback()
-            fail += 1
-
-    return ok, fail
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    def _int_env(name: str, default: str) -> int:
-        try:
-            return int(get_env(name, default))
-        except ValueError:
-            return int(default)
-
-    bulk_limit = _int_env("DETAIL_BULK_LIMIT", "200")
-    missing_limit = _int_env("DETAIL_MISSING_LIMIT", "10")
-    page_size = _int_env("DETAIL_PAGE_SIZE", "50")
-    connect_timeout = _int_env("MOVIDESK_CONNECT_TIMEOUT", "10")
-    read_timeout = _int_env("MOVIDESK_READ_TIMEOUT", "120")
-    max_attempts = _int_env("DETAIL_MAX_ATTEMPTS", "6")
-    window = _int_env("DETAIL_WINDOW", "50")  # ✅ -50/+50
-
-    token = get_env("MOVIDESK_TOKEN", required=True)
+        upsert_detail(conn, logger, ticket)
+        audit_delete(conn, audit_fqn, tid)
+        total_ok += 1
 
     logger.info(
-        "Iniciando sincronização detail (bulk=%s, missing=%s, page=%s, window=%s, timeout=(%ss,%ss), attempts=%s).",
-        bulk_limit, missing_limit, page_size, window, connect_timeout, read_timeout, max_attempts
+        f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), Falhas={total_missing}."
     )
 
-    conn = get_db_connection()
-    ensure_detail_table_exists(conn)
-
-    # ✅ Select "seguro" para LISTAGEM
-    SELECT_LIST = "id,lastUpdate"
-
-    # ✅ Select para DETALHE (por id)
-    SELECT_DETAIL = (
-        "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
-        "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
-        "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,resolvedIn,closedIn,"
-        "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
-        "customFieldValues,additionalFields,custom_fields"
-    )
-
-    client = MovideskClient(
-        token=token,
-        connect_timeout=connect_timeout,
-        read_timeout=read_timeout,
-        max_attempts=max_attempts,
-    )
-
-    ok_win, fail_win = sync_window_tickets(conn, client, window, page_size, SELECT_LIST, SELECT_DETAIL)
-    ok_new, fail_new = sync_new_tickets(conn, client, bulk_limit, page_size, SELECT_LIST, SELECT_DETAIL)
-    ok_missing, fail_missing = sync_missing_tickets(conn, client, missing_limit, SELECT_DETAIL)
-
-    logger.info(
-        "Processamento concluído. Sucesso=%s (janela=%s, novos=%s, missing=%s), Falhas=%s (janela=%s, novos=%s, missing=%s).",
-        ok_win + ok_new + ok_missing,
-        ok_win, ok_new, ok_missing,
-        fail_win + fail_new + fail_missing,
-        fail_win, fail_new, fail_missing
-    )
-
-    conn.close()
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
