@@ -14,14 +14,7 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
           ultima_data_validada timestamptz,
           id_inicial bigint,
           id_final bigint,
-          id_atual bigint,
-          constraint ck_range_scan_bounds check (
-            (data_inicio is not null) and (data_fim is not null) and (data_inicio <> data_fim) and
-            (ultima_data_validada is null or (
-              ultima_data_validada >= least(data_inicio, data_fim) and
-              ultima_data_validada <= greatest(data_inicio, data_fim)
-            ))
-          )
+          id_atual bigint
         )
         """
     )
@@ -56,6 +49,10 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
         if max_id is None:
             max_id = max_id2
 
+    id_inicial = max_id
+    id_final = min_id
+    id_atual = id_inicial
+
     cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
     exists = cur.fetchone()[0] != 0
 
@@ -66,7 +63,7 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
               (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual)
             values (%s, %s, %s, %s, %s, %s)
             """,
-            (max_lu, min_lu, max_lu, min_id, max_id, max_id),
+            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
         )
     else:
         cur.execute(
@@ -79,8 +76,8 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
                    id_final = %s,
                    id_atual = %s
             """,
-            (max_lu, min_lu, max_lu, min_id, max_id, max_id),
+            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
         )
     c.commit()
 
-print("Kickoff OK: range_scan_control atualizado.")
+print("Kickoff OK: range_scan_control atualizado (IDs topo→base).")
