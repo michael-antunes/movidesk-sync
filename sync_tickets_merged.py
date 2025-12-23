@@ -11,19 +11,20 @@ from psycopg2.extras import execute_values
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
+
 BATCH = int(os.getenv("MERGED_BATCH", "400"))
 THROTTLE = float(os.getenv("THROTTLE_SEC", "0.25"))
 LOOKBACK_HOURS = int(os.getenv("MERGED_LOOKBACK_HOURS", "24"))
 
-if not TOKEN or not DSN:
-    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
-
 S = requests.Session()
 S.headers.update({"User-Agent": "movidesk-sync/merged"})
 
+if not TOKEN or not DSN:
+    raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-def md_get(path_or_full, params=None, ok_404=False):
-    url = path_or_full if path_or_full.startswith("http") else f"{API_BASE}/{path_or_full}"
+
+def md_get(path, params=None, ok_404=False):
+    url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
     p = dict(params or {})
     p["token"] = TOKEN
     r = S.get(url, params=p, timeout=60)
@@ -39,7 +40,17 @@ def md_get(path_or_full, params=None, ok_404=False):
     r.raise_for_status()
 
 
-def ensure_table(conn):
+def to_aware(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return dt
+
+
+def ensure_schema_tables(conn):
     with conn.cursor() as cur:
         cur.execute("create schema if not exists visualizacao_resolvidos")
         cur.execute(
@@ -57,11 +68,6 @@ def ensure_table(conn):
         cur.execute(
             "create index if not exists ix_tk_merged_into on visualizacao_resolvidos.tickets_mesclados(merged_into_id)"
         )
-    conn.commit()
-
-
-def ensure_sync_control(conn):
-    with conn.cursor() as cur:
         cur.execute(
             """
             create table if not exists visualizacao_resolvidos.sync_control(
@@ -71,18 +77,6 @@ def ensure_sync_control(conn):
               run_at timestamptz default now()
             )
             """
-        )
-        cur.execute(
-            "alter table visualizacao_resolvidos.sync_control add column if not exists name text"
-        )
-        cur.execute(
-            "alter table visualizacao_resolvidos.sync_control add column if not exists job_name text"
-        )
-        cur.execute(
-            "alter table visualizacao_resolvidos.sync_control add column if not exists last_update timestamptz"
-        )
-        cur.execute(
-            "alter table visualizacao_resolvidos.sync_control add column if not exists run_at timestamptz default now()"
         )
     conn.commit()
 
@@ -98,13 +92,12 @@ def get_last_sync_update(conn):
             ("tickets_merged",),
         )
         row = cur.fetchone()
-        return row[0]
+        return to_aware(row[0]) if row and row[0] else None
 
 
 def register_sync_run(conn, last_update):
-    if not last_update:
-        return
     job = "tickets_merged"
+    v = to_aware(last_update) if isinstance(last_update, datetime) else last_update
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -115,7 +108,7 @@ def register_sync_run(conn, last_update):
               last_update = excluded.last_update,
               run_at      = now()
             """,
-            (job, job, last_update),
+            (job, job, v),
         )
     conn.commit()
 
@@ -127,9 +120,8 @@ def fmt_dt_for_md(d):
         return d
     if not isinstance(d, datetime):
         return str(d)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
-    return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    d = to_aware(d)
+    return d.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_merged_response(raw):
@@ -145,9 +137,7 @@ def normalize_merged_response(raw):
             v = raw.get(key)
             if isinstance(v, list):
                 return v
-        print("tickets_mesclados: resposta inesperada de /tickets/merged:", json.dumps(raw, ensure_ascii=False)[:400])
         return []
-    print("tickets_mesclados: tipo inesperado em /tickets/merged:", type(raw).__name__)
     return []
 
 
@@ -173,31 +163,24 @@ def upsert_rows(conn, rows):
 def try_fetch_dedicated(conn):
     last_dt = get_last_sync_update(conn)
     now_dt = datetime.now(timezone.utc)
+
     base_params = {}
     s = fmt_dt_for_md(last_dt)
     if s:
         base_params["startDate"] = s
     base_params["endDate"] = fmt_dt_for_md(now_dt)
+
     page = 1
-    total_pages = None
-    total_inserted = 0
     processed = 0
-    max_dt_val = None
+    total_inserted = 0
 
     print(f"tickets_mesclados: chamada dedicada /tickets/merged base_params={base_params}")
 
     while True:
         params = dict(base_params)
-        params["pageNumber"] = page
-        try:
-            raw = md_get("tickets/merged", params=params, ok_404=True)
-        except requests.HTTPError as e:
-            print(f"[WARN] dedicated endpoint not available ({e}). Using fallback by histories.")
-            return False
-        except Exception as e:
-            print(f"[WARN] erro ao chamar /tickets/merged: {e}. Usando fallback por histories.")
-            return False
+        params["page"] = page
 
+        raw = md_get("tickets/merged", params=params, ok_404=True)
         if raw is None:
             print("tickets_mesclados: endpoint /tickets/merged retornou 404.")
             return False
@@ -206,19 +189,11 @@ def try_fetch_dedicated(conn):
         if not data:
             break
 
-        if isinstance(raw, dict) and total_pages is None:
-            pn = raw.get("pageNumber") or ""
-            m = re.search(r"of\s+(\d+)", str(pn))
-            if m:
-                try:
-                    total_pages = int(m.group(1))
-                except Exception:
-                    total_pages = None
-
         rows = []
         for it in data:
             if not isinstance(it, dict):
                 continue
+
             principal = it.get("ticketId") or it.get("id")
             merged_ids_raw = it.get("mergedTicketsIds") or it.get("mergedTicketsId")
             dt_val = it.get("lastUpdate") or it.get("mergedDate") or it.get("performedAt") or it.get("date")
@@ -237,6 +212,7 @@ def try_fetch_dedicated(conn):
                 parts = re.split(r"[,\s;]+", str(merged_ids_raw))
                 ids_list = [p for p in parts if p]
 
+            payload = json.dumps(it, ensure_ascii=False)
             for sid in ids_list:
                 if processed >= BATCH:
                     break
@@ -244,10 +220,9 @@ def try_fetch_dedicated(conn):
                     src = int(str(sid))
                 except Exception:
                     continue
-                rows.append((src, principal, dt_val, json.dumps(it, ensure_ascii=False)))
+                rows.append((src, principal, dt_val, payload))
                 processed += 1
-                if dt_val and (max_dt_val is None or str(dt_val) > str(max_dt_val)):
-                    max_dt_val = dt_val
+
             if processed >= BATCH:
                 break
 
@@ -257,41 +232,17 @@ def try_fetch_dedicated(conn):
 
         if processed >= BATCH:
             break
-        if total_pages is not None and page >= total_pages:
-            break
 
         page += 1
         time.sleep(THROTTLE)
 
-    if max_dt_val:
-        register_sync_run(conn, max_dt_val)
-    else:
-        register_sync_run(conn, now_dt)
+    register_sync_run(conn, now_dt)
 
     if total_inserted == 0:
         print("tickets_mesclados: nenhum novo registro via /tickets/merged.")
     else:
         print(f"tickets_mesclados: {total_inserted} registros inseridos via /tickets/merged.")
     return True
-
-
-def get_missing_candidate_ids_from_audit(conn, limit):
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select a.ticket_id
-              from visualizacao_resolvidos.audit_recent_missing a
-         left join visualizacao_resolvidos.tickets_mesclados tm
-                on tm.ticket_id = a.ticket_id
-             where a.table_name = 'tickets_resolvidos'
-               and tm.ticket_id is null
-          group by a.ticket_id
-          order by max(a.run_id) desc, a.ticket_id desc
-             limit %s
-            """,
-            (limit,),
-        )
-        return [r[0] for r in cur.fetchall()]
 
 
 def regclass_exists(conn, name):
@@ -301,6 +252,7 @@ def regclass_exists(conn, name):
 
 
 def get_recent_candidate_ids(conn, limit, since_dt):
+    since_dt = to_aware(since_dt)
     parts = []
     params = []
 
@@ -359,6 +311,27 @@ def get_recent_candidate_ids(conn, limit, since_dt):
         return [r[0] for r in cur.fetchall()]
 
 
+def get_missing_candidate_ids_from_audit(conn, limit):
+    if not regclass_exists(conn, "visualizacao_resolvidos.audit_recent_missing"):
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select a.ticket_id
+              from visualizacao_resolvidos.audit_recent_missing a
+         left join visualizacao_resolvidos.tickets_mesclados tm
+                on tm.ticket_id = a.ticket_id
+             where a.table_name = 'tickets_resolvidos'
+               and tm.ticket_id is null
+          group by a.ticket_id
+          order by max(a.run_id) desc, a.ticket_id desc
+             limit %s
+            """,
+            (limit,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i : i + size]
@@ -369,27 +342,27 @@ def fetch_histories_for(ids):
         return []
     all_data = []
     for chunk in chunked(ids, 10):
-        filtro = " or ".join([f"id eq {i}" for i in chunk])
+        filtro = "(" + " or ".join([f"id eq '{int(i)}'" for i in chunk]) + ")"
         params = {
             "$select": "id,mergedTicketsIds,mergedTicketsId,lastUpdate",
             "$filter": filtro,
-            "$expand": "statusHistories($select=status,justification,changedDate)",
+            "$expand": "statusHistories",
         }
+
         data = []
         try:
-            data = md_get("tickets", params)
+            data = md_get("tickets", params=params)
         except requests.HTTPError as e:
             print(f"[WARN] erro HTTP ao buscar histories(/tickets) para chunk {chunk}: {e}")
+            data = []
         except Exception as e:
             print(f"[WARN] erro inesperado ao buscar histories(/tickets) para chunk {chunk}: {e}")
+            data = []
 
         if not data:
             try:
-                raw = md_get("tickets/past", params, ok_404=True)
-                if raw is None:
-                    data = []
-                else:
-                    data = raw or []
+                raw = md_get("tickets/past", params=params, ok_404=True)
+                data = [] if raw is None else (raw or [])
             except requests.HTTPError as e:
                 print(f"[WARN] erro HTTP ao buscar histories(/tickets/past) para chunk {chunk}: {e}")
                 data = []
@@ -399,6 +372,7 @@ def fetch_histories_for(ids):
 
         all_data.extend(data or [])
         time.sleep(THROTTLE)
+
     return all_data
 
 
@@ -433,9 +407,6 @@ def extract_merges_from_direct_fields(item):
     for sid in ids_list:
         try:
             src = int(str(sid))
-        except Exception:
-            continue
-        try:
             dst = int(str(principal))
         except Exception:
             continue
@@ -487,8 +458,10 @@ def run_fallback_for_recent(conn):
     now_dt = datetime.now(timezone.utc)
 
     since_dt = now_dt - timedelta(hours=LOOKBACK_HOURS)
-    if last_dt and last_dt < since_dt:
-        since_dt = last_dt
+    if last_dt:
+        last_dt = to_aware(last_dt)
+        if last_dt < since_dt:
+            since_dt = last_dt
 
     ids = get_recent_candidate_ids(conn, BATCH, since_dt)
     if not ids:
@@ -546,26 +519,25 @@ def run_fallback_for_missing(conn):
         return
 
     upsert_rows(conn, rows)
-    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback de statusHistories para missing.")
+    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(missing).")
 
 
 def main():
     with psycopg2.connect(DSN) as conn:
-        ensure_table(conn)
-        ensure_sync_control(conn)
-        try_fetch_dedicated(conn)
-        try:
-            run_fallback_for_recent(conn)
-        except requests.HTTPError as e:
-            print(f"[WARN] fallback(recent) por histories falhou: {e}")
-        except Exception as e:
-            print(f"[WARN] erro inesperado no fallback(recent): {e}")
+        ensure_schema_tables(conn)
+
+        ok = try_fetch_dedicated(conn)
+        if not ok:
+            try:
+                run_fallback_for_recent(conn)
+            except Exception as e:
+                print(f"[WARN] erro inesperado no fallback(recent): {e}")
+
         try:
             run_fallback_for_missing(conn)
-        except requests.HTTPError as e:
-            print(f"[WARN] fallback(missing) por histories falhou: {e}")
         except Exception as e:
             print(f"[WARN] erro inesperado no fallback(missing): {e}")
+
         with conn.cursor() as cur:
             cur.execute("select count(*) from visualizacao_resolvidos.tickets_mesclados")
             total = cur.fetchone()[0]
