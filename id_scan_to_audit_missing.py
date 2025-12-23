@@ -20,14 +20,7 @@ def ensure_control(cur):
           ultima_data_validada timestamptz,
           id_inicial bigint,
           id_final bigint,
-          id_atual bigint,
-          constraint ck_range_scan_bounds check (
-            (data_inicio is not null) and (data_fim is not null) and (data_inicio <> data_fim) and
-            (ultima_data_validada is null or (
-              ultima_data_validada >= least(data_inicio, data_fim) and
-              ultima_data_validada <= greatest(data_inicio, data_fim)
-            ))
-          )
+          id_atual bigint
         )
         """
     )
@@ -67,13 +60,17 @@ def init_control_row(cur):
         if max_id is None:
             max_id = max_id2
 
+    id_inicial = max_id
+    id_final = min_id
+    id_atual = id_inicial
+
     cur.execute(
         """
         insert into visualizacao_resolvidos.range_scan_control
           (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual)
         values (%s, %s, %s, %s, %s, %s)
         """,
-        (max_lu, min_lu, max_lu, min_id, max_id, max_id),
+        (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
     )
 
 def ensure_missing_tables(cur):
@@ -101,6 +98,12 @@ def ensure_missing_tables(cur):
           table_name text not null,
           ticket_id integer not null
         )
+        """
+    )
+    cur.execute(
+        """
+        create unique index if not exists audit_recent_missing_uniq
+        on visualizacao_resolvidos.audit_recent_missing(table_name, ticket_id)
         """
     )
 
@@ -184,7 +187,7 @@ def main():
         ensure_control(cur)
         init_control_row(cur)
         ensure_missing_tables(cur)
-        run_id = create_run(cur, "id-scan: range_scan_control ids -> audit_recent_missing (skip mesclados)")
+        run_id = create_run(cur, "id-scan: topo→base (skip mesclados) -> audit_recent_missing")
         c.commit()
 
         total_checked = 0
@@ -194,16 +197,17 @@ def main():
             id_inicial, id_final, id_atual = fetch_control(cur)
             if id_inicial is None or id_final is None:
                 break
+
             if id_atual is None:
-                id_atual = id_final
+                id_atual = id_inicial
                 update_control(cur, id_inicial, id_final, id_atual)
                 c.commit()
 
-            if id_atual < id_inicial:
+            if id_atual < id_final:
                 break
 
             start_id = int(id_atual)
-            end_id = int(max(id_inicial, id_atual - BATCH_SIZE + 1))
+            end_id = int(max(id_final, id_atual - BATCH_SIZE + 1))
             batch = list(range(start_id, end_id - 1, -1))
             total_checked += len(batch)
 
