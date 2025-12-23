@@ -81,6 +81,35 @@ def ensure_schema_tables(conn):
     conn.commit()
 
 
+def regclass_exists(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass(%s)", (name,))
+        return cur.fetchone()[0] is not None
+
+
+def column_exists(conn, schema, table, column):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select 1
+              from information_schema.columns
+             where table_schema = %s
+               and table_name = %s
+               and column_name = %s
+             limit 1
+            """,
+            (schema, table, column),
+        )
+        return cur.fetchone() is not None
+
+
+def pick_ts_column(conn, schema, table, candidates):
+    for c in candidates:
+        if column_exists(conn, schema, table, c):
+            return c
+    return None
+
+
 def get_last_sync_update(conn):
     with conn.cursor() as cur:
         cur.execute(
@@ -245,46 +274,61 @@ def try_fetch_dedicated(conn):
     return True
 
 
-def regclass_exists(conn, name):
-    with conn.cursor() as cur:
-        cur.execute("select to_regclass(%s)", (name,))
-        return cur.fetchone()[0] is not None
-
-
 def get_recent_candidate_ids(conn, limit, since_dt):
     since_dt = to_aware(since_dt)
+
     parts = []
     params = []
 
     if regclass_exists(conn, "dados_gerais.tickets_suporte"):
-        parts.append(
-            """
-            select ticket_id
-              from dados_gerais.tickets_suporte
-             where last_update >= %s
-            """
+        col = pick_ts_column(
+            conn,
+            "dados_gerais",
+            "tickets_suporte",
+            ["last_update", "lastUpdate", "updated_at", "raw_last_update", "created_at"],
         )
-        params.append(since_dt)
+        if col:
+            parts.append(
+                f"""
+                select ticket_id
+                  from dados_gerais.tickets_suporte
+                 where {col} >= %s
+                """
+            )
+            params.append(since_dt)
 
     if regclass_exists(conn, "visualizacao_atual.tickets_abertos"):
-        parts.append(
-            """
-            select ticket_id
-              from visualizacao_atual.tickets_abertos
-             where coalesce(last_update, raw_last_update, updated_at) >= %s
-            """
-        )
-        params.append(since_dt)
+        cols = []
+        for c in ["last_update", "raw_last_update", "updated_at", "created_at"]:
+            if column_exists(conn, "visualizacao_atual", "tickets_abertos", c):
+                cols.append(c)
+        if cols:
+            expr = "coalesce(" + ",".join(cols) + ")"
+            parts.append(
+                f"""
+                select ticket_id
+                  from visualizacao_atual.tickets_abertos
+                 where {expr} >= %s
+                """
+            )
+            params.append(since_dt)
 
     if regclass_exists(conn, "visualizacao_resolvidos.tickets_resolvidos_detail"):
-        parts.append(
-            """
-            select ticket_id
-              from visualizacao_resolvidos.tickets_resolvidos_detail
-             where updated_at >= %s
-            """
+        col = pick_ts_column(
+            conn,
+            "visualizacao_resolvidos",
+            "tickets_resolvidos_detail",
+            ["updated_at", "last_update", "lastUpdate", "created_at"],
         )
-        params.append(since_dt)
+        if col:
+            parts.append(
+                f"""
+                select ticket_id
+                  from visualizacao_resolvidos.tickets_resolvidos_detail
+                 where {col} >= %s
+                """
+            )
+            params.append(since_dt)
 
     if not parts:
         return []
@@ -454,72 +498,88 @@ def extract_merge_from_histories(item):
 
 
 def run_fallback_for_recent(conn):
-    last_dt = get_last_sync_update(conn)
-    now_dt = datetime.now(timezone.utc)
+    try:
+        last_dt = get_last_sync_update(conn)
+        now_dt = datetime.now(timezone.utc)
 
-    since_dt = now_dt - timedelta(hours=LOOKBACK_HOURS)
-    if last_dt:
-        last_dt = to_aware(last_dt)
-        if last_dt < since_dt:
-            since_dt = last_dt
+        since_dt = now_dt - timedelta(hours=LOOKBACK_HOURS)
+        if last_dt:
+            last_dt = to_aware(last_dt)
+            if last_dt < since_dt:
+                since_dt = last_dt
 
-    ids = get_recent_candidate_ids(conn, BATCH, since_dt)
-    if not ids:
-        print("tickets_mesclados: fallback(recent) não encontrou candidatos por last_update/updated_at.")
+        ids = get_recent_candidate_ids(conn, BATCH, since_dt)
+        if not ids:
+            print("tickets_mesclados: fallback(recent) não encontrou candidatos por timestamps disponíveis.")
+            register_sync_run(conn, now_dt)
+            return
+
+        data = fetch_histories_for(ids)
+
+        rows_map = {}
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+
+            for src, dst, dt in extract_merges_from_direct_fields(it):
+                key = (int(src), int(dst))
+                if key not in rows_map:
+                    rows_map[key] = (int(src), int(dst), dt, json.dumps(it, ensure_ascii=False))
+
+            got = extract_merge_from_histories(it)
+            if got:
+                src, dst, dt = got
+                key = (int(src), int(dst) if dst is not None else None)
+                if key not in rows_map:
+                    rows_map[key] = (int(src), int(dst) if dst is not None else None, dt, json.dumps(it, ensure_ascii=False))
+
+        rows = list(rows_map.values())
+        if not rows:
+            print(f"tickets_mesclados: fallback(recent) processou {len(ids)} tickets mas não identificou merges.")
+            register_sync_run(conn, now_dt)
+            return
+
+        upsert_rows(conn, rows)
         register_sync_run(conn, now_dt)
-        return
+        print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(recent).")
 
-    data = fetch_histories_for(ids)
-
-    rows_map = {}
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-
-        for src, dst, dt in extract_merges_from_direct_fields(it):
-            key = (int(src), int(dst))
-            if key not in rows_map:
-                rows_map[key] = (int(src), int(dst), dt, json.dumps(it, ensure_ascii=False))
-
-        got = extract_merge_from_histories(it)
-        if got:
-            src, dst, dt = got
-            key = (int(src), int(dst) if dst is not None else None)
-            if key not in rows_map:
-                rows_map[key] = (int(src), int(dst) if dst is not None else None, dt, json.dumps(it, ensure_ascii=False))
-
-    rows = list(rows_map.values())
-    if not rows:
-        print(f"tickets_mesclados: fallback(recent) processou {len(ids)} tickets mas não identificou merges.")
-        register_sync_run(conn, now_dt)
-        return
-
-    upsert_rows(conn, rows)
-    register_sync_run(conn, now_dt)
-    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(recent).")
+    except psycopg2.Error as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise e
 
 
 def run_fallback_for_missing(conn):
-    ids = get_missing_candidate_ids_from_audit(conn, BATCH)
-    if not ids:
-        print("tickets_mesclados: fallback(missing) não encontrou candidatos em audit_recent_missing.")
-        return
+    try:
+        ids = get_missing_candidate_ids_from_audit(conn, BATCH)
+        if not ids:
+            print("tickets_mesclados: fallback(missing) não encontrou candidatos em audit_recent_missing.")
+            return
 
-    data = fetch_histories_for(ids)
-    rows = []
-    for it in data:
-        got = extract_merge_from_histories(it)
-        if not got:
-            continue
-        src, dst, dt = got
-        rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
+        data = fetch_histories_for(ids)
+        rows = []
+        for it in data:
+            got = extract_merge_from_histories(it)
+            if not got:
+                continue
+            src, dst, dt = got
+            rows.append((src, dst, dt, json.dumps(it, ensure_ascii=False)))
 
-    if not rows:
-        print(f"tickets_mesclados: fallback(missing) processou {len(ids)} tickets mas não identificou merges.")
-        return
+        if not rows:
+            print(f"tickets_mesclados: fallback(missing) processou {len(ids)} tickets mas não identificou merges.")
+            return
 
-    upsert_rows(conn, rows)
-    print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(missing).")
+        upsert_rows(conn, rows)
+        print(f"tickets_mesclados: {len(rows)} registros inseridos via fallback(missing).")
+
+    except psycopg2.Error as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise e
 
 
 def main():
@@ -532,16 +592,31 @@ def main():
                 run_fallback_for_recent(conn)
             except Exception as e:
                 print(f"[WARN] erro inesperado no fallback(recent): {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
         try:
             run_fallback_for_missing(conn)
         except Exception as e:
             print(f"[WARN] erro inesperado no fallback(missing): {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
-        with conn.cursor() as cur:
-            cur.execute("select count(*) from visualizacao_resolvidos.tickets_mesclados")
-            total = cur.fetchone()[0]
-        print(f"tickets_mesclados: sincronização concluída. Total na tabela: {total}.")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select count(*) from visualizacao_resolvidos.tickets_mesclados")
+                total = cur.fetchone()[0]
+            print(f"tickets_mesclados: sincronização concluída. Total na tabela: {total}.")
+        except psycopg2.Error as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise e
 
 
 if __name__ == "__main__":
