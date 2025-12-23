@@ -6,9 +6,9 @@ import sys
 import time
 import json
 import math
-import traceback
+import logging
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, date, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
@@ -16,426 +16,406 @@ import psycopg2
 import psycopg2.extras
 
 
-# =========================
-# Config / Utils
-# =========================
-
-def log(msg: str) -> None:
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    print(f"{ts} | {msg}", flush=True)
-
-
-def warn(msg: str) -> None:
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    print(f"{ts} | [WARN] {msg}", flush=True)
+# ----------------------------
+# Logging
+# ----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("tickets_mesclados")
 
 
-def getenv_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
+# ----------------------------
+# Config
+# ----------------------------
+@dataclass
+class Config:
+    api_base: str
+    api_token: str
+
+    db_schema: str
+    table_name: str
+
+    window_days: int
+    days_back: int
+    start_date: Optional[date]
+    end_date: Optional[date]
+
+    throttle_seconds: float
+    timeout_seconds: int
+    max_retries: int
 
 
-def getenv_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return v if v is not None else default
+def parse_date_yyyy_mm_dd(s: str) -> date:
+    return datetime.strptime(s.strip(), "%Y-%m-%d").date()
 
 
-def parse_dt_any(s: Optional[str]) -> Optional[datetime]:
-    """
-    Tenta parsear timestamps comuns (ISO 8601, "YYYY-MM-DD HH:MM:SS", etc).
-    Retorna datetime timezone-aware (UTC) quando possível.
-    """
-    if not s:
-        return None
-    ss = s.strip()
-    if not ss:
-        return None
+def env_config() -> Config:
+    api_base = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1").rstrip("/")
+    api_token = os.getenv("MOVIDESK_API_TOKEN") or os.getenv("MOVIDESK_TOKEN") or ""
+    if not api_token:
+        raise RuntimeError("Falta MOVIDESK_API_TOKEN (ou MOVIDESK_TOKEN).")
 
-    # Normaliza Z
-    if ss.endswith("Z"):
-        ss = ss[:-1] + "+00:00"
+    db_schema = os.getenv("DB_SCHEMA", "visualizacao_resolvidos")
+    table_name = os.getenv("TABLE_NAME", "tickets_mesclados")
 
-    # Tenta ISO
-    try:
-        dt = datetime.fromisoformat(ss)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt
-    except Exception:
-        pass
+    window_days = int(os.getenv("WINDOW_DAYS", "7"))
+    if window_days < 1:
+        window_days = 1
+    if window_days > 7:
+        # manual diz janela máxima 7 dias
+        window_days = 7
 
-    # Tenta "YYYY-MM-DD HH:MM:SS"
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            dt = datetime.strptime(ss, fmt)
-            dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            continue
+    days_back = int(os.getenv("DAYS_BACK", "30"))
 
-    return None
+    start_date = os.getenv("START_DATE", "").strip() or None
+    end_date = os.getenv("END_DATE", "").strip() or None
 
+    throttle_seconds = float(os.getenv("THROTTLE_SECONDS", "6.2"))
+    timeout_seconds = int(os.getenv("HTTP_TIMEOUT", "60"))
+    max_retries = int(os.getenv("MAX_RETRIES", "5"))
 
-def to_yyyy_mm_dd(d: date) -> str:
-    return d.strftime("%Y-%m-%d")
+    return Config(
+        api_base=api_base,
+        api_token=api_token,
+        db_schema=db_schema,
+        table_name=table_name,
+        window_days=window_days,
+        days_back=days_back,
+        start_date=parse_date_yyyy_mm_dd(start_date) if start_date else None,
+        end_date=parse_date_yyyy_mm_dd(end_date) if end_date else None,
+        throttle_seconds=throttle_seconds,
+        timeout_seconds=timeout_seconds,
+        max_retries=max_retries,
+    )
 
 
-def chunked(it: List[Any], n: int) -> Iterable[List[Any]]:
-    for i in range(0, len(it), n):
-        yield it[i:i+n]
-
-
-# =========================
+# ----------------------------
 # Postgres
-# =========================
-
+# ----------------------------
 def pg_connect():
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        # DATABASE_URL pode vir com sslmode=require etc.
-        return psycopg2.connect(db_url)
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        return psycopg2.connect(database_url)
 
-    host = os.getenv("PGHOST")
-    dbname = os.getenv("PGDATABASE")
-    user = os.getenv("PGUSER")
-    pwd = os.getenv("PGPASSWORD")
-    port = os.getenv("PGPORT", "5432")
+    host = os.getenv("PGHOST", "").strip()
+    db = os.getenv("PGDATABASE", "").strip()
+    user = os.getenv("PGUSER", "").strip()
+    pwd = os.getenv("PGPASSWORD", "").strip()
+    port = os.getenv("PGPORT", "5432").strip()
 
-    if not (host and dbname and user and pwd):
+    if not (host and db and user and pwd):
         raise RuntimeError("Faltam variáveis de Postgres. Use DATABASE_URL ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD.")
 
-    return psycopg2.connect(
-        host=host, port=int(port), dbname=dbname, user=user, password=pwd
-    )
+    return psycopg2.connect(host=host, dbname=db, user=user, password=pwd, port=port)
 
 
 def ensure_schema_and_table(conn, schema: str, table: str) -> None:
     """
-    Cria schema/tabela e garante colunas essenciais.
-    Estrutura: 1 linha por par (ticket_id, merged_ticket_id).
+    Cria schema/tabela e garante colunas necessárias.
+    Estrutura alvo:
+      ticket_id bigint
+      merged_ticket_id bigint
+      merged_tickets integer
+      merged_tickets_ids text
+      last_update timestamptz
+      fetched_at timestamptz
+      raw jsonb
     """
     with conn.cursor() as cur:
         cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
 
         cur.execute(f"""
         CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
-            ticket_id BIGINT NOT NULL,
-            merged_ticket_id BIGINT NOT NULL,
-            merged_tickets INTEGER NULL,
-            merged_tickets_ids TEXT NULL,
-            last_update TIMESTAMPTZ NULL,
-            fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (ticket_id, merged_ticket_id)
+            ticket_id        BIGINT,
+            merged_ticket_id BIGINT,
+            merged_tickets   INTEGER,
+            merged_tickets_ids TEXT,
+            last_update      TIMESTAMPTZ,
+            fetched_at       TIMESTAMPTZ,
+            raw             JSONB
         );
         """)
 
-        # Garante colunas caso a tabela já existisse diferente
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS merged_ticket_id BIGINT;')
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS merged_tickets INTEGER;')
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS merged_tickets_ids TEXT;')
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS last_update TIMESTAMPTZ;')
-        cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ NOT NULL DEFAULT now();')
+        # add missing columns (para tabelas antigas)
+        required = {
+            "ticket_id": 'BIGINT',
+            "merged_ticket_id": 'BIGINT',
+            "merged_tickets": 'INTEGER',
+            "merged_tickets_ids": 'TEXT',
+            "last_update": 'TIMESTAMPTZ',
+            "fetched_at": 'TIMESTAMPTZ',
+            "raw": 'JSONB',
+        }
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s;
+        """, (schema, table))
+        existing = {r[0] for r in cur.fetchall()}
+
+        for col, coltype in required.items():
+            if col not in existing:
+                cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN "{col}" {coltype};')
+
+        # índice único para upsert
+        # (UNIQUE permite múltiplos NULLs, então não “quebra” tabela antiga)
+        cur.execute(f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_indexes
+                WHERE schemaname = %s AND tablename = %s AND indexname = %s
+            ) THEN
+                EXECUTE format('CREATE UNIQUE INDEX %I ON "{schema}"."{table}" (ticket_id, merged_ticket_id);', %s);
+            END IF;
+        END$$;
+        """, (schema, table, f"{table}_ticket_merged_uidx", f"{table}_ticket_merged_uidx"))
 
     conn.commit()
 
 
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple]) -> int:
-    """
-    rows: (ticket_id, merged_ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at)
-    """
+def get_max_last_update_date(conn, schema: str, table: str) -> Optional[date]:
+    with conn.cursor() as cur:
+        try:
+            cur.execute(f'SELECT MAX(last_update) FROM "{schema}"."{table}";')
+            val = cur.fetchone()[0]
+            if not val:
+                return None
+            if isinstance(val, datetime):
+                return val.date()
+            return None
+        except Exception:
+            conn.rollback()
+            return None
+
+
+def upsert_rows(conn, schema: str, table: str, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
 
     sql = f"""
     INSERT INTO "{schema}"."{table}"
-        (ticket_id, merged_ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at)
+        (ticket_id, merged_ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at, raw)
     VALUES %s
     ON CONFLICT (ticket_id, merged_ticket_id)
     DO UPDATE SET
         merged_tickets = EXCLUDED.merged_tickets,
         merged_tickets_ids = EXCLUDED.merged_tickets_ids,
         last_update = EXCLUDED.last_update,
-        fetched_at = EXCLUDED.fetched_at
+        fetched_at = EXCLUDED.fetched_at,
+        raw = EXCLUDED.raw
     ;
     """
 
+    values = []
+    for r in rows:
+        values.append((
+            r.get("ticket_id"),
+            r.get("merged_ticket_id"),
+            r.get("merged_tickets"),
+            r.get("merged_tickets_ids"),
+            r.get("last_update"),
+            r.get("fetched_at"),
+            psycopg2.extras.Json(r.get("raw")),
+        ))
+
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows, page_size=1000)
+        psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
+
     conn.commit()
     return len(rows)
 
 
-def count_rows(conn, schema: str, table: str) -> int:
-    with conn.cursor() as cur:
-        cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}";')
-        return int(cur.fetchone()[0])
-
-
-# =========================
+# ----------------------------
 # Movidesk API
-# =========================
-
-@dataclass
-class MoviCfg:
-    base_url: str
-    token: str
-    schema: str
-    table: str
-    lookback_days: int
-    window_days: int
-    sleep_s: float
-
-
-def http_get_json(url: str, params: Dict[str, Any], timeout: int = 60) -> Any:
+# ----------------------------
+def http_get_json(url: str, params: Dict[str, Any], timeout: int, max_retries: int) -> Any:
     """
-    GET com retry simples em 429/5xx.
+    GET com retry simples (inclui 429).
     """
-    session = requests.Session()
-    backoff = 1.5
-    max_tries = 6
-
-    # Não printar token
-    safe_params = dict(params)
-    if "token" in safe_params:
-        safe_params["token"] = "***"
-
-    for attempt in range(1, max_tries + 1):
+    for attempt in range(1, max_retries + 1):
         try:
-            r = session.get(url, params=params, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 504):
-                warn(f"HTTP {r.status_code} em {url} params={safe_params} | tentativa {attempt}/{max_tries}")
-                time.sleep(backoff ** attempt)
+            resp = requests.get(url, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                sleep_s = int(retry_after) if retry_after and retry_after.isdigit() else 65
+                log.warning("HTTP 429 (rate limit). Dormindo %ss e tentando novamente (tentativa %s/%s).", sleep_s, attempt, max_retries)
+                time.sleep(sleep_s)
                 continue
 
-            # 404 pode acontecer no tipo 1 (id não encontrado) — vamos tratar acima na lógica.
-            r.raise_for_status()
+            if resp.status_code == 404:
+                # em geral: sem dados/rota; trate como vazio
+                log.warning("HTTP 404 no endpoint (tratando como vazio): %s", resp.url)
+                return []
 
-            # Movidesk geralmente responde JSON
-            return r.json()
+            resp.raise_for_status()
+            if not resp.text.strip():
+                return []
+            return resp.json()
+        except requests.RequestException as e:
+            if attempt >= max_retries:
+                raise
+            sleep_s = min(2 ** attempt, 30)
+            log.warning("Erro HTTP (%s). Retry em %ss (tentativa %s/%s).", str(e), sleep_s, attempt, max_retries)
+            time.sleep(sleep_s)
 
-        except requests.HTTPError as e:
-            # Erros 4xx que não são retry
-            raise
-        except Exception as e:
-            warn(f"Erro inesperado HTTP em {url} params={safe_params} | tentativa {attempt}/{max_tries}: {e}")
-            time.sleep(backoff ** attempt)
-
-    raise RuntimeError(f"Falha após {max_tries} tentativas: {url}")
-
-
-def normalize_merged_payload(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Aceita:
-    - TIPO 2: dict com chave mergedTickets (lista)
-    - TIPO 1: dict de um item (ticketId/mergedTicketsIds/lastUpdate)
-    - lista direta de itens
-    - (opcional) dict com "value" (estilo OData) se ocorrer
-    """
-    if payload is None:
-        return []
-
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        # Tipo 2 (manual): wrapper com mergedTickets
-        mt = payload.get("mergedTickets")
-        if isinstance(mt, list):
-            return [x for x in mt if isinstance(x, dict)]
-
-        # OData-style
-        val = payload.get("value")
-        if isinstance(val, list):
-            return [x for x in val if isinstance(x, dict)]
-
-        # Tipo 1: um único item
-        if any(k in payload for k in ("ticketId", "id", "mergedTicketsIds")):
-            return [payload]
-
-        # Não reconhecido
-        return []
-
-    # Não reconhecido
     return []
 
 
-def explode_rows(items: List[Dict[str, Any]]) -> List[Tuple]:
-    """
-    Converte itens do /tickets/merged em linhas:
-    (ticket_id, merged_ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at)
-    """
-    out: List[Tuple] = []
-    fetched_at = datetime.now(timezone.utc)
+def fetch_merged_window(cfg: Config, start_d: date, end_d: date) -> List[Dict[str, Any]]:
+    # manual: /tickets/merged?token=TOKEN&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD:contentReference[oaicite:7]{index=7}
+    url = f"{cfg.api_base}/tickets/merged"
+    params = {
+        "token": cfg.api_token,
+        "startDate": start_d.isoformat(),
+        "endDate": end_d.isoformat(),
+    }
+    data = http_get_json(url, params=params, timeout=cfg.timeout_seconds, max_retries=cfg.max_retries)
+    if not isinstance(data, list):
+        log.warning("Resposta inesperada (não-list) em %s..%s: %s", start_d, end_d, type(data))
+        return []
+    return data
 
-    for it in items:
-        # Alguns ambientes podem retornar "ticketId" (manual) ou já vir como "id" (custom)
-        tid_raw = it.get("ticketId", it.get("id"))
-        if tid_raw is None:
-            continue
 
+def parse_last_update(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    s = str(v).strip()
+    if not s:
+        return None
+    # tenta ISO
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def split_merged_ids(v: Any) -> List[int]:
+    if v is None:
+        return []
+    s = str(v).strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(";") if p.strip()]
+    out = []
+    for p in parts:
         try:
-            ticket_id = int(str(tid_raw).strip())
+            out.append(int(p))
         except Exception:
             continue
+    return out
 
-        merged_tickets_raw = it.get("mergedTickets")
-        merged_tickets = None
-        if merged_tickets_raw is not None and str(merged_tickets_raw).strip() != "":
-            try:
-                merged_tickets = int(str(merged_tickets_raw).strip())
-            except Exception:
-                merged_tickets = None
 
-        merged_ids_str = it.get("mergedTicketsIds")
-        merged_ids_str = "" if merged_ids_str is None else str(merged_ids_str).strip()
+def normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Esperado pelo manual: ticketId, mergedTickets, mergedTicketsIds, lastUpdate:contentReference[oaicite:8]{index=8}
+    """
+    fetched_at = datetime.now(timezone.utc)
+    out: List[Dict[str, Any]] = []
 
-        last_update = parse_dt_any(it.get("lastUpdate"))
-        # Se não parseou, tenta guardar nulo mesmo.
-
-        # mergedTicketsIds pode ser "123;456"
-        merged_ids: List[int] = []
-        if merged_ids_str:
-            parts = [p.strip() for p in merged_ids_str.split(";") if p.strip()]
-            for p in parts:
-                try:
-                    merged_ids.append(int(p))
-                except Exception:
-                    pass
-
-        # Se não vierem IDs (estranho), ainda assim registra 1 linha com merged_ticket_id = 0
-        if not merged_ids:
-            out.append((ticket_id, 0, merged_tickets, merged_ids_str or None, last_update, fetched_at))
+    for it in items:
+        if not isinstance(it, dict):
             continue
 
+        ticket_id = it.get("ticketId")
+        merged_tickets = it.get("mergedTickets")
+        merged_ids_raw = it.get("mergedTicketsIds")
+        last_update_raw = it.get("lastUpdate")
+
+        try:
+            ticket_id_int = int(ticket_id)
+        except Exception:
+            log.warning("Item ignorado (ticketId inválido): %s", it)
+            continue
+
+        last_update = parse_last_update(last_update_raw)
+        merged_ids = split_merged_ids(merged_ids_raw)
+
+        # Se mergedTickets > 0 mas mergedTicketsIds vier vazio, não dá pra explodir em pares
+        if (merged_tickets not in (None, "", 0, "0")) and not merged_ids:
+            log.warning("Item com mergedTickets>0 mas sem mergedTicketsIds: %s", it)
+            continue
+
+        # 1 linha por par (ticket_id, merged_ticket_id)
         for mid in merged_ids:
-            out.append((ticket_id, mid, merged_tickets, merged_ids_str, last_update, fetched_at))
+            out.append({
+                "ticket_id": ticket_id_int,
+                "merged_ticket_id": mid,
+                "merged_tickets": int(merged_tickets) if str(merged_tickets).strip().isdigit() else None,
+                "merged_tickets_ids": str(merged_ids_raw) if merged_ids_raw is not None else None,
+                "last_update": last_update,
+                "fetched_at": fetched_at,
+                "raw": it,
+            })
 
     return out
 
 
-def fetch_merged_window(cfg: MoviCfg, start_d: date, end_d: date) -> List[Dict[str, Any]]:
-    """
-    Busca por intervalo (Tipo 2), paginando por 'page'.
-    """
-    url = cfg.base_url.rstrip("/") + "/tickets/merged"
-    items_all: List[Dict[str, Any]] = []
-
-    page = 1
-    while True:
-        params = {
-            "token": cfg.token,
-            "startDate": to_yyyy_mm_dd(start_d),
-            "endDate": to_yyyy_mm_dd(end_d),
-            "page": page,
-        }
-
-        payload = None
-        try:
-            payload = http_get_json(url, params=params, timeout=90)
-        except requests.HTTPError as e:
-            # Se vier 404 aqui, pode ser endpoint indisponível no seu tenant
-            # ou (menos provável) comportamento estranho. Vamos logar e abortar a janela.
-            warn(f"/tickets/merged retornou HTTP {getattr(e.response,'status_code',None)} para startDate={params['startDate']} endDate={params['endDate']}.")
-            break
-
-        items = normalize_merged_payload(payload)
-
-        # Se veio dict e não reconheceu formato, loga um exemplo
-        if isinstance(payload, dict) and not items:
-            exemplo = json.dumps(payload, ensure_ascii=False)[:300]
-            warn(f"payload dict não reconhecido em /tickets/merged | exemplo={exemplo}")
-
-        if not items:
-            break
-
-        items_all.extend(items)
-
-        # Se for tipo 2 wrapper, pode vir 'count' e 'pageNumber'
-        # Mesmo assim, como não há pageSize no manual, paramos quando vier vazio na próxima página.
-        page += 1
-        time.sleep(cfg.sleep_s)
-
-        # proteção contra loop infinito
-        if page > 5000:
-            warn("Abortando paginação: page > 5000 (proteção).")
-            break
-
-    return items_all
+def daterange_windows(start_d: date, end_d: date, window_days: int) -> Iterable[Tuple[date, date]]:
+    cur = start_d
+    while cur <= end_d:
+        w_end = min(end_d, cur + timedelta(days=window_days - 1))
+        yield (cur, w_end)
+        cur = w_end + timedelta(days=1)
 
 
-# =========================
+# ----------------------------
 # Main
-# =========================
-
+# ----------------------------
 def main() -> None:
-    token = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVI_TOKEN") or ""
-    if not token:
-        raise RuntimeError("Falta MOVIDESK_TOKEN (ou MOVI_TOKEN).")
-
-    cfg = MoviCfg(
-        base_url=getenv_str("MOVIDESK_BASE_URL", "https://api.movidesk.com/public/v1"),
-        token=token,
-        schema=getenv_str("DB_SCHEMA", "visualizacao_resolvidos"),
-        table=getenv_str("DB_TABLE", "tickets_mesclados"),
-        lookback_days=getenv_int("LOOKBACK_DAYS", 30),
-        window_days=getenv_int("WINDOW_DAYS", 7),
-        sleep_s=float(getenv_str("REQUEST_SLEEP_S", "0.4") or "0.4"),
-    )
-
-    # Intervalo
-    today_utc = datetime.now(timezone.utc).date()
-    start_base = today_utc - timedelta(days=cfg.lookback_days)
-    end_base = today_utc
-
-    log(f"tickets_mesclados: sync iniciando | schema={cfg.schema} tabela={cfg.table} | janela={start_base}..{end_base} (window_days={cfg.window_days})")
+    cfg = env_config()
 
     conn = pg_connect()
     try:
-        ensure_schema_and_table(conn, cfg.schema, cfg.table)
+        ensure_schema_and_table(conn, cfg.db_schema, cfg.table_name)
 
-        total_api_items = 0
-        total_upserts = 0
-
-        cur_start = start_base
-        while cur_start <= end_base:
-            cur_end = min(cur_start + timedelta(days=cfg.window_days - 1), end_base)
-            log(f"tickets_mesclados: buscando /tickets/merged startDate={cur_start} endDate={cur_end}")
-
-            items = fetch_merged_window(cfg, cur_start, cur_end)
-            total_api_items += len(items)
-
-            rows = explode_rows(items)
-            if rows:
-                up = upsert_rows(conn, cfg.schema, cfg.table, rows)
-                total_upserts += up
-                log(f"tickets_mesclados: upsert ok | itens_api={len(items)} rows={len(rows)} upserts={up}")
+        today = date.today()
+        end_d = cfg.end_date or today
+        if cfg.start_date:
+            start_d = cfg.start_date
+        else:
+            max_d = get_max_last_update_date(conn, cfg.db_schema, cfg.table_name)
+            if max_d:
+                # safety: volta 1 dia
+                start_d = max(max_d - timedelta(days=1), end_d - timedelta(days=cfg.days_back))
             else:
-                log(f"tickets_mesclados: nada a inserir | itens_api={len(items)}")
+                start_d = end_d - timedelta(days=cfg.days_back)
 
-            cur_start = cur_end + timedelta(days=1)
+        log.info(
+            "tickets_mesclados: sync iniciando | schema=%s tabela=%s | janela=%s..%s (window_days=%s) | api_base=%s",
+            cfg.db_schema, cfg.table_name, start_d.isoformat(), end_d.isoformat(), cfg.window_days, cfg.api_base
+        )
 
-        total_tbl = count_rows(conn, cfg.schema, cfg.table)
-        log(f"tickets_mesclados: sync finalizada | itens_api={total_api_items} | lines_upsert={total_upserts} | total_tabela={total_tbl}")
+        total_items = 0
+        total_rows = 0
+        for w_start, w_end in daterange_windows(start_d, end_d, cfg.window_days):
+            log.info("tickets_mesclados: buscando /tickets/merged startDate=%s endDate=%s", w_start.isoformat(), w_end.isoformat())
+            items = fetch_merged_window(cfg, w_start, w_end)
+            total_items += len(items)
+
+            rows = normalize_items(items)
+            if rows:
+                total_rows += upsert_rows(conn, cfg.db_schema, cfg.table_name, rows)
+
+            # throttle para respeitar limites (ex.: 10 req/min)
+            time.sleep(cfg.throttle_seconds)
+
+        with conn.cursor() as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "{cfg.db_schema}"."{cfg.table_name}";')
+            total_table = cur.fetchone()[0]
+
+        log.info("tickets_mesclados: sync concluído | itens_api=%s rows_upsert=%s total_tabela=%s", total_items, total_rows, total_table)
 
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        warn("Falha no sync_tickets_merged.py")
-        warn(str(e))
-        traceback.print_exc()
-        sys.exit(1)
+    main()
