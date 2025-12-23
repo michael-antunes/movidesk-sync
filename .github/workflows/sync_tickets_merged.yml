@@ -1,25 +1,80 @@
-name: Movidesk - Tickets mesclados
+name: Sync Movidesk Tickets Merged
 
 on:
+  workflow_dispatch:
+    inputs:
+      full_resync:
+        description: "Rodar full resync (ignora last_update do banco)"
+        required: false
+        default: "false"
+      merged_window_days:
+        description: "Tamanho da janela (dias) para consultar /tickets/merged"
+        required: false
+        default: "7"
+      start_date:
+        description: "Override START_DATE (YYYY-MM-DD) opcional"
+        required: false
+        default: ""
+      end_date:
+        description: "Override END_DATE (YYYY-MM-DD) opcional"
+        required: false
+        default: ""
+
   schedule:
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}
+    # Ajuste o horário conforme quiser (UTC)
+    - cron: "15 */2 * * *" # a cada 2 horas
+
+concurrency:
+  group: movidesk-sync-tickets-merged
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
-      - name: Sync merges
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Run sync_tickets_merged.py
         env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
+          # Movidesk
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          THROTTLE_SEC: "0.25"
-          MERGED_BATCH: "400"
-        run: python sync_tickets_merged.py
+          # opcional (se você usa base diferente)
+          # MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
+
+          # Postgres/Neon (use UM destes jeitos)
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          # ou, se você preferir padronizar:
+          # DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          # DB target
+          DB_SCHEMA: visualizacao_resolvidos
+
+          # Ajustes do script (opcionais)
+          FULL_RESYNC: ${{ inputs.full_resync || 'false' }}
+          MERGED_WINDOW_DAYS: ${{ inputs.merged_window_days || '7' }}
+          START_DATE: ${{ inputs.start_date || '' }}
+          END_DATE: ${{ inputs.end_date || '' }}
+
+          # HTTP tuning (opcionais)
+          HTTP_TIMEOUT: "60"
+          HTTP_RETRIES: "5"
+          HTTP_BACKOFF_BASE: "1.5"
+        run: |
+          python sync_tickets_merged.py
