@@ -1,42 +1,15 @@
-name: Sync Movidesk - Tickets Merged
+name: Sync Tickets Merged (Movidesk)
 
 on:
   workflow_dispatch:
   schedule:
-    # Rodar 1x por dia. Cron é em UTC.
-    - cron: "15 05 * * *"
-
-concurrency:
-  group: movidesk-tickets-merged
-  cancel-in-progress: false
+    # 03:20 UTC ~ 00:20 (BRT, America/Sao_Paulo) dependendo do DST (normalmente sem DST)
+    - cron: "20 3 * * *"
 
 jobs:
-  sync:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    env:
-      # Movidesk
-      MOVIDESK_BASE_URL: https://api.movidesk.com/public/v1
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-
-      # Postgres (aceita DATABASE_URL ou NEON_DSN)
-      DATABASE_URL: ${{ secrets.DATABASE_URL || secrets.NEON_DSN }}
-
-      # Tabela destino
-      DB_SCHEMA: visualizacao_resolvidos
-      DB_TABLE: tickets_mesclados
-
-      # Sync
-      WINDOW_DAYS: "7"
-      LOOKBACK_DAYS: "30"
-
-      # Rate limit (manual: 10 req/min => ~6s entre requisições)
-      MIN_SECONDS_BETWEEN_REQUESTS: "6.5"
-
-      # Logs
-      LOG_LEVEL: INFO
-      TZ: America/Sao_Paulo
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -47,23 +20,55 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests psycopg2-binary python-dateutil
+          pip install requests psycopg2-binary
 
       - name: Validate required env
+        env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
         run: |
-          python - << 'PY'
+          python - <<'PY'
           import os, sys
-          missing = []
-          if not os.getenv("MOVIDESK_TOKEN"): missing.append("MOVIDESK_TOKEN")
-          if not os.getenv("DATABASE_URL") and not os.getenv("NEON_DSN"): missing.append("DATABASE_URL(or NEON_DSN)")
-          if missing:
-              print("Missing:", ", ".join(missing))
-              sys.exit(2)
+          token = os.getenv("MOVIDESK_TOKEN")
+          if not token:
+            print("Missing secret: MOVIDESK_TOKEN")
+            sys.exit(1)
+
+          db_url = os.getenv("DATABASE_URL")
+          has_pg = all(os.getenv(k) for k in ["PGHOST","PGDATABASE","PGUSER","PGPASSWORD"])
+          if not (db_url or has_pg):
+            print("Missing DB secrets: set DATABASE_URL or PGHOST/PGDATABASE/PGUSER/PGPASSWORD")
+            sys.exit(1)
+
           print("OK: required env present")
           PY
 
       - name: Run sync
-        run: python sync_tickets_merged.py
+        env:
+          # API
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
+
+          # DB (use DATABASE_URL OR PG*)
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGPORT: ${{ secrets.PGPORT }}
+
+          # Job config
+          DB_SCHEMA: "visualizacao_resolvidos"
+          DB_TABLE: "tickets_mesclados"
+          LOOKBACK_DAYS: "30"
+          WINDOW_DAYS: "7"
+          REQUEST_SLEEP_S: "0.4"
+        run: |
+          python sync_tickets_merged.py
