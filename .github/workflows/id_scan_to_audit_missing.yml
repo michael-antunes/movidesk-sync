@@ -21,7 +21,7 @@ on:
         default: 0.2
 
 concurrency:
-  group: id-scan-to-audit-missing
+  group: movidesk-id-scan-to-audit-missing
   cancel-in-progress: false
 
 permissions:
@@ -31,8 +31,6 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    outputs:
-      done: ${{ steps.done.outputs.done }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,10 +39,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install psycopg2-binary
+        run: pip install requests psycopg2-binary
 
       - name: Run python id_scan_to_audit_missing.py
+        shell: bash
         run: |
+          set -euo pipefail
           python id_scan_to_audit_missing.py | tee scan_out.txt
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -55,31 +55,17 @@ jobs:
           MOVIDESK_THROTTLE: ${{ inputs.throttle }}
           TABLE_NAME: tickets_resolvidos
 
-      - name: done?
-        id: done
-        run: |
-          if grep -q "done=1" scan_out.txt; then
-            echo "done=1" >> $GITHUB_OUTPUT
-          else
-            echo "done=0" >> $GITHUB_OUTPUT
-          fi
-
-  rerun:
-    needs: scan
-    if: needs.scan.outputs.done != '1'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch again
+      - name: Dispatch self if not done
         env:
           GH_TOKEN: ${{ github.token }}
-          REF_NAME: ${{ github.ref_name }}
-          BATCH_SIZE: ${{ inputs.batch_size || 50 }}
-          ITERATIONS: ${{ inputs.iterations || 20 }}
-          TOP: ${{ inputs.top || 1000 }}
-          THROTTLE: ${{ inputs.throttle || 0.2 }}
+        shell: bash
         run: |
+          set -euo pipefail
+          if grep -q "done=1" scan_out.txt; then
+            exit 0
+          fi
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/id_scan_to_audit_missing.yml/dispatches \
-            -d "{\"ref\":\"${REF_NAME}\",\"inputs\":{\"batch_size\":\"${BATCH_SIZE}\",\"iterations\":\"${ITERATIONS}\",\"top\":\"${TOP}\",\"throttle\":\"${THROTTLE}\"}}"
+            -d '{"ref":"${{ github.ref_name }}"}'
