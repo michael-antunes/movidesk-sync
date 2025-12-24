@@ -3,7 +3,6 @@ name: Sync Movidesk - Tickets Merged
 on:
   workflow_dispatch: {}
   schedule:
-    # 06:20 UTC = 03:20 America/Sao_Paulo (UTC-3) (aprox)
     - cron: "20 6 * * *"
 
 jobs:
@@ -24,19 +23,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
+      # Debug SEM vazar segredo (só True/False)
+      - name: Debug env presence
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGPORT: ${{ secrets.PGPORT }}
+        run: |
+          python - << 'PY'
+          import os
+          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT"]
+          for k in keys:
+            print(f"{k} set? {bool(os.getenv(k))}")
+          PY
+
       - name: Run sync tickets merged
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-          # Opcional (defaults já cobrem):
+          # Postgres (use 1 dos modos abaixo)
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGPORT: ${{ secrets.PGPORT }}
+
           DB_SCHEMA: visualizacao_resolvidos
           DB_TABLE: tickets_mesclados
-
           LOOKBACK_DAYS: "30"
           WINDOW_DAYS: "7"
-
           LOG_LEVEL: INFO
-          # DRY_RUN: "true"
         run: |
           python sync_tickets_merged.py
