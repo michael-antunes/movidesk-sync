@@ -1,117 +1,60 @@
-name: Scan Tickets Merged (range)
+name: scanner tickets merged (range)
 
 on:
   workflow_dispatch:
-    inputs:
-      chunk_size:
-        description: "Qtd de IDs por execução (desc). Default 80"
-        required: false
-        default: "80"
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scanner-tickets-merged
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    concurrency:
-      group: scan-tickets-merged-range
-      cancel-in-progress: false
+    env:
+      MOVI_TOKEN: ${{ secrets.MOVI_TOKEN }}
+
+      # Range
+      ID_ATUAL_MERGED: ${{ secrets.ID_ATUAL_MERGED }}
+      ID_FINAL_MERGED: ${{ secrets.ID_FINAL_MERGED }}
+      BATCH_SIZE: "80"
+
+      # Postgres (1 secret só)
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # Tabelas
+      DB_SCHEMA: visualizacao_resolvidos
+      MERGED_TABLE: tickets_mesclados
+      STATE_TABLE: tickets_mesclados_scan_state
+      MISSING_TABLE: tickets_mesclados_scan_missing
+
+      LOG_LEVEL: INFO
+      DRY_RUN: "false"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Resolve secrets (DB + token)
-        shell: bash
-        env:
-          # DB (tenta vários nomes)
-          DB_URL_1: ${{ secrets.DATABASE_URL }}
-          DB_URL_2: ${{ secrets.POSTGRES_URL }}
-          DB_URL_3: ${{ secrets.SUPABASE_DB_URL }}
-          DB_URL_4: ${{ secrets.PG_DATABASE_URL }}
-          DB_URL_5: ${{ secrets.DB_URL }}
-
-          PGHOST: ${{ secrets.PGHOST }}
-          PGDATABASE: ${{ secrets.PGDATABASE }}
-          PGUSER: ${{ secrets.PGUSER }}
-          PGPASSWORD: ${{ secrets.PGPASSWORD }}
-          PGPORT: ${{ secrets.PGPORT }}
-          PGSSLMODE: ${{ secrets.PGSSLMODE }}
-
-          # TOKEN (tenta vários nomes)
-          MOVI_TOKEN_1: ${{ secrets.MOVI_TOKEN }}
-          MOVI_TOKEN_2: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVI_TOKEN_3: ${{ secrets.MOVI_API_TOKEN }}
-          MOVI_TOKEN_4: ${{ secrets.MOVIDESK_API_TOKEN }}
-        run: |
-          set -e
-
-          # Resolve MOVI_TOKEN
-          if [ -n "$MOVI_TOKEN_1" ]; then
-            echo "MOVI_TOKEN=$MOVI_TOKEN_1" >> $GITHUB_ENV
-          elif [ -n "$MOVI_TOKEN_2" ]; then
-            echo "MOVI_TOKEN=$MOVI_TOKEN_2" >> $GITHUB_ENV
-          elif [ -n "$MOVI_TOKEN_3" ]; then
-            echo "MOVI_TOKEN=$MOVI_TOKEN_3" >> $GITHUB_ENV
-          elif [ -n "$MOVI_TOKEN_4" ]; then
-            echo "MOVI_TOKEN=$MOVI_TOKEN_4" >> $GITHUB_ENV
-          fi
-
-          # Resolve DATABASE_URL
-          if [ -n "$DB_URL_1" ]; then
-            echo "DATABASE_URL=$DB_URL_1" >> $GITHUB_ENV
-          elif [ -n "$DB_URL_2" ]; then
-            echo "DATABASE_URL=$DB_URL_2" >> $GITHUB_ENV
-          elif [ -n "$DB_URL_3" ]; then
-            echo "DATABASE_URL=$DB_URL_3" >> $GITHUB_ENV
-          elif [ -n "$DB_URL_4" ]; then
-            echo "DATABASE_URL=$DB_URL_4" >> $GITHUB_ENV
-          elif [ -n "$DB_URL_5" ]; then
-            echo "DATABASE_URL=$DB_URL_5" >> $GITHUB_ENV
-          fi
-
-          # Se não tiver DATABASE_URL, tenta variáveis separadas
-          if [ -z "${DATABASE_URL}" ]; then
-            if [ -n "$PGHOST" ] && [ -n "$PGDATABASE" ] && [ -n "$PGUSER" ] && [ -n "$PGPASSWORD" ]; then
-              echo "PGHOST=$PGHOST" >> $GITHUB_ENV
-              echo "PGDATABASE=$PGDATABASE" >> $GITHUB_ENV
-              echo "PGUSER=$PGUSER" >> $GITHUB_ENV
-              echo "PGPASSWORD=$PGPASSWORD" >> $GITHUB_ENV
-              if [ -n "$PGPORT" ]; then echo "PGPORT=$PGPORT" >> $GITHUB_ENV; fi
-            fi
-          fi
-
-          # sslmode default
-          if [ -n "$PGSSLMODE" ]; then
-            echo "PGSSLMODE=$PGSSLMODE" >> $GITHUB_ENV
-          else
-            echo "PGSSLMODE=require" >> $GITHUB_ENV
-          fi
-
-      - name: Debug env (safe)
+      - name: Validate env presence (no secrets printed)
         run: |
           python - << 'PY'
           import os
-          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE","MOVI_TOKEN"]
-          for k in keys:
+          for k in ["MOVI_TOKEN","ID_ATUAL_MERGED","ID_FINAL_MERGED","DATABASE_URL"]:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
       - name: Run scanner
-        env:
-          DB_SCHEMA: visualizacao_resolvidos
-          TICKETS_TABLE: tickets_mesclados
-          CONTROL_TABLE: range_scan_control
-          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '80' }}
-          LOG_LEVEL: INFO
         run: |
           python sync_range_tickets_merged.py
