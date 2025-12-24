@@ -1,13 +1,36 @@
-name: Sync Movidesk - Tickets Merged
+name: Sync Tickets Merged (Movidesk)
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 6 * * *"
+    # GitHub cron é UTC. 04:15 UTC ~ 01:15 America/Sao_Paulo (UTC-3)
+    - cron: "15 4 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
+    env:
+      # Movidesk
+      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+      MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
+
+      # Postgres (use DATABASE_URL OU variáveis separadas)
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PGHOST: ${{ secrets.PGHOST }}
+      PGPORT: ${{ secrets.PGPORT }}
+      PGDATABASE: ${{ secrets.PGDATABASE }}
+      PGUSER: ${{ secrets.PGUSER }}
+      PGPASSWORD: ${{ secrets.PGPASSWORD }}
+
+      # Sync config
+      DB_SCHEMA: "visualizacao_resolvidos"
+      TABLE_NAME: "tickets_mesclados"
+      LOOKBACK_DAYS: "30"
+      WINDOW_DAYS: "7"
+      DRY_RUN: "false"
+      LOG_LEVEL: "INFO"
+      HTTP_TIMEOUT_S: "60"
 
     steps:
       - name: Checkout
@@ -18,44 +41,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      # Debug SEM vazar segredo (só True/False)
-      - name: Debug env presence
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PGHOST: ${{ secrets.PGHOST }}
-          PGDATABASE: ${{ secrets.PGDATABASE }}
-          PGUSER: ${{ secrets.PGUSER }}
-          PGPASSWORD: ${{ secrets.PGPASSWORD }}
-          PGPORT: ${{ secrets.PGPORT }}
+      - name: Debug env presence (no secrets printed)
         run: |
           python - << 'PY'
           import os
-          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT"]
+          keys = ["MOVIDESK_TOKEN","DATABASE_URL","PGHOST","PGPORT","PGDATABASE","PGUSER","PGPASSWORD"]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
-      - name: Run sync tickets merged
-        env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-
-          # Postgres (use 1 dos modos abaixo)
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PGHOST: ${{ secrets.PGHOST }}
-          PGDATABASE: ${{ secrets.PGDATABASE }}
-          PGUSER: ${{ secrets.PGUSER }}
-          PGPASSWORD: ${{ secrets.PGPASSWORD }}
-          PGPORT: ${{ secrets.PGPORT }}
-
-          DB_SCHEMA: visualizacao_resolvidos
-          DB_TABLE: tickets_mesclados
-          LOOKBACK_DAYS: "30"
-          WINDOW_DAYS: "7"
-          LOG_LEVEL: INFO
-        run: |
-          python sync_tickets_merged.py
+      - name: Run sync
+        run: python sync_tickets_merged.py
