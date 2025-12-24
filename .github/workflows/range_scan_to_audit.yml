@@ -1,41 +1,92 @@
-name: Movidesk - Range scan worker
+name: Movidesk - Range scan (API) -> audit_recent_missing
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      page_top:
+        type: number
+        required: false
+        default: 100
+      limit:
+        type: number
+        required: false
+        default: 400
+      throttle:
+        type: number
+        required: false
+        default: 0.25
+      max_runtime_sec:
+        type: number
+        required: false
+        default: 240
+      sleep_sec:
+        type: number
+        required: false
+        default: 0
 
 concurrency:
-  group: range-scan-worker
+  group: range-scan-to-audit
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  run:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    outputs:
+      done: ${{ steps.done.outputs.done }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install requests psycopg2-binary
 
-      - name: Range scan
+      - name: Run python range_scan_to_audit.py
+        run: |
+          python range_scan_to_audit.py | tee scan_out.txt
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT: "400"
-          RANGE_SCAN_THROTTLE: "0.25"
-          RANGE_SCAN_MAX_RUNTIME_SEC: "240"
-          RANGE_SCAN_SLEEP_SEC: "0"
-        run: python range_scan_to_audit.py
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN || secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_PAGE_TOP: ${{ inputs.page_top }}
+          RANGE_SCAN_LIMIT: ${{ inputs.limit }}
+          RANGE_SCAN_THROTTLE: ${{ inputs.throttle }}
+          RANGE_SCAN_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec }}
+          RANGE_SCAN_SLEEP_SEC: ${{ inputs.sleep_sec }}
+
+      - name: done?
+        id: done
+        run: |
+          if grep -q "hit_end=True" scan_out.txt || grep -q "FIM: ultima_data_validada já alcançou data_fim" scan_out.txt; then
+            echo "done=1" >> $GITHUB_OUTPUT
+          else
+            echo "done=0" >> $GITHUB_OUTPUT
+          fi
+
+  rerun:
+    needs: scan
+    if: needs.scan.outputs.done != '1'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          PAGE_TOP: ${{ inputs.page_top }}
+          LIMIT: ${{ inputs.limit }}
+          THROTTLE: ${{ inputs.throttle }}
+          MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec }}
+          SLEEP_SEC: ${{ inputs.sleep_sec }}
+        run: |
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
+            -d "{\"ref\":\"${REF_NAME}\",\"inputs\":{\"page_top\":\"${PAGE_TOP}\",\"limit\":\"${LIMIT}\",\"throttle\":\"${THROTTLE}\",\"max_runtime_sec\":\"${MAX_RUNTIME_SEC}\",\"sleep_sec\":\"${SLEEP_SEC}\"}}"
