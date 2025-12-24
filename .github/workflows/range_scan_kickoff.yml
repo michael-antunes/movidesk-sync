@@ -31,6 +31,16 @@ jobs:
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
 
+      - name: Dispatch sync_range_tickets_merged
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'
+
       - name: Dispatch range worker
         env:
           GH_TOKEN: ${{ github.token }}
