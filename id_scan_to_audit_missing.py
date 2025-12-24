@@ -13,20 +13,25 @@ DSN = os.getenv("NEON_DSN")
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 
 API_BASE = "https://api.movidesk.com/public/v1"
+
 TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
-BATCH_SIZE = int(os.getenv("ID_VALIDATE_BATCH_SIZE", "50"))
-MAX_RUNTIME_SEC = int(os.getenv("ID_VALIDATE_MAX_RUNTIME_SEC", "240"))
+BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "50"))
+ITERATIONS = int(os.getenv("ID_SCAN_ITERATIONS", "10"))
+TOP = int(os.getenv("MOVIDESK_TOP", "1000"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
 ATTEMPTS = int(os.getenv("MOVIDESK_ATTEMPTS", "5"))
 CONNECT_TIMEOUT = int(os.getenv("MOVIDESK_CONNECT_TIMEOUT", "10"))
 READ_TIMEOUT = int(os.getenv("MOVIDESK_READ_TIMEOUT", "60"))
 
-SELECT_MIN = "id,baseStatus"
-BASE_STATUSES = {"Resolved", "Closed", "Canceled"}
+START_ID_ENV = os.getenv("ID_SCAN_START_ID")
+END_ID = int(os.getenv("ID_SCAN_END_ID", "1"))
 
-CURSOR_SCHEMA = os.getenv("ID_VALIDATE_CURSOR_SCHEMA", "visualizacao_resolvidos")
-CURSOR_TABLE = os.getenv("ID_VALIDATE_CURSOR_TABLE", "id_validate_cursor_resolvidos")
+BASE_STATUSES = ("Resolved", "Closed", "Canceled")
+SELECT_LIST = "id,baseStatus"
+
+CURSOR_SCHEMA = "visualizacao_resolvidos"
+CURSOR_TABLE = "id_scan_api_cursor"
 
 
 if not DSN:
@@ -35,19 +40,72 @@ if not TOKEN:
     raise RuntimeError("MOVIDESK_TOKEN não definido")
 
 
+def pg_one(cur, sql, params=None):
+    cur.execute(sql, params or [])
+    return cur.fetchone()
+
+
+def pg_all(cur, sql, params=None):
+    cur.execute(sql, params or [])
+    return cur.fetchall()
+
+
 def get_columns(cur, schema: str, table: str):
-    cur.execute(
+    rows = pg_all(
+        cur,
         """
-        select column_name
+        select column_name, is_nullable, column_default
         from information_schema.columns
         where table_schema=%s and table_name=%s
         """,
         (schema, table),
     )
-    return {r[0] for r in cur.fetchall()}
+    cols = {}
+    for name, is_nullable, col_default in rows:
+        cols[name] = (is_nullable == "NO", col_default)
+    return cols
 
 
-def ensure_cursor(cur):
+def ensure_audit_tables(cur):
+    cur.execute("create schema if not exists visualizacao_resolvidos")
+
+    cur.execute(
+        """
+        create table if not exists visualizacao_resolvidos.audit_recent_run(
+          id bigserial primary key
+        )
+        """
+    )
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists window_start timestamptz")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists window_end timestamptz")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists total_api int")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists missing_total int")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists total_local int")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists notes text")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_run add column if not exists run_at timestamptz")
+
+    cur.execute(
+        """
+        create table if not exists visualizacao_resolvidos.audit_recent_missing(
+          run_id bigint,
+          table_name text not null,
+          ticket_id integer not null
+        )
+        """
+    )
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_missing add column if not exists run_id bigint")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_missing add column if not exists table_name text")
+    cur.execute("alter table visualizacao_resolvidos.audit_recent_missing add column if not exists ticket_id integer")
+
+    cur.execute(
+        """
+        create unique index if not exists audit_recent_missing_uniq
+        on visualizacao_resolvidos.audit_recent_missing(table_name, ticket_id)
+        """
+    )
+
+
+def ensure_cursor(cur, start_id: int):
     cur.execute(f"create schema if not exists {CURSOR_SCHEMA}")
     cur.execute(
         f"""
@@ -57,10 +115,8 @@ def ensure_cursor(cur):
         """
     )
     cur.execute(f"select count(*) from {CURSOR_SCHEMA}.{CURSOR_TABLE}")
-    if cur.fetchone()[0] == 0:
-        cur.execute("select coalesce(max(ticket_id),0) from visualizacao_resolvidos.tickets_resolvidos")
-        mx = int(cur.fetchone()[0] or 0)
-        cur.execute(f"insert into {CURSOR_SCHEMA}.{CURSOR_TABLE}(cursor_id) values (%s)", (mx,))
+    if int(cur.fetchone()[0] or 0) == 0:
+        cur.execute(f"insert into {CURSOR_SCHEMA}.{CURSOR_TABLE}(cursor_id) values (%s)", (int(start_id),))
 
 
 def get_cursor(cur) -> int:
@@ -72,84 +128,85 @@ def set_cursor(cur, v: int):
     cur.execute(f"update {CURSOR_SCHEMA}.{CURSOR_TABLE} set cursor_id=%s", (int(v),))
 
 
-def ensure_missing_tables(cur):
-    cur.execute("create schema if not exists visualizacao_resolvidos")
-    cur.execute(
-        """
-        create table if not exists visualizacao_resolvidos.audit_recent_run(
-          id bigserial primary key,
-          window_start timestamptz,
-          window_end timestamptz,
-          total_api int,
-          missing_total int,
-          total_local int,
-          notes text
-        )
-        """
-    )
-    cur.execute(
-        """
-        create table if not exists visualizacao_resolvidos.audit_recent_missing(
-          run_id bigint,
-          table_name text not null,
-          ticket_id integer not null
-        )
-        """
-    )
-    cur.execute(
-        """
-        create unique index if not exists audit_recent_missing_uniq
-        on visualizacao_resolvidos.audit_recent_missing(table_name, ticket_id)
-        """
-    )
+def compute_default_start_id(cur) -> int:
+    parts = []
+    try:
+        parts.append(int(pg_one(cur, "select coalesce(max(ticket_id),0) from visualizacao_resolvidos.tickets_resolvidos_detail")[0] or 0))
+    except Exception:
+        parts.append(0)
+
+    try:
+        parts.append(int(pg_one(cur, "select coalesce(max(ticket_id::bigint),0) from visualizacao_atual.tickets_abertos")[0] or 0))
+    except Exception:
+        parts.append(0)
+
+    try:
+        parts.append(int(pg_one(cur, "select coalesce(max(greatest(ticket_id, merged_into_id)),0) from visualizacao_resolvidos.tickets_mesclados")[0] or 0))
+    except Exception:
+        parts.append(0)
+
+    mx = max(parts) if parts else 0
+    return int(mx) if mx > 0 else 1
 
 
 def create_run(cur, notes: str) -> int:
     cols = get_columns(cur, "visualizacao_resolvidos", "audit_recent_run")
+
+    required = [c for c, (notnull, default) in cols.items() if notnull and default is None and c != "id"]
+    supported = {
+        "window_start",
+        "window_end",
+        "total_api",
+        "missing_total",
+        "total_local",
+        "notes",
+        "run_at",
+    }
+    missing_required = [c for c in required if c not in supported]
+    if missing_required:
+        raise RuntimeError(f"audit_recent_run tem colunas obrigatórias sem default não suportadas: {missing_required}")
+
     fields = []
-    values = []
+    values_sql = []
     params = []
 
-    def add(col, val):
-        fields.append(col)
-        values.append("%s")
-        params.append(val)
-
     if "window_start" in cols:
-        add("window_start", "now()")
+        fields.append("window_start")
+        values_sql.append("now()")
     if "window_end" in cols:
-        add("window_end", "now()")
+        fields.append("window_end")
+        values_sql.append("now()")
     if "total_api" in cols:
-        add("total_api", 0)
+        fields.append("total_api")
+        values_sql.append("%s")
+        params.append(0)
     if "missing_total" in cols:
-        add("missing_total", 0)
+        fields.append("missing_total")
+        values_sql.append("%s")
+        params.append(0)
     if "total_local" in cols:
-        add("total_local", 0)
+        fields.append("total_local")
+        values_sql.append("%s")
+        params.append(0)
+    if "run_at" in cols:
+        fields.append("run_at")
+        values_sql.append("now()")
     if "notes" in cols:
-        add("notes", notes)
+        fields.append("notes")
+        values_sql.append("%s")
+        params.append(notes)
 
-    sql_fields = []
-    sql_values = []
-    sql_params = []
-    for i, f in enumerate(fields):
-        sql_fields.append(f)
-        if params[i] == "now()":
-            sql_values.append("now()")
-        else:
-            sql_values.append(values[i])
-            sql_params.append(params[i])
-
-    if not sql_fields:
+    if not fields:
         cur.execute("insert into visualizacao_resolvidos.audit_recent_run default values returning id")
         return int(cur.fetchone()[0])
 
     cur.execute(
         f"""
-        insert into visualizacao_resolvidos.audit_recent_run({",".join(sql_fields)})
-        values ({",".join(sql_values)})
+        insert into visualizacao_resolvidos.audit_recent_run({",".join(fields)})
+        values ({",".join(values_sql)})
         returning id
         """,
-        sql_params,
+        params,
     )
     return int(cur.fetchone()[0])
 
@@ -213,57 +270,93 @@ def http_get_json(url, params):
     raise last if last else RuntimeError("HTTP failure")
 
 
-def api_exists_and_status(ticket_id: int):
-    p1 = {
-        "token": TOKEN,
-        "includeDeletedItems": "true",
-        "$select": SELECT_MIN,
-        "id": str(int(ticket_id)),
-    }
-    c1, j1 = http_get_json(f"{API_BASE}/tickets", p1)
-    if c1 == 200 and isinstance(j1, dict) and j1.get("id") is not None:
-        return True, str(j1.get("baseStatus") or "")
+def api_list_ids(endpoint, low_id: int, high_id: int):
+    flt = (
+        f"id ge {int(low_id)} and id le {int(high_id)} and "
+        f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
+    )
+    ids = set()
+    skip = 0
+    while True:
+        params = {
+            "token": TOKEN,
+            "includeDeletedItems": "true",
+            "$filter": flt,
+            "$select": SELECT_LIST,
+            "$top": str(TOP),
+            "$skip": str(skip),
+            "$orderby": "id",
+        }
+        code, payload = http_get_json(f"{API_BASE}/{endpoint}", params)
+        if code != 200 or not isinstance(payload, list):
+            break
+        if not payload:
+            break
+        for x in payload:
+            if isinstance(x, dict) and x.get("id") is not None:
+                ids.add(int(x["id"]))
+        if len(payload) < TOP:
+            break
+        skip += TOP
+        if THROTTLE > 0:
+            time.sleep(THROTTLE)
+    return ids
 
-    p2 = {
-        "token": TOKEN,
-        "includeDeletedItems": "true",
-        "$select": SELECT_MIN,
-        "$filter": f"id eq {int(ticket_id)}",
-        "$top": "1",
-    }
-    c2, j2 = http_get_json(f"{API_BASE}/tickets/past", p2)
-    if c2 == 200 and isinstance(j2, list) and len(j2) > 0 and isinstance(j2[0], dict) and j2[0].get("id") is not None:
-        return True, str(j2[0].get("baseStatus") or "")
 
-    return False, ""
-
-
-def fetch_candidates(cur, cursor_id: int, limit: int):
+def ids_in_detail(cur, ids):
+    if not ids:
+        return set()
     cur.execute(
         """
-        select tr.ticket_id
-          from visualizacao_resolvidos.tickets_resolvidos tr
-         where tr.ticket_id <= %s
-           and not exists (select 1 from visualizacao_resolvidos.tickets_resolvidos_detail d where d.ticket_id = tr.ticket_id)
-           and not exists (select 1 from visualizacao_atual.tickets_abertos a where a.ticket_id::bigint = tr.ticket_id)
-           and not exists (
-             select 1
-               from visualizacao_resolvidos.tickets_mesclados m
-              where m.ticket_id = tr.ticket_id
-                 or m.merged_into_id = tr.ticket_id
-           )
-           and not exists (
-             select 1
-               from visualizacao_resolvidos.audit_recent_missing miss
-              where miss.table_name = %s
-                and miss.ticket_id = tr.ticket_id
-           )
-         order by tr.ticket_id desc
-         limit %s
+        select ticket_id
+        from visualizacao_resolvidos.tickets_resolvidos_detail
+        where ticket_id = any(%s)
         """,
-        (int(cursor_id), TABLE_NAME, int(limit)),
+        (list(ids),),
     )
-    return [int(r[0]) for r in cur.fetchall()]
+    return {int(r[0]) for r in cur.fetchall()}
+
+
+def ids_in_abertos(cur, ids):
+    if not ids:
+        return set()
+    cur.execute(
+        """
+        select ticket_id::bigint
+        from visualizacao_atual.tickets_abertos
+        where ticket_id::bigint = any(%s)
+        """,
+        (list(ids),),
+    )
+    return {int(r[0]) for r in cur.fetchall()}
+
+
+def ids_in_mesclados(cur, ids):
+    if not ids:
+        return set()
+    cur.execute(
+        """
+        select ticket_id
+        from visualizacao_resolvidos.tickets_mesclados
+        where ticket_id = any(%s) or merged_into_id = any(%s)
+        """,
+        (list(ids), list(ids)),
+    )
+    return {int(r[0]) for r in cur.fetchall()}
+
+
+def ids_in_missing(cur, ids):
+    if not ids:
+        return set()
+    cur.execute(
+        """
+        select ticket_id
+        from visualizacao_resolvidos.audit_recent_missing
+        where table_name = %s and ticket_id = any(%s)
+        """,
+        (TABLE_NAME, list(ids)),
+    )
+    return {int(r[0]) for r in cur.fetchall()}
 
 
 def insert_missing(cur, run_id: int, ids):
@@ -276,51 +369,72 @@ def insert_missing(cur, run_id: int, ids):
         values %s
         on conflict do nothing
         """,
-        [(int(run_id), TABLE_NAME, int(i)) for i in ids],
+        [(int(run_id), TABLE_NAME, int(t)) for t in ids],
     )
     return len(ids)
 
 
 def main():
     with psycopg2.connect(DSN) as conn, conn.cursor() as cur:
-        ensure_missing_tables(cur)
-        ensure_cursor(cur)
-        run_id = create_run(cur, "id-validate-api: candidatos de tickets_resolvidos; valida /tickets + /tickets/past; insere audit_recent_missing")
+        ensure_audit_tables(cur)
+
+        if START_ID_ENV:
+            start_id = int(START_ID_ENV)
+        else:
+            start_id = compute_default_start_id(cur)
+
+        ensure_cursor(cur, start_id)
+        cursor = get_cursor(cur)
+        if cursor <= 0:
+            cursor = start_id
+            set_cursor(cur, cursor)
+
+        run_id = create_run(cur, f"id-scan-api: range {cursor}->{END_ID} | insere faltantes (detail/abertos/mesclados)")
         conn.commit()
 
-        t0 = time.time()
-        cursor_id = get_cursor(cur)
+        total_ranges = 0
+        total_api_ids = 0
+        total_insert = 0
+        total_excluded = 0
 
-        total_local = 0
-        total_api = 0
-        total_inserted = 0
-
-        while cursor_id > 0 and (time.time() - t0) < MAX_RUNTIME_SEC:
-            batch = fetch_candidates(cur, cursor_id, BATCH_SIZE)
-            if not batch:
+        for _ in range(max(1, ITERATIONS)):
+            if cursor < END_ID:
                 break
 
-            total_local += len(batch)
+            high_id = int(cursor)
+            low_id = int(max(END_ID, cursor - BATCH_SIZE + 1))
 
-            valid = []
-            for tid in batch:
-                ok, bs = api_exists_and_status(tid)
-                total_api += 1
-                if ok and bs in BASE_STATUSES:
-                    valid.append(tid)
-                if THROTTLE > 0:
-                    time.sleep(THROTTLE)
+            api_ids = set()
+            api_ids |= api_list_ids("tickets", low_id, high_id)
+            api_ids |= api_list_ids("tickets/past", low_id, high_id)
 
-            total_inserted += insert_missing(cur, run_id, valid)
+            total_ranges += 1
+            total_api_ids += len(api_ids)
 
-            cursor_id = min(batch) - 1
-            set_cursor(cur, cursor_id)
+            in_detail = ids_in_detail(cur, api_ids)
+            in_abertos = ids_in_abertos(cur, api_ids)
+            in_mesclados = ids_in_mesclados(cur, api_ids)
+            in_missing = ids_in_missing(cur, api_ids)
+
+            excluded = in_detail | in_abertos | in_mesclados | in_missing
+            total_excluded += len(excluded)
+
+            candidates = sorted(list(api_ids - excluded))
+            total_insert += insert_missing(cur, run_id, candidates)
+
+            cursor = low_id - 1
+            set_cursor(cur, cursor)
             conn.commit()
 
-        update_run(cur, run_id, total_api, total_inserted, total_local)
+            if THROTTLE > 0:
+                time.sleep(THROTTLE)
+
+        update_run(cur, run_id, total_api_ids, total_insert, total_ranges)
         conn.commit()
 
-        print(f"scanned_local={total_local} api_checked={total_api} inserted_missing={total_inserted} cursor_now={cursor_id}")
+        print(
+            f"ranges={total_ranges} api_ids={total_api_ids} excluded={total_excluded} inserted_missing={total_insert} cursor_now={cursor}"
+        )
 
 
 if __name__ == "__main__":
