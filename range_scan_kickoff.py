@@ -14,13 +14,16 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
           ultima_data_validada timestamptz,
           id_inicial bigint,
           id_final bigint,
-          id_atual bigint
+          id_atual bigint,
+          id_atual_merged bigint
         )
         """
     )
+
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_inicial bigint")
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_final bigint")
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_atual bigint")
+    cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_atual_merged bigint")
 
     cur.execute(
         """
@@ -52,6 +55,7 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
     id_inicial = max_id
     id_final = min_id
     id_atual = id_inicial
+    id_atual_merged = id_atual
 
     cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
     exists = cur.fetchone()[0] != 0
@@ -60,10 +64,10 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
         cur.execute(
             """
             insert into visualizacao_resolvidos.range_scan_control
-              (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual)
-            values (%s, %s, %s, %s, %s, %s)
+              (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged)
+            values (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
+            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual, id_atual_merged),
         )
     else:
         cur.execute(
@@ -74,10 +78,12 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
                    ultima_data_validada = %s,
                    id_inicial = %s,
                    id_final = %s,
-                   id_atual = %s
+                   id_atual = %s,
+                   id_atual_merged = %s
             """,
-            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
+            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual, id_atual_merged),
         )
+
     c.commit()
 
 print("Kickoff OK: range_scan_control atualizado (IDs topo→base).")
