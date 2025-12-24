@@ -89,7 +89,7 @@ def pg_all(conn, sql, params=None):
 
 
 def ensure_audit_table(conn, logger: logging.Logger):
-    schema = os.getenv("AUDIT_SCHEMA", "dados_gerais")
+    schema = os.getenv("AUDIT_SCHEMA", "visualizacao_resolvidos")
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
         cur.execute(
