@@ -1,36 +1,52 @@
 name: Sync Tickets Merged (Movidesk)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Quantos dias para trás buscar (padrão 30)"
+        required: false
+        default: "30"
+      window_days:
+        description: "Tamanho da janela em dias (padrão 7)"
+        required: false
+        default: "7"
   schedule:
-    # GitHub cron é UTC. 04:15 UTC ~ 01:15 America/Sao_Paulo (UTC-3)
-    - cron: "15 4 * * *"
+    # Cron é em UTC
+    - cron: "20 03 * * *"
+
+concurrency:
+  group: sync-tickets-merged
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     env:
       # Movidesk
       MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
       MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
 
-      # Postgres (use DATABASE_URL OU variáveis separadas)
+      # Postgres (use um OU outro; o script aceita ambos)
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NEON_DSN: ${{ secrets.NEON_DSN }}
+
+      # Alternativa via variáveis separadas (opcional)
       PGHOST: ${{ secrets.PGHOST }}
-      PGPORT: ${{ secrets.PGPORT }}
       PGDATABASE: ${{ secrets.PGDATABASE }}
       PGUSER: ${{ secrets.PGUSER }}
       PGPASSWORD: ${{ secrets.PGPASSWORD }}
+      PGPORT: ${{ secrets.PGPORT }}
 
-      # Sync config
+      # Destino
       DB_SCHEMA: "visualizacao_resolvidos"
       TABLE_NAME: "tickets_mesclados"
-      LOOKBACK_DAYS: "30"
-      WINDOW_DAYS: "7"
-      DRY_RUN: "false"
-      LOG_LEVEL: "INFO"
-      HTTP_TIMEOUT_S: "60"
+
+      # Sync params (workflow_dispatch sobrescreve)
+      LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
+      WINDOW_DAYS: ${{ github.event.inputs.window_days || '7' }}
 
     steps:
       - name: Checkout
@@ -46,14 +62,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Debug env presence (no secrets printed)
+      - name: Sanity env (sem vazar secrets)
         run: |
-          python - << 'PY'
+          python - <<'PY'
           import os
-          keys = ["MOVIDESK_TOKEN","DATABASE_URL","PGHOST","PGPORT","PGDATABASE","PGUSER","PGPASSWORD"]
+          keys = ["MOVIDESK_TOKEN","DATABASE_URL","NEON_DSN","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT"]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
       - name: Run sync
-        run: python sync_tickets_merged.py
+        run: |
+          python sync_tickets_merged.py
