@@ -1,0 +1,72 @@
+name: Sync Tickets Merged (Range Scan)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Validate env presence (no secrets printed)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGPORT: ${{ secrets.PGPORT }}
+          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+        run: |
+          python - << 'PY'
+          import os
+          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","MOVI_TOKEN"]
+          for k in keys:
+            print(f"{k} set? {bool(os.getenv(k))}")
+          PY
+
+      - name: Run range scan
+        env:
+          # --- Postgres (use DATABASE_URL OR the PG* set) ---
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PGHOST: ${{ secrets.PGHOST }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGPORT: ${{ secrets.PGPORT }}
+
+          # --- Movidesk ---
+          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVI_BASE_URL: "https://api.movidesk.com/public/v1"
+
+          # --- Tables ---
+          DB_SCHEMA: "visualizacao_resolvidos"
+          CONTROL_TABLE: "range_scan_control"
+          MERGED_TABLE: "tickets_mesclados"
+
+          # --- Behavior ---
+          # Ajuste BATCH_SIZE de acordo com o limite 10 req/min:
+          #  - 80 ids ~ 8-9 min (se MOVI_RPM=9)
+          #  - 500 ids ~ ~55 min (não cabe em 10 min)
+          BATCH_SIZE: "80"
+          MOVI_RPM: "9"
+          DRY_RUN: "false"
+          HTTP_TIMEOUT: "30"
+        run: |
+          python sync_range_tickets_merged.py
