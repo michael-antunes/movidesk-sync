@@ -3,14 +3,12 @@
 
 import os
 import sys
-import json
 import time
 import math
-import argparse
 import logging
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone, date
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
@@ -18,65 +16,97 @@ import psycopg2.extras
 
 
 # -----------------------------
-# Logging
+# Config / Logging
 # -----------------------------
-LOG = logging.getLogger("tickets_mesclados")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
-# -----------------------------
-# Config
-# -----------------------------
-@dataclass
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or not v.strip():
+        return default
+    try:
+        return int(v.strip())
+    except Exception:
+        return default
+
+
+def _setup_logger() -> logging.Logger:
+    level = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    return logging.getLogger("tickets_mesclados")
+
+
+log = _setup_logger()
+
+
+@dataclass(frozen=True)
 class Config:
-    movidesk_token: str
-    base_url: str = "https://api.movidesk.com/public/v1"
-    timeout_sec: int = 60
-    retries: int = 3
-    retry_sleep_sec: float = 2.0
+    # Movidesk
+    movi_base_url: str
+    movi_token: str
 
-    db_schema: str = "visualizacao_resolvidos"
-    table_name: str = "tickets_mesclados"
+    # DB
+    db_schema: str
+    table_name: str
 
-    lookback_days: int = 30
-    window_days: int = 7
+    # Sync windows
+    lookback_days: int
+    window_days: int
 
-    dry_run: bool = False
-
-
-def getenv_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
-    return int(v)
+    # Behavior
+    dry_run: bool
+    timeout_s: int
 
 
-def getenv_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+def load_config() -> Config:
+    movi_token = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVI_TOKEN") or os.getenv("MOVI_TOKEN")
+    if not movi_token:
+        raise RuntimeError("Falta token do Movidesk. Use MOVIDESK_TOKEN (recomendado).")
 
+    movi_base_url = os.getenv("MOVIDESK_BASE_URL") or os.getenv("MOVI_BASE_URL") or "https://api.movidesk.com/public/v1"
+    movi_base_url = movi_base_url.rstrip("/")
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Sync Movidesk merged tickets into Postgres")
-    p.add_argument("--schema", default=os.getenv("DB_SCHEMA", "visualizacao_resolvidos"))
-    p.add_argument("--table", default=os.getenv("DB_TABLE", "tickets_mesclados"))
-    p.add_argument("--lookback-days", type=int, default=getenv_int("LOOKBACK_DAYS", 30))
-    p.add_argument("--window-days", type=int, default=getenv_int("WINDOW_DAYS", 7))
-    p.add_argument("--dry-run", action="store_true", default=getenv_bool("DRY_RUN", False))
-    return p.parse_args()
+    db_schema = os.getenv("DB_SCHEMA", "visualizacao_resolvidos")
+    table_name = os.getenv("TABLE_NAME", "tickets_mesclados")
+
+    lookback_days = _env_int("LOOKBACK_DAYS", 30)
+    window_days = _env_int("WINDOW_DAYS", 7)
+    if window_days <= 0:
+        window_days = 7
+
+    dry_run = _env_bool("DRY_RUN", False)
+    timeout_s = _env_int("HTTP_TIMEOUT_S", 60)
+
+    return Config(
+        movi_base_url=movi_base_url,
+        movi_token=movi_token,
+        db_schema=db_schema,
+        table_name=table_name,
+        lookback_days=lookback_days,
+        window_days=window_days,
+        dry_run=dry_run,
+        timeout_s=timeout_s,
+    )
 
 
 # -----------------------------
 # Postgres
 # -----------------------------
-def pg_connect() -> psycopg2.extensions.connection:
+
+def pg_connect():
     """
-    Conecta via DATABASE_URL (preferencial) ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD/PGPORT.
+    Conecta usando:
+      - DATABASE_URL (recomendado)
+      - OU PGHOST/PGDATABASE/PGUSER/PGPASSWORD (+ PGPORT opcional)
     """
     db_url = os.getenv("DATABASE_URL")
     if db_url and db_url.strip():
@@ -89,359 +119,292 @@ def pg_connect() -> psycopg2.extensions.connection:
     port = os.getenv("PGPORT", "5432")
 
     if not (host and dbname and user and password):
-        raise RuntimeError(
-            "Faltam variáveis de Postgres. Use DATABASE_URL ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD."
-        )
+        raise RuntimeError("Faltam variáveis de Postgres. Use DATABASE_URL ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD.")
 
     return psycopg2.connect(
-        host=host, dbname=dbname, user=user, password=password, port=port
+        host=host,
+        dbname=dbname,
+        user=user,
+        password=password,
+        port=int(port),
     )
 
 
-def ensure_schema_and_table(conn: psycopg2.extensions.connection, schema: str, table: str) -> None:
+def _ensure_schema_and_table(conn, schema: str, table: str) -> None:
     """
-    Cria schema/tabela se não existirem e garante colunas necessárias.
+    Tabela “1 linha por ticketId”, compatível com o retorno do /tickets/merged:
+      - ticket_id (PK)
+      - merged_tickets (int)
+      - merged_tickets_ids (text)  -> ex: "123;456"
+      - last_update (timestamp)
+      - fetched_at (timestamptz)
+    Além de fazer ALTER TABLE se faltar coluna (pra evitar erros de coluna inexistente).
     """
-    ddl_schema = f'CREATE SCHEMA IF NOT EXISTS "{schema}";'
-
-    ddl_table = f"""
-    CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
-        ticket_id BIGINT NOT NULL,
-        merged_tickets INTEGER NULL,
-        merged_tickets_ids TEXT NULL,
-        last_update TIMESTAMPTZ NULL,
-        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """
-
-    # Garante unique para ON CONFLICT
-    ddl_uniq = f"""
-    CREATE UNIQUE INDEX IF NOT EXISTS "{table}_ticket_id_ux"
-    ON "{schema}"."{table}" (ticket_id);
-    """
-
-    # Garante colunas (caso a tabela exista antiga)
-    needed_cols = {
-        "ticket_id": 'ALTER TABLE "{schema}"."{table}" ADD COLUMN ticket_id BIGINT;',
-        "merged_tickets": 'ALTER TABLE "{schema}"."{table}" ADD COLUMN merged_tickets INTEGER;',
-        "merged_tickets_ids": 'ALTER TABLE "{schema}"."{table}" ADD COLUMN merged_tickets_ids TEXT;',
-        "last_update": 'ALTER TABLE "{schema}"."{table}" ADD COLUMN last_update TIMESTAMPTZ;',
-        "fetched_at": 'ALTER TABLE "{schema}"."{table}" ADD COLUMN fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW();',
-    }
-
     with conn.cursor() as cur:
-        cur.execute(ddl_schema)
-        cur.execute(ddl_table)
-        conn.commit()
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
 
-        # checa colunas existentes
-        cur.execute(
-            """
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
+                ticket_id BIGINT PRIMARY KEY,
+                merged_tickets INTEGER NULL,
+                merged_tickets_ids TEXT NULL,
+                last_update TIMESTAMP NULL,
+                fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+        """)
+
+        # Checar colunas existentes
+        cur.execute("""
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            """,
-            (schema, table),
-        )
+            WHERE table_schema = %s AND table_name = %s;
+        """, (schema, table))
         existing = {r[0] for r in cur.fetchall()}
 
-        for col, ddl_tpl in needed_cols.items():
+        def add_col(col: str, ddl_type: str):
             if col not in existing:
-                ddl = ddl_tpl.format(schema=schema, table=table)
-                LOG.warning("Tabela sem coluna %s. Executando: %s", col, ddl.strip())
-                cur.execute(ddl)
-                conn.commit()
+                log.warning('Coluna ausente "%s". Fazendo ALTER TABLE para adicionar...', col)
+                cur.execute(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN {col} {ddl_type};')
+                existing.add(col)
 
-        cur.execute(ddl_uniq)
-        conn.commit()
+        add_col("merged_tickets", "INTEGER NULL")
+        add_col("merged_tickets_ids", "TEXT NULL")
+        add_col("last_update", "TIMESTAMP NULL")
+        add_col("fetched_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+
+    conn.commit()
 
 
-def upsert_rows(
-    conn: psycopg2.extensions.connection, schema: str, table: str, rows: List[Dict[str, Any]]
-) -> int:
-    """
-    Upsert por ticket_id.
-    Retorna quantidade de linhas enviadas (não necessariamente rowcount real).
-    """
+def upsert_rows(conn, schema: str, table: str, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
 
-    sql = f"""
-    INSERT INTO "{schema}"."{table}"
-        (ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at)
-    VALUES %s
-    ON CONFLICT (ticket_id) DO UPDATE SET
-        merged_tickets = EXCLUDED.merged_tickets,
-        merged_tickets_ids = EXCLUDED.merged_tickets_ids,
-        last_update = EXCLUDED.last_update,
-        fetched_at = EXCLUDED.fetched_at
-    ;
-    """
-
+    # Monta valores
     values = []
-    now = datetime.now(timezone.utc)
     for r in rows:
-        values.append(
-            (
-                int(r["ticket_id"]),
-                r.get("merged_tickets"),
-                r.get("merged_tickets_ids"),
-                r.get("last_update"),
-                now,
-            )
-        )
+        values.append((
+            int(r["ticket_id"]),
+            r.get("merged_tickets"),
+            r.get("merged_tickets_ids"),
+            r.get("last_update"),
+            r.get("fetched_at"),
+        ))
+
+    sql = f"""
+        INSERT INTO "{schema}"."{table}"
+            (ticket_id, merged_tickets, merged_tickets_ids, last_update, fetched_at)
+        VALUES %s
+        ON CONFLICT (ticket_id) DO UPDATE SET
+            merged_tickets = EXCLUDED.merged_tickets,
+            merged_tickets_ids = EXCLUDED.merged_tickets_ids,
+            last_update = EXCLUDED.last_update,
+            fetched_at = EXCLUDED.fetched_at
+    """
 
     with conn.cursor() as cur:
-        try:
-            psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
-            conn.commit()
-            return len(values)
-        except Exception:
-            conn.rollback()
-            raise
+        psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
+
+    conn.commit()
+    return len(values)
 
 
 # -----------------------------
-# Movidesk API helpers
+# Movidesk HTTP
 # -----------------------------
-def http_get_json(cfg: Config, path: str, params: Dict[str, Any]) -> Any:
-    url = cfg.base_url.rstrip("/") + "/" + path.lstrip("/")
 
-    # token é via querystring no Movidesk
-    params = dict(params)
-    params["token"] = cfg.movidesk_token
-
-    last_err = None
-    for attempt in range(1, cfg.retries + 1):
+def _request_with_retries(
+    method: str,
+    url: str,
+    *,
+    params: Dict[str, Any],
+    timeout_s: int,
+    max_retries: int = 6,
+) -> requests.Response:
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=cfg.timeout_sec)
-            if resp.status_code == 404:
-                # endpoint não existe nessa conta/cluster
-                raise requests.HTTPError("404 Not Found", response=resp)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            last_err = e
-            if attempt < cfg.retries:
-                time.sleep(cfg.retry_sleep_sec * attempt)
-            else:
-                raise
-
-    raise last_err  # pragma: no cover
-
-
-def parse_page_number(page_number: Optional[str]) -> Tuple[int, int]:
-    """
-    pageNumber pode vir como "1 of 333" (manual).
-    Retorna (current, total). Se não der, retorna (1,1).
-    """
-    if not page_number:
-        return (1, 1)
-    s = str(page_number).strip()
-    if "of" in s:
-        parts = [p.strip() for p in s.split("of")]
-        try:
-            cur = int(parts[0])
-            tot = int(parts[1])
-            return (cur, tot)
-        except Exception:
-            return (1, 1)
-    return (1, 1)
-
-
-def normalize_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Aceita variações:
-      - ticketId (manual /tickets/merged)
-      - id (algumas respostas antigas)
-    mergedTicketsIds geralmente é string com ';'
-    lastUpdate pode vir como string "YYYY-MM-DD HH:MM:SS"
-    """
-    if not isinstance(item, dict):
-        return None
-
-    ticket_id = item.get("ticketId", item.get("id"))
-    if ticket_id is None:
-        return None
-
-    merged_tickets = item.get("mergedTickets")
-    merged_tickets_ids = item.get("mergedTicketsIds")
-
-    # normalize ints/strings
-    try:
-        if merged_tickets is not None and merged_tickets != "":
-            merged_tickets = int(merged_tickets)
-        else:
-            merged_tickets = None
-    except Exception:
-        merged_tickets = None
-
-    if merged_tickets_ids is not None:
-        merged_tickets_ids = str(merged_tickets_ids).strip()
-        if merged_tickets_ids == "":
-            merged_tickets_ids = None
-
-    # lastUpdate -> timestamptz
-    last_update = None
-    lu = item.get("lastUpdate")
-    if lu:
-        s = str(lu).strip()
-        # tenta formatos comuns: "YYYY-MM-DD HH:MM:SS" ou ISO
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
-            try:
-                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-                last_update = dt
-                break
-            except Exception:
+            resp = requests.request(method, url, params=params, timeout=timeout_s)
+            # Retry em 429 / 5xx
+            if resp.status_code in (429, 500, 502, 503, 504):
+                wait = min(60, 2 ** attempt)
+                log.warning("HTTP %s em %s (tentativa %s/%s). Aguardando %ss...",
+                            resp.status_code, url, attempt, max_retries, wait)
+                time.sleep(wait)
                 continue
+            return resp
+        except Exception as e:
+            last_exc = e
+            wait = min(60, 2 ** attempt)
+            log.warning("Erro de rede em %s (tentativa %s/%s): %s | aguardando %ss...",
+                        url, attempt, max_retries, e, wait)
+            time.sleep(wait)
 
-    return {
-        "ticket_id": int(ticket_id),
-        "merged_tickets": merged_tickets,
-        "merged_tickets_ids": merged_tickets_ids,
-        "last_update": last_update,
-    }
+    raise RuntimeError(f"Falha após retries em {url}: {last_exc}")
 
 
-def extract_items_from_response(data: Any) -> List[Dict[str, Any]]:
+def _parse_last_update(s: Optional[str]) -> Optional[datetime]:
     """
-    No manual do /tickets/merged:
-      { startDate, endDate, count, pageNumber, mergedTickets: [...] }
-
-    Mas em alguns ambientes pode vir direto como lista.
+    No manual costuma vir "YYYY-MM-DD HH:MM:SS" (sem TZ).
+    Armazeno como timestamp (sem tz) no Postgres.
     """
-    if isinstance(data, dict):
-        if "mergedTickets" in data and isinstance(data["mergedTickets"], list):
-            return data["mergedTickets"]
-        # fallback: alguns retornos podem vir com "value"
-        if "value" in data and isinstance(data["value"], list):
-            return data["value"]
-        # ou caso venham itens num formato inesperado:
-        return []
-    if isinstance(data, list):
-        return data
-    return []
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt
+        except Exception:
+            continue
+    return None
 
 
-def fetch_merged_window(cfg: Config, start_d: date, end_d: date) -> List[Dict[str, Any]]:
+def fetch_tickets_merged(cfg: Config, start_d: date, end_d: date) -> List[Dict[str, Any]]:
     """
-    Busca todos os merged tickets no intervalo (startDate/endDate) paginando.
-    No manual, startDate/endDate são datas.
-    """
-    all_items: List[Dict[str, Any]] = []
+    GET /tickets/merged?token=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&page=N
 
-    # Manual aceita datas (YYYY-MM-DD). Vamos seguir isso para evitar 404/400 por formato.
-    start_s = start_d.isoformat()
-    end_s = end_d.isoformat()
+    Retorno normal (range) inclui:
+      - mergedTickets: [ { ticketId, mergedTickets, mergedTicketsIds, lastUpdate, ... } ]
+      - pageNumber / totalPages
+    """
+    url = f"{cfg.movi_base_url}/tickets/merged"
+
+    # manual pede UTC e formato YYYY-MM-DD
+    start_str = start_d.strftime("%Y-%m-%d")
+    end_str = end_d.strftime("%Y-%m-%d")
 
     page = 1
-    total_pages = 1
+    all_items: List[Dict[str, Any]] = []
 
-    while page <= total_pages:
-        LOG.info(
-            "buscando /tickets/merged | page=%s | startDate=%s endDate=%s",
-            page, start_s, end_s
-        )
-        data = http_get_json(
-            cfg,
-            "/tickets/merged",
-            {"startDate": start_s, "endDate": end_s, "page": page},
-        )
+    while True:
+        params = {
+            "token": cfg.movi_token,
+            "startDate": start_str,
+            "endDate": end_str,
+            "page": page,
+        }
 
-        # total pages (se vier)
-        if isinstance(data, dict):
-            _, total_pages = parse_page_number(data.get("pageNumber"))
-        else:
-            total_pages = 1
+        resp = _request_with_retries("GET", url, params=params, timeout_s=cfg.timeout_s)
+        if resp.status_code == 404:
+            # Esse 404 normalmente acontece quando a URL está errada (ex: faltando /public/v1)
+            # ou o endpoint não está habilitado. Aqui a gente loga o URL completo.
+            log.warning("Endpoint retornou 404. URL chamada: %s | params=%s | body=%s", url, {k:v for k,v in params.items() if k!="token"}, resp.text[:500])
+            return []
 
-        items = extract_items_from_response(data)
+        if resp.status_code >= 400:
+            log.warning("Erro HTTP %s ao chamar %s | params=%s | body=%s", resp.status_code, url, {k:v for k,v in params.items() if k!="token"}, resp.text[:800])
+            return []
+
+        data = resp.json() if resp.content else {}
+        items = data.get("mergedTickets") or []
         all_items.extend(items)
+
+        page_number = data.get("pageNumber")
+        total_pages = data.get("totalPages")
+
+        # Se não vier paginação, encerra
+        if not page_number or not total_pages:
+            break
+
+        try:
+            page_number_i = int(page_number)
+            total_pages_i = int(total_pages)
+        except Exception:
+            break
+
+        if page_number_i >= total_pages_i:
+            break
+
         page += 1
 
     return all_items
 
 
 # -----------------------------
-# Main
+# Main sync
 # -----------------------------
+
+def daterange_windows(end_inclusive: date, lookback_days: int, window_days: int) -> List[Tuple[date, date]]:
+    start = end_inclusive - timedelta(days=lookback_days)
+    windows = []
+    cur = start
+    while cur <= end_inclusive:
+        win_end = min(end_inclusive, cur + timedelta(days=window_days - 1))
+        windows.append((cur, win_end))
+        cur = win_end + timedelta(days=1)
+    return windows
+
+
 def main() -> None:
-    args = parse_args()
+    cfg = load_config()
 
-    token = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIESK_TOKEN") or os.getenv("TOKEN")
-    if not token:
-        raise RuntimeError("Falta MOVIDESK_TOKEN nas variáveis de ambiente (GitHub Secrets).")
-
-    cfg = Config(
-        movidesk_token=token,
-        db_schema=args.schema,
-        table_name=args.table,
-        lookback_days=args.lookback_days,
-        window_days=args.window_days,
-        dry_run=args.dry_run,
-    )
-
+    # “hoje” em UTC pra bater com o manual (datas UTC)
     today_utc = datetime.now(timezone.utc).date()
-    start_all = today_utc - timedelta(days=cfg.lookback_days)
-    end_all = today_utc
+    start_utc = today_utc - timedelta(days=cfg.lookback_days)
 
-    LOG.info(
+    log.info(
         "sync iniciando | schema=%s tabela=%s | intervalo=%s..%s | lookback_days=%s | window_days=%s | dry_run=%s",
-        cfg.db_schema, cfg.table_name, start_all.isoformat(), end_all.isoformat(),
-        cfg.lookback_days, cfg.window_days, cfg.dry_run
+        cfg.db_schema, cfg.table_name, start_utc, today_utc, cfg.lookback_days, cfg.window_days, cfg.dry_run
     )
 
-    conn = pg_connect()
-    try:
-        ensure_schema_and_table(conn, cfg.db_schema, cfg.table_name)
+    if cfg.dry_run:
+        conn = None
+    else:
+        conn = pg_connect()
+        _ensure_schema_and_table(conn, cfg.db_schema, cfg.table_name)
 
-        total_api = 0
-        total_upsert_sent = 0
+    total_upsert = 0
+    windows = daterange_windows(today_utc, cfg.lookback_days, cfg.window_days)
 
-        cur_start = start_all
-        while cur_start <= end_all:
-            cur_end = min(cur_start + timedelta(days=cfg.window_days - 1), end_all)
+    for (w_start, w_end) in windows:
+        log.info("buscando /tickets/merged | startDate=%s endDate=%s", w_start, w_end)
 
-            raw_items = fetch_merged_window(cfg, cur_start, cur_end)
-            total_api += len(raw_items)
+        items = fetch_tickets_merged(cfg, w_start, w_end)
+        if not items:
+            continue
 
-            normalized: List[Dict[str, Any]] = []
-            for it in raw_items:
-                n = normalize_item(it)
-                if not n:
-                    # loga um exemplo sem explodir o log
-                    try:
-                        LOG.warning("item inesperado em /tickets/merged (descartado): %s", json.dumps(it)[:500])
-                    except Exception:
-                        LOG.warning("item inesperado em /tickets/merged (descartado).")
-                    continue
-                normalized.append(n)
+        fetched_at = datetime.now(timezone.utc)
 
-            # opcional: só grava quem tem merge de fato
-            normalized = [
-                r for r in normalized
-                if (r.get("merged_tickets") and r["merged_tickets"] > 0) or (r.get("merged_tickets_ids"))
-            ]
+        batch: List[Dict[str, Any]] = []
+        for it in items:
+            # Campos típicos do retorno
+            ticket_id = it.get("ticketId") or it.get("id")  # fallback defensivo
+            if ticket_id is None:
+                continue
 
-            if cfg.dry_run:
-                LOG.info("dry_run: janela %s..%s teria %s registros para upsert", cur_start, cur_end, len(normalized))
-            else:
-                up = upsert_rows(conn, cfg.db_schema, cfg.table_name, normalized)
-                total_upsert_sent += up
+            merged_tickets = it.get("mergedTickets")
+            try:
+                merged_tickets_i = int(merged_tickets) if merged_tickets is not None else None
+            except Exception:
+                merged_tickets_i = None
 
-            cur_start = cur_end + timedelta(days=1)
+            merged_tickets_ids = it.get("mergedTicketsIds")
+            if merged_tickets_ids is not None:
+                merged_tickets_ids = str(merged_tickets_ids).strip()
 
-        # total na tabela
-        with conn.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{cfg.db_schema}"."{cfg.table_name}"')
-            total_table = cur.fetchone()[0]
+            last_update = _parse_last_update(it.get("lastUpdate"))
 
-        LOG.info(
-            "sincronização concluída | itens_api=%s | linhas_upsert_enviadas=%s | total_tabela=%s",
-            total_api, total_upsert_sent, total_table
-        )
-    finally:
-        conn.close()
+            batch.append({
+                "ticket_id": int(ticket_id),
+                "merged_tickets": merged_tickets_i,
+                "merged_tickets_ids": merged_tickets_ids,
+                "last_update": last_update,
+                "fetched_at": fetched_at,
+            })
+
+        if cfg.dry_run:
+            log.info("DRY_RUN: capturados %s tickets nesta janela (não gravando no banco).", len(batch))
+            continue
+
+        total_upsert += upsert_rows(conn, cfg.db_schema, cfg.table_name, batch)
+        log.info("janela %s..%s: upsert %s linhas", w_start, w_end, len(batch))
+
+    log.info("sincronização concluída. Total upserts nesta execução: %s", total_upsert)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception("Falha fatal: %s", e)
+        sys.exit(1)
