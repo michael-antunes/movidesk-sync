@@ -1,7 +1,6 @@
 name: Movidesk - Range scan to audit (loop)
 
-on:
-  workflow_dispatch:
+on: [workflow_dispatch]
 
 concurrency:
   group: range-scan-to-audit-loop
@@ -37,9 +36,9 @@ jobs:
           RANGE_SCAN_MAX_RUNTIME_SEC: "240"
           RANGE_SCAN_SLEEP_SEC: "0"
         run: |
-          python range_scan_to_audit.py | tee scan_out.txt
+          python range_scan_to_audit.py
 
-      - name: Check done (ultima_data_validada <= data_fim)
+      - name: Check done (coalesce(ultima_data_validada,data_inicio) <= data_fim)
         id: check
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -53,13 +52,8 @@ with psycopg2.connect(dsn) as c:
     with c.cursor() as cur:
         cur.execute("""
           select
-            case
-              when ultima_data_validada is null then false
-              when data_fim is null then false
-              when ultima_data_validada <= data_fim then true
-              else false
-            end as done,
-            ultima_data_validada,
+            (coalesce(ultima_data_validada, data_inicio) <= data_fim) as done,
+            coalesce(ultima_data_validada, data_inicio) as ultima,
             data_fim
           from visualizacao_resolvidos.range_scan_control
           limit 1
@@ -75,9 +69,9 @@ else:
 PY
           cat done_check.txt
           if head -n1 done_check.txt | grep -q '^1$'; then
-            echo "done=1" >> $GITHUB_OUTPUT
+            echo "done=1" >> "$GITHUB_OUTPUT"
           else
-            echo "done=0" >> $GITHUB_OUTPUT
+            echo "done=0" >> "$GITHUB_OUTPUT"
           fi
 
   rerun:
@@ -86,14 +80,15 @@ PY
     runs-on: ubuntu-latest
     permissions:
       actions: write
+      contents: read
     steps:
       - name: Dispatch again
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          curl -L -X POST \
+          curl -sS -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches" \
             -d "{\"ref\":\"${REF_NAME}\"}"
