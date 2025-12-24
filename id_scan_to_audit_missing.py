@@ -202,17 +202,7 @@ def get_control(cur):
 
 
 def set_id_atual(cur, v):
-    cols = get_table_cols(cur, SCHEMA, "range_scan_control")
-    if "ultima_data_validada" in cols:
-        cur.execute(
-            f"update {CONTROL_TABLE} set id_atual=%s, ultima_data_validada=now()",
-            (v,),
-        )
-    else:
-        cur.execute(
-            f"update {CONTROL_TABLE} set id_atual=%s",
-            (v,),
-        )
+    cur.execute(f"update {CONTROL_TABLE} set id_atual=%s", (v,))
 
 
 def http_get_json(url, params):
