@@ -30,10 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      # Traz possíveis nomes de secrets (se não existirem, viram vazio)
-      - name: Resolve DB env
+      - name: Resolve secrets (DB + token)
         shell: bash
         env:
+          # DB (tenta vários nomes)
           DB_URL_1: ${{ secrets.DATABASE_URL }}
           DB_URL_2: ${{ secrets.POSTGRES_URL }}
           DB_URL_3: ${{ secrets.SUPABASE_DB_URL }}
@@ -46,10 +46,27 @@ jobs:
           PGPASSWORD: ${{ secrets.PGPASSWORD }}
           PGPORT: ${{ secrets.PGPORT }}
           PGSSLMODE: ${{ secrets.PGSSLMODE }}
+
+          # TOKEN (tenta vários nomes)
+          MOVI_TOKEN_1: ${{ secrets.MOVI_TOKEN }}
+          MOVI_TOKEN_2: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVI_TOKEN_3: ${{ secrets.MOVI_API_TOKEN }}
+          MOVI_TOKEN_4: ${{ secrets.MOVIDESK_API_TOKEN }}
         run: |
           set -e
 
-          # Prioriza DATABASE_URL (qualquer um desses)
+          # Resolve MOVI_TOKEN
+          if [ -n "$MOVI_TOKEN_1" ]; then
+            echo "MOVI_TOKEN=$MOVI_TOKEN_1" >> $GITHUB_ENV
+          elif [ -n "$MOVI_TOKEN_2" ]; then
+            echo "MOVI_TOKEN=$MOVI_TOKEN_2" >> $GITHUB_ENV
+          elif [ -n "$MOVI_TOKEN_3" ]; then
+            echo "MOVI_TOKEN=$MOVI_TOKEN_3" >> $GITHUB_ENV
+          elif [ -n "$MOVI_TOKEN_4" ]; then
+            echo "MOVI_TOKEN=$MOVI_TOKEN_4" >> $GITHUB_ENV
+          fi
+
+          # Resolve DATABASE_URL
           if [ -n "$DB_URL_1" ]; then
             echo "DATABASE_URL=$DB_URL_1" >> $GITHUB_ENV
           elif [ -n "$DB_URL_2" ]; then
@@ -84,25 +101,17 @@ jobs:
         run: |
           python - << 'PY'
           import os
-          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE","MOVI_TOKEN","MOVIDESK_TOKEN"]
+          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE","MOVI_TOKEN"]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
       - name: Run scanner
         env:
-          # Movidesk (no seu log, você já usa MOVI_TOKEN)
-          MOVI_TOKEN: ${{ secrets.MOVI_TOKEN }}
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_BASE_URL: ${{ secrets.MOVIDESK_BASE_URL }}
-
-          # Configs do scan
           DB_SCHEMA: visualizacao_resolvidos
           TICKETS_TABLE: tickets_mesclados
           CONTROL_TABLE: range_scan_control
           CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '80' }}
-
           LOG_LEVEL: INFO
         run: |
-          # ajuste o nome do arquivo conforme o seu repo
           python sync_range_tickets_merged.py
