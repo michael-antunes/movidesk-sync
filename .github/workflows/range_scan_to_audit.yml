@@ -1,7 +1,7 @@
 name: Movidesk - Range scan to audit (loop)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 concurrency:
   group: range-scan-to-audit-loop
@@ -55,6 +55,7 @@ with psycopg2.connect(dsn) as c:
           select
             case
               when ultima_data_validada is null then false
+              when data_fim is null then false
               when ultima_data_validada <= data_fim then true
               else false
             end as done,
