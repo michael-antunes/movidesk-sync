@@ -16,21 +16,32 @@ THROTTLE = float(os.getenv("RANGE_SCAN_THROTTLE", "0.25"))
 MAX_RUNTIME_SEC = int(os.getenv("RANGE_SCAN_MAX_RUNTIME_SEC", "240"))
 SLEEP_SEC = float(os.getenv("RANGE_SCAN_SLEEP_SEC", "0"))
 
+SCHEMA = "visualizacao_resolvidos"
+TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
+
 if not TOKEN or not DSN:
     raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN são obrigatórios")
 
 
-def to_utc(d):
-    if d is None:
+def conn():
+    return psycopg2.connect(DSN)
+
+
+def to_utc(dt):
+    if dt is None:
         return None
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
-    return d.astimezone(timezone.utc).replace(microsecond=0)
+    if isinstance(dt, str):
+        dt = parse_dt(dt)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0)
 
 
-def iso_z(d):
-    d = to_utc(d)
-    return d.isoformat().replace("+00:00", "Z")
+def iso_z(dt):
+    dt = to_utc(dt)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def parse_dt(s):
@@ -38,67 +49,155 @@ def parse_dt(s):
         return None
     try:
         if s.endswith("Z"):
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return datetime.fromisoformat(s)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
 
-def conn():
-    return psycopg2.connect(DSN)
+def fetch_page(params):
+    r = requests.get(API, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    return data or []
 
 
-def ensure_table():
-    with conn() as c, c.cursor() as cur:
-        cur.execute(
-            """
-            create table if not exists visualizacao_resolvidos.range_scan_control(
-              data_fim timestamptz not null,
-              data_inicio timestamptz not null,
-              ultima_data_validada timestamptz,
-              constraint ck_range_scan_bounds check(
-                data_inicio is not null and data_fim is not null and data_inicio <> data_fim
-                and (
-                  ultima_data_validada is null
-                  or (
-                    ultima_data_validada >= least(data_inicio,data_fim)
-                    and ultima_data_validada <= greatest(data_inicio,data_fim)
-                  )
-                )
-              )
-            )
-            """
-        )
-        cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
-        n = cur.fetchone()[0]
-        if n == 0:
-            cur.execute(
-                """
-                insert into visualizacao_resolvidos.range_scan_control(data_fim, data_inicio, ultima_data_validada)
-                values (now(), timestamptz '2018-01-01 00:00:00+00', now())
-                """
-            )
-        c.commit()
-
-
-def mesclados_last_updates(cur, ids):
-    if not ids:
-        return {}
+def audit_recent_run_cols(cur):
     cur.execute(
         """
         select column_name
         from information_schema.columns
-        where table_schema = 'visualizacao_resolvidos'
-          and table_name = 'tickets_mesclados'
-        """
+        where table_schema=%s and table_name='audit_recent_run'
+        """,
+        (SCHEMA,),
     )
-    cols = [r[0] for r in cur.fetchall()]
-    if not cols:
+    return {r[0] for r in cur.fetchall()}
+
+
+def ensure_run_id(cur, data_fim, ultima):
+    cur.execute(f"select max(id) from {SCHEMA}.audit_recent_run")
+    rid = cur.fetchone()[0]
+    if rid is not None:
+        return int(rid)
+
+    cols = audit_recent_run_cols(cur)
+    ins_cols = []
+    ins_vals = []
+    params = []
+
+    if "started_at" in cols:
+        ins_cols.append("started_at")
+        ins_vals.append("now()")
+    if "window_start" in cols:
+        ins_cols.append("window_start")
+        ins_vals.append("now()")
+    if "window_end" in cols:
+        ins_cols.append("window_end")
+        ins_vals.append("now()")
+    if "total_api" in cols:
+        ins_cols.append("total_api")
+        ins_vals.append("0")
+    if "missing_total" in cols:
+        ins_cols.append("missing_total")
+        ins_vals.append("0")
+    if "run_at" in cols:
+        ins_cols.append("run_at")
+        ins_vals.append("now()")
+    if "window_from" in cols:
+        ins_cols.append("window_from")
+        ins_vals.append("%s")
+        params.append(data_fim)
+    if "window_to" in cols:
+        ins_cols.append("window_to")
+        ins_vals.append("%s")
+        params.append(ultima)
+    if "notes" in cols:
+        ins_cols.append("notes")
+        ins_vals.append("%s")
+        params.append("range-scan")
+
+    if not ins_cols:
+        cur.execute(f"insert into {SCHEMA}.audit_recent_run default values returning id")
+        return int(cur.fetchone()[0])
+
+    cur.execute(
+        f"insert into {SCHEMA}.audit_recent_run({','.join(ins_cols)}) values ({','.join(ins_vals)}) returning id",
+        tuple(params),
+    )
+    return int(cur.fetchone()[0])
+
+
+def existing_in_missing(cur, ids):
+    if not ids:
+        return set()
+    cur.execute(
+        f"""
+        select ticket_id
+        from {SCHEMA}.audit_recent_missing
+        where table_name=%s and ticket_id = any(%s)
+        """,
+        (TABLE_NAME, list(ids)),
+    )
+    return {int(r[0]) for r in cur.fetchall()}
+
+
+def existing_in_abertos(cur, ids):
+    if not ids:
+        return set()
+    cur.execute(
+        """
+        select ticket_id
+        from visualizacao_atual.tickets_abertos
+        where ticket_id = any(%s)
+        """,
+        (list(ids),),
+    )
+    return {int(r[0]) for r in cur.fetchall()}
+
+
+def detail_last_updates(cur, ids):
+    if not ids:
         return {}
+    cur.execute(
+        f"""
+        select ticket_id, last_update
+        from {SCHEMA}.tickets_resolvidos_detail
+        where ticket_id = any(%s)
+        """,
+        (list(ids),),
+    )
+    out = {}
+    for tid, lu in cur.fetchall():
+        if tid is None:
+            continue
+        out[int(tid)] = to_utc(lu)
+    return out
+
+
+def mesclados_info(cur, ids):
+    if not ids:
+        return {}, set()
+
+    cur.execute(
+        """
+        select column_name
+        from information_schema.columns
+        where table_schema=%s and table_name='tickets_mesclados'
+        """,
+        (SCHEMA,),
+    )
+    cols = {r[0] for r in cur.fetchall()}
+    if not cols:
+        return {}, set()
+
     lu_col = None
-    for c in cols:
-        lc = c.lower()
-        if lc in ("last_update", "lastupdate", "updated_at", "last_updated_at", "lastupdateat"):
+    for c in ("last_update", "lastupdate", "updated_at", "last_updated_at"):
+        if c in cols:
             lu_col = c
             break
     if lu_col is None:
@@ -107,47 +206,59 @@ def mesclados_last_updates(cur, ids):
             if "last" in lc and "update" in lc:
                 lu_col = c
                 break
-    if lu_col is None:
-        return {}
-    try:
-        cur.execute(
-            f"select ticket_id, {lu_col} from visualizacao_resolvidos.tickets_mesclados where ticket_id = any(%s)",
-            (ids,),
-        )
-    except Exception:
-        return {}
-    out = {}
-    for tid, lu in cur.fetchall():
-        if tid is None or lu is None:
-            continue
-        out[int(tid)] = lu
-    return out
 
+    mesclado_ticket_last = {}
+    if lu_col:
+        try:
+            cur.execute(
+                f"""
+                select ticket_id, {lu_col}
+                from {SCHEMA}.tickets_mesclados
+                where ticket_id = any(%s)
+                """,
+                (list(ids),),
+            )
+            for tid, lu in cur.fetchall():
+                if tid is None or lu is None:
+                    continue
+                mesclado_ticket_last[int(tid)] = to_utc(lu)
+        except Exception:
+            mesclado_ticket_last = {}
 
-def fetch_page(params):
-    r = requests.get(API, params=params, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.status_code} {r.text[:300]}")
-    data = r.json()
-    return data or []
+    cur.execute(
+        f"""
+        select merged_into_id
+        from {SCHEMA}.tickets_mesclados
+        where merged_into_id = any(%s)
+        """,
+        (list(ids),),
+    )
+    merged_into = {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
+
+    return mesclado_ticket_last, merged_into
 
 
 def do_one_cycle():
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            """
+            f"""
             select data_inicio, data_fim, coalesce(ultima_data_validada, data_inicio)
-            from visualizacao_resolvidos.range_scan_control
+            from {SCHEMA}.range_scan_control
             limit 1
             """
         )
         row = cur.fetchone()
+        if not row:
+            return True, 0
+
         data_inicio, data_fim, ultima = row[0], row[1], row[2]
+        data_inicio = to_utc(data_inicio)
+        data_fim = to_utc(data_fim)
+        ultima = to_utc(ultima)
 
     ids = []
     api_last = {}
     min_lu = None
-
     skip = 0
 
     while True:
@@ -165,7 +276,7 @@ def do_one_cycle():
             break
 
         for t in page:
-            lu = parse_dt(t.get("lastUpdate"))
+            lu = to_utc(parse_dt(t.get("lastUpdate")))
             if not lu:
                 continue
             if lu < data_fim or lu > ultima:
@@ -174,11 +285,13 @@ def do_one_cycle():
                 tid = int(t.get("id"))
             except Exception:
                 continue
-            if tid not in ids:
+            if tid not in api_last:
                 ids.append(tid)
                 api_last[tid] = lu
                 if min_lu is None or lu < min_lu:
                     min_lu = lu
+            if len(ids) >= LIMIT:
+                break
 
         if len(ids) >= LIMIT:
             break
@@ -186,82 +299,67 @@ def do_one_cycle():
             break
 
         skip += PAGE_TOP
-        time.sleep(THROTTLE)
+        if THROTTLE > 0:
+            time.sleep(THROTTLE)
 
     missing = []
 
     with conn() as c, c.cursor() as cur:
         if ids:
-            cur.execute(
-                """
-                select ticket_id, last_update
-                from visualizacao_resolvidos.tickets_resolvidos_detail
-                where ticket_id = any(%s)
-                """,
-                (ids,),
-            )
-            rows = cur.fetchall()
-            db_last = {int(r[0]): r[1] for r in rows}
+            rid = ensure_run_id(cur, data_fim, ultima)
 
-            mesclados_last = mesclados_last_updates(cur, ids)
+            in_missing = existing_in_missing(cur, ids)
+            in_abertos = existing_in_abertos(cur, ids)
+            detail_last = detail_last_updates(cur, ids)
+            mesclado_ticket_last, merged_into = mesclados_info(cur, ids)
 
             for tid in ids:
-                api_dt = to_utc(api_last.get(tid))
-                m_dt = mesclados_last.get(tid)
-                if m_dt is not None and api_dt is not None:
-                    if to_utc(m_dt) >= api_dt:
-                        continue
-                db_dt = db_last.get(tid)
+                if tid in in_missing:
+                    continue
+                if tid in in_abertos:
+                    continue
+                if tid in merged_into:
+                    continue
+
+                api_dt = api_last.get(tid)
+
+                m_dt = mesclado_ticket_last.get(tid)
+                if m_dt is not None and api_dt is not None and api_dt <= m_dt:
+                    continue
+
+                db_dt = detail_last.get(tid)
                 if db_dt is None:
                     missing.append(tid)
                 else:
-                    if to_utc(db_dt) != api_dt:
+                    if api_dt is None:
+                        continue
+                    if db_dt != api_dt:
                         missing.append(tid)
-
-            cur.execute("select max(id) from visualizacao_resolvidos.audit_recent_run")
-            rid = cur.fetchone()[0]
-            if rid is None:
-                cur.execute(
-                    """
-                    insert into visualizacao_resolvidos.audit_recent_run(table_name, range_count, api_ids, inserted_missing)
-                    values (%s, 0, 0, 0)
-                    returning id
-                    """,
-                    ("tickets_resolvidos",),
-                )
-                rid = cur.fetchone()[0]
 
             if missing:
                 execute_values(
                     cur,
-                    """
-                    insert into visualizacao_resolvidos.audit_recent_missing
-                      (run_id, table_name, ticket_id)
+                    f"""
+                    insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id)
                     values %s
                     on conflict do nothing
                     """,
-                    [(rid, "tickets_resolvidos", m) for m in missing],
+                    [(rid, TABLE_NAME, int(m)) for m in missing],
+                    page_size=1000,
                 )
 
-        if min_lu is not None:
-            nv = min_lu
-        else:
-            nv = data_fim
-
+        nv = min_lu if min_lu is not None else data_fim
         cur.execute(
-            """
-            update visualizacao_resolvidos.range_scan_control
-               set ultima_data_validada = %s
-            """,
+            f"update {SCHEMA}.range_scan_control set ultima_data_validada=%s",
             (nv,),
         )
         c.commit()
 
     with conn() as c, c.cursor() as cur:
         cur.execute(
-            """
+            f"""
             select (coalesce(ultima_data_validada, data_inicio) <= data_fim)
-            from visualizacao_resolvidos.range_scan_control
+            from {SCHEMA}.range_scan_control
             limit 1
             """
         )
@@ -271,7 +369,6 @@ def do_one_cycle():
 
 
 def main():
-    ensure_table()
     start = time.time()
     while True:
         hit_end, got = do_one_cycle()
