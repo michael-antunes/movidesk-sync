@@ -48,11 +48,16 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT: ${{ inputs.limit }}
-          RANGE_SCAN_THROTTLE: ${{ inputs.throttle }}
-          RANGE_SCAN_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec }}
-          RANGE_SCAN_SLEEP_SEC: ${{ inputs.sleep_sec }}
+          RANGE_SCAN_LIMIT: ${{ github.event.inputs.limit }}
+          RANGE_SCAN_THROTTLE: ${{ github.event.inputs.throttle }}
+          RANGE_SCAN_MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec }}
+          RANGE_SCAN_SLEEP_SEC: ${{ github.event.inputs.sleep_sec }}
         run: |
+          RANGE_SCAN_LIMIT="${RANGE_SCAN_LIMIT:-400}"
+          RANGE_SCAN_THROTTLE="${RANGE_SCAN_THROTTLE:-0.25}"
+          RANGE_SCAN_MAX_RUNTIME_SEC="${RANGE_SCAN_MAX_RUNTIME_SEC:-240}"
+          RANGE_SCAN_SLEEP_SEC="${RANGE_SCAN_SLEEP_SEC:-0}"
+          export RANGE_SCAN_LIMIT RANGE_SCAN_THROTTLE RANGE_SCAN_MAX_RUNTIME_SEC RANGE_SCAN_SLEEP_SEC
           python range_scan_to_audit.py | tee scan_out.txt
 
       - name: done?
@@ -60,7 +65,7 @@ jobs:
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
-          done=$(python - <<'PY'
+          python - <<'PY' > done_check.txt
 import os
 import psycopg2
 
@@ -84,10 +89,12 @@ else:
     print("1" if bool(done) else "0")
     print(f"ultima_data_validada={ultima} data_fim={data_fim}")
 PY
-          )
-          flag=$(echo "$done" | head -n1)
-          echo "done=${flag}" >> $GITHUB_OUTPUT
-          echo "$done" | tail -n +2 || true
+          cat done_check.txt
+          if head -n1 done_check.txt | grep -q '^1$'; then
+            echo "done=1" >> $GITHUB_OUTPUT
+          else
+            echo "done=0" >> $GITHUB_OUTPUT
+          fi
 
   rerun:
     needs: run
@@ -100,11 +107,16 @@ PY
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
-          LIMIT: ${{ github.event.inputs.limit || '400' }}
-          THROTTLE: ${{ github.event.inputs.throttle || '0.25' }}
-          MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec || '240' }}
-          SLEEP_SEC: ${{ github.event.inputs.sleep_sec || '0' }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          THROTTLE: ${{ github.event.inputs.throttle }}
+          MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec }}
+          SLEEP_SEC: ${{ github.event.inputs.sleep_sec }}
         run: |
+          LIMIT="${LIMIT:-400}"
+          THROTTLE="${THROTTLE:-0.25}"
+          MAX_RUNTIME_SEC="${MAX_RUNTIME_SEC:-240}"
+          SLEEP_SEC="${SLEEP_SEC:-0}"
+
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
