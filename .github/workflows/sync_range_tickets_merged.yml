@@ -1,14 +1,20 @@
-name: Sync Tickets Merged (Range Scan)
+name: Scan Tickets Merged (range)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/10 * * * *"
+    inputs:
+      chunk_size:
+        description: "Qtd de IDs por execução (desc). Default 80"
+        required: false
+        default: "80"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+
+    concurrency:
+      group: scan-tickets-merged-range
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -19,54 +25,84 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Validate env presence (no secrets printed)
+      # Traz possíveis nomes de secrets (se não existirem, viram vazio)
+      - name: Resolve DB env
+        shell: bash
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_URL_1: ${{ secrets.DATABASE_URL }}
+          DB_URL_2: ${{ secrets.POSTGRES_URL }}
+          DB_URL_3: ${{ secrets.SUPABASE_DB_URL }}
+          DB_URL_4: ${{ secrets.PG_DATABASE_URL }}
+          DB_URL_5: ${{ secrets.DB_URL }}
+
           PGHOST: ${{ secrets.PGHOST }}
           PGDATABASE: ${{ secrets.PGDATABASE }}
           PGUSER: ${{ secrets.PGUSER }}
           PGPASSWORD: ${{ secrets.PGPASSWORD }}
           PGPORT: ${{ secrets.PGPORT }}
-          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          PGSSLMODE: ${{ secrets.PGSSLMODE }}
+        run: |
+          set -e
+
+          # Prioriza DATABASE_URL (qualquer um desses)
+          if [ -n "$DB_URL_1" ]; then
+            echo "DATABASE_URL=$DB_URL_1" >> $GITHUB_ENV
+          elif [ -n "$DB_URL_2" ]; then
+            echo "DATABASE_URL=$DB_URL_2" >> $GITHUB_ENV
+          elif [ -n "$DB_URL_3" ]; then
+            echo "DATABASE_URL=$DB_URL_3" >> $GITHUB_ENV
+          elif [ -n "$DB_URL_4" ]; then
+            echo "DATABASE_URL=$DB_URL_4" >> $GITHUB_ENV
+          elif [ -n "$DB_URL_5" ]; then
+            echo "DATABASE_URL=$DB_URL_5" >> $GITHUB_ENV
+          fi
+
+          # Se não tiver DATABASE_URL, tenta variáveis separadas
+          if [ -z "${DATABASE_URL}" ]; then
+            if [ -n "$PGHOST" ] && [ -n "$PGDATABASE" ] && [ -n "$PGUSER" ] && [ -n "$PGPASSWORD" ]; then
+              echo "PGHOST=$PGHOST" >> $GITHUB_ENV
+              echo "PGDATABASE=$PGDATABASE" >> $GITHUB_ENV
+              echo "PGUSER=$PGUSER" >> $GITHUB_ENV
+              echo "PGPASSWORD=$PGPASSWORD" >> $GITHUB_ENV
+              if [ -n "$PGPORT" ]; then echo "PGPORT=$PGPORT" >> $GITHUB_ENV; fi
+            fi
+          fi
+
+          # sslmode default
+          if [ -n "$PGSSLMODE" ]; then
+            echo "PGSSLMODE=$PGSSLMODE" >> $GITHUB_ENV
+          else
+            echo "PGSSLMODE=require" >> $GITHUB_ENV
+          fi
+
+      - name: Debug env (safe)
         run: |
           python - << 'PY'
           import os
-          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","MOVI_TOKEN"]
+          keys = ["DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE","MOVI_TOKEN","MOVIDESK_TOKEN"]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
-      - name: Run range scan
+      - name: Run scanner
         env:
-          # --- Postgres (use DATABASE_URL OR the PG* set) ---
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PGHOST: ${{ secrets.PGHOST }}
-          PGDATABASE: ${{ secrets.PGDATABASE }}
-          PGUSER: ${{ secrets.PGUSER }}
-          PGPASSWORD: ${{ secrets.PGPASSWORD }}
-          PGPORT: ${{ secrets.PGPORT }}
+          # Movidesk (no seu log, você já usa MOVI_TOKEN)
+          MOVI_TOKEN: ${{ secrets.MOVI_TOKEN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_BASE_URL: ${{ secrets.MOVIDESK_BASE_URL }}
 
-          # --- Movidesk ---
-          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVI_BASE_URL: "https://api.movidesk.com/public/v1"
+          # Configs do scan
+          DB_SCHEMA: visualizacao_resolvidos
+          TICKETS_TABLE: tickets_mesclados
+          CONTROL_TABLE: range_scan_control
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size || '80' }}
 
-          # --- Tables ---
-          DB_SCHEMA: "visualizacao_resolvidos"
-          CONTROL_TABLE: "range_scan_control"
-          MERGED_TABLE: "tickets_mesclados"
-
-          # --- Behavior ---
-          # Ajuste BATCH_SIZE de acordo com o limite 10 req/min:
-          #  - 80 ids ~ 8-9 min (se MOVI_RPM=9)
-          #  - 500 ids ~ ~55 min (não cabe em 10 min)
-          BATCH_SIZE: "80"
-          MOVI_RPM: "9"
-          DRY_RUN: "false"
-          HTTP_TIMEOUT: "30"
+          LOG_LEVEL: INFO
         run: |
+          # ajuste o nome do arquivo conforme o seu repo
           python sync_range_tickets_merged.py
