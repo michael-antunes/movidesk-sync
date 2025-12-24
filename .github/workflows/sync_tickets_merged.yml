@@ -1,37 +1,14 @@
-name: Sync Movidesk - Tickets Mesclados
+name: Sync Movidesk - Tickets Merged
 
 on:
-  workflow_dispatch:
-    inputs:
-      lookback_days:
-        description: "Quantos dias para trás (se for primeira carga / tabela vazia)"
-        required: false
-        default: "30"
-      window_days:
-        description: "Tamanho da janela (dias) por requisição no /tickets/merged"
-        required: false
-        default: "7"
-      db_schema:
-        description: "Schema no Postgres"
-        required: false
-        default: "visualizacao_resolvidos"
-      table_name:
-        description: "Tabela no Postgres"
-        required: false
-        default: "tickets_mesclados"
-
+  workflow_dispatch: {}
   schedule:
-    # 06:10 UTC ~= 03:10 America/Sao_Paulo (BRT)
-    - cron: "10 6 * * *"
-
-concurrency:
-  group: movidesk-sync-tickets-merged
-  cancel-in-progress: false
+    # 06:20 UTC = 03:20 America/Sao_Paulo (UTC-3) (aprox)
+    - cron: "20 6 * * *"
 
 jobs:
-  sync:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -42,38 +19,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Sanity check secrets (sem vazar valor)
+      - name: Run sync tickets merged
         env:
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python - <<'PY'
-          import os, sys
-          missing=[]
-          for k in ["MOVIDESK_API_TOKEN","DATABASE_URL"]:
-            if not os.getenv(k):
-              missing.append(k)
-          if missing:
-            print("Faltando secrets:", ", ".join(missing))
-            sys.exit(2)
-          print("Secrets OK (presentes).")
-          PY
-
-      - name: Run sync_tickets_merged.py
-        env:
-          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
-          # defaults (podem ser sobrescritos no workflow_dispatch)
-          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
-          WINDOW_DAYS: ${{ github.event.inputs.window_days || '7' }}
-          DB_SCHEMA: ${{ github.event.inputs.db_schema || 'visualizacao_resolvidos' }}
-          TABLE_NAME: ${{ github.event.inputs.table_name || 'tickets_mesclados' }}
+          # Opcional (defaults já cobrem):
+          DB_SCHEMA: visualizacao_resolvidos
+          DB_TABLE: tickets_mesclados
 
+          LOOKBACK_DAYS: "30"
+          WINDOW_DAYS: "7"
+
+          LOG_LEVEL: INFO
+          # DRY_RUN: "true"
         run: |
           python sync_tickets_merged.py
