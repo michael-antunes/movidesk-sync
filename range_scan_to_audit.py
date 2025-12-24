@@ -29,14 +29,17 @@ def to_utc(d):
 
 
 def iso_z(d):
-    return to_utc(d).strftime("%Y-%m-%dT%H:%M:%SZ")
+    d = to_utc(d)
+    return d.isoformat().replace("+00:00", "Z")
 
 
 def parse_dt(s):
     if not s:
         return None
     try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).astimezone(timezone.utc)
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
@@ -67,15 +70,58 @@ def ensure_table():
             """
         )
         cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
-        if cur.fetchone()[0] == 0:
+        n = cur.fetchone()[0]
+        if n == 0:
             cur.execute(
                 """
-                insert into visualizacao_resolvidos.range_scan_control
-                  (data_inicio, data_fim, ultima_data_validada)
+                insert into visualizacao_resolvidos.range_scan_control(data_fim, data_inicio, ultima_data_validada)
                 values (now(), timestamptz '2018-01-01 00:00:00+00', now())
                 """
             )
         c.commit()
+
+
+def mesclados_last_updates(cur, ids):
+    if not ids:
+        return {}
+    cur.execute(
+        """
+        select column_name
+        from information_schema.columns
+        where table_schema = 'visualizacao_resolvidos'
+          and table_name = 'tickets_mesclados'
+        """
+    )
+    cols = [r[0] for r in cur.fetchall()]
+    if not cols:
+        return {}
+    lu_col = None
+    for c in cols:
+        lc = c.lower()
+        if lc in ("last_update", "lastupdate", "updated_at", "last_updated_at", "lastupdateat"):
+            lu_col = c
+            break
+    if lu_col is None:
+        for c in cols:
+            lc = c.lower()
+            if "last" in lc and "update" in lc:
+                lu_col = c
+                break
+    if lu_col is None:
+        return {}
+    try:
+        cur.execute(
+            f"select ticket_id, {lu_col} from visualizacao_resolvidos.tickets_mesclados where ticket_id = any(%s)",
+            (ids,),
+        )
+    except Exception:
+        return {}
+    out = {}
+    for tid, lu in cur.fetchall():
+        if tid is None or lu is None:
+            continue
+        out[int(tid)] = lu
+    return out
 
 
 def fetch_page(params):
@@ -95,14 +141,13 @@ def do_one_cycle():
             limit 1
             """
         )
-        data_inicio, data_fim, ultima = cur.fetchone()
-
-    if ultima <= data_fim:
-        return True, 0
+        row = cur.fetchone()
+        data_inicio, data_fim, ultima = row[0], row[1], row[2]
 
     ids = []
     api_last = {}
     min_lu = None
+
     skip = 0
 
     while True:
@@ -134,8 +179,6 @@ def do_one_cycle():
                 api_last[tid] = lu
                 if min_lu is None or lu < min_lu:
                     min_lu = lu
-            if len(ids) >= LIMIT:
-                break
 
         if len(ids) >= LIMIT:
             break
@@ -160,8 +203,14 @@ def do_one_cycle():
             rows = cur.fetchall()
             db_last = {int(r[0]): r[1] for r in rows}
 
+            mesclados_last = mesclados_last_updates(cur, ids)
+
             for tid in ids:
                 api_dt = to_utc(api_last.get(tid))
+                m_dt = mesclados_last.get(tid)
+                if m_dt is not None and api_dt is not None:
+                    if to_utc(m_dt) >= api_dt:
+                        continue
                 db_dt = db_last.get(tid)
                 if db_dt is None:
                     missing.append(tid)
@@ -174,13 +223,11 @@ def do_one_cycle():
             if rid is None:
                 cur.execute(
                     """
-                    insert into visualizacao_resolvidos.audit_recent_run
-                      (window_start, window_end, total_api, missing_total, run_at,
-                       window_from, window_to, total_local, notes)
-                    values (now(), now(), 0, 0, now(), %s, %s, 0, 'range-scan-semanal')
+                    insert into visualizacao_resolvidos.audit_recent_run(table_name, range_count, api_ids, inserted_missing)
+                    values (%s, 0, 0, 0)
                     returning id
                     """,
-                    (data_fim, ultima),
+                    ("tickets_resolvidos",),
                 )
                 rid = cur.fetchone()[0]
 
