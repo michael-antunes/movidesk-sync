@@ -14,8 +14,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    outputs:
-      done: ${{ steps.check.outputs.done }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,45 +34,37 @@ jobs:
           RANGE_SCAN_THROTTLE: "0.25"
           RANGE_SCAN_MAX_RUNTIME_SEC: "240"
           RANGE_SCAN_SLEEP_SEC: "0"
-        run: |
-          python range_scan_to_audit.py
+        run: python range_scan_to_audit.py
 
-      - name: Check done (ultima_data_validada = data_fim)
-        id: check
+      - name: Check done and dispatch again if needed
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           DONE=$(python - <<'PY'
 import os, psycopg2
 dsn=os.environ["NEON_DSN"]
 with psycopg2.connect(dsn) as c:
-    with c.cursor() as cur:
-        cur.execute("""
-          select case
-            when data_fim is null then 0
-            when coalesce(ultima_data_validada, data_inicio) = data_fim then 1
-            else 0
-          end
-          from visualizacao_resolvidos.range_scan_control
-          limit 1
-        """)
-        r=cur.fetchone()
+  with c.cursor() as cur:
+    cur.execute("""
+      select case
+        when data_fim is null then 0
+        when coalesce(ultima_data_validada, data_inicio) = data_fim then 1
+        else 0
+      end
+      from visualizacao_resolvidos.range_scan_control
+      limit 1
+    """)
+    r=cur.fetchone()
 print(int(r[0]) if r else 0)
 PY
 )
-          echo "done=${DONE}" >> "$GITHUB_OUTPUT"
+          echo "done=${DONE}"
 
-  rerun:
-    needs: run
-    if: needs.run.outputs.done != '1'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch again
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -L -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+          if [ "${DONE}" != "1" ]; then
+            curl -sS -o /dev/null -w "%{http_code}\n" -L -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
+              -d '{"ref":"${{ github.ref_name }}"}'
+          fi
