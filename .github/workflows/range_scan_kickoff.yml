@@ -1,40 +1,37 @@
-name: Movidesk - Range scan KICKOFF (quinta 20h BRT)
+name: Movidesk - Scan Kickoff
 
 on:
-  schedule:
-    - cron: "0 23 * * 4"
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1"
 
 concurrency:
-  group: range-scan-kickoff
+  group: movidesk-scan-kickoff
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   kickoff:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install psycopg2-binary
 
-      - name: Kickoff range scan
+      - name: Kickoff (range/date)
+        run: python range_scan_kickoff.py
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: python range_scan_kickoff.py
 
-      - name: Disparar worker de range scan
+      - name: Dispatch range worker
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -42,9 +39,9 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d '{"ref":"main"}'
+            -d '{"ref":"${{ github.ref_name }}"}'
 
-      - name: Disparar worker de ID scan
+      - name: Dispatch id worker
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -52,4 +49,4 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/id_scan_to_audit_missing.yml/dispatches \
-            -d '{"ref":"main"}'
+            -d '{"ref":"${{ github.ref_name }}"}'
