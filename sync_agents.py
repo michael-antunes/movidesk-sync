@@ -141,14 +141,6 @@ def _extract_time_squad_from_custom_fields(p):
 def _val(x):
     return x if x not in ("", [], {}) else None
 
-def _raw_min(p):
-    if not isinstance(p, dict):
-        return p
-    d = dict(p)
-    if "emails" in d:
-        d.pop("emails", None)
-    return d
-
 def normalize(p):
     pid = p.get("id")
     try:
@@ -162,7 +154,6 @@ def normalize(p):
     team_primary, teams = _extract_teams(p)
     time_squad = _extract_time_squad_from_custom_fields(p)
     raw_full = p
-    raw = _raw_min(p)
     return {
         "agent_id": agent_id,
         "name": _val(name),
@@ -171,24 +162,23 @@ def normalize(p):
         "teams": teams,
         "access_type": _val(access_type),
         "is_active": bool(is_active) if is_active is not None else None,
-        "raw": raw,
         "raw_full": raw_full,
         "time_squad": _val(time_squad),
     }
 
 def upsert_agentes(rows):
     assert NEON_DSN, "NEON_DSN ausente"
-    template = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)"
+    template = "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)"
     values = []
     for r in rows:
         values.append((
             r["agent_id"], r["name"], r["email"], r["team_primary"], r["teams"],
-            r["access_type"], r["is_active"], Json(r["raw"]), Json(r["raw_full"]), r["time_squad"]
+            r["access_type"], r["is_active"], Json(r["raw_full"]), r["time_squad"]
         ))
     with psycopg2.connect(NEON_DSN) as conn, conn.cursor() as cur:
         sql = """
         INSERT INTO visualizacao_agentes.agentes
-          (agent_id, name, email, team_primary, teams, access_type, is_active, raw, raw_full, updated_at, time_squad)
+          (agent_id, name, email, team_primary, teams, access_type, is_active, raw_full, updated_at, time_squad)
         VALUES %s
         ON CONFLICT (agent_id) DO UPDATE SET
           name = EXCLUDED.name,
@@ -197,7 +187,6 @@ def upsert_agentes(rows):
           teams = EXCLUDED.teams,
           access_type = EXCLUDED.access_type,
           is_active = EXCLUDED.is_active,
-          raw = EXCLUDED.raw,
           raw_full = EXCLUDED.raw_full,
           updated_at = NOW(),
           time_squad = COALESCE(EXCLUDED.time_squad, visualizacao_agentes.agentes.time_squad)
@@ -212,7 +201,7 @@ def main():
         return
     batch = int(os.getenv("UPSERT_BATCH", "1000"))
     for i in range(0, len(rows), batch):
-        upsert_agentes(rows[i:i+batch])
+        upsert_agentes(rows[i:i + batch])
 
 if __name__ == "__main__":
     main()
