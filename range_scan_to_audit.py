@@ -27,28 +27,11 @@ def conn():
     return psycopg2.connect(DSN)
 
 
-def to_utc(dt):
-    if dt is None:
-        return None
-    if isinstance(dt, str):
-        dt = parse_dt(dt)
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(microsecond=0)
-
-
-def iso_z(dt):
-    dt = to_utc(dt)
-    return dt.isoformat().replace("+00:00", "Z")
-
-
 def parse_dt(s):
     if not s:
         return None
     try:
-        if s.endswith("Z"):
+        if isinstance(s, str) and s.endswith("Z"):
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         else:
             dt = datetime.fromisoformat(s)
@@ -57,6 +40,23 @@ def parse_dt(s):
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def to_utc(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        dt = parse_dt(dt)
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def iso_z(dt):
+    dt = to_utc(dt)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def fetch_page(params):
@@ -86,6 +86,7 @@ def ensure_run_id(cur, data_fim, ultima):
         return int(rid)
 
     cols = audit_recent_run_cols(cur)
+
     ins_cols = []
     ins_vals = []
     params = []
@@ -277,7 +278,7 @@ def do_one_cycle():
 
         for t in page:
             lu = to_utc(parse_dt(t.get("lastUpdate")))
-            if not lu:
+            if lu is None:
                 continue
             if lu < data_fim or lu > ultima:
                 continue
@@ -349,6 +350,9 @@ def do_one_cycle():
                 )
 
         nv = min_lu if min_lu is not None else data_fim
+        if nv < data_fim:
+            nv = data_fim
+
         cur.execute(
             f"update {SCHEMA}.range_scan_control set ultima_data_validada=%s",
             (nv,),
