@@ -1,6 +1,7 @@
 name: Movidesk - Range scan to audit (loop)
 
-on: [workflow_dispatch]
+on:
+  workflow_dispatch:
 
 concurrency:
   group: range-scan-to-audit-loop
@@ -38,7 +39,7 @@ jobs:
         run: |
           python range_scan_to_audit.py
 
-      - name: Check done (coalesce(ultima_data_validada,data_inicio) <= data_fim)
+      - name: Check done (ultima_data_validada = data_fim)
         id: check
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -52,7 +53,7 @@ with psycopg2.connect(dsn) as c:
     with c.cursor() as cur:
         cur.execute("""
           select
-            (coalesce(ultima_data_validada, data_inicio) <= data_fim) as done,
+            (coalesce(ultima_data_validada, data_inicio) = data_fim) as done,
             coalesce(ultima_data_validada, data_inicio) as ultima,
             data_fim
           from visualizacao_resolvidos.range_scan_control
