@@ -1,7 +1,24 @@
-name: Movidesk - Range scan worker
+name: Movidesk - Range scan worker (loop até ultima_data_validada = data_fim)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      limit:
+        type: number
+        required: false
+        default: 400
+      throttle:
+        type: number
+        required: false
+        default: 0.25
+      max_runtime_sec:
+        type: number
+        required: false
+        default: 240
+      sleep_sec:
+        type: number
+        required: false
+        default: 0
 
 concurrency:
   group: range-scan-worker
@@ -27,38 +44,69 @@ jobs:
         run: pip install requests psycopg2-binary
 
       - name: Range scan
-        run: |
-          python range_scan_to_audit.py | tee scan_out.txt
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT: "400"
-          RANGE_SCAN_THROTTLE: "0.25"
-          RANGE_SCAN_MAX_RUNTIME_SEC: "240"
-          RANGE_SCAN_SLEEP_SEC: "0"
+          RANGE_SCAN_LIMIT: ${{ inputs.limit }}
+          RANGE_SCAN_THROTTLE: ${{ inputs.throttle }}
+          RANGE_SCAN_MAX_RUNTIME_SEC: ${{ inputs.max_runtime_sec }}
+          RANGE_SCAN_SLEEP_SEC: ${{ inputs.sleep_sec }}
+        run: |
+          python range_scan_to_audit.py | tee scan_out.txt
 
       - name: done?
         id: done
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
-          if grep -q "hit_end=True" scan_out.txt || grep -q "FIM: ultima_data_validada já alcançou data_fim" scan_out.txt; then
-            echo "done=1" >> $GITHUB_OUTPUT
-          else
-            echo "done=0" >> $GITHUB_OUTPUT
-          fi
+          done=$(python - <<'PY'
+import os
+import psycopg2
+
+dsn = os.environ["NEON_DSN"]
+with psycopg2.connect(dsn) as c:
+    with c.cursor() as cur:
+        cur.execute("""
+          select
+            (coalesce(ultima_data_validada, data_inicio) = data_fim) as done,
+            coalesce(ultima_data_validada, data_inicio) as ultima,
+            data_fim
+          from visualizacao_resolvidos.range_scan_control
+          limit 1
+        """)
+        row = cur.fetchone()
+
+if not row:
+    print("0")
+else:
+    done, ultima, data_fim = row
+    print("1" if bool(done) else "0")
+    print(f"ultima_data_validada={ultima} data_fim={data_fim}")
+PY
+          )
+          flag=$(echo "$done" | head -n1)
+          echo "done=${flag}" >> $GITHUB_OUTPUT
+          echo "$done" | tail -n +2 || true
 
   rerun:
     needs: run
     if: needs.run.outputs.done != '1'
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
     steps:
       - name: Dispatch again
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
+          LIMIT: ${{ github.event.inputs.limit || '400' }}
+          THROTTLE: ${{ github.event.inputs.throttle || '0.25' }}
+          MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec || '240' }}
+          SLEEP_SEC: ${{ github.event.inputs.sleep_sec || '0' }}
         run: |
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d "{\"ref\":\"${REF_NAME}\"}"
+            -d "{\"ref\":\"${REF_NAME}\",\"inputs\":{\"limit\":\"${LIMIT}\",\"throttle\":\"${THROTTLE}\",\"max_runtime_sec\":\"${MAX_RUNTIME_SEC}\",\"sleep_sec\":\"${SLEEP_SEC}\"}}"
