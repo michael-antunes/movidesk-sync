@@ -1,12 +1,10 @@
-name: Movidesk - Scan Kickoff
+name: Movidesk - Range scan to audit (loop)
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 3 * * 1"
 
 concurrency:
-  group: movidesk-scan-kickoff
+  group: range-scan-to-audit-loop
   cancel-in-progress: false
 
 permissions:
@@ -14,8 +12,10 @@ permissions:
   actions: write
 
 jobs:
-  kickoff:
+  run:
     runs-on: ubuntu-latest
+    outputs:
+      done: ${{ steps.check.outputs.done }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,24 +24,52 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install psycopg2-binary
+        run: pip install requests psycopg2-binary
 
-      - name: Kickoff (range/date)
-        run: python range_scan_kickoff.py
+      - name: Run range_scan_to_audit.py
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-
-      - name: Dispatch sync_range_tickets_merged
-        env:
-          GH_TOKEN: ${{ github.token }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
+          RANGE_SCAN_PAGE_TOP: "100"
+          RANGE_SCAN_LIMIT: "400"
+          RANGE_SCAN_THROTTLE: "0.25"
+          RANGE_SCAN_MAX_RUNTIME_SEC: "240"
+          RANGE_SCAN_SLEEP_SEC: "0"
         run: |
-          curl -L -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+          python range_scan_to_audit.py
 
-      - name: Dispatch range worker
+      - name: Check done (ultima_data_validada = data_fim)
+        id: check
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
+          DONE=$(python - <<'PY'
+import os, psycopg2
+dsn=os.environ["NEON_DSN"]
+with psycopg2.connect(dsn) as c:
+    with c.cursor() as cur:
+        cur.execute("""
+          select case
+            when data_fim is null then 0
+            when coalesce(ultima_data_validada, data_inicio) = data_fim then 1
+            else 0
+          end
+          from visualizacao_resolvidos.range_scan_control
+          limit 1
+        """)
+        r=cur.fetchone()
+print(int(r[0]) if r else 0)
+PY
+)
+          echo "done=${DONE}" >> "$GITHUB_OUTPUT"
+
+  rerun:
+    needs: run
+    if: needs.run.outputs.done != '1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch again
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -49,14 +77,4 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
-
-      - name: Dispatch id worker
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -L -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/id_scan_to_audit_missing.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'
