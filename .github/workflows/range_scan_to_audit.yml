@@ -1,27 +1,10 @@
-name: Movidesk - Range scan worker (loop até ultima_data_validada = data_fim)
+name: Movidesk - Range scan to audit (loop)
 
 on:
-  workflow_dispatch:
-    inputs:
-      limit:
-        type: number
-        required: false
-        default: 400
-      throttle:
-        type: number
-        required: false
-        default: 0.25
-      max_runtime_sec:
-        type: number
-        required: false
-        default: 240
-      sleep_sec:
-        type: number
-        required: false
-        default: 0
+  workflow_dispatch: {}
 
 concurrency:
-  group: range-scan-worker
+  group: range-scan-to-audit-loop
   cancel-in-progress: false
 
 permissions:
@@ -32,7 +15,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     outputs:
-      done: ${{ steps.done.outputs.done }}
+      done: ${{ steps.check.outputs.done }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,28 +23,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install requests psycopg2-binary
 
-      - name: Range scan
+      - name: Run range scan
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           MOVIDESK_API_TOKEN: ${{ secrets.MOVIDESK_API_TOKEN }}
-          RANGE_SCAN_LIMIT: ${{ github.event.inputs.limit }}
-          RANGE_SCAN_THROTTLE: ${{ github.event.inputs.throttle }}
-          RANGE_SCAN_MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec }}
-          RANGE_SCAN_SLEEP_SEC: ${{ github.event.inputs.sleep_sec }}
+          RANGE_SCAN_PAGE_TOP: "100"
+          RANGE_SCAN_LIMIT: "400"
+          RANGE_SCAN_THROTTLE: "0.25"
+          RANGE_SCAN_MAX_RUNTIME_SEC: "240"
+          RANGE_SCAN_SLEEP_SEC: "0"
         run: |
-          RANGE_SCAN_LIMIT="${RANGE_SCAN_LIMIT:-400}"
-          RANGE_SCAN_THROTTLE="${RANGE_SCAN_THROTTLE:-0.25}"
-          RANGE_SCAN_MAX_RUNTIME_SEC="${RANGE_SCAN_MAX_RUNTIME_SEC:-240}"
-          RANGE_SCAN_SLEEP_SEC="${RANGE_SCAN_SLEEP_SEC:-0}"
-          export RANGE_SCAN_LIMIT RANGE_SCAN_THROTTLE RANGE_SCAN_MAX_RUNTIME_SEC RANGE_SCAN_SLEEP_SEC
           python range_scan_to_audit.py | tee scan_out.txt
 
-      - name: done?
-        id: done
+      - name: Check done (ultima_data_validada <= data_fim)
+        id: check
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
@@ -74,8 +53,12 @@ with psycopg2.connect(dsn) as c:
     with c.cursor() as cur:
         cur.execute("""
           select
-            (coalesce(ultima_data_validada, data_inicio) = data_fim) as done,
-            coalesce(ultima_data_validada, data_inicio) as ultima,
+            case
+              when ultima_data_validada is null then false
+              when ultima_data_validada <= data_fim then true
+              else false
+            end as done,
+            ultima_data_validada,
             data_fim
           from visualizacao_resolvidos.range_scan_control
           limit 1
@@ -85,9 +68,9 @@ with psycopg2.connect(dsn) as c:
 if not row:
     print("0")
 else:
-    done, ultima, data_fim = row
+    done, ultima, fim = row
     print("1" if bool(done) else "0")
-    print(f"ultima_data_validada={ultima} data_fim={data_fim}")
+    print(f"ultima_data_validada={ultima} data_fim={fim}")
 PY
           cat done_check.txt
           if head -n1 done_check.txt | grep -q '^1$'; then
@@ -107,18 +90,9 @@ PY
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
-          LIMIT: ${{ github.event.inputs.limit }}
-          THROTTLE: ${{ github.event.inputs.throttle }}
-          MAX_RUNTIME_SEC: ${{ github.event.inputs.max_runtime_sec }}
-          SLEEP_SEC: ${{ github.event.inputs.sleep_sec }}
         run: |
-          LIMIT="${LIMIT:-400}"
-          THROTTLE="${THROTTLE:-0.25}"
-          MAX_RUNTIME_SEC="${MAX_RUNTIME_SEC:-240}"
-          SLEEP_SEC="${SLEEP_SEC:-0}"
-
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d "{\"ref\":\"${REF_NAME}\",\"inputs\":{\"limit\":\"${LIMIT}\",\"throttle\":\"${THROTTLE}\",\"max_runtime_sec\":\"${MAX_RUNTIME_SEC}\",\"sleep_sec\":\"${SLEEP_SEC}\"}}"
+            -d "{\"ref\":\"${REF_NAME}\"}"
