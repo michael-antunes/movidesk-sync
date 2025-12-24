@@ -1,172 +1,185 @@
 import os
+import time
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+
+import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
-DSN = os.getenv("NEON_DSN")
-BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "50"))
-ITERATIONS = int(os.getenv("ID_SCAN_ITERATIONS", "1"))
-TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
-if not DSN:
-    raise RuntimeError("NEON_DSN não definido")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)7s  %(message)s")
+
+BASE = "https://api.movidesk.com/public/v1"
+TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+DSN = os.getenv("NEON_DSN")
+
+TABLE_NAME = "tickets_resolvidos"
+BASE_STATUSES = {"Resolved", "Closed", "Canceled"}
+
+BATCH_SIZE = int(os.getenv("ID_VALIDATE_BATCH_SIZE", "200"))
+MAX_RUNTIME_SEC = int(os.getenv("ID_VALIDATE_MAX_RUNTIME_SEC", "240"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
+ATTEMPTS = int(os.getenv("MOVIDESK_ATTEMPTS", "5"))
+CONNECT_TIMEOUT = int(os.getenv("MOVIDESK_CONNECT_TIMEOUT", "10"))
+READ_TIMEOUT = int(os.getenv("MOVIDESK_READ_TIMEOUT", "60"))
+
+START_ID_ENV = os.getenv("ID_VALIDATE_START_ID")
+END_ID = int(os.getenv("ID_VALIDATE_END_ID", "1"))
+
+SELECT_MIN = "id,baseStatus,isDeleted,lastUpdate"
+
+
+def pg_conn():
+    return psycopg2.connect(DSN)
+
 
 def ensure_control(cur):
     cur.execute("create schema if not exists visualizacao_resolvidos")
     cur.execute(
         """
-        create table if not exists visualizacao_resolvidos.range_scan_control(
-          data_fim timestamptz not null,
-          data_inicio timestamptz not null,
-          ultima_data_validada timestamptz,
-          id_inicial bigint,
-          id_final bigint,
-          id_atual bigint
+        create table if not exists visualizacao_resolvidos.id_validate_api_control(
+          id_cursor bigint not null
         )
         """
     )
-    cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_inicial bigint")
-    cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_final bigint")
-    cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_atual bigint")
+    cur.execute("select count(*) from visualizacao_resolvidos.id_validate_api_control")
+    if cur.fetchone()[0] == 0:
+        cur.execute("insert into visualizacao_resolvidos.id_validate_api_control(id_cursor) values (0)")
 
-def init_control_row(cur):
-    cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
-    if cur.fetchone()[0] != 0:
-        return
 
+def get_max_known_id(cur):
     cur.execute(
         """
-        select
-          min(last_update) filter (where last_update is not null) as min_lu,
-          max(last_update) filter (where last_update is not null) as max_lu,
-          min(ticket_id) as min_id,
-          max(ticket_id) as max_id
-        from visualizacao_resolvidos.tickets_resolvidos_detail
-        """
-    )
-    min_lu, max_lu, min_id, max_id = cur.fetchone()
-
-    if max_lu is None:
-        cur.execute("select now()")
-        max_lu = cur.fetchone()[0]
-    if min_lu is None:
-        cur.execute("select now() - interval '1 day'")
-        min_lu = cur.fetchone()[0]
-
-    if max_id is None or min_id is None:
-        cur.execute("select min(ticket_id), max(ticket_id) from dados_gerais.tickets_suporte")
-        min_id2, max_id2 = cur.fetchone()
-        if min_id is None:
-            min_id = min_id2
-        if max_id is None:
-            max_id = max_id2
-
-    id_inicial = max_id
-    id_final = min_id
-    id_atual = id_inicial
-
-    cur.execute(
-        """
-        insert into visualizacao_resolvidos.range_scan_control
-          (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual)
-        values (%s, %s, %s, %s, %s, %s)
-        """,
-        (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual),
-    )
-
-def ensure_missing_tables(cur):
-    cur.execute(
-        """
-        create table if not exists visualizacao_resolvidos.audit_recent_run(
-          id bigserial primary key,
-          started_at timestamptz not null default now(),
-          window_start timestamptz not null,
-          window_end timestamptz not null,
-          total_api int not null,
-          missing_total int not null default 0,
-          run_at timestamptz,
-          window_from timestamptz,
-          window_to timestamptz,
-          total_local int,
-          notes text
+        select greatest(
+          coalesce((select max(ticket_id) from visualizacao_resolvidos.tickets_resolvidos_detail),0),
+          coalesce((select max(ticket_id::bigint) from visualizacao_atual.tickets_abertos),0),
+          coalesce((select max(greatest(ticket_id, merged_into_id)) from visualizacao_resolvidos.tickets_mesclados),0)
         )
         """
     )
-    cur.execute(
-        """
-        create table if not exists visualizacao_resolvidos.audit_recent_missing(
-          run_id bigint not null references visualizacao_resolvidos.audit_recent_run(id) on delete cascade,
-          table_name text not null,
-          ticket_id integer not null
-        )
-        """
-    )
-    cur.execute(
-        """
-        create unique index if not exists audit_recent_missing_uniq
-        on visualizacao_resolvidos.audit_recent_missing(table_name, ticket_id)
-        """
-    )
+    return int(cur.fetchone()[0] or 0)
+
+
+def get_cursor(cur):
+    cur.execute("select id_cursor from visualizacao_resolvidos.id_validate_api_control limit 1")
+    return int(cur.fetchone()[0] or 0)
+
+
+def set_cursor(cur, v):
+    cur.execute("update visualizacao_resolvidos.id_validate_api_control set id_cursor=%s", (int(v),))
+
 
 def create_run(cur, notes):
     cur.execute(
         """
-        insert into visualizacao_resolvidos.audit_recent_run(window_start, window_end, total_api, missing_total, notes)
-        values (now(), now(), 0, 0, %s)
+        insert into visualizacao_resolvidos.audit_recent_run
+          (window_start, window_end, total_api, missing_total, run_at, notes)
+        values (now(), now(), 0, 0, now(), %s)
         returning id
         """,
         (notes,),
     )
     return int(cur.fetchone()[0])
 
-def fetch_control(cur):
-    cur.execute(
-        """
-        select id_inicial, id_final, id_atual
-        from visualizacao_resolvidos.range_scan_control
-        limit 1
-        """
-    )
-    row = cur.fetchone()
-    if not row:
-        return None, None, None
-    return row[0], row[1], row[2]
 
-def update_control(cur, id_inicial, id_final, id_atual):
+def update_run(cur, run_id, total_api, missing_total, total_local):
     cur.execute(
         """
-        update visualizacao_resolvidos.range_scan_control
-           set id_inicial = %s,
-               id_final = %s,
-               id_atual = %s
+        update visualizacao_resolvidos.audit_recent_run
+           set window_end = now(),
+               total_api = %s,
+               missing_total = %s,
+               total_local = %s
+         where id = %s
         """,
-        (id_inicial, id_final, id_atual),
+        (int(total_api), int(missing_total), int(total_local), int(run_id)),
     )
 
-def ids_exist_tickets_suporte(cur, ids):
-    if not ids:
-        return set()
+
+def fetch_skip_sets(cur, ids):
     cur.execute(
-        """
-        select ticket_id
-        from dados_gerais.tickets_suporte
-        where ticket_id = any(%s)
-        """,
+        "select ticket_id from visualizacao_resolvidos.tickets_resolvidos_detail where ticket_id = any(%s)",
         (ids,),
     )
-    return {int(r[0]) for r in cur.fetchall()}
+    in_detail = {int(r[0]) for r in cur.fetchall()}
 
-def ids_in_mesclados(cur, ids):
-    if not ids:
-        return set()
+    cur.execute(
+        "select ticket_id::bigint from visualizacao_atual.tickets_abertos where ticket_id::bigint = any(%s)",
+        (ids,),
+    )
+    in_abertos = {int(r[0]) for r in cur.fetchall()}
+
     cur.execute(
         """
         select ticket_id
-        from visualizacao_resolvidos.tickets_mesclados
-        where ticket_id = any(%s) or merged_into_id = any(%s)
+          from visualizacao_resolvidos.tickets_mesclados
+         where ticket_id = any(%s) or merged_into_id = any(%s)
         """,
         (ids, ids),
     )
-    return {int(r[0]) for r in cur.fetchall()}
+    in_mesclados = {int(r[0]) for r in cur.fetchall()}
+
+    cur.execute(
+        """
+        select ticket_id
+          from visualizacao_resolvidos.audit_recent_missing
+         where table_name = %s
+           and ticket_id = any(%s)
+        """,
+        (TABLE_NAME, ids),
+    )
+    in_missing = {int(r[0]) for r in cur.fetchall()}
+
+    return in_detail, in_abertos, in_mesclados, in_missing
+
+
+def http_get(session, url, params):
+    last = None
+    for i in range(1, ATTEMPTS + 1):
+        try:
+            r = session.get(url, params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(10, 2 ** (i - 1)))
+                continue
+            return r
+        except Exception as e:
+            last = e
+            time.sleep(min(10, 2 ** (i - 1)))
+    raise last if last else RuntimeError("http failed")
+
+
+def api_check_ticket(session, ticket_id):
+    p = {
+        "token": TOKEN,
+        "includeDeletedItems": "true",
+        "$select": SELECT_MIN,
+        "id": str(int(ticket_id)),
+    }
+    r = http_get(session, f"{BASE}/tickets", p)
+    if r.status_code == 200:
+        j = r.json()
+        if isinstance(j, dict) and j.get("id") is not None:
+            return True, str(j.get("baseStatus") or "")
+        return False, ""
+    if r.status_code != 404:
+        return False, ""
+
+    p2 = {
+        "token": TOKEN,
+        "includeDeletedItems": "true",
+        "$select": SELECT_MIN,
+        "$filter": f"id eq {int(ticket_id)}",
+    }
+    r2 = http_get(session, f"{BASE}/tickets/past", p2)
+    if r2.status_code == 200:
+        j2 = r2.json()
+        if isinstance(j2, list) and len(j2) > 0 and isinstance(j2[0], dict) and j2[0].get("id") is not None:
+            return True, str(j2[0].get("baseStatus") or "")
+        return False, ""
+    return False, ""
+
 
 def insert_missing(cur, run_id, ids):
     if not ids:
@@ -174,64 +187,77 @@ def insert_missing(cur, run_id, ids):
     execute_values(
         cur,
         """
-        insert into visualizacao_resolvidos.audit_recent_missing(run_id, table_name, ticket_id)
+        insert into visualizacao_resolvidos.audit_recent_missing
+          (run_id, table_name, ticket_id)
         values %s
         on conflict do nothing
         """,
-        [(run_id, TABLE_NAME, int(t)) for t in ids],
+        [(int(run_id), TABLE_NAME, int(i)) for i in ids],
     )
     return len(ids)
 
+
 def main():
-    with psycopg2.connect(DSN) as c, c.cursor() as cur:
+    if not DSN or not TOKEN:
+        raise RuntimeError("NEON_DSN e MOVIDESK_TOKEN são obrigatórios")
+
+    with pg_conn() as conn, conn.cursor() as cur:
         ensure_control(cur)
-        init_control_row(cur)
-        ensure_missing_tables(cur)
-        run_id = create_run(cur, "id-scan: topo→base (skip mesclados) -> audit_recent_missing")
-        c.commit()
 
-        total_checked = 0
-        total_missing = 0
+        if START_ID_ENV:
+            start_id = int(START_ID_ENV)
+        else:
+            start_id = get_max_known_id(cur)
 
-        for _ in range(max(1, ITERATIONS)):
-            id_inicial, id_final, id_atual = fetch_control(cur)
-            if id_inicial is None or id_final is None:
-                break
+        cursor = get_cursor(cur)
+        if cursor <= 0 or cursor > start_id:
+            cursor = start_id
+            set_cursor(cur, cursor)
 
-            if id_atual is None:
-                id_atual = id_inicial
-                update_control(cur, id_inicial, id_final, id_atual)
-                c.commit()
+        run_id = create_run(cur, f"id-validate-api: range {cursor}->{END_ID} | skip detail/abertos/mesclados | insert audit_missing")
+        conn.commit()
 
-            if id_atual < id_final:
-                break
+        session = requests.Session()
 
-            start_id = int(id_atual)
-            end_id = int(max(id_final, id_atual - BATCH_SIZE + 1))
-            batch = list(range(start_id, end_id - 1, -1))
-            total_checked += len(batch)
+        t0 = time.time()
+        total_scanned = 0
+        total_api = 0
+        total_insert = 0
 
-            exist = ids_exist_tickets_suporte(cur, batch)
-            mesclados = ids_in_mesclados(cur, batch)
-            missing = [i for i in batch if i not in exist and i not in mesclados]
+        while cursor >= END_ID and (time.time() - t0) < MAX_RUNTIME_SEC:
+            batch_end = max(END_ID, cursor - BATCH_SIZE + 1)
+            ids = list(range(cursor, batch_end - 1, -1))
+            total_scanned += len(ids)
 
-            total_missing += insert_missing(cur, run_id, missing)
+            in_detail, in_abertos, in_mesclados, in_missing = fetch_skip_sets(cur, ids)
+            skip = in_detail | in_abertos | in_mesclados | in_missing
+            candidates = [i for i in ids if i not in skip]
 
-            next_id = end_id - 1
-            update_control(cur, id_inicial, id_final, next_id)
-            c.commit()
+            valid = []
+            for tid in candidates:
+                ok, base_status = api_check_ticket(session, tid)
+                total_api += 1
+                if ok and base_status in BASE_STATUSES:
+                    valid.append(tid)
+                if THROTTLE > 0:
+                    time.sleep(THROTTLE)
 
-        cur.execute(
-            """
-            update visualizacao_resolvidos.audit_recent_run
-               set window_end = now(),
-                   total_api = %s,
-                   missing_total = %s
-             where id = %s
-            """,
-            (total_checked, total_missing, run_id),
+            total_insert += insert_missing(cur, run_id, valid)
+            cursor = batch_end - 1
+            set_cursor(cur, cursor)
+            conn.commit()
+
+        update_run(cur, run_id, total_api, total_insert, total_scanned)
+        conn.commit()
+
+        logging.info(
+            "Finalizado. scanned=%s api_checked=%s inserted=%s cursor=%s",
+            total_scanned,
+            total_api,
+            total_insert,
+            cursor,
         )
-        c.commit()
+
 
 if __name__ == "__main__":
     main()
