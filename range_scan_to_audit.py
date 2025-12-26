@@ -1,13 +1,12 @@
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg2
 from psycopg2.extras import execute_values
 import requests
 
 API = "https://api.movidesk.com/public/v1/tickets"
-
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
@@ -81,43 +80,60 @@ def table_cols(cur, schema, table):
     )
     return {r[0] for r in cur.fetchall()}
 
-def ensure_run_id(cur):
+def create_run(cur, data_fim, ultima):
     cols = table_cols(cur, SCHEMA, "audit_recent_run")
-    if not cols:
-        cur.execute(f"insert into {SCHEMA}.audit_recent_run default values returning id")
-        return int(cur.fetchone()[0])
+    ins_cols = []
+    ins_vals = []
+    params = []
 
-    if "table_name" in cols:
-        cur.execute(
-            f"insert into {SCHEMA}.audit_recent_run(table_name) values (%s) returning id",
-            (TABLE_NAME,),
-        )
-        return int(cur.fetchone()[0])
+    def add_expr(col, expr):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append(expr)
 
-    cur.execute(f"insert into {SCHEMA}.audit_recent_run default values returning id")
+    def add_param(col, val):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append("%s")
+            params.append(val)
+
+    add_expr("started_at", "now()")
+    add_expr("window_start", "now()")
+    add_expr("window_end", "now()")
+    add_expr("total_api", "0")
+    add_expr("missing_total", "0")
+    add_expr("run_at", "now()")
+    add_param("window_from", data_fim)
+    add_param("window_to", ultima)
+    add_param("notes", "range-scan")
+
+    cur.execute(
+        f"insert into {SCHEMA}.audit_recent_run({','.join(ins_cols)}) values ({','.join(ins_vals)}) returning id",
+        tuple(params),
+    )
     return int(cur.fetchone()[0])
 
-def update_run(cur, run_id, api_ids, inserted_missing, cycles):
+def update_run(cur, run_id, total_api, missing_total):
     cols = table_cols(cur, SCHEMA, "audit_recent_run")
     sets = []
-    args = []
-    if "api_ids" in cols:
-        sets.append("api_ids=%s")
-        args.append(int(api_ids))
-    if "inserted_missing" in cols:
-        sets.append("inserted_missing=%s")
-        args.append(int(inserted_missing))
-    if "range_count" in cols:
-        sets.append("range_count=%s")
-        args.append(int(cycles))
-    if "updated_at" in cols:
-        sets.append("updated_at=now()")
+    params = []
+
+    if "window_end" in cols:
+        sets.append("window_end=now()")
+    if "total_api" in cols:
+        sets.append("total_api=%s")
+        params.append(int(total_api))
+    if "missing_total" in cols:
+        sets.append("missing_total=%s")
+        params.append(int(missing_total))
+
     if not sets:
         return
-    args.append(int(run_id))
+
+    params.append(int(run_id))
     cur.execute(
         f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where id=%s",
-        tuple(args),
+        tuple(params),
     )
 
 def existing_in_missing(cur, ids):
@@ -159,162 +175,120 @@ def existing_in_detail(cur, ids):
     )
     return {int(r[0]) for r in cur.fetchall()}
 
-def mesclados_info(cur, ids):
+def mesclados_sets(cur, ids):
     if not ids:
-        return {}, set(), set()
-
+        return set()
     cols = table_cols(cur, SCHEMA, "tickets_mesclados")
     if not cols:
-        return {}, set(), set()
-
-    lu_col = None
-    for c in ("last_update", "updated_at", "lastupdate", "lastUpdate", "last_updated_at"):
-        if c in cols:
-            lu_col = c
-            break
-    if lu_col is None:
-        for c in cols:
-            lc = c.lower()
-            if "last" in lc and "update" in lc:
-                lu_col = c
-                break
-
-    ticket_last = {}
-    ticket_ids = set()
-    if lu_col:
-        cur.execute(
-            f"""
-            select ticket_id, {lu_col}
-            from {SCHEMA}.tickets_mesclados
-            where ticket_id = any(%s)
-            """,
-            (list(ids),),
-        )
-        for tid, lu in cur.fetchall():
-            if tid is None or lu is None:
-                continue
-            ticket_ids.add(int(tid))
-            ticket_last[int(tid)] = to_utc(parse_dt(lu))
-    else:
-        cur.execute(
-            f"""
-            select ticket_id
-            from {SCHEMA}.tickets_mesclados
-            where ticket_id = any(%s)
-            """,
-            (list(ids),),
-        )
-        for (tid,) in cur.fetchall():
-            if tid is not None:
-                ticket_ids.add(int(tid))
-
+        return set()
     cur.execute(
         f"""
-        select merged_into_id
+        select ticket_id as id
+        from {SCHEMA}.tickets_mesclados
+        where ticket_id = any(%s)
+        union
+        select merged_into_id as id
         from {SCHEMA}.tickets_mesclados
         where merged_into_id = any(%s)
         """,
-        (list(ids),),
+        (list(ids), list(ids)),
     )
-    merged_into = {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
+    out = set()
+    for (v,) in cur.fetchall():
+        if v is not None:
+            out.add(int(v))
+    return out
 
-    return ticket_last, ticket_ids, merged_into
+def read_control(cur):
+    cur.execute(
+        f"""
+        select data_inicio, data_fim, coalesce(ultima_data_validada, data_inicio)
+        from {SCHEMA}.range_scan_control
+        limit 1
+        """
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    data_inicio, data_fim, ultima = row[0], row[1], row[2]
+    data_inicio = to_utc(parse_dt(data_inicio))
+    data_fim = to_utc(parse_dt(data_fim))
+    ultima = to_utc(parse_dt(ultima))
+    if data_inicio is None or data_fim is None or ultima is None:
+        raise RuntimeError("range_scan_control com datas inválidas")
+    if ultima > data_inicio:
+        ultima = data_inicio
+    if ultima < data_fim:
+        ultima = data_fim
+    return data_inicio, data_fim, ultima
 
-def read_control():
-    with conn() as c, c.cursor() as cur:
-        cur.execute(
-            f"""
-            select data_inicio, data_fim, coalesce(ultima_data_validada, data_inicio)
-            from {SCHEMA}.range_scan_control
-            limit 1
-            """
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        data_inicio, data_fim, ultima = row[0], row[1], row[2]
-        data_inicio = to_utc(parse_dt(data_inicio))
-        data_fim = to_utc(parse_dt(data_fim))
-        ultima = to_utc(parse_dt(ultima))
-        if ultima is None or data_inicio is None or data_fim is None:
-            raise RuntimeError("range_scan_control com datas inválidas")
-        if ultima > data_inicio:
-            ultima = data_inicio
-        if ultima < data_fim:
-            ultima = data_fim
-        return data_inicio, data_fim, ultima
+def set_ultima_validada(cur, nv):
+    cur.execute(
+        f"update {SCHEMA}.range_scan_control set ultima_data_validada=%s",
+        (nv,),
+    )
 
-def set_ultima_validada(nv):
-    with conn() as c, c.cursor() as cur:
-        cur.execute(
-            f"update {SCHEMA}.range_scan_control set ultima_data_validada=%s",
-            (nv,),
-        )
-        c.commit()
-
-def hit_end_now():
-    with conn() as c, c.cursor() as cur:
-        cur.execute(
-            f"""
-            select (coalesce(ultima_data_validada, data_inicio) <= data_fim)
-            from {SCHEMA}.range_scan_control
-            limit 1
-            """
-        )
-        return bool(cur.fetchone()[0])
+def hit_end(cur):
+    cur.execute(
+        f"""
+        select (coalesce(ultima_data_validada, data_inicio) <= data_fim)
+        from {SCHEMA}.range_scan_control
+        limit 1
+        """
+    )
+    return bool(cur.fetchone()[0])
 
 def do_one_cycle(run_id):
-    ctrl = read_control()
-    if ctrl is None:
-        return True, 0, 0, None
-
-    data_inicio, data_fim, ultima = ctrl
-
     ids = []
     api_last = {}
     min_lu = None
     skip = 0
 
-    while True:
-        page = fetch_page(data_fim, ultima, skip)
-        if not page:
-            break
+    with conn() as c, c.cursor() as cur:
+        ctrl = read_control(cur)
+        if ctrl is None:
+            return True, 0, 0
 
-        for t in page:
-            lu = to_utc(parse_dt(t.get("lastUpdate")))
-            if lu is None:
-                continue
-            if lu < data_fim or lu > ultima:
-                continue
-            try:
-                tid = int(t.get("id"))
-            except Exception:
-                continue
-            if tid not in api_last:
-                ids.append(tid)
-                api_last[tid] = lu
-                if min_lu is None or lu < min_lu:
-                    min_lu = lu
-            if len(ids) >= LIMIT:
+        _, data_fim, ultima = ctrl
+
+        while True:
+            page = fetch_page(data_fim, ultima, skip)
+            if not page:
                 break
 
-        if len(ids) >= LIMIT:
-            break
-        if len(page) < PAGE_TOP:
-            break
+            for t in page:
+                lu = to_utc(parse_dt(t.get("lastUpdate")))
+                if lu is None:
+                    continue
+                if lu < data_fim or lu > ultima:
+                    continue
+                try:
+                    tid = int(t.get("id"))
+                except Exception:
+                    continue
+                if tid not in api_last:
+                    ids.append(tid)
+                    api_last[tid] = lu
+                    if min_lu is None or lu < min_lu:
+                        min_lu = lu
+                if len(ids) >= LIMIT:
+                    break
 
-        skip += PAGE_TOP
-        if THROTTLE > 0:
-            time.sleep(THROTTLE)
+            if len(ids) >= LIMIT:
+                break
+            if len(page) < PAGE_TOP:
+                break
 
-    inserted = 0
+            skip += PAGE_TOP
+            if THROTTLE > 0:
+                time.sleep(THROTTLE)
 
-    with conn() as c, c.cursor() as cur:
+        inserted = 0
         if ids:
             in_missing = existing_in_missing(cur, ids)
             in_abertos = existing_in_abertos(cur, ids)
             in_detail = existing_in_detail(cur, ids)
-            mesclado_last, mesclado_ticket_ids, merged_into = mesclados_info(cur, ids)
+            in_mesclados = mesclados_sets(cur, ids)
 
             to_insert = []
             for tid in ids:
@@ -324,67 +298,61 @@ def do_one_cycle(run_id):
                     continue
                 if tid in in_detail:
                     continue
-                if tid in merged_into:
+                if tid in in_mesclados:
                     continue
-
-                if tid in mesclado_ticket_ids:
-                    api_dt = api_last.get(tid)
-                    m_dt = mesclado_last.get(tid)
-                    if api_dt is None or m_dt is None:
-                        continue
-                    if api_dt <= m_dt:
-                        continue
-
                 to_insert.append(tid)
 
             if to_insert:
                 execute_values(
                     cur,
-                    f"""
-                    insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id, first_seen, last_seen, attempts)
-                    values %s
-                    on conflict (table_name, ticket_id) do update
-                      set last_seen = excluded.last_seen,
-                          run_id = excluded.run_id
-                    """,
-                    [(int(run_id), TABLE_NAME, int(tid), "now()", "now()", 0) for tid in to_insert],
-                    template="(%s,%s,%s,now(),now(),0)",
+                    f"insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id) values %s",
+                    [(int(run_id), TABLE_NAME, int(tid)) for tid in to_insert],
+                    template="(%s,%s,%s)",
                     page_size=1000,
                 )
                 inserted = len(to_insert)
+
+        nv = min_lu
+        if nv is None:
+            nv = data_fim
+        else:
+            nv = nv - timedelta(microseconds=1)
+            if nv < data_fim:
+                nv = data_fim
+
+        set_ultima_validada(cur, nv)
+
         c.commit()
-
-    nv = min_lu if min_lu is not None else data_fim
-    if nv < data_fim:
-        nv = data_fim
-    set_ultima_validada(nv)
-
-    return hit_end_now(), len(ids), inserted, nv
+        return hit_end(cur), len(ids), inserted
 
 def main():
     start = time.time()
-    cycles = 0
-    api_total = 0
-    inserted_total = 0
+    total_api = 0
+    total_missing = 0
 
     with conn() as c, c.cursor() as cur:
-        run_id = ensure_run_id(cur)
+        ctrl = read_control(cur)
+        if ctrl is None:
+            print("[range-scan] sem range_scan_control")
+            return
+        _, data_fim, ultima = ctrl
+        run_id = create_run(cur, data_fim, ultima)
         c.commit()
 
     while True:
-        hit_end, got, inserted, nv = do_one_cycle(run_id)
-        cycles += 1
-        api_total += int(got)
-        inserted_total += int(inserted)
-        print(f"[range-scan] ciclo: tickets_api={got} inserted_missing={inserted} hit_end={hit_end}")
-        if hit_end:
+        hit, got, ins = do_one_cycle(run_id)
+        total_api += int(got)
+        total_missing += int(ins)
+        print(f"[range-scan] ciclo: tickets_api={got} inserted_missing={ins} hit_end={hit}")
+
+        if hit:
             break
         if time.time() - start >= MAX_RUNTIME_SEC:
             print(f"[range-scan] tempo esgotado ({time.time()-start:.1f}s >= {MAX_RUNTIME_SEC}s). Encerrando este job.")
             break
 
     with conn() as c, c.cursor() as cur:
-        update_run(cur, run_id, api_total, inserted_total, cycles)
+        update_run(cur, run_id, total_api, total_missing)
         c.commit()
 
 if __name__ == "__main__":
