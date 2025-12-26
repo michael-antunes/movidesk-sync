@@ -1,20 +1,21 @@
-name: sync_range_tickets_merged
+name: Sync range tickets merged (scanner)
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "*/10 * * * *"
+  schedule:
+    - cron: "*/10 * * * *"  # a cada 10 minutos
+
+concurrency:
+  group: sync-range-tickets-merged
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -23,25 +24,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Debug env (presence only)
-        env:
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          NEON_DSN: ${{ secrets.NEON_DSN }}
+      - name: Debug env (safe)
         run: |
           python - <<'PY'
           import os
-          keys = [
-            "MOVIDESK_TOKEN","NEON_DSN","DATABASE_URL",
+          def show(k): print(f"{k} set? {bool(os.getenv(k))}")
+          for k in [
+            "MOVIDESK_TOKEN","MOVI_TOKEN",
+            "NEON_DSN","DATABASE_URL",
             "PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE",
-            "DB_SCHEMA","TABLE_NAME","CONTROL_TABLE","RESOLVED_TABLE","RESOLVED_ID_COL","RESOLVED_DATE_COL",
+            "DB_SCHEMA","TABLE_NAME","CONTROL_TABLE","RESOLVED_TABLE",
+            "RESOLVED_ID_COL","RESOLVED_DATE_COL",
             "LIMIT","RPM","DRY_RUN"
-          ]
-          for k in keys:
-            print(f"{k} set? {bool(os.getenv(k))}")
+          ]:
+            show(k)
           PY
 
       - name: Run scanner
         env:
+          # Mesmos secrets do workflow original (isso evita 90% dos seus erros anteriores)
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
 
@@ -50,9 +51,9 @@ jobs:
           CONTROL_TABLE: range_scan_control
           RESOLVED_TABLE: tickets_resolvidos_detail
 
-          # Se você quiser forçar (senão o script tenta inferir):
+          # Se o script não conseguir inferir as colunas do resolved_table, defina aqui:
           # RESOLVED_ID_COL: ticket_id
-          # RESOLVED_DATE_COL: resolved_date
+          # RESOLVED_DATE_COL: data_fim
 
           LIMIT: "80"
           RPM: "9"
