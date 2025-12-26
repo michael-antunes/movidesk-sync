@@ -1,14 +1,14 @@
-name: Range scan - tickets mesclados
+name: sync_range_tickets_merged
 
 on:
   workflow_dispatch:
-  # Para rodar a cada 10 minutos (quando você quiser ativar):
   # schedule:
   #   - cron: "*/10 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,25 +23,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Debug env (sem revelar secrets)
+      - name: Debug env (presence only)
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          DB_SCHEMA: visualizacao_resolvidos
-          TABLE_NAME: tickets_mesclados
-          CONTROL_TABLE: range_scan_control
-          RESOLVED_TABLE: tickets_resolvidos_detail
-          LIMIT: "80"
-          RPM: "9"
-          DRY_RUN: "false"
         run: |
           python - <<'PY'
           import os
           keys = [
-            "MOVIDESK_TOKEN","MOVI_TOKEN",
-            "NEON_DSN","DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE",
+            "MOVIDESK_TOKEN","NEON_DSN","DATABASE_URL",
+            "PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE",
             "DB_SCHEMA","TABLE_NAME","CONTROL_TABLE","RESOLVED_TABLE","RESOLVED_ID_COL","RESOLVED_DATE_COL",
-            "LIMIT","RPM","DRY_RUN",
+            "LIMIT","RPM","DRY_RUN"
           ]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
@@ -49,17 +42,17 @@ jobs:
 
       - name: Run scanner
         env:
-          # Compat: o script aceita MOVIDESK_TOKEN e MOVI_TOKEN
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-
-          # Compat: o script aceita NEON_DSN e DATABASE_URL
           NEON_DSN: ${{ secrets.NEON_DSN }}
 
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
           CONTROL_TABLE: range_scan_control
           RESOLVED_TABLE: tickets_resolvidos_detail
+
+          # Se você quiser forçar (senão o script tenta inferir):
+          # RESOLVED_ID_COL: ticket_id
+          # RESOLVED_DATE_COL: resolved_date
 
           LIMIT: "80"
           RPM: "9"
