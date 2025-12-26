@@ -41,7 +41,7 @@ jobs:
       - name: Install deps
         run: pip install requests psycopg2-binary
 
-      - name: Run python id_scan_to_audit_missing.py
+      - name: Run id_scan_to_audit_missing.py
         shell: bash
         run: |
           set -euo pipefail
