@@ -1,63 +1,68 @@
-name: Scan merged tickets by range
+name: Range scan - tickets mesclados
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/10 * * * *'
+  # Para rodar a cada 10 minutos (quando você quiser ativar):
+  # schedule:
+  #   - cron: "*/10 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    concurrency:
-      group: range-scan-tickets-merged
-      cancel-in-progress: false
-
-    env:
-      # Segredos (mesmo padrão do workflow ORIGINAL que funcionou)
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-      NEON_DSN: ${{ secrets.NEON_DSN }}
-
-      # Opcional (se você usa outro segredo)
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-
-      # Config do scanner
-      DB_SCHEMA: visualizacao_resolvidos
-      TABLE_NAME: tickets_mesclados
-      CONTROL_TABLE: range_scan_control
-      LIMIT: '80'
-      RPM: '9'
-      DRY_RUN: 'false'
-
-      # Bootstrap opcional (use só se a tabela de controle estiver vazia/sem linha aberta)
-      # ID_ATUAL_MERGED: '299048'
-      # ID_FINAL_MERGED: '30501'
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests psycopg2-binary
 
-      - name: Env check (sem vazar segredos)
+      - name: Debug env (sem revelar secrets)
+        env:
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          DB_SCHEMA: visualizacao_resolvidos
+          TABLE_NAME: tickets_mesclados
+          CONTROL_TABLE: range_scan_control
+          RESOLVED_TABLE: tickets_resolvidos_detail
+          LIMIT: "80"
+          RPM: "9"
+          DRY_RUN: "false"
         run: |
           python - <<'PY'
           import os
           keys = [
-            "MOVIDESK_TOKEN","NEON_DSN","DATABASE_URL",
-            "PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT",
-            "ID_ATUAL_MERGED","ID_FINAL_MERGED",
-            "DB_SCHEMA","TABLE_NAME","CONTROL_TABLE","LIMIT","RPM","DRY_RUN",
+            "MOVIDESK_TOKEN","MOVI_TOKEN",
+            "NEON_DSN","DATABASE_URL","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT","PGSSLMODE",
+            "DB_SCHEMA","TABLE_NAME","CONTROL_TABLE","RESOLVED_TABLE","RESOLVED_ID_COL","RESOLVED_DATE_COL",
+            "LIMIT","RPM","DRY_RUN",
           ]
           for k in keys:
             print(f"{k} set? {bool(os.getenv(k))}")
           PY
 
       - name: Run scanner
+        env:
+          # Compat: o script aceita MOVIDESK_TOKEN e MOVI_TOKEN
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVI_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+
+          # Compat: o script aceita NEON_DSN e DATABASE_URL
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+
+          DB_SCHEMA: visualizacao_resolvidos
+          TABLE_NAME: tickets_mesclados
+          CONTROL_TABLE: range_scan_control
+          RESOLVED_TABLE: tickets_resolvidos_detail
+
+          LIMIT: "80"
+          RPM: "9"
+          DRY_RUN: "false"
         run: |
           python sync_range_tickets_merged.py
