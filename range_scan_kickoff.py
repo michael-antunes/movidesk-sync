@@ -12,6 +12,7 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
           data_fim timestamptz not null,
           data_inicio timestamptz not null,
           ultima_data_validada timestamptz,
+          ultima_data_validada_merged timestamptz,
           id_inicial bigint,
           id_final bigint,
           id_atual bigint,
@@ -24,6 +25,7 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_final bigint")
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_atual bigint")
     cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists id_atual_merged bigint")
+    cur.execute("alter table visualizacao_resolvidos.range_scan_control add column if not exists ultima_data_validada_merged timestamptz")
 
     cur.execute(
         """
@@ -57,6 +59,10 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
     id_atual = id_inicial
     id_atual_merged = id_atual
 
+    data_inicio = max_lu
+    data_fim = min_lu
+    ultima_data_validada_merged = data_inicio
+
     cur.execute("select count(*) from visualizacao_resolvidos.range_scan_control")
     exists = cur.fetchone()[0] != 0
 
@@ -64,10 +70,10 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
         cur.execute(
             """
             insert into visualizacao_resolvidos.range_scan_control
-              (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged)
-            values (%s, %s, %s, %s, %s, %s, %s)
+              (data_inicio, data_fim, ultima_data_validada, ultima_data_validada_merged, id_inicial, id_final, id_atual, id_atual_merged)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual, id_atual_merged),
+            (data_inicio, data_fim, data_inicio, ultima_data_validada_merged, id_inicial, id_final, id_atual, id_atual_merged),
         )
     else:
         cur.execute(
@@ -75,15 +81,15 @@ with psycopg2.connect(DSN) as c, c.cursor() as cur:
             update visualizacao_resolvidos.range_scan_control
                set data_inicio = %s,
                    data_fim = %s,
-                   ultima_data_validada = %s,
+                   ultima_data_validada_merged = %s,
                    id_inicial = %s,
                    id_final = %s,
                    id_atual = %s,
                    id_atual_merged = %s
             """,
-            (max_lu, min_lu, max_lu, id_inicial, id_final, id_atual, id_atual_merged),
+            (data_inicio, data_fim, ultima_data_validada_merged, id_inicial, id_final, id_atual, id_atual_merged),
         )
 
     c.commit()
 
-print("Kickoff OK: range_scan_control atualizado (IDs topo→base).")
+print("Kickoff OK: range_scan_control atualizado (IDs topo→base) e ultima_data_validada_merged=data_inicio.")
