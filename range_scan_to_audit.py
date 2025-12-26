@@ -1,10 +1,11 @@
 import os
 import time
+import random
 from datetime import datetime, timezone, timedelta
 
 import psycopg2
-from psycopg2.extras import execute_values
 import requests
+from psycopg2.extras import execute_values
 
 API = "https://api.movidesk.com/public/v1/tickets"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
@@ -17,6 +18,12 @@ PAGE_TOP = int(os.getenv("RANGE_SCAN_PAGE_TOP", "100"))
 LIMIT = int(os.getenv("RANGE_SCAN_LIMIT", "400"))
 THROTTLE = float(os.getenv("RANGE_SCAN_THROTTLE", "0.25"))
 MAX_RUNTIME_SEC = int(os.getenv("RANGE_SCAN_MAX_RUNTIME_SEC", "240"))
+
+DB_LOCK_TIMEOUT_MS = int(os.getenv("RANGE_SCAN_DB_LOCK_TIMEOUT_MS", "2000"))
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("RANGE_SCAN_DB_STATEMENT_TIMEOUT_MS", "15000"))
+DB_RETRIES = int(os.getenv("RANGE_SCAN_DB_RETRIES", "6"))
+
+RETRYABLE_PGCODES = {"40P01", "55P03", "57014"}
 
 if not TOKEN or not DSN:
     raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN são obrigatórios")
@@ -80,6 +87,10 @@ def table_cols(cur, schema, table):
     )
     return {r[0] for r in cur.fetchall()}
 
+def apply_timeouts(cur):
+    cur.execute(f"set local lock_timeout = '{int(DB_LOCK_TIMEOUT_MS)}ms'")
+    cur.execute(f"set local statement_timeout = '{int(DB_STATEMENT_TIMEOUT_MS)}ms'")
+
 def create_run(cur, data_fim, ultima):
     cols = table_cols(cur, SCHEMA, "audit_recent_run")
     ins_cols = []
@@ -100,12 +111,16 @@ def create_run(cur, data_fim, ultima):
     add_expr("started_at", "now()")
     add_expr("window_start", "now()")
     add_expr("window_end", "now()")
+    add_expr("run_at", "now()")
     add_expr("total_api", "0")
     add_expr("missing_total", "0")
-    add_expr("run_at", "now()")
+    add_expr("api_ids", "0")
+    add_expr("inserted_missing", "0")
+    add_expr("range_count", "0")
+    add_param("table_name", TABLE_NAME)
+    add_param("notes", "range-scan")
     add_param("window_from", data_fim)
     add_param("window_to", ultima)
-    add_param("notes", "range-scan")
 
     cur.execute(
         f"insert into {SCHEMA}.audit_recent_run({','.join(ins_cols)}) values ({','.join(ins_vals)}) returning id",
@@ -125,6 +140,12 @@ def update_run(cur, run_id, total_api, missing_total):
         params.append(int(total_api))
     if "missing_total" in cols:
         sets.append("missing_total=%s")
+        params.append(int(missing_total))
+    if "api_ids" in cols:
+        sets.append("api_ids=%s")
+        params.append(int(total_api))
+    if "inserted_missing" in cols:
+        sets.append("inserted_missing=%s")
         params.append(int(missing_total))
 
     if not sets:
@@ -181,22 +202,23 @@ def mesclados_sets(cur, ids):
     cols = table_cols(cur, SCHEMA, "tickets_mesclados")
     if not cols:
         return set()
+    if "ticket_id" not in cols or "merged_into_id" not in cols:
+        return set()
+
     cur.execute(
         f"""
-        select ticket_id as id
+        select ticket_id, merged_into_id
         from {SCHEMA}.tickets_mesclados
-        where ticket_id = any(%s)
-        union
-        select merged_into_id as id
-        from {SCHEMA}.tickets_mesclados
-        where merged_into_id = any(%s)
+        where ticket_id = any(%s) or merged_into_id = any(%s)
         """,
         (list(ids), list(ids)),
     )
     out = set()
-    for (v,) in cur.fetchall():
-        if v is not None:
-            out.add(int(v))
+    for a, b in cur.fetchall():
+        if a is not None:
+            out.add(int(a))
+        if b is not None:
+            out.add(int(b))
     return out
 
 def read_control(cur):
@@ -238,92 +260,146 @@ def hit_end(cur):
     )
     return bool(cur.fetchone()[0])
 
+def is_retryable_db_error(e):
+    code = getattr(e, "pgcode", None)
+    if code in RETRYABLE_PGCODES:
+        return True
+    msg = str(e).lower()
+    if "deadlock" in msg or "lock timeout" in msg or "statement timeout" in msg:
+        return True
+    return False
+
 def do_one_cycle(run_id):
     ids = []
-    api_last = {}
     min_lu = None
     skip = 0
 
     with conn() as c, c.cursor() as cur:
+        apply_timeouts(cur)
         ctrl = read_control(cur)
         if ctrl is None:
             return True, 0, 0
 
         _, data_fim, ultima = ctrl
 
-        while True:
-            page = fetch_page(data_fim, ultima, skip)
-            if not page:
-                break
+    while True:
+        page = fetch_page(data_fim, ultima, skip)
+        if not page:
+            break
 
-            for t in page:
-                lu = to_utc(parse_dt(t.get("lastUpdate")))
-                if lu is None:
-                    continue
-                if lu < data_fim or lu > ultima:
-                    continue
-                try:
-                    tid = int(t.get("id"))
-                except Exception:
-                    continue
-                if tid not in api_last:
-                    ids.append(tid)
-                    api_last[tid] = lu
-                    if min_lu is None or lu < min_lu:
-                        min_lu = lu
-                if len(ids) >= LIMIT:
-                    break
-
+        for t in page:
+            lu = to_utc(parse_dt(t.get("lastUpdate")))
+            if lu is None:
+                continue
+            if lu < data_fim or lu > ultima:
+                continue
+            try:
+                tid = int(t.get("id"))
+            except Exception:
+                continue
+            ids.append(tid)
+            if min_lu is None or lu < min_lu:
+                min_lu = lu
             if len(ids) >= LIMIT:
                 break
-            if len(page) < PAGE_TOP:
-                break
 
-            skip += PAGE_TOP
-            if THROTTLE > 0:
-                time.sleep(THROTTLE)
+        if len(ids) >= LIMIT:
+            break
+        if len(page) < PAGE_TOP:
+            break
 
-        inserted = 0
-        if ids:
-            in_missing = existing_in_missing(cur, ids)
-            in_abertos = existing_in_abertos(cur, ids)
-            in_detail = existing_in_detail(cur, ids)
-            in_mesclados = mesclados_sets(cur, ids)
+        skip += PAGE_TOP
+        if THROTTLE > 0:
+            time.sleep(THROTTLE)
 
-            to_insert = []
-            for tid in ids:
-                if tid in in_missing:
-                    continue
-                if tid in in_abertos:
-                    continue
-                if tid in in_detail:
-                    continue
-                if tid in in_mesclados:
-                    continue
-                to_insert.append(tid)
+    ids = list(dict.fromkeys(ids))
 
-            if to_insert:
-                execute_values(
-                    cur,
-                    f"insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id) values %s",
-                    [(int(run_id), TABLE_NAME, int(tid)) for tid in to_insert],
-                    template="(%s,%s,%s)",
-                    page_size=1000,
-                )
-                inserted = len(to_insert)
+    for attempt in range(DB_RETRIES):
+        try:
+            with conn() as c, c.cursor() as cur:
+                apply_timeouts(cur)
 
-        nv = min_lu
-        if nv is None:
-            nv = data_fim
-        else:
-            nv = nv - timedelta(microseconds=1)
-            if nv < data_fim:
-                nv = data_fim
+                if ids:
+                    in_missing = existing_in_missing(cur, ids)
+                    in_abertos = existing_in_abertos(cur, ids)
+                    in_detail = existing_in_detail(cur, ids)
+                    in_mesclados = mesclados_sets(cur, ids)
 
-        set_ultima_validada(cur, nv)
+                    candidates = []
+                    for tid in ids:
+                        if tid in in_missing:
+                            continue
+                        if tid in in_abertos:
+                            continue
+                        if tid in in_detail:
+                            continue
+                        if tid in in_mesclados:
+                            continue
+                        candidates.append(tid)
 
-        c.commit()
-        return hit_end(cur), len(ids), inserted
+                    inserted = 0
+                    if candidates:
+                        cols = table_cols(cur, SCHEMA, "audit_recent_missing")
+                        if "run_id" in cols and "table_name" in cols and "ticket_id" in cols:
+                            if "first_seen" in cols and "last_seen" in cols and "attempts" in cols:
+                                sql = f"""
+                                    insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id, first_seen, last_seen, attempts)
+                                    values %s
+                                    on conflict (table_name, ticket_id) do update
+                                      set last_seen = now(),
+                                          run_id = excluded.run_id
+                                """
+                                execute_values(
+                                    cur,
+                                    sql,
+                                    [(int(run_id), TABLE_NAME, int(tid)) for tid in candidates],
+                                    template="(%s,%s,%s,now(),now(),0)",
+                                    page_size=1000,
+                                )
+                            else:
+                                sql = f"""
+                                    insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id)
+                                    values %s
+                                    on conflict (table_name, ticket_id) do update
+                                      set run_id = excluded.run_id
+                                """
+                                execute_values(
+                                    cur,
+                                    sql,
+                                    [(int(run_id), TABLE_NAME, int(tid)) for tid in candidates],
+                                    template="(%s,%s,%s)",
+                                    page_size=1000,
+                                )
+                            inserted = len(candidates)
+                        else:
+                            inserted = 0
+                else:
+                    inserted = 0
+
+                if min_lu is None:
+                    nv = data_fim
+                else:
+                    nv = min_lu - timedelta(microseconds=1)
+                    if nv < data_fim:
+                        nv = data_fim
+
+                set_ultima_validada(cur, nv)
+                c.commit()
+
+                with conn() as c2, c2.cursor() as cur2:
+                    apply_timeouts(cur2)
+                    done = hit_end(cur2)
+                    c2.commit()
+
+                return done, len(ids), inserted
+
+        except psycopg2.Error as e:
+            if not is_retryable_db_error(e) or attempt == DB_RETRIES - 1:
+                raise
+            backoff = (0.25 * (2 ** attempt)) + random.random() * 0.25
+            time.sleep(backoff)
+
+    return False, len(ids), 0
 
 def main():
     start = time.time()
@@ -331,6 +407,7 @@ def main():
     total_missing = 0
 
     with conn() as c, c.cursor() as cur:
+        apply_timeouts(cur)
         ctrl = read_control(cur)
         if ctrl is None:
             print("[range-scan] sem range_scan_control")
@@ -352,6 +429,7 @@ def main():
             break
 
     with conn() as c, c.cursor() as cur:
+        apply_timeouts(cur)
         update_run(cur, run_id, total_api, total_missing)
         c.commit()
 
