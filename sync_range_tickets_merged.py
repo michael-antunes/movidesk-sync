@@ -159,6 +159,7 @@ class ControlRow:
     data_inicio: datetime
     data_fim: datetime
     ultima_data_validada: Optional[datetime]
+    ultima_data_validada_merged: Optional[datetime]
     id_inicial: Optional[int]
     id_final: Optional[int]
     id_atual: Optional[int]
@@ -171,6 +172,7 @@ def read_latest_control(conn, schema: str, control_table: str) -> Optional[Contr
                data_inicio,
                data_fim,
                ultima_data_validada,
+               ultima_data_validada_merged,
                id_inicial,
                id_final,
                id_atual,
@@ -189,10 +191,11 @@ def read_latest_control(conn, schema: str, control_table: str) -> Optional[Contr
             data_inicio=_parse_dt(row[1]) or _dt_now(),
             data_fim=_parse_dt(row[2]) or _dt_now(),
             ultima_data_validada=_parse_dt(row[3]),
-            id_inicial=row[4],
-            id_final=row[5],
-            id_atual=row[6],
-            id_atual_merged=row[7],
+            ultima_data_validada_merged=_parse_dt(row[4]),
+            id_inicial=row[5],
+            id_final=row[6],
+            id_atual=row[7],
+            id_atual_merged=row[8],
         )
 
 
@@ -205,6 +208,7 @@ def update_control(
     data_inicio: Optional[datetime] = None,
     data_fim: Optional[datetime] = None,
     ultima_data_validada: Optional[datetime] = None,
+    ultima_data_validada_merged: Optional[datetime] = None,
     id_inicial: Optional[int] = None,
     id_final: Optional[int] = None,
     id_atual: Optional[int] = None,
@@ -223,6 +227,8 @@ def update_control(
         add("data_fim", data_fim)
     if ultima_data_validada is not None:
         add("ultima_data_validada", ultima_data_validada)
+    if ultima_data_validada_merged is not None:
+        add("ultima_data_validada_merged", ultima_data_validada_merged)
     if id_inicial is not None:
         add("id_inicial", id_inicial)
     if id_final is not None:
@@ -525,7 +531,7 @@ def main() -> None:
 
     if cfg.dry_run:
         LOG.info(
-            "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada=%s",
+            "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada_merged=%s",
             checked,
             merged_found,
             0,
@@ -554,7 +560,7 @@ def main() -> None:
                 control2.ctid,
                 data_inicio=start_dt,
                 data_fim=end_dt,
-                ultima_data_validada=oldest_dt,
+                ultima_data_validada_merged=oldest_dt,
                 id_atual=new_ptr,
                 id_atual_merged=new_ptr,
                 id_inicial=control2.id_inicial,
@@ -564,7 +570,7 @@ def main() -> None:
             conn2.commit()
 
             LOG.info(
-                "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada=%s",
+                "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada_merged=%s",
                 checked,
                 merged_found,
                 upserted,
