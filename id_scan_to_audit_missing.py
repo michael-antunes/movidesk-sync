@@ -4,11 +4,11 @@ import psycopg2
 from psycopg2.extras import execute_values
 import requests
 
-API = "https://api.movidesk.com/public/v1"
+API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
-SCHEMA = "visualizacao_resolvidos"
+SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
 TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
 BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "50"))
@@ -22,8 +22,106 @@ if not TOKEN or not DSN:
 def conn():
     return psycopg2.connect(DSN)
 
+def table_cols(cur, schema, table):
+    cur.execute(
+        """
+        select column_name
+        from information_schema.columns
+        where table_schema=%s and table_name=%s
+        """,
+        (schema, table),
+    )
+    return {r[0] for r in cur.fetchall()}
+
+def ensure_missing_unique(cur):
+    cur.execute(
+        f"create unique index if not exists audit_recent_missing_uniq on {SCHEMA}.audit_recent_missing(table_name, ticket_id)"
+    )
+
+def create_run(cur):
+    cols = table_cols(cur, SCHEMA, "audit_recent_run")
+    ins_cols = []
+    ins_vals = []
+    params = []
+
+    def add_expr(col, expr):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append(expr)
+
+    def add_param(col, val):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append("%s")
+            params.append(val)
+
+    add_expr("started_at", "now()")
+    add_expr("window_start", "now()")
+    add_expr("window_end", "now()")
+    add_expr("run_at", "now()")
+    add_expr("total_api", "0")
+    add_expr("missing_total", "0")
+    add_expr("api_ids", "0")
+    add_expr("inserted_missing", "0")
+    add_expr("range_count", "0")
+    add_param("table_name", TABLE_NAME)
+    add_param("notes", "id-scan")
+
+    cur.execute(
+        f"insert into {SCHEMA}.audit_recent_run({','.join(ins_cols)}) values ({','.join(ins_vals)}) returning id",
+        tuple(params),
+    )
+    return int(cur.fetchone()[0])
+
+def update_run(cur, run_id, total_api, inserted_missing, range_count):
+    cols = table_cols(cur, SCHEMA, "audit_recent_run")
+    sets = []
+    params = []
+
+    if "window_end" in cols:
+        sets.append("window_end=now()")
+    if "total_api" in cols:
+        sets.append("total_api=%s")
+        params.append(int(total_api))
+    if "missing_total" in cols:
+        sets.append("missing_total=%s")
+        params.append(int(inserted_missing))
+    if "api_ids" in cols:
+        sets.append("api_ids=%s")
+        params.append(int(total_api))
+    if "inserted_missing" in cols:
+        sets.append("inserted_missing=%s")
+        params.append(int(inserted_missing))
+    if "range_count" in cols:
+        sets.append("range_count=%s")
+        params.append(int(range_count))
+
+    if not sets:
+        return
+
+    params.append(int(run_id))
+    cur.execute(
+        f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where id=%s",
+        tuple(params),
+    )
+
+def get_control(cur):
+    cur.execute(
+        f"select id_inicial, id_final, id_atual from {SCHEMA}.range_scan_control limit 1"
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+def set_id_atual(cur, v):
+    cur.execute(
+        f"update {SCHEMA}.range_scan_control set id_atual=%s",
+        (None if v is None else int(v),),
+    )
+
 def api_list_ids(endpoint, low_id, high_id):
-    url = f"{API}/{endpoint}"
+    url = f"{API_BASE}/{endpoint}"
     params = {
         "token": TOKEN,
         "$select": "id,baseStatus",
@@ -34,7 +132,7 @@ def api_list_ids(endpoint, low_id, high_id):
     }
     r = requests.get(url, params=params, timeout=60)
     if r.status_code != 200:
-        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:500]}")
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:800]}")
     data = r.json() or []
     out = []
     for x in data:
@@ -65,6 +163,9 @@ def ids_in_abertos(cur, ids):
 def ids_in_mesclados(cur, ids):
     if not ids:
         return set()
+    cols = table_cols(cur, SCHEMA, "tickets_mesclados")
+    if not cols:
+        return set()
     cur.execute(
         f"""
         select ticket_id as id
@@ -92,44 +193,44 @@ def ids_in_missing(cur, ids):
     )
     return {int(r[0]) for r in cur.fetchall()}
 
-def get_control(cur):
-    cur.execute(
-        f"select id_inicial, id_final, id_atual from {SCHEMA}.range_scan_control limit 1"
-    )
-    row = cur.fetchone()
-    if not row:
-        return None, None, None
-    return row[0], row[1], row[2]
-
-def set_id_atual(cur, v):
-    cur.execute(
-        f"update {SCHEMA}.range_scan_control set id_atual=%s",
-        (None if v is None else int(v),),
-    )
-
-def create_run(cur):
-    cur.execute(f"insert into {SCHEMA}.audit_recent_run default values returning id")
-    return int(cur.fetchone()[0])
-
-def insert_missing(cur, run_id, ids):
+def upsert_missing(cur, run_id, ids):
     if not ids:
         return 0
+    cols = table_cols(cur, SCHEMA, "audit_recent_missing")
+    ins_cols = ["run_id", "table_name", "ticket_id"]
+    template_parts = ["%s", "%s", "%s"]
+    upd_sets = ["run_id=excluded.run_id"]
+
+    if "first_seen" in cols:
+        ins_cols.append("first_seen")
+        template_parts.append("now()")
+    if "last_seen" in cols:
+        ins_cols.append("last_seen")
+        template_parts.append("now()")
+        upd_sets.append("last_seen=now()")
+    if "attempts" in cols:
+        ins_cols.append("attempts")
+        template_parts.append("0")
+
+    template = "(" + ",".join(template_parts) + ")"
+
+    sql = (
+        f"insert into {SCHEMA}.audit_recent_missing({','.join(ins_cols)}) values %s "
+        f"on conflict (table_name, ticket_id) do update set {', '.join(upd_sets)}"
+    )
+
     execute_values(
         cur,
-        f"""
-        insert into {SCHEMA}.audit_recent_missing(run_id, table_name, ticket_id, first_seen, last_seen, attempts)
-        values %s
-        on conflict (table_name, ticket_id) do update
-          set last_seen = now()
-        """,
+        sql,
         [(int(run_id), TABLE_NAME, int(tid)) for tid in ids],
-        template="(%s,%s,%s,now(),now(),0)",
+        template=template,
         page_size=1000,
     )
     return len(ids)
 
 def main():
     with conn() as c, c.cursor() as cur:
+        ensure_missing_unique(cur)
         id_inicial, id_final, id_atual = get_control(cur)
         if id_inicial is None or id_final is None:
             print("done=1 ranges=0 api_ids=0 excluded=0 inserted_missing=0 cursor_now=null")
@@ -137,7 +238,9 @@ def main():
 
         cursor = int(id_atual) if id_atual is not None else int(id_inicial)
         if cursor < int(id_final):
-            print("done=1 ranges=0 api_ids=0 excluded=0 inserted_missing=0 cursor_now=null")
+            set_id_atual(cur, None)
+            c.commit()
+            print(f"done=1 ranges=0 api_ids=0 excluded=0 inserted_missing=0 cursor_now=null id_inicial={id_inicial} id_final={id_final}")
             return
 
         run_id = create_run(cur)
@@ -167,14 +270,14 @@ def main():
             total_excluded += len(excluded)
 
             candidates = sorted(list(api_ids - excluded))
-            total_insert += insert_missing(cur, run_id, candidates)
+            total_insert += upsert_missing(cur, run_id, candidates)
             c.commit()
 
             next_cursor = low_id - 1
             if next_cursor < int(id_final):
+                cursor = None
                 set_id_atual(cur, None)
                 c.commit()
-                cursor = None
                 break
 
             cursor = int(next_cursor)
@@ -183,6 +286,9 @@ def main():
 
             if THROTTLE > 0:
                 time.sleep(float(THROTTLE))
+
+        update_run(cur, run_id, total_api_ids, total_insert, total_ranges)
+        c.commit()
 
         done = 1 if cursor is None else 0
         cnow = "null" if cursor is None else str(cursor)
