@@ -20,6 +20,7 @@ SELECT_DETAIL = (
     "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
     "customFieldValues"
 )
+DETAIL_SELECT = SELECT_DETAIL  # alias (compat) - alguns trechos antigos usam DETAIL_SELECT
 
 BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
@@ -55,16 +56,8 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
-def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict,
-                       timeout: tuple, attempts: int):
-    """Faz uma chamada HTTP com retry/backoff para 429/5xx.
-    - Para códigos diferentes de 429/5xx, retorna a Response (mesmo 4xx).
-    - Se esgotar tentativas em 429/5xx, lança uma exceção COM o último status para facilitar auditoria.
-    """
-    last_exc: Exception | None = None
-    last_status: int | None = None
-    last_text: str | None = None
-
+def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
+    last_exc = None
     for i in range(1, attempts + 1):
         try:
             req = requests.Request(method=method, url=url, params=params)
@@ -72,42 +65,17 @@ def request_with_retry(session: requests.Session, logger: logging.Logger, method
             masked = mask_token(prepped.url)
             resp = session.send(prepped, timeout=timeout)
             logger.info(f"GET {masked} -> {resp.status_code} (attempt {i}/{attempts})")
-
             if resp.status_code in (429, 500, 502, 503, 504):
-                last_status = resp.status_code
-                # guarda um pedaço do corpo (p/ não explodir log)
-                last_text = (resp.text or "")[:400]
                 time.sleep(min(30, 2 ** (i - 1)))
                 continue
-
             return resp
-
         except Exception as e:
             last_exc = e
-            logger.info(
-                f"GET {mask_token(url)} -> EXC (attempt {i}/{attempts}): {type(e).__name__}: {e}"
-            )
+            logger.info(f"GET {mask_token(url)} -> EXC (attempt {i}/{attempts}): {type(e).__name__}: {e}")
             time.sleep(min(30, 2 ** (i - 1)))
             continue
+    raise last_exc if last_exc else RuntimeError("request failed")
 
-    if last_exc is not None:
-        raise last_exc
-    if last_status is not None:
-        raise RuntimeError(f"HTTP {last_status}: {last_text}")
-    raise RuntimeError("request failed")
-
-def safe_request(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict,
-                 timeout: tuple[int, int], attempts: int):
-    """Wrapper do request_with_retry que NUNCA levanta exceção.
-    Retorna (resp, status_code, error_message)."""
-    try:
-        resp = request_with_retry(session, logger, method, url, params, timeout, attempts)
-        return resp, getattr(resp, "status_code", None), None
-    except Exception as e:
-        msg = str(e)
-        m = re.search(r"HTTP\s+(\d{3})", msg)
-        sc = int(m.group(1)) if m else None
-        return None, sc, f"{type(e).__name__}: {msg}"
 
 def pg_one(conn, sql, params=None):
     with conn.cursor() as cur:
@@ -243,81 +211,68 @@ def audit_delete(conn, audit_fqn: str, ticket_id: int):
     conn.commit()
 
 
-def list_tickets(session: requests.Session, logger: logging.Logger, token: str, flt: str, select: str,
-                timeout: tuple[int, int], attempts: int, top: int | None = None, orderby: str | None = None):
+def list_tickets(session: requests.Session, logger: logging.Logger, token: str, flt: str, select: str, timeout: tuple, attempts: int, top: int | None = None, orderby: str | None = None):
     params = {"$filter": flt, "$select": select, "includeDeletedItems": "true", "token": token}
     if top is not None:
         params["$top"] = str(top)
     if orderby:
         params["$orderby"] = orderby
-
-    resp, sc, err = safe_request(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
-    if resp is None or getattr(resp, "status_code", None) != 200:
-        return [], sc, (err or (resp.text if resp is not None else None))
-
+    try:
+        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    except Exception as exc:
+        logger.error(f"list_tickets: falha ao chamar /tickets: {type(exc).__name__}: {exc}")
+        return [], None, f"{type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        try:
+            body = resp.text
+        except Exception:
+            body = ""
+        return [], resp.status_code, body
     try:
         data = resp.json()
     except Exception:
         return [], resp.status_code, resp.text
-
     if isinstance(data, list):
         return data, 200, None
     return [], 200, None
 
-def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, tid: int,
-                     timeout: tuple[int, int], attempts: int):
-    # 1) tenta /tickets?id=...
-    params = {
-        "id": str(tid),
-        "$select": DETAIL_SELECT,
-        "includeDeletedItems": "true",
-        "token": token,
-    }
 
-    resp, sc, err = safe_request(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
-    if resp is None:
-        return None, sc, err
-
+def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
+    params = {"id": str(ticket_id), "$select": DETAIL_SELECT, "includeDeletedItems": "true", "token": token}
+    try:
+        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
     if resp.status_code == 200:
         try:
-            data = resp.json()
+            return resp.json(), 200, None
         except Exception:
             return None, 200, resp.text
 
-        # A API pode voltar objeto (mais comum) ou lista (alguns cenários)
-        ticket = data[0] if isinstance(data, list) and data else data
-        return ticket, 200, None
-
-    # qualquer coisa que não seja 404, devolve erro direto
     if resp.status_code != 404:
-        return None, resp.status_code, (resp.text or "")
+        try:
+            return None, resp.status_code, resp.text
+        except Exception:
+            return None, resp.status_code, None
 
-    # 2) fallback: /tickets/past (quando o item já foi para "past")
-    flt = f"id eq {tid}"
-    params2 = {
-        "$filter": flt,
-        "$select": DETAIL_SELECT,
-        "includeDeletedItems": "true",
-        "token": token,
-        "$top": "1",
-    }
-
-    resp2, sc2, err2 = safe_request(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
-    if resp2 is None:
-        return None, sc2, err2
-
+    params2 = {"$filter": f"id eq {int(ticket_id)}", "$select": DETAIL_SELECT, "includeDeletedItems": "true", "token": token}
+    resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
     if resp2.status_code != 200:
-        return None, resp2.status_code, (resp2.text or "")
+        try:
+            return None, resp2.status_code, resp2.text
+        except Exception:
+            return None, resp2.status_code, None
 
     try:
-        data2 = resp2.json()
+        data = resp2.json()
     except Exception:
         return None, 200, resp2.text
 
-    if isinstance(data2, list) and data2:
-        return data2[0], 200, None
+    if isinstance(data, list) and data:
+        return data[0], 200, None
 
-    return None, 404, "not found"
+    return None, 404, None
+
 
 def main():
     logger = setup_logger()
@@ -415,7 +370,7 @@ def main():
     else:
         logger.info(f"detail: Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id={last_id}.")
 
-    pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY attempts ASC, last_attempt NULLS FIRST, ticket_id DESC LIMIT %s", [missing_limit])
+    pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY ticket_id DESC LIMIT %s", [missing_limit])
     pend_ids = [int(r[0]) for r in pend]
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
 
