@@ -1,522 +1,648 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Range scanner de Tickets_Merged (Movidesk) por ID.
+Scanner incremental de tickets mesclados (Movidesk).
 
-Como funciona:
-- Existe uma tabela de controle (default: visualizacao_resolvidos.range_scan_control)
-  com uma "linha aberta" (data_fim IS NULL) contendo id_inicial, id_final e id_atual_merged.
-- A cada execução o script valida N IDs (LIMIT) em ordem decrescente começando em id_atual_merged.
-- Para cada ticket_id, consulta GET /tickets/merged?id=<ticket_id>.
-  * Se houver resposta com mergedTickets > 0, faz upsert em tickets_mesclados.
-  * Se não existir/404 ou mergedTickets == 0, ignora.
-- Ao final atualiza id_atual_merged no controle. Quando chega no id_final, fecha a linha (data_fim = now()).
+- Lê um scan aberto na tabela de controle (range_scan_control).
+- Seleciona tickets em tickets_resolvidos_detail dentro do intervalo data_inicio..data_fim.
+- Processa em ordem decrescente, a partir de id_atual_merged (ponteiro), em lotes (LIMIT).
+- Para cada ticket_id, consulta a API /tickets/merged?id=<ticket_id>.
+- Se o ticket tiver mescla (mergedTickets > 0), faz upsert em tickets_mesclados.
+- Atualiza id_atual_merged e ultima_data_validada a cada execução.
 
-ENV (compatível com seu workflow original):
-  Movidesk:
-    - MOVIDESK_TOKEN (ou MOVI_TOKEN) [obrigatório]
-    - MOVIDESK_BASE_URL (default: https://api.movidesk.com/public/v1)
+ENV (mesmos nomes do workflow original)
+- Token Movidesk: MOVIDESK_TOKEN (fallback MOVI_TOKEN)
+- Postgres DSN: NEON_DSN (fallback DATABASE_URL) ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD
 
-  Postgres:
-    - NEON_DSN (ou DATABASE_URL / POSTGRES_URL / PG_URL)
-      OU PGHOST/PGDATABASE/PGUSER/PGPASSWORD (opcional PGPORT)
-
-  Controle:
-    - DB_SCHEMA (default visualizacao_resolvidos)
-    - TABLE_NAME (default tickets_mesclados)
-    - CONTROL_TABLE (default range_scan_control)
-
-  Execução:
-    - LIMIT (default 80)
-    - RPM (default 9)  # requests/minuto
-    - DRY_RUN (default false)
-
-  Bootstrap (se não houver linha aberta no controle):
-    - ID_ATUAL_MERGED e ID_FINAL_MERGED (opcionais)
+ENV opcionais
+- DB_SCHEMA (default: visualizacao_resolvidos)
+- TABLE_NAME (default: tickets_mesclados)
+- CONTROL_TABLE (default: range_scan_control)
+- RESOLVED_TABLE (default: tickets_resolvidos_detail)
+- RESOLVED_ID_COL (override do nome da coluna ID)
+- RESOLVED_DATE_COL (override do nome da coluna de data/fechamento)
+- LIMIT (default: 80)
+- RPM (default: 9) => throttle = 60/rpm entre requisições
+- DRY_RUN (default: false) => não escreve no banco
 """
 
 from __future__ import annotations
 
-import os
-import time
+import datetime as dt
+import json
 import logging
+import os
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import requests
 import psycopg2
 import psycopg2.extras
-from psycopg2 import sql
+import requests
+
+BASE_URL = "https://api.movidesk.com/public/v1"
 
 
-LOG = logging.getLogger("range_scan")
+def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
 
 
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or v == "":
-        return default
-    return v
-
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    v = _env(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _int_env(name: str, default: int) -> int:
-    v = _env(name)
-    if v is None:
         return default
     try:
         return int(v)
     except ValueError:
-        raise RuntimeError(f"Env {name} inválida: esperado inteiro, veio {v!r}")
+        raise RuntimeError(f"ENV {name} inválida (esperado int): {v!r}")
 
 
-def _float_env(name: str, default: float) -> float:
-    v = _env(name)
-    if v is None:
+def env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or v == "":
         return default
     try:
         return float(v)
     except ValueError:
-        raise RuntimeError(f"Env {name} inválida: esperado float, veio {v!r}")
+        raise RuntimeError(f"ENV {name} inválida (esperado float): {v!r}")
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None or v == "":
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise RuntimeError(f"ENV {name} inválida (esperado bool): {v!r}")
 
 
-def parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    s = dt_str.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(s)
-    except ValueError:
-        return None
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("range_scan")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    h = logging.StreamHandler(sys.stdout)
+    h.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    h.setFormatter(fmt)
+    logger.addHandler(h)
+    return logger
 
 
-def parse_merged_ids(ids_str: Optional[str]) -> Optional[List[int]]:
-    if not ids_str:
-        return None
-    parts = [p.strip() for p in ids_str.split(";") if p.strip()]
-    out: List[int] = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except ValueError:
-            continue
-    return out or None
+log = setup_logger()
 
 
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     movi_token: str
-    base_url: str
-    dsn: str
     db_schema: str
     table_name: str
     control_table: str
+    resolved_table: str
+    resolved_id_col: Optional[str]
+    resolved_date_col: Optional[str]
     limit: int
     rpm: float
     dry_run: bool
-    timeout_s: int = 30
+
+    @property
+    def throttle_seconds(self) -> float:
+        if self.rpm <= 0:
+            return 0.0
+        return 60.0 / float(self.rpm)
 
 
 def load_settings() -> Settings:
-    token = _env("MOVIDESK_TOKEN") or _env("MOVI_TOKEN") or _env("MOVIDESK_API_TOKEN")
+    token = env_str("MOVIDESK_TOKEN") or env_str("MOVI_TOKEN")
     if not token:
-        raise RuntimeError("Falta MOVIDESK_TOKEN (ou MOVI_TOKEN).")
-
-    base_url = _env("MOVIDESK_BASE_URL", "https://api.movidesk.com/public/v1").rstrip("/")
-
-    dsn = _env("NEON_DSN") or _env("DATABASE_URL") or _env("POSTGRES_URL") or _env("PG_URL")
-    if not dsn:
-        host = _env("PGHOST")
-        db = _env("PGDATABASE")
-        user = _env("PGUSER")
-        pwd = _env("PGPASSWORD")
-        port = _env("PGPORT", "5432")
-        if not all([host, db, user, pwd]):
-            raise RuntimeError(
-                "Faltam variáveis de Postgres. Use NEON_DSN/DATABASE_URL (recomendado) "
-                "ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD."
-            )
-        dsn = f"host={host} dbname={db} user={user} password={pwd} port={port}"
-
-    schema = _env("DB_SCHEMA", "visualizacao_resolvidos")
-    table = _env("TABLE_NAME", "tickets_mesclados")
-    control = _env("CONTROL_TABLE", "range_scan_control")
-
-    limit = _int_env("LIMIT", 80)
-    rpm = _float_env("RPM", 9.0)
-    if rpm <= 0:
-        raise RuntimeError("RPM deve ser > 0")
-    dry_run = _bool_env("DRY_RUN", False)
+        raise RuntimeError("Falta MOVIDESK_TOKEN (ou MOVI_TOKEN) - token da API Movidesk.")
 
     return Settings(
         movi_token=token,
-        base_url=base_url,
-        dsn=dsn,
-        db_schema=schema,
-        table_name=table,
-        control_table=control,
-        limit=limit,
-        rpm=rpm,
-        dry_run=dry_run,
+        db_schema=env_str("DB_SCHEMA", "visualizacao_resolvidos") or "visualizacao_resolvidos",
+        table_name=env_str("TABLE_NAME", "tickets_mesclados") or "tickets_mesclados",
+        control_table=env_str("CONTROL_TABLE", "range_scan_control") or "range_scan_control",
+        resolved_table=env_str("RESOLVED_TABLE", "tickets_resolvidos_detail") or "tickets_resolvidos_detail",
+        resolved_id_col=env_str("RESOLVED_ID_COL"),
+        resolved_date_col=env_str("RESOLVED_DATE_COL"),
+        limit=max(1, env_int("LIMIT", 80)),
+        rpm=env_float("RPM", 9.0),
+        dry_run=env_bool("DRY_RUN", False),
     )
 
 
-def pg_connect(dsn: str):
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = False
+def pg_connect() -> "psycopg2.extensions.connection":
+    dsn = env_str("DATABASE_URL") or env_str("NEON_DSN")
+    if dsn:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        return conn
+
+    host = env_str("PGHOST")
+    dbname = env_str("PGDATABASE")
+    user = env_str("PGUSER")
+    password = env_str("PGPASSWORD")
+    port = env_str("PGPORT", "5432")
+    sslmode = env_str("PGSSLMODE")
+
+    if not (host and dbname and user and password):
+        raise RuntimeError(
+            "Faltam variáveis de Postgres. Use NEON_DSN/DATABASE_URL ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD."
+        )
+
+    kwargs: Dict[str, Any] = dict(host=host, dbname=dbname, user=user, password=password, port=port)
+    if sslmode:
+        kwargs["sslmode"] = sslmode
+
+    conn = psycopg2.connect(**kwargs)
+    conn.autocommit = True
     return conn
 
 
-def ensure_tables(conn, schema: str, table: str, control: str) -> None:
+def ensure_schema_and_tables(conn, schema: str, tickets_table: str, control_table: str) -> None:
     with conn.cursor() as cur:
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
 
-        # destino
         cur.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {}.{} (
-                    ticket_id             BIGINT PRIMARY KEY,
-                    merged_tickets        INTEGER,
-                    merged_tickets_ids    TEXT,
-                    merged_ticket_ids_arr BIGINT[],
-                    last_update           TIMESTAMPTZ,
-                    synced_at             TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            ).format(sql.Identifier(schema), sql.Identifier(table))
+            f"""
+            CREATE TABLE IF NOT EXISTS "{schema}"."{tickets_table}" (
+                ticket_id BIGINT PRIMARY KEY,
+                merged_tickets INTEGER,
+                merged_tickets_ids TEXT,
+                merged_ticket_ids_arr BIGINT[],
+                last_update TIMESTAMP,
+                synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
         )
 
-        # garante colunas (caso tabela antiga)
-        for col, typ in [
-            ("merged_tickets", "INTEGER"),
-            ("merged_tickets_ids", "TEXT"),
-            ("merged_ticket_ids_arr", "BIGINT[]"),
-            ("last_update", "TIMESTAMPTZ"),
-            ("synced_at", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
-        ]:
-            cur.execute(
-                sql.SQL("ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} " + typ).format(
-                    sql.Identifier(schema), sql.Identifier(table), sql.Identifier(col)
-                )
-            )
-
-        # controle
         cur.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {}.{} (
-                    data_inicio           TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    data_fim              TIMESTAMPTZ,
-                    ultima_data_validada  TIMESTAMPTZ,
-                    id_inicial            BIGINT,
-                    id_final              BIGINT,
-                    id_atual              BIGINT,
-                    id_atual_merged       BIGINT
-                )
-                """
-            ).format(sql.Identifier(schema), sql.Identifier(control))
+            f"""
+            CREATE TABLE IF NOT EXISTS "{schema}"."{control_table}" (
+                id BIGSERIAL PRIMARY KEY,
+                data_inicio TIMESTAMPTZ NOT NULL,
+                data_fim TIMESTAMPTZ NOT NULL,
+                ultima_data_validada TIMESTAMPTZ,
+                id_inicial BIGINT,
+                id_final BIGINT,
+                id_atual BIGINT,
+                id_atual_merged BIGINT,
+                concluido_em TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
         )
 
-        for col, typ in [
-            ("data_inicio", "TIMESTAMPTZ NOT NULL DEFAULT now()"),
-            ("data_fim", "TIMESTAMPTZ"),
+        for col, ddl in [
             ("ultima_data_validada", "TIMESTAMPTZ"),
             ("id_inicial", "BIGINT"),
             ("id_final", "BIGINT"),
             ("id_atual", "BIGINT"),
             ("id_atual_merged", "BIGINT"),
+            ("concluido_em", "TIMESTAMPTZ"),
+            ("created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            ("updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
         ]:
-            cur.execute(
-                sql.SQL("ALTER TABLE {}.{} ADD COLUMN IF NOT EXISTS {} " + typ).format(
-                    sql.Identifier(schema), sql.Identifier(control), sql.Identifier(col)
-                )
-            )
-
-    conn.commit()
+            cur.execute(f'ALTER TABLE "{schema}"."{control_table}" ADD COLUMN IF NOT EXISTS {col} {ddl};')
 
 
-def get_or_bootstrap_control_row(conn, cfg: Settings) -> Optional[Tuple[str, int, int, int]]:
+def get_table_columns(conn, schema: str, table: str) -> List[Tuple[str, str, str]]:
+    sql = """
+        SELECT column_name, data_type, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position;
     """
-    Retorna (ctid, id_inicial, id_final, id_atual_merged) de uma linha aberta (data_fim IS NULL),
-    já travada FOR UPDATE SKIP LOCKED.
-
-    Se não existir e houver envs ID_ATUAL_MERGED/ID_FINAL_MERGED, cria uma linha.
-    Se não existir e não houver envs, retorna None.
-    """
-    schema, control = cfg.db_schema, cfg.control_table
     with conn.cursor() as cur:
-        cur.execute(
-            sql.SQL(
-                """
-                SELECT ctid::text, id_inicial, id_final, COALESCE(id_atual_merged, id_inicial) AS id_atual_merged
-                FROM {}.{}
-                WHERE data_fim IS NULL
-                ORDER BY data_inicio DESC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-                """
-            ).format(sql.Identifier(schema), sql.Identifier(control))
-        )
-        row = cur.fetchone()
-        if row:
-            ctid_s, id_inicial, id_final, id_atual_merged = row
-            if id_inicial is None or id_final is None or id_atual_merged is None:
-                raise RuntimeError(
-                    f"Linha aberta em {schema}.{control} existe mas faltam campos (id_inicial/id_final/id_atual_merged)."
-                )
-            return ctid_s, int(id_inicial), int(id_final), int(id_atual_merged)
+        cur.execute(sql, (schema, table))
+        return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
-        boot_atual = _env("ID_ATUAL_MERGED")
-        boot_final = _env("ID_FINAL_MERGED")
-        if not (boot_atual and boot_final):
-            conn.rollback()
-            LOG.info(
-                "nenhuma linha aberta em %s.%s e sem envs de bootstrap -> encerrando OK",
-                schema,
-                control,
-            )
+
+def guess_id_col(cols: List[Tuple[str, str, str]]) -> Optional[str]:
+    preferred = ["ticket_id", "ticketid", "id"]
+    colnames = [c[0] for c in cols]
+    lower_map = {c.lower(): c for c in colnames}
+
+    for p in preferred:
+        if p in lower_map:
+            return lower_map[p]
+
+    for name, data_type, _udt in cols:
+        n = name.lower()
+        if "ticket" in n and data_type in ("integer", "bigint", "numeric"):
+            return name
+
+    for name, data_type, _udt in cols:
+        if data_type in ("integer", "bigint", "numeric"):
+            return name
+
+    return None
+
+
+def guess_date_col(cols: List[Tuple[str, str, str]]) -> Optional[str]:
+    preferred = [
+        "resolved_at", "resolved_date", "resolveddate",
+        "closed_at", "closed_date", "closeddate",
+        "finished_at", "finished_date",
+        "completed_at", "completed_date",
+        "updated_at", "last_update", "lastupdate",
+        "created_at", "created_date",
+        "data_resolucao", "data_resolvido", "data_resolvido_em",
+        "data_fechamento", "data_conclusao", "fechado_em", "resolvido_em",
+        "data_finalizacao", "data_encerramento",
+    ]
+    colnames = [c[0] for c in cols]
+    lower_map = {c.lower(): c for c in colnames}
+
+    for p in preferred:
+        if p in lower_map:
+            return lower_map[p]
+
+    for name, data_type, _udt in cols:
+        n = name.lower()
+        if data_type in ("timestamp with time zone", "timestamp without time zone", "date"):
+            if any(k in n for k in ("resol", "fech", "close", "finish", "complete")):
+                return name
+
+    for name, data_type, _udt in cols:
+        if data_type in ("timestamp with time zone", "timestamp without time zone", "date"):
+            return name
+
+    return None
+
+
+@dataclass
+class ControlRow:
+    id: int
+    data_inicio: dt.datetime
+    data_fim: dt.datetime
+    ultima_data_validada: Optional[dt.datetime]
+    id_inicial: Optional[int]
+    id_final: Optional[int]
+    id_atual_merged: Optional[int]
+    concluido_em: Optional[dt.datetime]
+
+
+def read_open_control(conn, schema: str, control_table: str) -> Optional[ControlRow]:
+    sql = f"""
+        SELECT id, data_inicio, data_fim, ultima_data_validada,
+               id_inicial, id_final, id_atual_merged, concluido_em
+        FROM "{schema}"."{control_table}"
+        WHERE concluido_em IS NULL
+        ORDER BY data_inicio DESC, id DESC
+        LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        row = cur.fetchone()
+        if not row:
+            return None
+        return ControlRow(
+            id=int(row[0]),
+            data_inicio=row[1],
+            data_fim=row[2],
+            ultima_data_validada=row[3],
+            id_inicial=row[4],
+            id_final=row[5],
+            id_atual_merged=row[6],
+            concluido_em=row[7],
+        )
+
+
+def update_control_progress(
+    conn,
+    schema: str,
+    control_table: str,
+    control_id: int,
+    *,
+    id_inicial: Optional[int] = None,
+    id_final: Optional[int] = None,
+    id_atual_merged: Optional[int] = None,
+    ultima_data_validada: Optional[dt.datetime] = None,
+    concluido_em: Optional[dt.datetime] = None,
+) -> None:
+    sets = []
+    params: List[Any] = []
+
+    if id_inicial is not None:
+        sets.append("id_inicial = %s")
+        params.append(id_inicial)
+    if id_final is not None:
+        sets.append("id_final = %s")
+        params.append(id_final)
+    if id_atual_merged is not None:
+        sets.append("id_atual_merged = %s")
+        params.append(id_atual_merged)
+    if ultima_data_validada is not None:
+        sets.append("ultima_data_validada = %s")
+        params.append(ultima_data_validada)
+    if concluido_em is not None:
+        sets.append("concluido_em = %s")
+        params.append(concluido_em)
+
+    sets.append("updated_at = NOW()")
+
+    sql = f"""
+        UPDATE "{schema}"."{control_table}"
+        SET {", ".join(sets)}
+        WHERE id = %s;
+    """
+    params.append(control_id)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+
+
+class MovideskClient:
+    def __init__(self, token: str, rpm: float):
+        self.token = token
+        self.session = requests.Session()
+        self.throttle = 0.0 if rpm <= 0 else 60.0 / float(rpm)
+        self._last_call_ts = 0.0
+
+    def _sleep_throttle(self) -> None:
+        if self.throttle <= 0:
+            return
+        now = time.time()
+        elapsed = now - self._last_call_ts
+        if elapsed < self.throttle:
+            time.sleep(self.throttle - elapsed)
+        self._last_call_ts = time.time()
+
+    def get_merged_by_ticket(self, ticket_id: int, timeout: int = 30) -> Optional[Dict[str, Any]]:
+        self._sleep_throttle()
+        url = f"{BASE_URL}/tickets/merged"
+        params = {"token": self.token, "id": str(ticket_id)}
+
+        for attempt in range(1, 4):
+            try:
+                resp = self.session.get(url, params=params, timeout=timeout)
+            except requests.RequestException:
+                if attempt == 3:
+                    raise
+                time.sleep(1.5 * attempt)
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except json.JSONDecodeError:
+                    log.warning("JSON inválido para ticket %s: %s", ticket_id, resp.text[:200])
+                    return None
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == 3:
+                    log.warning("API falhou (%s) para ticket %s: %s", resp.status_code, ticket_id, resp.text[:200])
+                    return None
+                time.sleep(2.0 * attempt)
+                continue
+
+            if resp.status_code == 404:
+                return None
+
+            log.warning("API retornou %s para ticket %s: %s", resp.status_code, ticket_id, resp.text[:200])
             return None
 
-        id_atual = int(boot_atual)
-        id_final = int(boot_final)
-
-        cur.execute(
-            sql.SQL(
-                """
-                INSERT INTO {}.{} (data_inicio, data_fim, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged)
-                VALUES (now(), NULL, NULL, %s, %s, %s, %s)
-                """
-            ).format(sql.Identifier(schema), sql.Identifier(control)),
-            (id_atual, id_final, id_atual, id_atual),
-        )
-
-        cur.execute(
-            sql.SQL(
-                """
-                SELECT ctid::text, id_inicial, id_final, COALESCE(id_atual_merged, id_inicial) AS id_atual_merged
-                FROM {}.{}
-                WHERE data_fim IS NULL
-                ORDER BY data_inicio DESC
-                LIMIT 1
-                FOR UPDATE
-                """
-            ).format(sql.Identifier(schema), sql.Identifier(control))
-        )
-        row2 = cur.fetchone()
-        if not row2:
-            raise RuntimeError("Falha ao bootstrapar linha de controle.")
-        ctid_s, id_inicial, id_final, id_atual_merged = row2
-        return ctid_s, int(id_inicial), int(id_final), int(id_atual_merged)
-
-
-def movidesk_get_merged(session: requests.Session, base_url: str, token: str, ticket_id: int, timeout_s: int) -> Optional[Dict[str, Any]]:
-    url = f"{base_url}/tickets/merged"
-    params = {"token": token, "id": str(ticket_id)}
-
-    try:
-        r = session.get(url, params=params, timeout=timeout_s)
-    except requests.RequestException as e:
-        LOG.warning("falha HTTP ticket_id=%s: %s", ticket_id, e)
         return None
 
-    if r.status_code == 404:
-        return None
 
-    if r.status_code == 429:
-        ra = r.headers.get("Retry-After")
+def parse_last_update(s: Optional[str]) -> Optional[dt.datetime]:
+    if not s:
+        return None
+    s = str(s).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            wait_s = float(ra) if ra else 10.0
+            return dt.datetime.strptime(s, fmt)
         except ValueError:
-            wait_s = 10.0
-        LOG.warning("rate limit (429). aguardando %.1fs ...", wait_s)
-        time.sleep(max(0.0, wait_s))
-        return None
-
-    if r.status_code >= 400:
-        LOG.warning("erro API status=%s ticket_id=%s body=%s", r.status_code, ticket_id, r.text[:200])
-        return None
-
+            pass
     try:
-        data = r.json()
+        return dt.datetime.fromisoformat(s)
     except ValueError:
-        LOG.warning("json inválido ticket_id=%s body=%s", ticket_id, r.text[:200])
         return None
 
-    return data if isinstance(data, dict) else None
 
-
-def normalize_merged_record(ticket_id: int, data: Dict[str, Any]) -> Optional[Tuple[int, Optional[int], Optional[str], Optional[List[int]], Optional[datetime]]]:
-    tid = data.get("ticketId", ticket_id)
-    try:
-        tid_i = int(tid)
-    except Exception:
-        tid_i = ticket_id
-
-    merged_raw = data.get("mergedTickets")
-    merged_tickets = int(merged_raw) if str(merged_raw).isdigit() else None
-
-    merged_ids_str = data.get("mergedTicketsIds")
-    merged_ids_arr = parse_merged_ids(merged_ids_str)
-
-    last_update = parse_dt(data.get("lastUpdate"))
-
-    if not merged_tickets or merged_tickets <= 0:
-        return None
-
-    return (tid_i, merged_tickets, merged_ids_str, merged_ids_arr, last_update)
-
-
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, Optional[int], Optional[str], Optional[List[int]], Optional[datetime]]]) -> int:
+def upsert_merged_rows(
+    conn,
+    schema: str,
+    table: str,
+    rows: Sequence[Tuple[int, int, Optional[str], Optional[List[int]], Optional[dt.datetime], dt.datetime]],
+) -> int:
     if not rows:
         return 0
 
-    cols = ["ticket_id", "merged_tickets", "merged_tickets_ids", "merged_ticket_ids_arr", "last_update", "synced_at"]
-    values = [(r[0], r[1], r[2], r[3], r[4], utcnow()) for r in rows]
-
-    insert_sql = sql.SQL(
-        """
-        INSERT INTO {}.{} ({})
+    sql = f"""
+        INSERT INTO "{schema}"."{table}"
+            (ticket_id, merged_tickets, merged_tickets_ids, merged_ticket_ids_arr, last_update, synced_at)
         VALUES %s
         ON CONFLICT (ticket_id) DO UPDATE SET
             merged_tickets = EXCLUDED.merged_tickets,
             merged_tickets_ids = EXCLUDED.merged_tickets_ids,
             merged_ticket_ids_arr = EXCLUDED.merged_ticket_ids_arr,
             last_update = EXCLUDED.last_update,
-            synced_at = EXCLUDED.synced_at
-        """
-    ).format(
-        sql.Identifier(schema),
-        sql.Identifier(table),
-        sql.SQL(", ").join(sql.Identifier(c) for c in cols),
-    )
-
+            synced_at = EXCLUDED.synced_at;
+    """
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, insert_sql.as_string(conn), values, page_size=1000)
-
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
     return len(rows)
 
 
-def update_control_progress(conn, cfg: Settings, ctid_s: str, new_id_atual_merged: int, finished: bool) -> None:
-    schema, control = cfg.db_schema, cfg.control_table
+def compute_id_bounds(
+    conn,
+    schema: str,
+    resolved_table: str,
+    id_col: str,
+    date_col: str,
+    start_dt: dt.datetime,
+    end_dt: dt.datetime,
+) -> Tuple[Optional[int], Optional[int]]:
+    sql = f"""
+        SELECT MIN("{id_col}")::BIGINT, MAX("{id_col}")::BIGINT
+        FROM "{schema}"."{resolved_table}"
+        WHERE "{date_col}" >= %s AND "{date_col}" <= %s;
+    """
     with conn.cursor() as cur:
-        if finished:
-            cur.execute(
-                sql.SQL(
-                    """
-                    UPDATE {}.{}
-                    SET id_atual_merged = %s,
-                        ultima_data_validada = now(),
-                        data_fim = now()
-                    WHERE ctid::text = %s
-                    """
-                ).format(sql.Identifier(schema), sql.Identifier(control)),
-                (new_id_atual_merged, ctid_s),
-            )
-        else:
-            cur.execute(
-                sql.SQL(
-                    """
-                    UPDATE {}.{}
-                    SET id_atual_merged = %s,
-                        ultima_data_validada = now()
-                    WHERE ctid::text = %s
-                    """
-                ).format(sql.Identifier(schema), sql.Identifier(control)),
-                (new_id_atual_merged, ctid_s),
-            )
+        cur.execute(sql, (start_dt, end_dt))
+        mn, mx = cur.fetchone()
+        return (mn, mx)
+
+
+def fetch_candidate_batch(
+    conn,
+    schema: str,
+    resolved_table: str,
+    id_col: str,
+    date_col: str,
+    start_dt: dt.datetime,
+    end_dt: dt.datetime,
+    cursor_id: int,
+    limit: int,
+) -> List[Tuple[int, Optional[dt.datetime]]]:
+    sql = f"""
+        SELECT "{id_col}"::BIGINT, "{date_col}"
+        FROM "{schema}"."{resolved_table}"
+        WHERE "{date_col}" >= %s
+          AND "{date_col}" <= %s
+          AND "{id_col}" <= %s
+        ORDER BY "{id_col}" DESC
+        LIMIT %s;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (start_dt, end_dt, cursor_id, limit))
+        return [(int(r[0]), r[1]) for r in cur.fetchall()]
+
+
+def existing_ticket_ids(conn, schema: str, table: str, ids: Sequence[int]) -> set:
+    if not ids:
+        return set()
+    sql = f'SELECT ticket_id FROM "{schema}"."{table}" WHERE ticket_id = ANY(%s);'
+    with conn.cursor() as cur:
+        cur.execute(sql, (list(ids),))
+        return {int(r[0]) for r in cur.fetchall()}
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
     cfg = load_settings()
-    throttle_s = 60.0 / cfg.rpm
+    conn = pg_connect()
 
-    LOG.info(
-        "scanner iniciando | schema=%s tabela=%s control=%s | limit=%s | rpm=%s | throttle=%.2fs | dry_run=%s",
-        cfg.db_schema, cfg.table_name, cfg.control_table, cfg.limit, cfg.rpm, throttle_s, cfg.dry_run
+    ensure_schema_and_tables(conn, cfg.db_schema, cfg.table_name, cfg.control_table)
+
+    control = read_open_control(conn, cfg.db_schema, cfg.control_table)
+    if not control:
+        log.info("nenhuma linha aberta em %s.%s -> encerrando OK", cfg.db_schema, cfg.control_table)
+        return
+
+    cols = get_table_columns(conn, cfg.db_schema, cfg.resolved_table)
+    if not cols:
+        raise RuntimeError(f"Tabela {cfg.db_schema}.{cfg.resolved_table} não existe ou não tem colunas visíveis.")
+
+    id_col = cfg.resolved_id_col or guess_id_col(cols)
+    date_col = cfg.resolved_date_col or guess_date_col(cols)
+    if not id_col:
+        raise RuntimeError("Não consegui identificar a coluna ID da tabela de resolvidos. Defina RESOLVED_ID_COL.")
+    if not date_col:
+        raise RuntimeError("Não consegui identificar a coluna de data da tabela de resolvidos. Defina RESOLVED_DATE_COL.")
+
+    start_dt = control.data_inicio
+    end_dt = control.data_fim
+
+    mn_id, mx_id = compute_id_bounds(conn, cfg.db_schema, cfg.resolved_table, id_col, date_col, start_dt, end_dt)
+
+    if mn_id is None or mx_id is None:
+        log.info(
+            "nenhum ticket em %s..%s na tabela %s.%s -> marcando scan como concluído",
+            start_dt.date(), end_dt.date(), cfg.db_schema, cfg.resolved_table
+        )
+        if not cfg.dry_run:
+            update_control_progress(
+                conn, cfg.db_schema, cfg.control_table, control.id,
+                ultima_data_validada=end_dt,
+                concluido_em=dt.datetime.utcnow(),
+            )
+        return
+
+    if not cfg.dry_run and (control.id_inicial is None or control.id_final is None):
+        update_control_progress(
+            conn, cfg.db_schema, cfg.control_table, control.id,
+            id_inicial=int(mx_id),
+            id_final=int(mn_id),
+        )
+
+    cursor_id = control.id_atual_merged if control.id_atual_merged is not None else int(mx_id)
+    cursor_id = min(cursor_id, int(mx_id))
+
+    log.info(
+        "scanner iniciando | schema=%s tabela=%s control=%s | intervalo=%s..%s | id_range=%s..%s | cursor=%s | limit=%s | rpm=%.2f | throttle=%.2fs | dry_run=%s",
+        cfg.db_schema, cfg.table_name, cfg.control_table,
+        start_dt.date(), end_dt.date(),
+        int(mx_id), int(mn_id),
+        cursor_id, cfg.limit, cfg.rpm, cfg.throttle_seconds, cfg.dry_run,
     )
 
-    conn = pg_connect(cfg.dsn)
-    try:
-        ensure_tables(conn, cfg.db_schema, cfg.table_name, cfg.control_table)
+    batch = fetch_candidate_batch(
+        conn, cfg.db_schema, cfg.resolved_table, id_col, date_col,
+        start_dt, end_dt, cursor_id, cfg.limit
+    )
+    if not batch:
+        log.info("nenhum candidato restante (cursor=%s). Finalizando scan.", cursor_id)
+        if not cfg.dry_run:
+            update_control_progress(
+                conn, cfg.db_schema, cfg.control_table, control.id,
+                id_atual_merged=int(mn_id) - 1,
+                ultima_data_validada=end_dt,
+                concluido_em=dt.datetime.utcnow(),
+            )
+        return
 
-        row = get_or_bootstrap_control_row(conn, cfg)
-        if not row:
-            return
+    ids = [tid for tid, _dtv in batch]
+    exists = existing_ticket_ids(conn, cfg.db_schema, cfg.table_name, ids)
 
-        ctid_s, id_inicial, id_final, id_atual_merged = row
+    client = MovideskClient(cfg.movi_token, cfg.rpm)
+    now_ts = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
 
-        if id_atual_merged < id_final:
-            LOG.info("scanner já finalizado (id_atual_merged=%s < id_final=%s). Fechando linha.", id_atual_merged, id_final)
-            if not cfg.dry_run:
-                update_control_progress(conn, cfg, ctid_s, id_final, finished=True)
-                conn.commit()
-            else:
-                conn.rollback()
-            return
+    upsert_rows: List[Tuple[int, int, Optional[str], Optional[List[int]], Optional[dt.datetime], dt.datetime]] = []
+    checked = 0
+    merged_found = 0
 
-        start_id = id_atual_merged
-        end_id = max(id_final, start_id - cfg.limit + 1)  # inclusivo
-        ids = list(range(start_id, end_id - 1, -1))
-        next_id = end_id - 1
+    for tid, _resolved_dt in batch:
+        checked += 1
+        data = client.get_merged_by_ticket(tid)
+        if not data:
+            continue
 
-        LOG.info("lote | id_atual_merged=%s -> end=%s (n=%s)", start_id, end_id, len(ids))
+        try:
+            merged_cnt = int(str(data.get("mergedTickets") or "0"))
+        except ValueError:
+            merged_cnt = 0
 
-        session = requests.Session()
-        session.headers.update({"User-Agent": "movidesk-sync-range-scan/1.0"})
+        merged_ids_str = data.get("mergedTicketsIds")
+        if merged_cnt <= 0 or not merged_ids_str:
+            continue
 
-        to_upsert: List[Tuple[int, Optional[int], Optional[str], Optional[List[int]], Optional[datetime]]] = []
-        fetched = 0
+        merged_ids: List[int] = []
+        for part in str(merged_ids_str).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                merged_ids.append(int(part))
+            except ValueError:
+                continue
 
-        for idx, tid in enumerate(ids):
-            data = movidesk_get_merged(session, cfg.base_url, cfg.movi_token, tid, cfg.timeout_s)
-            fetched += 1
-            if data:
-                rec = normalize_merged_record(tid, data)
-                if rec:
-                    to_upsert.append(rec)
+        last_update = parse_last_update(data.get("lastUpdate"))
+        upsert_rows.append((tid, merged_cnt, str(merged_ids_str), merged_ids or None, last_update, now_ts))
+        merged_found += 1
 
-            if idx < len(ids) - 1:
-                time.sleep(throttle_s)
+        if tid in exists:
+            log.info("ticket %s é mesclado (já existia na tabela) -> upsert", tid)
+        else:
+            log.info("ticket %s é mesclado (novo) -> inserir/upsert", tid)
 
-        if cfg.dry_run:
-            LOG.info("dry_run=True | fetched=%s to_upsert=%s | não gravou nada", fetched, len(to_upsert))
-            conn.rollback()
-            return
+    upserted = 0
+    if upsert_rows and not cfg.dry_run:
+        upserted = upsert_merged_rows(conn, cfg.db_schema, cfg.table_name, upsert_rows)
 
-        upserted = upsert_rows(conn, cfg.db_schema, cfg.table_name, to_upsert)
+    last_id = batch[-1][0]
+    last_dt = batch[-1][1]
+    next_cursor = int(last_id) - 1
 
-        finished = next_id < id_final
-        new_progress = id_final if finished else next_id
-        update_control_progress(conn, cfg, ctid_s, new_progress, finished=finished)
+    if not cfg.dry_run:
+        update_control_progress(
+            conn, cfg.db_schema, cfg.control_table, control.id,
+            id_atual_merged=next_cursor,
+            ultima_data_validada=last_dt or control.ultima_data_validada,
+        )
 
-        conn.commit()
-        LOG.info("scanner concluído | fetched=%s upserted=%s | novo_id_atual_merged=%s | finished=%s",
-                 fetched, upserted, new_progress, finished)
-
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    log.info(
+        "scanner concluído | batch=%s checked=%s merged_found=%s upserted=%s | next_cursor=%s",
+        len(batch), checked, merged_found, upserted, next_cursor
+    )
 
 
 if __name__ == "__main__":
