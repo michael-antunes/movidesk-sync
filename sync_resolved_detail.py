@@ -21,7 +21,6 @@ SELECT_DETAIL = (
     "customFieldValues"
 )
 DETAIL_SELECT = SELECT_DETAIL
-
 BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
 
@@ -110,19 +109,35 @@ def get_table_columns(conn, schema: str, table: str):
     return {r[0] for r in rows}
 
 
-def ensure_audit_unique(conn, schema: str, table: str):
+def get_audit_columns_info(conn, schema: str, table: str):
+    rows = pg_all(
+        conn,
+        """
+        SELECT column_name, data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s
+        ORDER BY ordinal_position
+        """,
+        [schema, table],
+    )
+    info = {}
+    for name, dtype, is_nullable, coldef in rows:
+        info[name] = {"data_type": dtype, "nullable": (is_nullable == "YES"), "default": coldef}
+    return info
+
+
+def ensure_unique_ticket_id(conn, schema: str, table: str):
     sql = """
     SELECT 1
-    FROM pg_constraint c
-    JOIN pg_class t ON t.oid=c.conrelid
+    FROM pg_index i
+    JOIN pg_class t ON t.oid=i.indrelid
     JOIN pg_namespace n ON n.oid=t.relnamespace
-    WHERE n.nspname=%s AND t.relname=%s AND c.contype IN ('p','u')
-      AND EXISTS (
-        SELECT 1
-        FROM unnest(c.conkey) k
-        JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k
-        WHERE a.attname='ticket_id'
-      )
+    JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=((i.indkey::int2[])[1])
+    WHERE n.nspname=%s
+      AND t.relname=%s
+      AND i.indisunique
+      AND array_length(i.indkey::int2[], 1)=1
+      AND a.attname='ticket_id'
     LIMIT 1
     """
     with conn.cursor() as cur:
@@ -158,6 +173,8 @@ def ensure_audit_table(conn, logger: logging.Logger):
             )
             """
         )
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS run_id bigint")
+        cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS run_started_at timestamptz")
         cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS first_seen timestamptz NOT NULL DEFAULT now()")
         cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS last_seen timestamptz NOT NULL DEFAULT now()")
         cur.execute(f"ALTER TABLE {schema}.audit_recent_missing ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0")
@@ -168,7 +185,7 @@ def ensure_audit_table(conn, logger: logging.Logger):
         cur.execute(f"UPDATE {schema}.audit_recent_missing SET first_seen=now() WHERE first_seen IS NULL")
         cur.execute(f"UPDATE {schema}.audit_recent_missing SET last_seen=now() WHERE last_seen IS NULL")
     conn.commit()
-    ensure_audit_unique(conn, schema, "audit_recent_missing")
+    ensure_unique_ticket_id(conn, schema, "audit_recent_missing")
     conn.commit()
     logger.info(f"detail: audit_recent_missing em {schema}.audit_recent_missing")
     return f"{schema}.audit_recent_missing"
@@ -215,20 +232,129 @@ def upsert_detail(conn, ticket: dict, cols: set[str], raw_col: str):
     conn.commit()
 
 
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
 def audit_upsert(conn, audit_fqn: str, ticket_id: int, status_code: int | None, error_text: str | None):
     schema, table = audit_fqn.split(".", 1)
+    info = get_audit_columns_info(conn, schema, table)
+    cols = set(info.keys())
+
+    run_id_val = _env_int("GITHUB_RUN_ID", _env_int("RUN_ID", 0))
+    run_attempt_val = _env_int("GITHUB_RUN_ATTEMPT", 0)
+    run_number_val = _env_int("GITHUB_RUN_NUMBER", 0)
+
+    insert_cols = []
+    insert_vals = []
+    params = []
+
+    def add_param(col: str, val):
+        insert_cols.append(col)
+        insert_vals.append("%s")
+        params.append(val)
+
+    def add_now(col: str):
+        insert_cols.append(col)
+        insert_vals.append("now()")
+
+    add_param("ticket_id", int(ticket_id))
+
+    if "run_id" in cols:
+        add_param("run_id", run_id_val)
+
+    for cand in ("run_started_at", "run_start_at", "run_at", "run_time", "run_ts", "run_datetime", "run_created_at"):
+        if cand in cols:
+            add_now(cand)
+            break
+
+    if "workflow" in cols:
+        add_param("workflow", os.getenv("GITHUB_WORKFLOW", ""))
+    if "job" in cols:
+        add_param("job", os.getenv("GITHUB_JOB", ""))
+    if "repository" in cols:
+        add_param("repository", os.getenv("GITHUB_REPOSITORY", ""))
+    if "sha" in cols:
+        add_param("sha", os.getenv("GITHUB_SHA", ""))
+    if "ref" in cols:
+        add_param("ref", os.getenv("GITHUB_REF", ""))
+    if "run_attempt" in cols:
+        add_param("run_attempt", run_attempt_val)
+    if "run_number" in cols:
+        add_param("run_number", run_number_val)
+
+    if "first_seen" in cols:
+        add_now("first_seen")
+    if "last_seen" in cols:
+        add_now("last_seen")
+    if "attempts" in cols:
+        add_param("attempts", 1)
+    if "last_attempt" in cols:
+        add_now("last_attempt")
+    if "last_status" in cols:
+        add_param("last_status", status_code)
+    if "last_error" in cols:
+        add_param("last_error", error_text)
+
+    for col, meta in info.items():
+        if col in insert_cols:
+            continue
+        if col == "ticket_id":
+            continue
+        if meta["nullable"]:
+            continue
+        if meta["default"] is not None:
+            continue
+        dt = (meta["data_type"] or "").lower()
+        if col == "run_id":
+            add_param(col, run_id_val)
+            continue
+        if "timestamp" in dt or dt == "date":
+            add_now(col)
+            continue
+        if dt in ("integer", "bigint", "smallint", "numeric", "real", "double precision"):
+            add_param(col, 0)
+            continue
+        if dt == "boolean":
+            add_param(col, False)
+            continue
+        if dt in ("json", "jsonb"):
+            add_param(col, Json({}))
+            continue
+        add_param(col, "")
+
+    updates = []
+    if "run_id" in cols:
+        updates.append("run_id=EXCLUDED.run_id")
+    for cand in ("run_started_at", "run_start_at", "run_at", "run_time", "run_ts", "run_datetime", "run_created_at"):
+        if cand in cols:
+            updates.append(f"{cand}=COALESCE({schema}.{table}.{cand}, EXCLUDED.{cand})")
+            break
+    if "last_seen" in cols:
+        updates.append("last_seen=now()")
+    if "attempts" in cols:
+        updates.append(f"attempts=COALESCE({schema}.{table}.attempts,0) + 1")
+    if "last_attempt" in cols:
+        updates.append("last_attempt=now()")
+    if "last_status" in cols:
+        updates.append("last_status=EXCLUDED.last_status")
+    if "last_error" in cols:
+        updates.append("last_error=EXCLUDED.last_error")
+
     sql = f"""
-    INSERT INTO {schema}.{table} (ticket_id, first_seen, last_seen, attempts, last_attempt, last_status, last_error)
-    VALUES (%s, now(), now(), 1, now(), %s, %s)
+    INSERT INTO {schema}.{table} ({",".join(insert_cols)})
+    VALUES ({",".join(insert_vals)})
     ON CONFLICT (ticket_id) DO UPDATE SET
-      last_seen=now(),
-      attempts=COALESCE({schema}.{table}.attempts,0) + 1,
-      last_attempt=now(),
-      last_status=EXCLUDED.last_status,
-      last_error=EXCLUDED.last_error
+      {",".join(updates) if updates else "ticket_id=EXCLUDED.ticket_id"}
     """
     with conn.cursor() as cur:
-        cur.execute(sql, [int(ticket_id), status_code, error_text])
+        cur.execute(sql, params)
     conn.commit()
 
 
