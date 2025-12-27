@@ -20,7 +20,7 @@ SELECT_DETAIL = (
     "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
     "customFieldValues"
 )
-DETAIL_SELECT = SELECT_DETAIL  # alias (compat) - alguns trechos antigos usam DETAIL_SELECT
+DETAIL_SELECT = SELECT_DETAIL
 
 BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
@@ -40,10 +40,6 @@ def mask_token(url: str) -> str:
         return url
 
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("detail")
     logger.setLevel(logging.INFO)
@@ -54,6 +50,18 @@ def setup_logger() -> logging.Logger:
     if not logger.handlers:
         logger.addHandler(h)
     return logger
+
+
+def pg_connect(dsn: str):
+    return psycopg2.connect(
+        dsn,
+        connect_timeout=int(os.getenv("PGCONNECT_TIMEOUT", "15")),
+        application_name=os.getenv("PGAPPNAME", "movidesk-detail"),
+        keepalives=1,
+        keepalives_idle=int(os.getenv("PGKEEPALIVES_IDLE", "30")),
+        keepalives_interval=int(os.getenv("PGKEEPALIVES_INTERVAL", "10")),
+        keepalives_count=int(os.getenv("PGKEEPALIVES_COUNT", "5")),
+    )
 
 
 def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
@@ -89,6 +97,49 @@ def pg_all(conn, sql, params=None):
         return cur.fetchall()
 
 
+def get_table_columns(conn, schema: str, table: str):
+    rows = pg_all(
+        conn,
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s
+        """,
+        [schema, table],
+    )
+    return {r[0] for r in rows}
+
+
+def ensure_audit_unique(conn, schema: str, table: str):
+    sql = """
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid=c.conrelid
+    JOIN pg_namespace n ON n.oid=t.relnamespace
+    WHERE n.nspname=%s AND t.relname=%s AND c.contype IN ('p','u')
+      AND EXISTS (
+        SELECT 1
+        FROM unnest(c.conkey) k
+        JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k
+        WHERE a.attname='ticket_id'
+      )
+    LIMIT 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, [schema, table])
+        ok = cur.fetchone() is not None
+        if ok:
+            return
+        cur.execute(
+            f"""
+            DELETE FROM {schema}.{table} a
+            USING {schema}.{table} b
+            WHERE a.ticket_id=b.ticket_id AND a.ctid<b.ctid
+            """
+        )
+        cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_ticket_id_uq ON {schema}.{table}(ticket_id)")
+
+
 def ensure_audit_table(conn, logger: logging.Logger):
     schema = os.getenv("AUDIT_SCHEMA", "visualizacao_resolvidos")
     with conn.cursor() as cur:
@@ -117,38 +168,15 @@ def ensure_audit_table(conn, logger: logging.Logger):
         cur.execute(f"UPDATE {schema}.audit_recent_missing SET first_seen=now() WHERE first_seen IS NULL")
         cur.execute(f"UPDATE {schema}.audit_recent_missing SET last_seen=now() WHERE last_seen IS NULL")
     conn.commit()
+    ensure_audit_unique(conn, schema, "audit_recent_missing")
+    conn.commit()
     logger.info(f"detail: audit_recent_missing em {schema}.audit_recent_missing")
     return f"{schema}.audit_recent_missing"
 
 
-def get_table_columns(conn, schema: str, table: str):
-    rows = pg_all(
-        conn,
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s
-        """,
-        [schema, table],
-    )
-    return {r[0] for r in rows}
-
-
-def upsert_detail(conn, logger: logging.Logger, ticket: dict):
+def upsert_detail(conn, ticket: dict, cols: set[str], raw_col: str):
     schema = "visualizacao_resolvidos"
     table = "tickets_resolvidos_detail"
-    cols = get_table_columns(conn, schema, table)
-
-    if "ticket_id" not in cols:
-        raise RuntimeError(f"Coluna ticket_id não existe em {schema}.{table}")
-
-    raw_col = None
-    for c in ("raw", "raw_json", "payload", "data"):
-        if c in cols:
-            raw_col = c
-            break
-    if raw_col is None:
-        raise RuntimeError(f"Nenhuma coluna de JSON encontrada em {schema}.{table} (raw/raw_json/payload/data)")
 
     insert_cols = ["ticket_id", raw_col]
     placeholders = ["%s", "%s"]
@@ -274,6 +302,30 @@ def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: 
     return None, 404, None
 
 
+def db_run(dsn: str, fn):
+    for i in (1, 2):
+        conn = None
+        try:
+            conn = pg_connect(dsn)
+            conn.autocommit = False
+            return fn(conn)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if i == 1:
+                continue
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
 def main():
     logger = setup_logger()
 
@@ -292,14 +344,45 @@ def main():
 
     logger.info(f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts}).")
 
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = False
+    def load_state(conn):
+        audit_fqn = ensure_audit_table(conn, logger)
 
-    audit_fqn = ensure_audit_table(conn, logger)
+        cols = get_table_columns(conn, "visualizacao_resolvidos", "tickets_resolvidos_detail")
+        if "ticket_id" not in cols:
+            raise RuntimeError("Coluna ticket_id não existe em visualizacao_resolvidos.tickets_resolvidos_detail")
 
-    last_row = pg_one(conn, "SELECT COALESCE(MAX(ticket_id),0) FROM visualizacao_resolvidos.tickets_resolvidos_detail")
-    last_id = int(last_row[0] if last_row else 0)
-    logger.info(f"detail: Último ticket_id em tickets_resolvidos_detail: {last_id}")
+        raw_col = None
+        for c in ("raw", "raw_json", "payload", "data"):
+            if c in cols:
+                raw_col = c
+                break
+        if raw_col is None:
+            raise RuntimeError("Nenhuma coluna de JSON encontrada em visualizacao_resolvidos.tickets_resolvidos_detail (raw/raw_json/payload/data)")
+
+        last_row = pg_one(conn, "SELECT COALESCE(MAX(ticket_id),0) FROM visualizacao_resolvidos.tickets_resolvidos_detail")
+        last_id = int(last_row[0] if last_row else 0)
+        logger.info(f"detail: Último ticket_id em tickets_resolvidos_detail: {last_id}")
+
+        lower = max(0, last_id - window - 1)
+        upper = last_id + window
+
+        db_rows = pg_all(
+            conn,
+            """
+            SELECT ticket_id
+            FROM visualizacao_resolvidos.tickets_resolvidos_detail
+            WHERE ticket_id > %s AND ticket_id <= %s
+            """,
+            [lower, upper],
+        )
+        db_ids = {int(r[0]) for r in db_rows}
+
+        pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY ticket_id DESC LIMIT %s", [missing_limit])
+        pend_ids = [int(r[0]) for r in pend]
+
+        return audit_fqn, cols, raw_col, last_id, lower, upper, db_ids, pend_ids
+
+    audit_fqn, detail_cols, raw_col, last_id, lower, upper, db_ids, pend_ids = db_run(dsn, load_state)
 
     session = requests.Session()
 
@@ -307,9 +390,6 @@ def main():
     total_new = 0
     total_window = 0
     total_missing = 0
-
-    lower = max(0, last_id - window - 1)
-    upper = last_id + window
 
     flt_window = (
         f"id gt {lower} and id le {upper} and "
@@ -320,17 +400,6 @@ def main():
     window_items, code, err = list_tickets(session, logger, token, flt_window, SELECT_LIST, timeout, attempts, top=1000, orderby="id")
     api_ids = {int(x.get("id")) for x in window_items if isinstance(x, dict) and x.get("id") is not None}
 
-    db_rows = pg_all(
-        conn,
-        """
-        SELECT ticket_id
-        FROM visualizacao_resolvidos.tickets_resolvidos_detail
-        WHERE ticket_id > %s AND ticket_id <= %s
-        """,
-        [lower, upper],
-    )
-    db_ids = {int(r[0]) for r in db_rows}
-
     to_fetch = sorted(list(api_ids - db_ids))
     logger.info(f"detail: Janela (center={last_id}): encontrados={len(api_ids)}, já_existiam={len(db_ids)}, para_buscar={len(to_fetch)}")
 
@@ -339,11 +408,11 @@ def main():
             logger.info(f"detail: Janela: buscando detalhe {idx}/{min(len(to_fetch), bulk_limit)} (ID={tid})")
             ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
             if ticket is None:
-                audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+                db_run(dsn, lambda conn: audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None))
                 total_missing += 1
                 continue
-            upsert_detail(conn, logger, ticket)
-            audit_delete(conn, audit_fqn, tid)
+            db_run(dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col))
+            db_run(dsn, lambda conn: audit_delete(conn, audit_fqn, tid))
             total_ok += 1
             total_window += 1
 
@@ -360,37 +429,30 @@ def main():
             logger.info(f"detail: Novo: buscando detalhe {idx}/{len(new_ids)} (ID={tid})")
             ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
             if ticket is None:
-                audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+                db_run(dsn, lambda conn: audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None))
                 total_missing += 1
                 continue
-            upsert_detail(conn, logger, ticket)
-            audit_delete(conn, audit_fqn, tid)
+            db_run(dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col))
+            db_run(dsn, lambda conn: audit_delete(conn, audit_fqn, tid))
             total_ok += 1
             total_new += 1
     else:
         logger.info(f"detail: Nenhum ticket novo (Resolved/Closed/Canceled) encontrado após id={last_id}.")
 
-    pend = pg_all(conn, f"SELECT ticket_id FROM {audit_fqn} ORDER BY ticket_id DESC LIMIT %s", [missing_limit])
-    pend_ids = [int(r[0]) for r in pend]
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
 
     for idx, tid in enumerate(pend_ids, start=1):
         logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
         ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
         if ticket is None:
-            audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None)
+            db_run(dsn, lambda conn: audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None))
             total_missing += 1
             continue
-        upsert_detail(conn, logger, ticket)
-        audit_delete(conn, audit_fqn, tid)
+        db_run(dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col))
+        db_run(dsn, lambda conn: audit_delete(conn, audit_fqn, tid))
         total_ok += 1
 
     logger.info(f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), Falhas={total_missing}.")
-
-    try:
-        conn.close()
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
