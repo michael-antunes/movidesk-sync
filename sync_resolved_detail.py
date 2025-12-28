@@ -103,22 +103,30 @@ def db_run(dsn: str, fn):
 
 def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
     last_exc = None
+    last_resp = None
     for i in range(1, attempts + 1):
         try:
             req = requests.Request(method=method, url=url, params=params)
             prepped = session.prepare_request(req)
             masked = mask_token(prepped.url)
             resp = session.send(prepped, timeout=timeout)
+            last_resp = resp
             logger.info(f"GET {masked} -> {resp.status_code} (attempt {i}/{attempts})")
-            if resp.status_code in (429, 500, 502, 503, 504):
+            if resp.status_code in (408, 429, 500, 502, 503, 504):
+                if i == attempts:
+                    return resp
                 time.sleep(min(30, 2 ** (i - 1)))
                 continue
             return resp
         except Exception as e:
             last_exc = e
             logger.info(f"GET {mask_token(url)} -> EXC (attempt {i}/{attempts}): {type(e).__name__}: {e}")
+            if i == attempts:
+                break
             time.sleep(min(30, 2 ** (i - 1)))
             continue
+    if last_resp is not None:
+        return last_resp
     raise last_exc if last_exc else RuntimeError("request failed")
 
 
@@ -279,7 +287,12 @@ def list_tickets(session: requests.Session, logger: logging.Logger, token: str, 
         params["$top"] = str(top)
     if orderby:
         params["$orderby"] = orderby
-    resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    try:
+        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    except Exception as exc:
+        return [], None, f"{type(exc).__name__}: {exc}"
+    if resp is None:
+        return [], None, "request failed"
     if resp.status_code != 200:
         try:
             body = resp.text
@@ -297,7 +310,14 @@ def list_tickets(session: requests.Session, logger: logging.Logger, token: str, 
 
 def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
     params = {"id": str(ticket_id), "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
-    resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    try:
+        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    if resp is None:
+        return None, None, "request failed"
+
     if resp.status_code == 200:
         try:
             return resp.json(), 200, None
@@ -311,7 +331,14 @@ def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: 
             return None, resp.status_code, None
 
     params2 = {"$filter": f"id eq {int(ticket_id)}", "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
-    resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
+    try:
+        resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+    if resp2 is None:
+        return None, None, "request failed"
+
     if resp2.status_code != 200:
         try:
             return None, resp2.status_code, resp2.text
@@ -337,15 +364,22 @@ def main():
     if not dsn or not token:
         raise SystemExit("NEON_DSN e MOVIDESK_TOKEN são obrigatórios")
 
-    bulk_limit = int(os.getenv("DETAIL_BULK_LIMIT", "200"))
-    missing_limit = int(os.getenv("DETAIL_MISSING_LIMIT", "10"))
-    window = int(os.getenv("DETAIL_WINDOW", "50"))
-    attempts = int(os.getenv("DETAIL_ATTEMPTS", "6"))
-    connect_timeout = int(os.getenv("DETAIL_CONNECT_TIMEOUT", "10"))
-    read_timeout = int(os.getenv("DETAIL_READ_TIMEOUT", "120"))
+    bulk_limit = _env_int("DETAIL_BULK_LIMIT", 200)
+    missing_limit = _env_int("DETAIL_MISSING_LIMIT", 10)
+    window = _env_int("DETAIL_WINDOW", 50)
+
+    attempts = _env_int("DETAIL_ATTEMPTS", 6)
+    connect_timeout = _env_int("DETAIL_CONNECT_TIMEOUT", 10)
+    read_timeout = _env_int("DETAIL_READ_TIMEOUT", 120)
     timeout = (connect_timeout, read_timeout)
 
-    logger.info(f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts}).")
+    pending_attempts = _env_int("DETAIL_PENDING_ATTEMPTS", 2)
+    pending_read_timeout = _env_int("DETAIL_PENDING_READ_TIMEOUT", 45)
+    pending_timeout = (connect_timeout, pending_read_timeout)
+
+    logger.info(
+        f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, window={window}, timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts})."
+    )
 
     def load_state(conn):
         audit_fqn = ensure_audit_table(conn, logger)
@@ -429,7 +463,7 @@ def main():
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
     for idx, tid in enumerate(pend_ids, start=1):
         logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
-        ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
+        ticket, sc, e = get_ticket_detail(session, logger, token, tid, pending_timeout, pending_attempts)
         if ticket is None:
             db_run(dsn, lambda conn: audit_upsert(conn, audit_fqn, tid, sc, (e or "")[:4000] if e else None))
             total_missing += 1
