@@ -1,4 +1,3 @@
-# sync_resolved_detail.py
 import os
 import sys
 import time
@@ -13,11 +12,8 @@ API_BASE = "https://api.movidesk.com/public/v1"
 
 BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
-# inclui actionCount pra gente identificar ticket "gigante" antes de buscar o detail
 SELECT_LIST = "id,baseStatus,lastUpdate,isDeleted,actionCount"
 SELECT_META = "id,baseStatus,lastUpdate,isDeleted,actionCount"
-
-# detalhe completo (pode ser pesado em tickets com muitas ações)
 SELECT_DETAIL = (
     "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
     "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
@@ -155,7 +151,11 @@ def get_columns_info(conn, schema: str, table: str):
     )
     info = {}
     for name, dtype, is_nullable, coldef in rows:
-        info[name] = {"data_type": (dtype or "").lower(), "nullable": (is_nullable == "YES"), "default": coldef}
+        info[name] = {
+            "data_type": (dtype or "").lower(),
+            "nullable": (is_nullable == "YES"),
+            "default": coldef,
+        }
     return info
 
 
@@ -191,18 +191,36 @@ def get_primary_key_columns(conn, schema: str, table: str):
     return [r[0] for r in rowset]
 
 
+def get_fk_target_column(conn, schema: str, table: str, column: str) -> str | None:
+    # Descobre a coluna referenciada pelo FK do (schema.table.column)
+    row = pg_one(
+        conn,
+        """
+        SELECT att2.attname AS ref_column
+        FROM pg_constraint con
+        JOIN pg_class rel ON rel.oid = con.conrelid
+        JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+        JOIN pg_class rel2 ON rel2.oid = con.confrelid
+        JOIN pg_namespace nsp2 ON nsp2.oid = rel2.relnamespace
+        JOIN unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON TRUE
+        JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = ck.attnum
+        JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = ck.ord
+        JOIN pg_attribute att2 ON att2.attrelid = rel2.oid AND att2.attnum = fk.attnum
+        WHERE con.contype = 'f'
+          AND nsp.nspname = %s
+          AND rel.relname = %s
+          AND att.attname = %s
+        LIMIT 1
+        """,
+        [schema, table, column],
+    )
+    return (row[0] if row else None)
+
+
 # -----------------------
 # HTTP helpers
 # -----------------------
-def request_with_retry(
-    session: requests.Session,
-    logger: logging.Logger,
-    method: str,
-    url: str,
-    params: dict,
-    timeout: tuple,
-    attempts: int,
-):
+def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
     last_exc = None
     last_resp = None
     for i in range(1, attempts + 1):
@@ -231,17 +249,7 @@ def request_with_retry(
     raise last_exc if last_exc else RuntimeError("request failed")
 
 
-def list_tickets(
-    session: requests.Session,
-    logger: logging.Logger,
-    token: str,
-    flt: str,
-    select: str,
-    timeout: tuple,
-    attempts: int,
-    top: int | None = None,
-    orderby: str | None = None,
-):
+def list_tickets(session: requests.Session, logger: logging.Logger, token: str, flt: str, select: str, timeout: tuple, attempts: int, top: int | None = None, orderby: str | None = None):
     params = {"$filter": flt, "$select": select, "includeDeletedItems": "true", "token": token}
     if top is not None:
         params["$top"] = str(top)
@@ -268,14 +276,7 @@ def list_tickets(
     return [], 200, None
 
 
-def get_ticket_meta(
-    session: requests.Session,
-    logger: logging.Logger,
-    token: str,
-    ticket_id: int,
-    timeout: tuple,
-    attempts: int,
-):
+def get_ticket_meta(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
     flt = f"id eq {int(ticket_id)}"
     params = {"$filter": flt, "$select": SELECT_META, "includeDeletedItems": "true", "token": token, "$top": "1"}
     try:
@@ -298,14 +299,7 @@ def get_ticket_meta(
         return None, resp.status_code, None
 
 
-def get_ticket_detail(
-    session: requests.Session,
-    logger: logging.Logger,
-    token: str,
-    ticket_id: int,
-    timeout: tuple,
-    attempts: int,
-):
+def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
     params = {"id": str(ticket_id), "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
     try:
         resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
@@ -327,7 +321,6 @@ def get_ticket_detail(
         except Exception:
             return None, resp.status_code, None
 
-    # fallback: tickets/past
     params2 = {"$filter": f"id eq {int(ticket_id)}", "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
     try:
         resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
@@ -370,6 +363,7 @@ def get_detail_table_info(conn):
     schema = "visualizacao_resolvidos"
     table = "tickets_resolvidos_detail"
     cols = get_table_columns(conn, schema, table)
+
     raw_col = None
     for c in ("raw", "raw_json", "payload", "data"):
         if c in cols:
@@ -377,6 +371,7 @@ def get_detail_table_info(conn):
             break
     if raw_col is None:
         raise RuntimeError(f"Nenhuma coluna de JSON encontrada em {schema}.{table} (raw/raw_json/payload/data)")
+
     dt = (get_column_type(conn, schema, table, raw_col) or "").lower()
     raw_is_json = dt in ("json", "jsonb")
     return cols, raw_col, raw_is_json
@@ -424,15 +419,7 @@ def upsert_detail(conn, ticket: dict, cols: set[str], raw_col: str, raw_is_json:
         cur.execute(sql, values)
 
 
-def upsert_too_big(
-    conn,
-    ticket_id: int,
-    base_status: str | None,
-    last_update: str | None,
-    cols: set[str],
-    raw_col: str,
-    raw_is_json: bool,
-):
+def upsert_too_big(conn, ticket_id: int, base_status: str | None, last_update: str | None, cols: set[str], raw_col: str, raw_is_json: bool):
     schema = "visualizacao_resolvidos"
     table = "tickets_resolvidos_detail"
 
@@ -472,24 +459,23 @@ def upsert_too_big(
 
 
 # -----------------------
-# Audit tables (ensure + write)
+# Audit tables
 # -----------------------
 def ensure_audit_tables(conn, logger: logging.Logger):
     schema = os.getenv("AUDIT_SCHEMA", "visualizacao_resolvidos")
 
-    # Cria estruturas "mínimas" caso não existam. Se já existem com mais colunas/constraints, não atrapalha.
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
-        # audit_recent_run (PK normalmente é id)
+        # Se não existir, cria com window_start/window_end como timestamptz (igual seu erro mostrou)
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {schema}.audit_recent_run
             (
               id bigserial PRIMARY KEY,
               created_at timestamptz NOT NULL DEFAULT now(),
-              window_start bigint NOT NULL DEFAULT 0,
-              window_end bigint NOT NULL DEFAULT 0,
+              window_start timestamptz NOT NULL DEFAULT now(),
+              window_end timestamptz NOT NULL DEFAULT now(),
               table_name text NOT NULL DEFAULT 'tickets_resolvidos_detail',
               run_id bigint,
               workflow text,
@@ -497,16 +483,18 @@ def ensure_audit_tables(conn, logger: logging.Logger):
               ref text,
               sha text,
               repo text,
-              max_actions integer
+              max_actions integer,
+              window_start_id bigint,
+              window_end_id bigint,
+              window_center_id bigint
             )
             """
         )
 
-        # adiciona colunas caso faltem (sem mexer em NOT NULL dos existentes)
         for col_ddl in (
             "ADD COLUMN IF NOT EXISTS created_at timestamptz",
-            "ADD COLUMN IF NOT EXISTS window_start bigint",
-            "ADD COLUMN IF NOT EXISTS window_end bigint",
+            "ADD COLUMN IF NOT EXISTS window_start timestamptz",
+            "ADD COLUMN IF NOT EXISTS window_end timestamptz",
             "ADD COLUMN IF NOT EXISTS table_name text",
             "ADD COLUMN IF NOT EXISTS run_id bigint",
             "ADD COLUMN IF NOT EXISTS workflow text",
@@ -515,10 +503,12 @@ def ensure_audit_tables(conn, logger: logging.Logger):
             "ADD COLUMN IF NOT EXISTS sha text",
             "ADD COLUMN IF NOT EXISTS repo text",
             "ADD COLUMN IF NOT EXISTS max_actions integer",
+            "ADD COLUMN IF NOT EXISTS window_start_id bigint",
+            "ADD COLUMN IF NOT EXISTS window_end_id bigint",
+            "ADD COLUMN IF NOT EXISTS window_center_id bigint",
         ):
             cur.execute(f"ALTER TABLE {schema}.audit_recent_run {col_ddl}")
 
-        # audit_recent_missing (muitas vezes ticket_id é PK, mas seu schema pode não ter. A gente lida no upsert.)
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {schema}.audit_recent_missing
@@ -555,40 +545,41 @@ def ensure_audit_tables(conn, logger: logging.Logger):
 
 
 def run_context(max_actions: int):
-    run_id = _env_int("GITHUB_RUN_ID", _env_int("RUN_ID", 0))
-    if run_id <= 0:
-        run_id = int(time.time())
+    external_run_id = _env_int("GITHUB_RUN_ID", _env_int("RUN_ID", 0))
+    if external_run_id <= 0:
+        external_run_id = int(time.time())
     return {
-        "external_run_id": run_id,  # GitHub run id
+        "external_run_id": int(external_run_id),
         "table_name": "tickets_resolvidos_detail",
         "workflow": os.getenv("GITHUB_WORKFLOW", "") or "",
         "job": os.getenv("GITHUB_JOB", "") or "",
         "ref": os.getenv("GITHUB_REF", "") or "",
         "sha": os.getenv("GITHUB_SHA", "") or "",
         "repo": os.getenv("GITHUB_REPOSITORY", "") or "",
-        "max_actions": max_actions,
-        "window_start": 0,
-        "window_end": 0,
-        "window_center": 0,
+        "max_actions": int(max_actions),
+        "window_start_id": 0,
+        "window_end_id": 0,
+        "window_center_id": 0,
+        "run_db_id": None,     # id (PK) se existir
+        "missing_fk_target": None,  # 'id' ou 'run_id' (descoberto no DB)
     }
 
 
-def audit_run_create_and_get_id(conn, run_fqn: str, ctx: dict) -> int | None:
+def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
     """
-    Cria um registro em audit_recent_run e retorna o PK (id) para usar como FK em audit_recent_missing.run_id.
-    Robusto: se o run table tiver colunas NOT NULL sem default (ex: window_start), a função preenche.
+    Garante que existe um registro em audit_recent_run para este run.
+    Retorna o PK (id) se existir/for possível.
     """
     schema, table = run_fqn.split(".", 1)
     info = get_columns_info(conn, schema, table)
     cols = set(info.keys())
+    ext = int(ctx["external_run_id"])
 
-    ext = int(ctx.get("external_run_id") or 0)
-
-    # se existir coluna "run_id" (comum no seu schema), tenta reaproveitar o mesmo run
-    if "run_id" in cols and ext > 0:
+    # tenta achar um registro existente deste run_id
+    if "run_id" in cols:
         row = pg_one(conn, f"SELECT id FROM {schema}.{table} WHERE run_id=%s ORDER BY id DESC LIMIT 1", [ext])
         if row:
-            return int(row[0])
+            return int(row[0]) if row[0] is not None else None
 
     insert_cols = []
     insert_vals = []
@@ -603,10 +594,10 @@ def audit_run_create_and_get_id(conn, run_fqn: str, ctx: dict) -> int | None:
         insert_cols.append(col)
         insert_vals.append("now()")
 
-    # campos conhecidos
+    # básicos
     if "created_at" in cols:
         add_now("created_at")
-    if "run_id" in cols and ext > 0:
+    if "run_id" in cols:
         add_param("run_id", ext)
     if "table_name" in cols:
         add_param("table_name", ctx.get("table_name", "tickets_resolvidos_detail"))
@@ -623,18 +614,26 @@ def audit_run_create_and_get_id(conn, run_fqn: str, ctx: dict) -> int | None:
     if "max_actions" in cols:
         add_param("max_actions", int(ctx.get("max_actions") or 0))
 
-    # IMPORTANTÍSSIMO: window_start/window_end (no seu schema podem ser NOT NULL)
-    if "window_start" in cols:
-        add_param("window_start", int(ctx.get("window_start") or 0))
-    if "window_end" in cols:
-        add_param("window_end", int(ctx.get("window_end") or 0))
+    # window_start/window_end: se forem timestamp => now(); se forem numéricos => usa ids
+    for colname, id_key in (("window_start", "window_start_id"), ("window_end", "window_end_id")):
+        if colname in cols:
+            dt = (info[colname]["data_type"] or "").lower()
+            if "timestamp" in dt or dt == "date":
+                add_now(colname)
+            elif dt in ("bigint", "integer", "smallint", "numeric", "real", "double precision"):
+                add_param(colname, int(ctx.get(id_key) or 0))
+            else:
+                add_param(colname, str(ctx.get(id_key) or ""))
 
-    # alguns schemas têm started_at/run_started_at
-    for c in ("started_at", "run_started_at"):
-        if c in cols and c not in insert_cols:
-            add_now(c)
+    # ids separados (se existirem)
+    if "window_start_id" in cols:
+        add_param("window_start_id", int(ctx.get("window_start_id") or 0))
+    if "window_end_id" in cols:
+        add_param("window_end_id", int(ctx.get("window_end_id") or 0))
+    if "window_center_id" in cols:
+        add_param("window_center_id", int(ctx.get("window_center_id") or 0))
 
-    # preenche qualquer NOT NULL sem default que ainda não entrou no insert
+    # preenche qualquer NOT NULL sem default que ainda falte
     for col, meta in info.items():
         if col in insert_cols:
             continue
@@ -644,7 +643,6 @@ def audit_run_create_and_get_id(conn, run_fqn: str, ctx: dict) -> int | None:
             continue
         if col in ("id",):
             continue
-
         dt = (meta["data_type"] or "").lower()
         if "timestamp" in dt or dt == "date":
             add_now(col)
@@ -657,57 +655,21 @@ def audit_run_create_and_get_id(conn, run_fqn: str, ctx: dict) -> int | None:
         else:
             add_param(col, "")
 
-    if not insert_cols:
-        with conn.cursor() as cur:
-            cur.execute(f"INSERT INTO {schema}.{table} DEFAULT VALUES RETURNING id")
-            return int(cur.fetchone()[0])
+    returning = "RETURNING id" if "id" in cols else ""
+    sql = f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)}) {returning}"
 
     with conn.cursor() as cur:
-        cur.execute(
-            f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)}) RETURNING id",
-            params,
-        )
-        return int(cur.fetchone()[0])
-
-
-def get_audit_missing_conflict_cols(conn, audit_fqn: str):
-    schema, table = audit_fqn.split(".", 1)
-    pk = get_primary_key_columns(conn, schema, table)
-    if pk:
-        return pk
-    # tenta achar um UNIQUE também
-    rows = pg_all(
-        conn,
-        """
-        SELECT a.attname
-        FROM pg_constraint con
-        JOIN pg_class rel ON rel.oid = con.conrelid
-        JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
-        JOIN unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON TRUE
-        JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = ck.attnum
-        WHERE nsp.nspname = %s
-          AND rel.relname = %s
-          AND con.contype = 'u'
-        ORDER BY con.conname, ck.ord
-        """,
-        [schema, table],
-    )
-    cols = [r[0] for r in rows]
-    if cols:
-        return cols
-    # fallback: se tiver ticket_id, a gente faz delete+insert
-    tcols = get_table_columns(conn, schema, table)
-    if "ticket_id" in tcols:
-        return []
-    return []
+        cur.execute(sql, params)
+        if returning:
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        return None
 
 
 def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: int | None, error_text: str | None):
     schema, table = audit_fqn.split(".", 1)
     info = get_columns_info(conn, schema, table)
     cols = set(info.keys())
-
-    conflict_cols = get_audit_missing_conflict_cols(conn, audit_fqn)
 
     insert_cols = []
     insert_vals = []
@@ -722,14 +684,22 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
         insert_cols.append(col)
         insert_vals.append("now()")
 
-    # campos principais
     if "ticket_id" in cols:
         add_param("ticket_id", int(ticket_id))
 
-    # FK run_id -> audit_recent_run(id)
-    # ctx["run_db_id"] é o ID gerado no audit_recent_run
-    if "run_id" in cols:
-        add_param("run_id", int(ctx.get("run_db_id") or 0))
+    # decide o valor correto de run_id conforme FK (audit_recent_missing.run_id -> audit_recent_run.id OU run_id)
+    run_id_value = None
+    fk_target = ctx.get("missing_fk_target")
+    if fk_target == "id":
+        run_id_value = ctx.get("run_db_id")
+    elif fk_target == "run_id":
+        run_id_value = ctx.get("external_run_id")
+    else:
+        # fallback seguro
+        run_id_value = ctx.get("run_db_id") or ctx.get("external_run_id")
+
+    if "run_id" in cols and run_id_value is not None:
+        add_param("run_id", int(run_id_value))
 
     if "table_name" in cols:
         add_param("table_name", ctx.get("table_name", "tickets_resolvidos_detail"))
@@ -750,7 +720,7 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     if "last_error" in cols:
         add_param("last_error", error_text)
 
-    # completa NOT NULL sem default
+    # preenche NOT NULL sem default
     for col, meta in info.items():
         if col in insert_cols:
             continue
@@ -758,7 +728,7 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
             continue
         if meta["default"] is not None:
             continue
-        dt = meta["data_type"]
+        dt = (meta["data_type"] or "").lower()
         if "timestamp" in dt or dt == "date":
             add_now(col)
         elif dt in ("integer", "bigint", "smallint", "numeric", "real", "double precision"):
@@ -786,6 +756,10 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     if "table_name" in cols:
         updates.append("table_name=EXCLUDED.table_name")
 
+    # tenta usar PK se existir; se não existir, usa ticket_id como conflito
+    pk = get_primary_key_columns(conn, schema, table)
+    conflict_cols = pk if pk else (["ticket_id"] if "ticket_id" in cols else [])
+
     with conn.cursor() as cur:
         if conflict_cols:
             conflict = ",".join(conflict_cols)
@@ -798,13 +772,7 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
                 params,
             )
         else:
-            # sem PK/UNIQUE: garante 1 linha por ticket_id na marra
-            if "ticket_id" in cols:
-                cur.execute(f"DELETE FROM {schema}.{table} WHERE ticket_id=%s", [int(ticket_id)])
-            cur.execute(
-                f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)})",
-                params,
-            )
+            cur.execute(f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)})", params)
 
 
 def audit_delete(conn, audit_fqn: str, ticket_id: int):
@@ -841,10 +809,8 @@ def main():
     meta_read_timeout = _env_int("DETAIL_META_READ_TIMEOUT", 20)
     meta_timeout = (connect_timeout, meta_read_timeout)
 
-    # default agora é 150 (como você pediu)
+    # default 150 como você pediu
     max_actions = _env_int("DETAIL_MAX_ACTIONS", 150)
-
-    # após X tentativas com timeout, marca como "Ticket muito grande"
     big_after_attempts = _env_int("DETAIL_BIG_AFTER_ATTEMPTS", 2)
 
     ctx = run_context(max_actions=max_actions)
@@ -889,19 +855,20 @@ def main():
             [missing_limit],
         )
 
-        return run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows
+        # descobre FK do missing.run_id
+        fk_target = get_fk_target_column(conn, schema, table, "run_id") if "run_id" in get_table_columns(conn, schema, table) else None
+        return run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows, fk_target
 
-    run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows = db_run(dsn, load_state)
-
-    # salva janela no ctx (pra não quebrar audit_recent_run.window_start NOT NULL)
-    ctx["window_start"] = lower
-    ctx["window_end"] = upper
-    ctx["window_center"] = last_id
-
+    run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows, fk_target = db_run(dsn, load_state)
     logger.info(f"detail: Último ticket_id em tickets_resolvidos_detail: {last_id}")
 
-    # cria run no banco e pega o ID (PK) pra usar como FK no missing
-    ctx["run_db_id"] = db_run(dsn, lambda conn: audit_run_create_and_get_id(conn, run_fqn, ctx))
+    ctx["window_start_id"] = lower
+    ctx["window_end_id"] = upper
+    ctx["window_center_id"] = last_id
+    ctx["missing_fk_target"] = fk_target  # pode ser 'id' ou 'run_id' ou None
+
+    # garante run no banco (e pega id se existir)
+    ctx["run_db_id"] = db_run(dsn, lambda conn: audit_run_ensure(conn, run_fqn, ctx))
 
     session = requests.Session()
 
@@ -912,13 +879,12 @@ def main():
     total_big = 0
 
     # -----------------------
-    # Window scan: pega lacunas no range [last-window, last+window]
+    # Janela
     # -----------------------
     flt_window = (
         f"id gt {lower} and id le {upper} and "
         f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
     )
-
     logger.info(f"detail: Janela: /tickets com id > {lower} e <= {upper} (Resolved/Closed/Canceled)")
     window_items, _, _ = list_tickets(session, logger, token, flt_window, SELECT_LIST, timeout, attempts, top=1000, orderby="id")
 
@@ -949,12 +915,7 @@ def main():
         logger.info(f"detail: Janela: buscando detalhe {idx}/{min(len(to_fetch), bulk_limit)} (ID={tid})")
         ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
         if ticket is None:
-            db_try(
-                logger,
-                dsn,
-                lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None),
-                "audit_upsert(window)",
-            )
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(window)")
             total_missing += 1
             continue
 
@@ -964,7 +925,7 @@ def main():
         total_window += 1
 
     # -----------------------
-    # New tickets: id > last_id
+    # Novos (id > last_id)
     # -----------------------
     flt_new = (
         f"id gt {last_id} and "
@@ -998,12 +959,7 @@ def main():
         logger.info(f"detail: Novo: buscando detalhe {idx}/{len(new_ids)} (ID={tid})")
         ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
         if ticket is None:
-            db_try(
-                logger,
-                dsn,
-                lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None),
-                "audit_upsert(new)",
-            )
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(new)")
             total_missing += 1
             continue
 
@@ -1013,7 +969,7 @@ def main():
         total_new += 1
 
     # -----------------------
-    # Pending from audit_recent_missing
+    # Pendentes (audit_recent_missing)
     # -----------------------
     pend_ids = [(int(r[0]), int(r[1] or 0), str(r[2] or "")) for r in pend_rows]
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
@@ -1021,14 +977,12 @@ def main():
     for idx, (tid, prev_attempts, prev_err) in enumerate(pend_ids, start=1):
         logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
 
-        # se já tentou algumas vezes e só dá timeout, marca como "Ticket muito grande"
         if prev_attempts >= big_after_attempts and is_timeout_like(None, prev_err):
             db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, None, None, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_by_attempts)")
             db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_by_attempts)")
             total_big += 1
             continue
 
-        # tenta meta rápido: se actionCount > max_actions, não busca detail
         meta_obj, msc, me = get_ticket_meta(session, logger, token, tid, meta_timeout, meta_attempts)
         if isinstance(meta_obj, dict):
             ac = meta_obj.get("actionCount")
@@ -1040,7 +994,6 @@ def main():
                 total_big += 1
                 continue
 
-        # se nem o meta responde (timeout) e já bateu o limite, marca too_big
         if meta_obj is None and is_timeout_like(msc, me) and (prev_attempts + 1) >= big_after_attempts:
             db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, None, None, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_meta_timeout)")
             db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_meta_timeout)")
@@ -1057,12 +1010,7 @@ def main():
                 total_big += 1
                 continue
 
-            db_try(
-                logger,
-                dsn,
-                lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None),
-                "audit_upsert(pending)",
-            )
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(pending)")
             total_missing += 1
             continue
 
