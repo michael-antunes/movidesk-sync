@@ -59,23 +59,28 @@ def ensure_control_table(cur, schema: str, table: str):
     cur.execute(
         f"""
         create table if not exists {schema}.{table} (
-            id bigserial primary key,
-            schema_name text not null,
-            table_name text not null,
-            mode text not null,
-            dt_start timestamptz null,
-            dt_end timestamptz null,
-            id_inicial bigint null,
-            id_final bigint null,
-            id_atual bigint null,
-            id_atual_merged bigint null,
-            status text not null default 'pending',
-            created_at timestamptz not null default now(),
-            updated_at timestamptz not null default now(),
-            note text null
+            id bigserial primary key
         )
         """
     )
+
+    cur.execute(f"alter table {schema}.{table} add column if not exists schema_name text")
+    cur.execute(f"alter table {schema}.{table} add column if not exists table_name text")
+    cur.execute(f"alter table {schema}.{table} add column if not exists mode text")
+    cur.execute(f"alter table {schema}.{table} add column if not exists dt_start timestamptz")
+    cur.execute(f"alter table {schema}.{table} add column if not exists dt_end timestamptz")
+    cur.execute(f"alter table {schema}.{table} add column if not exists id_inicial bigint")
+    cur.execute(f"alter table {schema}.{table} add column if not exists id_final bigint")
+    cur.execute(f"alter table {schema}.{table} add column if not exists id_atual bigint")
+    cur.execute(f"alter table {schema}.{table} add column if not exists id_atual_merged bigint")
+    cur.execute(f"alter table {schema}.{table} add column if not exists status text")
+    cur.execute(f"alter table {schema}.{table} add column if not exists created_at timestamptz")
+    cur.execute(f"alter table {schema}.{table} add column if not exists updated_at timestamptz")
+    cur.execute(f"alter table {schema}.{table} add column if not exists note text")
+
+    cur.execute(f"alter table {schema}.{table} alter column status set default 'pending'")
+    cur.execute(f"alter table {schema}.{table} alter column created_at set default now()")
+    cur.execute(f"alter table {schema}.{table} alter column updated_at set default now()")
 
 
 def table_exists(cur, schema: str, table: str) -> bool:
@@ -259,7 +264,7 @@ def main():
                     f"""
                     select 1
                       from {schema_ctl}.{table_ctl}
-                     where status in ('running','pending')
+                     where coalesce(status,'pending') in ('running','pending')
                      limit 1
                     """
                 )
