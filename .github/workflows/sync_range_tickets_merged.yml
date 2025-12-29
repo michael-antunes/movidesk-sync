@@ -1,4 +1,4 @@
-name: Movidesk - Range scan (tickets merged)
+name: Movidesk - Range scan (tickets merged) (loop)
 
 on:
   workflow_dispatch:
@@ -19,11 +19,12 @@ on:
     - cron: "*/10 * * * *"
 
 concurrency:
-  group: movidesk-range-scan-tickets-merged
+  group: movidesk-range-scan-tickets-merged-loop
   cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   run:
@@ -58,7 +59,39 @@ jobs:
           TABLE_NAME: tickets_mesclados
           CONTROL_TABLE: range_scan_control
           RESOLVED_TABLE: tickets_resolvidos_detail
-          LIMIT: ${{ github.event.inputs.limit || '80' }}
-          RPM: ${{ github.event.inputs.rpm || '9' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        run: python sync_range_tickets_merged.py
+          LIMIT: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.limit) || '80' }}
+          RPM: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.rpm) || '9' }}
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run) || 'false' }}
+        run: python sync_range_tickets_merged.py | tee scan_out.txt
+
+      - name: Check done
+        shell: bash
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          DB_SCHEMA: visualizacao_resolvidos
+          CONTROL_TABLE: range_scan_control
+        run: |
+          set -euo pipefail
+          DONE=$(python -c 'import os,psycopg2; dsn=os.environ["NEON_DSN"]; schema=os.getenv("DB_SCHEMA","visualizacao_resolvidos"); ctl=os.getenv("CONTROL_TABLE","range_scan_control"); c=psycopg2.connect(dsn); cur=c.cursor(); cur.execute(f"SELECT 1 FROM {schema}.{ctl} WHERE id_atual_merged = id_final LIMIT 1"); r=cur.fetchone(); print("1" if r else "0"); cur.close(); c.close()')
+          echo "done=${DONE}" | tee done_out.txt
+
+      - name: Dispatch self if not done
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIMIT: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.limit) || '80' }}
+          RPM: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.rpm) || '9' }}
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run) || 'false' }}
+        run: |
+          set -euo pipefail
+          if grep -q "done=1" done_out.txt; then
+            exit 0
+          fi
+          cat > dispatch.json <<EOF
+          {"ref":"${{ github.ref_name }}","inputs":{"limit":"${LIMIT}","rpm":"${RPM}","dry_run":"${DRY_RUN}"}}
+          EOF
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
+            -d @dispatch.json
