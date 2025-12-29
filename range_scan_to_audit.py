@@ -20,10 +20,17 @@ RANGE_SCAN_LOCK_NAME = os.getenv("RANGE_SCAN_LOCK_NAME", f"{SCHEMA}.range_scan_c
 USE_DB_ADVISORY_LOCK = os.getenv("USE_DB_ADVISORY_LOCK", "true").lower() in ("1", "true", "yes", "y")
 
 
-def iso_z(dt: datetime) -> str:
+def as_aware_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def iso_z(dt: datetime) -> str:
+    dt = as_aware_utc(dt)
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def try_advisory_lock(cur) -> bool:
@@ -40,11 +47,7 @@ def read_control(cur):
         f"""
         SELECT data_inicio,
                data_fim,
-               ultima_data_validada,
-               COALESCE(ultima_data_validada, data_inicio) AS ultima,
-               id_inicial,
-               id_final,
-               id_atual
+               ultima_data_validada
           FROM {SCHEMA}.range_scan_control
          LIMIT 1;
         """
@@ -52,19 +55,21 @@ def read_control(cur):
     row = cur.fetchone()
     if not row:
         return None
-    data_inicio, data_fim, ultima_raw, ultima, id_inicial, id_final, id_atual = row
+
+    data_inicio = as_aware_utc(row[0])
+    data_fim = as_aware_utc(row[1])
+    ultima_raw = as_aware_utc(row[2])
+    ultima = ultima_raw or data_inicio
+
     return {
         "data_inicio": data_inicio,
         "data_fim": data_fim,
         "ultima_raw": ultima_raw,
         "ultima": ultima,
-        "id_inicial": id_inicial,
-        "id_final": id_final,
-        "id_atual": id_atual,
     }
 
 
-def set_ultima_validada(cur, nv, expected) -> int:
+def set_ultima_validada(cur, nv: datetime, expected) -> int:
     cur.execute(
         f"""
         UPDATE {SCHEMA}.range_scan_control
@@ -87,7 +92,7 @@ def http_get(url, params):
     r.raise_for_status()
 
 
-def fetch_hits(data_fim, ultima):
+def fetch_hits(data_fim: datetime, ultima: datetime):
     flt = (
         f"lastUpdate ge {iso_z(data_fim)} and lastUpdate le {iso_z(ultima)} and "
         "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')"
@@ -103,6 +108,14 @@ def fetch_hits(data_fim, ultima):
     return http_get(url, params) or []
 
 
+def parse_last_update(s: str) -> datetime:
+    s = str(s).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    return as_aware_utc(dt)
+
+
 def do_one_cycle():
     with closing(psycopg2.connect(NEON_DSN)) as conn:
         conn.autocommit = True
@@ -111,7 +124,6 @@ def do_one_cycle():
             if not ctrl:
                 return 0
 
-            data_inicio = ctrl["data_inicio"]
             data_fim = ctrl["data_fim"]
             ultima = ctrl["ultima"]
 
@@ -123,7 +135,7 @@ def do_one_cycle():
             if not hits:
                 nv = data_fim
             else:
-                min_lu = min(datetime.fromisoformat(x["lastUpdate"].replace("Z", "+00:00")) for x in hits)
+                min_lu = min(parse_last_update(x["lastUpdate"]) for x in hits if x.get("lastUpdate"))
                 nv = min_lu - timedelta(seconds=1)
                 if nv < data_fim:
                     nv = data_fim
@@ -136,11 +148,12 @@ def do_one_cycle():
 
 
 def main():
-    with closing(psycopg2.connect(NEON_DSN)) as conn:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            if USE_DB_ADVISORY_LOCK and not try_advisory_lock(cur):
-                return
+    if USE_DB_ADVISORY_LOCK:
+        with closing(psycopg2.connect(NEON_DSN)) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                if not try_advisory_lock(cur):
+                    return
 
     loops = 0
     while loops < MAX_LOOPS:
@@ -150,10 +163,10 @@ def main():
             break
         time.sleep(SLEEP_BETWEEN_LOOPS)
 
-    with closing(psycopg2.connect(NEON_DSN)) as conn:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            if USE_DB_ADVISORY_LOCK:
+    if USE_DB_ADVISORY_LOCK:
+        with closing(psycopg2.connect(NEON_DSN)) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
                 advisory_unlock(cur)
 
 
