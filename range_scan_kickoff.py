@@ -1,23 +1,23 @@
 import os
 import sys
-import time
 import logging
 from datetime import datetime, timezone
 
 import psycopg2
 
 
-DEFAULT_SCHEMA = "visualizacao_resolvidos"
-CONTROL_TABLE = "range_scan_control"
+SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
+CONTROL_TABLE = os.getenv("CONTROL_TABLE", "range_scan_control")
+DATA_FIM = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
-PREFERRED_SOURCE_TABLES = [
-    ("visualizacao_resolvidos", "tickets_resolvidos_detail"),
-]
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def setup_logger() -> logging.Logger:
     logger = logging.getLogger("kickoff")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     if not logger.handlers:
@@ -25,259 +25,153 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def parse_iso(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    s = str(s).strip()
-    if not s:
-        return None
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = str(v).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
 def pg_connect(dsn: str):
     return psycopg2.connect(dsn)
 
 
-def ensure_control_table(cur, schema: str, table: str):
-    cur.execute(
-        f"""
-        create table if not exists {schema}.{table} (
-            id bigserial primary key
+def ensure_schema_and_control_table(conn):
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA}.{CONTROL_TABLE} (
+                data_fim timestamptz NOT NULL,
+                data_inicio timestamptz NOT NULL,
+                ultima_data_validada timestamptz,
+                id_inicial bigint,
+                id_final bigint,
+                id_atual bigint,
+                id_atual_merged bigint,
+                concluido_em timestamptz,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                ultima_data_validada_merged timestamptz
+            )
+            """
         )
-        """
-    )
-
-    cur.execute(f"alter table {schema}.{table} add column if not exists schema_name text")
-    cur.execute(f"alter table {schema}.{table} add column if not exists table_name text")
-    cur.execute(f"alter table {schema}.{table} add column if not exists mode text")
-    cur.execute(f"alter table {schema}.{table} add column if not exists dt_start timestamptz")
-    cur.execute(f"alter table {schema}.{table} add column if not exists dt_end timestamptz")
-    cur.execute(f"alter table {schema}.{table} add column if not exists id_inicial bigint")
-    cur.execute(f"alter table {schema}.{table} add column if not exists id_final bigint")
-    cur.execute(f"alter table {schema}.{table} add column if not exists id_atual bigint")
-    cur.execute(f"alter table {schema}.{table} add column if not exists id_atual_merged bigint")
-    cur.execute(f"alter table {schema}.{table} add column if not exists status text")
-    cur.execute(f"alter table {schema}.{table} add column if not exists created_at timestamptz")
-    cur.execute(f"alter table {schema}.{table} add column if not exists updated_at timestamptz")
-    cur.execute(f"alter table {schema}.{table} add column if not exists note text")
-
-    cur.execute(f"alter table {schema}.{table} alter column status set default 'pending'")
-    cur.execute(f"alter table {schema}.{table} alter column created_at set default now()")
-    cur.execute(f"alter table {schema}.{table} alter column updated_at set default now()")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS data_fim timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS data_inicio timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS ultima_data_validada timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS id_inicial bigint")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS id_final bigint")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS id_atual bigint")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS id_atual_merged bigint")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS concluido_em timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS created_at timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS updated_at timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ADD COLUMN IF NOT EXISTS ultima_data_validada_merged timestamptz")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ALTER COLUMN created_at SET DEFAULT now()")
+        cur.execute(f"ALTER TABLE {SCHEMA}.{CONTROL_TABLE} ALTER COLUMN updated_at SET DEFAULT now()")
 
 
-def table_exists(cur, schema: str, table: str) -> bool:
-    cur.execute(
-        """
-        select exists(
-            select 1
-              from information_schema.tables
-             where table_schema = %s
-               and table_name = %s
+def table_exists(conn, schema: str, table: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1
+                  FROM information_schema.tables
+                 WHERE table_schema=%s
+                   AND table_name=%s
+            )
+            """,
+            (schema, table),
         )
-        """,
-        (schema, table),
-    )
-    return bool(cur.fetchone()[0])
+        return bool(cur.fetchone()[0])
 
 
-def get_columns(cur, schema: str, table: str) -> set[str]:
-    cur.execute(
-        """
-        select column_name
-          from information_schema.columns
-         where table_schema = %s
-           and table_name = %s
-        """,
-        (schema, table),
-    )
-    return {r[0] for r in cur.fetchall()}
+def get_columns(conn, schema: str, table: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema=%s
+               AND table_name=%s
+            """,
+            (schema, table),
+        )
+        return {r[0] for r in cur.fetchall()}
 
 
-def find_source_table(cur, logger: logging.Logger):
-    for schema, table in PREFERRED_SOURCE_TABLES:
-        if table_exists(cur, schema, table):
-            logger.info("kickoff: tabela-fonte encontrada: %s.%s", schema, table)
-            return schema, table
-    logger.info("kickoff: nenhuma tabela-fonte encontrada (tickets_resolvidos_detail).")
-    return None, None
+def pick_source_table(conn, logger: logging.Logger):
+    if table_exists(conn, "visualizacao_resolvidos", "tickets_resolvidos_detail"):
+        logger.info("tabela-fonte encontrada: visualizacao_resolvidos.tickets_resolvidos_detail")
+        return "visualizacao_resolvidos", "tickets_resolvidos_detail"
+    raise RuntimeError("Tabela fonte não encontrada: visualizacao_resolvidos.tickets_resolvidos_detail")
 
 
-def choose_id_column(cols: set[str]) -> str:
-    for c in ("ticket_id", "id"):
-        if c in cols:
-            return c
-    raise RuntimeError("Tabela fonte não tem coluna ticket_id nem id.")
-
-
-def choose_raw_column(cols: set[str]) -> str | None:
-    for c in ("raw_payload", "raw", "payload", "data"):
-        if c in cols:
-            return c
-    return None
-
-
-def choose_dt_column(cols: set[str]) -> str | None:
-    for c in ("created_at", "updated_at", "last_update", "last_updated_at"):
-        if c in cols:
-            return c
-    return None
-
-
-def compute_limits_from_source(cur, schema: str, table: str, cols: set[str], logger: logging.Logger):
-    id_col = choose_id_column(cols)
-    raw_col = choose_raw_column(cols)
-    dt_col = choose_dt_column(cols)
-
-    cur.execute(f"select max({id_col})::bigint, min({id_col})::bigint from {schema}.{table}")
-    max_id, min_id = cur.fetchone()
-
+def compute_id_bounds(conn, schema: str, table: str) -> tuple[int, int]:
+    cols = get_columns(conn, schema, table)
+    id_col = "ticket_id" if "ticket_id" in cols else ("id" if "id" in cols else None)
+    if not id_col:
+        raise RuntimeError(f"Tabela fonte {schema}.{table} não tem coluna ticket_id nem id.")
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT MAX({id_col})::bigint, MIN({id_col})::bigint FROM {schema}.{table}")
+        max_id, min_id = cur.fetchone()
     if max_id is None or min_id is None:
-        raise RuntimeError(f"Tabela fonte {schema}.{table} está vazia (sem IDs).")
+        raise RuntimeError(f"Tabela fonte {schema}.{table} está vazia.")
+    return int(max_id), int(min_id)
 
-    min_dt = None
-    max_dt = None
 
-    if dt_col:
+def reset_and_insert_control(conn, row: dict):
+    with conn.cursor() as cur:
+        cur.execute(f"DELETE FROM {SCHEMA}.{CONTROL_TABLE}")
         cur.execute(
             f"""
-            select
-              min({dt_col})::timestamptz,
-              max({dt_col})::timestamptz
-            from {schema}.{table}
-            """
+            INSERT INTO {SCHEMA}.{CONTROL_TABLE}
+              (data_inicio, data_fim, ultima_data_validada,
+               id_inicial, id_final, id_atual, id_atual_merged,
+               concluido_em, created_at, updated_at, ultima_data_validada_merged)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s, now(), now(), %s)
+            """,
+            (
+                row["data_inicio"],
+                row["data_fim"],
+                row["ultima_data_validada"],
+                row["id_inicial"],
+                row["id_final"],
+                row["id_atual"],
+                row["id_atual_merged"],
+                row["concluido_em"],
+                row["ultima_data_validada_merged"],
+            ),
         )
-        min_dt, max_dt = cur.fetchone()
-
-    if (min_dt is None or max_dt is None) and raw_col:
-        cur.execute(
-            f"""
-            select
-              min(nullif(({raw_col}->>'createdDate')::text,'')::timestamptz),
-              max(nullif(({raw_col}->>'createdDate')::text,'')::timestamptz)
-            from {schema}.{table}
-            """
-        )
-        rmin, rmax = cur.fetchone()
-        min_dt = min_dt or rmin
-        max_dt = max_dt or rmax
-
-    if min_dt is None or max_dt is None:
-        now = utcnow()
-        min_dt = min_dt or now.replace(year=now.year - 5)
-        max_dt = max_dt or now
-
-    logger.info(
-        "kickoff: bounds fonte %s.%s: ids [%s .. %s] (max→min), datas [%s .. %s]",
-        schema,
-        table,
-        int(max_id),
-        int(min_id),
-        min_dt,
-        max_dt,
-    )
-    return int(max_id), int(min_id), min_dt, max_dt
-
-
-def upsert_range(cur, schema_ctl: str, table_ctl: str, schema_src: str, table_src: str, mode: str, dt_start, dt_end, min_id, max_id, note: str | None):
-    cur.execute(
-        f"""
-        insert into {schema_ctl}.{table_ctl} (
-            schema_name, table_name, mode, dt_start, dt_end,
-            id_inicial, id_final, id_atual, id_atual_merged,
-            status, note, created_at, updated_at
-        )
-        values (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,now(),now())
-        """,
-        (
-            schema_src,
-            table_src,
-            mode,
-            dt_start,
-            dt_end,
-            max_id,
-            min_id,
-            None,
-            max_id,
-            note,
-        ),
-    )
 
 
 def main():
     logger = setup_logger()
-
     dsn = os.getenv("NEON_DSN")
     if not dsn:
         raise SystemExit("NEON_DSN não definido")
-
-    schema_ctl = os.getenv("CONTROL_SCHEMA", DEFAULT_SCHEMA)
-    table_ctl = os.getenv("CONTROL_TABLE", CONTROL_TABLE)
-
-    mode = os.getenv("MODE", "day")
-    note = os.getenv("NOTE")
-
-    lock_seconds = int(os.getenv("LOCK_SECONDS", "0") or "0")
-    reset_force = env_bool("RESET_FORCE", False)
-
     with pg_connect(dsn) as conn:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            ensure_control_table(cur, schema_ctl, table_ctl)
-
-            if lock_seconds > 0:
-                cur.execute("select pg_advisory_lock(hashtext(%s))", (f"{schema_ctl}.{table_ctl}",))
-
-            schema_src, table_src = find_source_table(cur, logger)
-            if not schema_src or not table_src:
-                raise SystemExit("Não encontrei tabela fonte para descobrir limites (tickets_resolvidos_detail).")
-
-            cols = get_columns(cur, schema_src, table_src)
-            max_id, min_id, min_dt, max_dt = compute_limits_from_source(cur, schema_src, table_src, cols, logger)
-
-            dt_start_env = parse_iso(os.getenv("DT_START"))
-            dt_end_env = parse_iso(os.getenv("DT_END"))
-            if dt_start_env:
-                min_dt = dt_start_env
-            if dt_end_env:
-                max_dt = dt_end_env
-
-            if not reset_force:
-                cur.execute(
-                    f"""
-                    select 1
-                      from {schema_ctl}.{table_ctl}
-                     where coalesce(status,'pending') in ('running','pending')
-                     limit 1
-                    """
-                )
-                if cur.fetchone():
-                    logger.info("kickoff: já existe range_scan_control pendente/em andamento; não criando novo range.")
-                    return
-
-            upsert_range(cur, schema_ctl, table_ctl, schema_src, table_src, mode, min_dt, max_dt, min_id, max_id, note)
-            logger.info("kickoff: range criado em %s.%s (mode=%s)", schema_ctl, table_ctl, mode)
-
-            if lock_seconds > 0:
-                time.sleep(lock_seconds)
-                cur.execute("select pg_advisory_unlock(hashtext(%s))", (f"{schema_ctl}.{table_ctl}",))
+        conn.autocommit = False
+        ensure_schema_and_control_table(conn)
+        src_schema, src_table = pick_source_table(conn, logger)
+        max_id, min_id = compute_id_bounds(conn, src_schema, src_table)
+        row = {
+            "data_inicio": now_utc(),
+            "data_fim": DATA_FIM,
+            "ultima_data_validada": None,
+            "ultima_data_validada_merged": None,
+            "id_inicial": max_id,
+            "id_final": min_id,
+            "id_atual": None,
+            "id_atual_merged": max_id,
+            "concluido_em": None,
+        }
+        reset_and_insert_control(conn, row)
+        conn.commit()
+        logger.info(
+            "OK. data_inicio=%s data_fim=%s id_inicial=%s id_final=%s id_atual=%s id_atual_merged=%s",
+            row["data_inicio"],
+            row["data_fim"],
+            row["id_inicial"],
+            row["id_final"],
+            row["id_atual"],
+            row["id_atual_merged"],
+        )
 
 
 if __name__ == "__main__":
