@@ -27,63 +27,59 @@ def _env_str(*names: str, default: Optional[str] = None) -> Optional[str]:
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if v is None or str(v).strip() == "":
         return default
-    return int(v)
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if v is None or str(v).strip() == "":
         return default
-    return float(v)
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if v is None or v.strip() == "":
+    if v is None:
         return default
-    s = v.strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
         return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
+    if s in ("0", "false", "no", "n", "off"):
         return False
-    raise ValueError(f"{name} inválida: {v!r}")
+    return default
 
 
 def _dt_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_dt(value: Any) -> Optional[datetime]:
-    if value is None:
+def _parse_dt(x: Any) -> Optional[datetime]:
+    if x is None:
         return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        try:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
-            try:
-                dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-                return dt
-            except Exception:
-                continue
-    return None
-
-
-def _qident(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+    if isinstance(x, datetime):
+        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+    s = str(x).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 def qname(schema: str, table: str) -> str:
-    return f"{_qident(schema)}.{_qident(table)}"
+    return f'"{schema}"."{table}"'
 
 
 @dataclass
@@ -126,31 +122,10 @@ def load_settings() -> Settings:
 
 
 def pg_connect():
-    common_kwargs = dict(
-        connect_timeout=int(os.getenv("PGCONNECT_TIMEOUT", "15")),
-        application_name=os.getenv("PGAPPNAME", "movidesk-range-scan"),
-        keepalives=1,
-        keepalives_idle=int(os.getenv("PGKEEPALIVES_IDLE", "30")),
-        keepalives_interval=int(os.getenv("PGKEEPALIVES_INTERVAL", "10")),
-        keepalives_count=int(os.getenv("PGKEEPALIVES_COUNT", "5")),
-    )
-
     dsn = _env_str("NEON_DSN", "DATABASE_URL")
-    if dsn:
-        return psycopg2.connect(dsn, **common_kwargs)
-
-    host = os.getenv("PGHOST")
-    db = os.getenv("PGDATABASE")
-    user = os.getenv("PGUSER")
-    pwd = os.getenv("PGPASSWORD")
-    port = os.getenv("PGPORT") or "5432"
-    sslmode = os.getenv("PGSSLMODE") or "require"
-
-    if not (host and db and user and pwd):
-        raise RuntimeError("Faltam variáveis de Postgres. Use NEON_DSN/DATABASE_URL ou PGHOST/PGDATABASE/PGUSER/PGPASSWORD.")
-
-    parts = [f"host={host}", f"dbname={db}", f"user={user}", f"password={pwd}", f"port={port}", f"sslmode={sslmode}"]
-    return psycopg2.connect(" ".join(parts), **common_kwargs)
+    if not dsn:
+        raise RuntimeError("Falta NEON_DSN (ou DATABASE_URL)")
+    return psycopg2.connect(dsn)
 
 
 @dataclass
@@ -169,17 +144,13 @@ class ControlRow:
 def read_latest_control(conn, schema: str, control_table: str) -> Optional[ControlRow]:
     sql = f"""
         SELECT ctid::text,
-               data_inicio,
-               data_fim,
-               ultima_data_validada,
-               ultima_data_validada_merged,
-               id_inicial,
-               id_final,
-               id_atual,
-               id_atual_merged
-        FROM {qname(schema, control_table)}
-        ORDER BY data_inicio DESC NULLS LAST, data_fim DESC NULLS LAST
-        LIMIT 1
+               data_inicio, data_fim,
+               ultima_data_validada, ultima_data_validada_merged,
+               id_inicial, id_final,
+               id_atual, id_atual_merged
+          FROM {qname(schema, control_table)}
+         ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+         LIMIT 1
     """
     with conn.cursor() as cur:
         cur.execute(sql)
@@ -217,9 +188,11 @@ def update_control(
     sets: List[str] = []
     params: List[Any] = []
 
-    def add(col: str, val: Any):
+    def add(col: str, val: Any) -> None:
         sets.append(f"{col} = %s")
         params.append(val)
+
+    add("updated_at", _dt_now())
 
     if data_inicio is not None:
         add("data_inicio", data_inicio)
@@ -252,8 +225,8 @@ def update_control(
         cur.execute(sql, params)
         r = cur.fetchone()
         if not r:
-            raise RuntimeError("Falha ao atualizar control table")
-        return str(r[0])
+            return ctid
+        return r[0]
 
 
 def bootstrap_ids_from_resolved(
@@ -261,22 +234,19 @@ def bootstrap_ids_from_resolved(
     schema: str,
     resolved_table: str,
     id_col: str,
-    date_col: str,
-    start_dt: datetime,
-    end_dt: datetime,
 ) -> Tuple[Optional[int], Optional[int]]:
     sql = f"""
         SELECT MAX({id_col})::bigint AS max_id,
                MIN({id_col})::bigint AS min_id
         FROM {qname(schema, resolved_table)}
-        WHERE {date_col} >= %s AND {date_col} <= %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (start_dt, end_dt))
+        cur.execute(sql)
         r = cur.fetchone()
         if not r:
             return None, None
         return r[0], r[1]
+
 
 
 def fetch_next_batch_ids(
@@ -284,32 +254,24 @@ def fetch_next_batch_ids(
     schema: str,
     resolved_table: str,
     id_col: str,
-    date_col: str,
-    start_dt: datetime,
-    end_dt: datetime,
     *,
     from_id: int,
     to_id: int,
     limit: int,
-) -> List[Tuple[int, datetime]]:
+) -> List[int]:
     sql = f"""
-        SELECT {id_col}::bigint AS ticket_id,
-               {date_col} AS updated_at
+        SELECT {id_col}::bigint AS ticket_id
         FROM {qname(schema, resolved_table)}
-        WHERE {date_col} >= %s AND {date_col} <= %s
-          AND {id_col} <= %s
-          AND {id_col} >= %s
-        ORDER BY {id_col} DESC
+        WHERE {id_col}::bigint <= %s
+          AND {id_col}::bigint >= %s
+        ORDER BY {id_col}::bigint DESC
         LIMIT %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (start_dt, end_dt, from_id, to_id, limit))
+        cur.execute(sql, (from_id, to_id, limit))
         rows = cur.fetchall()
+    return [int(r[0]) for r in rows]
 
-    out: List[Tuple[int, datetime]] = []
-    for tid, dt in rows:
-        out.append((int(tid), _parse_dt(dt) or _dt_now()))
-    return out
 
 
 def _session() -> requests.Session:
@@ -347,8 +309,13 @@ def normalize_merged_record(raw: Dict[str, Any]) -> Optional[Tuple[int, int, str
     if ids is None:
         return None
 
+    merged_ids: List[int] = []
     if isinstance(ids, list):
-        merged_ids = [int(x) for x in ids if str(x).strip().isdigit()]
+        for x in ids:
+            try:
+                merged_ids.append(int(x))
+            except Exception:
+                pass
     else:
         s = str(ids).strip()
         if not s:
@@ -388,11 +355,23 @@ def upsert_merged_rows(
             last_update = EXCLUDED.last_update,
             synced_at = EXCLUDED.synced_at
     """
-    now = _dt_now()
-    values = [(r[0], r[1], r[2], r[3], r[4], now) for r in rows]
+
+    values = []
+    for ticket_id, merged_tickets, merged_ids_text, merged_ids_arr, last_update in rows:
+        values.append(
+            (
+                int(ticket_id),
+                int(merged_tickets),
+                merged_ids_text,
+                merged_ids_arr,
+                last_update,
+                _dt_now(),
+            )
+        )
+
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, values, page_size=1000)
-    return len(rows)
+        psycopg2.extras.execute_values(cur, sql, values, page_size=500)
+    return len(values)
 
 
 def _safe_rollback(conn) -> None:
@@ -419,16 +398,11 @@ def main() -> None:
             _safe_rollback(conn)
             return
 
-        start_dt = min(control.data_inicio, control.data_fim)
-        end_dt = max(control.data_inicio, control.data_fim)
-
-        if control.data_inicio > control.data_fim and not cfg.dry_run:
-            control.ctid = update_control(conn, cfg.db_schema, cfg.control_table, control.ctid, data_inicio=start_dt, data_fim=end_dt)
-            conn.commit()
-
         id_inicial = control.id_inicial
         id_final = control.id_final
-        id_ptr = control.id_atual_merged or control.id_atual
+        id_ptr = control.id_atual_merged
+        if id_ptr is None and id_inicial is not None:
+            id_ptr = id_inicial
 
         if id_inicial is None or id_final is None or id_ptr is None:
             max_id, min_id = bootstrap_ids_from_resolved(
@@ -436,17 +410,16 @@ def main() -> None:
                 cfg.db_schema,
                 cfg.resolved_table,
                 cfg.resolved_id_col,
-                cfg.resolved_date_col,
-                start_dt,
-                end_dt,
             )
             if max_id is None or min_id is None:
                 _safe_rollback(conn)
                 return
 
-            id_inicial = id_inicial or int(max_id)
-            id_final = id_final or int(min_id)
-            id_ptr = id_ptr or id_inicial
+            id_inicial = int(max_id) if id_inicial is None else int(id_inicial)
+            id_final = int(min_id) if id_final is None else int(id_final)
+
+            if id_ptr is None:
+                id_ptr = id_inicial
 
             if not cfg.dry_run:
                 control.ctid = update_control(
@@ -454,11 +427,8 @@ def main() -> None:
                     cfg.db_schema,
                     cfg.control_table,
                     control.ctid,
-                    data_inicio=start_dt,
-                    data_fim=end_dt,
                     id_inicial=id_inicial,
                     id_final=id_final,
-                    id_atual=id_ptr,
                     id_atual_merged=id_ptr,
                 )
                 conn.commit()
@@ -472,9 +442,6 @@ def main() -> None:
             cfg.db_schema,
             cfg.resolved_table,
             cfg.resolved_id_col,
-            cfg.resolved_date_col,
-            start_dt,
-            end_dt,
             from_id=id_ptr,
             to_id=id_final,
             limit=cfg.limit,
@@ -491,12 +458,13 @@ def main() -> None:
             pass
 
     LOG.info(
-        "scanner iniciando | schema=%s tabela=%s control=%s | range=%s..%s | limit=%s | rpm=%.2f | throttle=%.2fs | dry_run=%s",
+        "scanner iniciando | schema=%s tabela=%s control=%s | id_inicial=%s id_final=%s id_ptr=%s | limit=%s | rpm=%.2f | throttle=%.2fs | dry_run=%s",
         cfg.db_schema,
         cfg.table_name,
         cfg.control_table,
-        start_dt.date(),
-        end_dt.date(),
+        id_inicial,
+        id_final,
+        id_ptr,
         cfg.limit,
         cfg.rpm,
         cfg.throttle_seconds,
@@ -508,14 +476,9 @@ def main() -> None:
     checked = 0
     merged_found = 0
 
-    for ticket_id, _updated_at in batch:
+    for ticket_id in batch:
         checked += 1
-        raw = None
-        try:
-            raw = movidesk_get_merged(session, cfg.base_url, cfg.token, ticket_id)
-        except Exception as e:
-            LOG.warning("Falha API ticket %s: %s", ticket_id, e)
-
+        raw = movidesk_get_merged(session, cfg.base_url, cfg.token, ticket_id)
         if raw:
             norm = normalize_merged_record(raw)
             if norm:
@@ -525,19 +488,17 @@ def main() -> None:
         if cfg.throttle_seconds > 0:
             time.sleep(cfg.throttle_seconds)
 
-    last_ticket_id = batch[-1][0]
+    last_ticket_id = batch[-1]
     new_ptr = last_ticket_id - 1
-    oldest_dt = min(dt for _, dt in batch)
 
     if cfg.dry_run:
         LOG.info(
-            "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada_merged=%s",
+            "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s",
             checked,
             merged_found,
             0,
             id_ptr,
             new_ptr,
-            oldest_dt.isoformat(),
         )
         return
 
@@ -547,21 +508,18 @@ def main() -> None:
             conn2 = pg_connect()
             conn2.autocommit = False
 
-            upserted = upsert_merged_rows(conn2, cfg.db_schema, cfg.table_name, to_upsert, dry_run=False)
+            upserted = upsert_merged_rows(conn2, cfg.db_schema, cfg.table_name, to_upsert, dry_run=cfg.dry_run)
 
             control2 = read_latest_control(conn2, cfg.db_schema, cfg.control_table)
             if not control2:
-                raise RuntimeError("Controle não encontrado")
+                _safe_rollback(conn2)
+                return
 
             update_control(
                 conn2,
                 cfg.db_schema,
                 cfg.control_table,
                 control2.ctid,
-                data_inicio=start_dt,
-                data_fim=end_dt,
-                ultima_data_validada_merged=oldest_dt,
-                id_atual=new_ptr,
                 id_atual_merged=new_ptr,
                 id_inicial=control2.id_inicial,
                 id_final=control2.id_final,
@@ -570,13 +528,12 @@ def main() -> None:
             conn2.commit()
 
             LOG.info(
-                "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s | ultima_data_validada_merged=%s",
+                "scanner concluído | checked=%d merged_found=%d upserted=%d | id_ptr %s -> %s",
                 checked,
                 merged_found,
                 upserted,
                 id_ptr,
                 new_ptr,
-                oldest_dt.isoformat(),
             )
             return
 
@@ -588,9 +545,9 @@ def main() -> None:
                 except Exception:
                     pass
             if attempt == 1:
-                LOG.warning("Falha conexão Neon; reconectando: %s", e)
+                time.sleep(1.5)
                 continue
-            raise
+            raise e
         finally:
             if conn2 is not None:
                 try:
