@@ -19,8 +19,7 @@ def setup_logger() -> logging.Logger:
     logger = logging.getLogger("kickoff")
     logger.setLevel(logging.INFO)
     h = logging.StreamHandler(sys.stdout)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    h.setFormatter(fmt)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     if not logger.handlers:
         logger.addHandler(h)
     return logger
@@ -78,149 +77,118 @@ def ensure_control_table(cur, schema: str, table: str):
         """
     )
 
+
+def table_exists(cur, schema: str, table: str) -> bool:
     cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists schema_name text
         """
+        select exists(
+            select 1
+              from information_schema.tables
+             where table_schema = %s
+               and table_name = %s
+        )
+        """,
+        (schema, table),
     )
+    return bool(cur.fetchone()[0])
+
+
+def get_columns(cur, schema: str, table: str) -> set[str]:
     cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists table_name text
         """
+        select column_name
+          from information_schema.columns
+         where table_schema = %s
+           and table_name = %s
+        """,
+        (schema, table),
     )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists mode text
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists dt_start timestamptz
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists dt_end timestamptz
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists id_inicial bigint
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists id_final bigint
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists id_atual bigint
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists id_atual_merged bigint
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists status text
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists created_at timestamptz
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists updated_at timestamptz
-        """
-    )
-    cur.execute(
-        f"""
-        alter table {schema}.{table}
-            add column if not exists note text
-        """
-    )
+    return {r[0] for r in cur.fetchall()}
 
 
 def find_source_table(cur, logger: logging.Logger):
     for schema, table in PREFERRED_SOURCE_TABLES:
-        cur.execute(
-            """
-            select exists(
-                select 1
-                  from information_schema.tables
-                 where table_schema = %s
-                   and table_name = %s
-            )
-            """,
-            (schema, table),
-        )
-        exists = cur.fetchone()[0]
-        if exists:
+        if table_exists(cur, schema, table):
             logger.info("kickoff: tabela-fonte encontrada: %s.%s", schema, table)
             return schema, table
     logger.info("kickoff: nenhuma tabela-fonte encontrada (tickets_resolvidos_detail).")
     return None, None
 
 
-def compute_limits_from_source(cur, schema: str, table: str):
-    cur.execute(
-        f"""
-        select
-            min(ticket_id)::bigint,
-            max(ticket_id)::bigint
-        from {schema}.{table}
-        """
-    )
-    row = cur.fetchone()
-    min_id, max_id = row[0], row[1]
-    cur.execute(
-        f"""
-        select
-            min(created_at)::timestamptz,
-            max(created_at)::timestamptz
-        from {schema}.{table}
-        """
-    )
-    dt_row = cur.fetchone()
-    min_dt, max_dt = dt_row[0], dt_row[1]
+def choose_id_column(cols: set[str]) -> str:
+    for c in ("ticket_id", "id"):
+        if c in cols:
+            return c
+    raise RuntimeError("Tabela fonte não tem coluna ticket_id nem id.")
 
-    if min_dt is None or max_dt is None:
+
+def choose_raw_column(cols: set[str]) -> str | None:
+    for c in ("raw_payload", "raw", "payload", "data"):
+        if c in cols:
+            return c
+    return None
+
+
+def choose_dt_column(cols: set[str]) -> str | None:
+    for c in ("created_at", "updated_at", "last_update", "last_updated_at"):
+        if c in cols:
+            return c
+    return None
+
+
+def compute_limits_from_source(cur, schema: str, table: str, cols: set[str], logger: logging.Logger):
+    id_col = choose_id_column(cols)
+    raw_col = choose_raw_column(cols)
+    dt_col = choose_dt_column(cols)
+
+    cur.execute(f"select max({id_col})::bigint, min({id_col})::bigint from {schema}.{table}")
+    max_id, min_id = cur.fetchone()
+
+    if max_id is None or min_id is None:
+        raise RuntimeError(f"Tabela fonte {schema}.{table} está vazia (sem IDs).")
+
+    min_dt = None
+    max_dt = None
+
+    if dt_col:
         cur.execute(
             f"""
             select
-                min((raw_payload->>'createdDate')::timestamptz),
-                max((raw_payload->>'createdDate')::timestamptz)
+              min({dt_col})::timestamptz,
+              max({dt_col})::timestamptz
             from {schema}.{table}
             """
         )
-        dt_row2 = cur.fetchone()
-        if dt_row2 and (dt_row2[0] or dt_row2[1]):
-            min_dt = dt_row2[0] or min_dt
-            max_dt = dt_row2[1] or max_dt
+        min_dt, max_dt = cur.fetchone()
+
+    if (min_dt is None or max_dt is None) and raw_col:
+        cur.execute(
+            f"""
+            select
+              min(nullif(({raw_col}->>'createdDate')::text,'')::timestamptz),
+              max(nullif(({raw_col}->>'createdDate')::text,'')::timestamptz)
+            from {schema}.{table}
+            """
+        )
+        rmin, rmax = cur.fetchone()
+        min_dt = min_dt or rmin
+        max_dt = max_dt or rmax
 
     if min_dt is None or max_dt is None:
         now = utcnow()
-        min_dt = now.replace(year=now.year - 5)
-        max_dt = now
+        min_dt = min_dt or now.replace(year=now.year - 5)
+        max_dt = max_dt or now
 
-    return min_id, max_id, min_dt, max_dt
+    logger.info(
+        "kickoff: bounds fonte %s.%s: ids [%s .. %s] (max→min), datas [%s .. %s]",
+        schema,
+        table,
+        int(max_id),
+        int(min_id),
+        min_dt,
+        max_dt,
+    )
+    return int(max_id), int(min_id), min_dt, max_dt
 
 
 def upsert_range(cur, schema_ctl: str, table_ctl: str, schema_src: str, table_src: str, mode: str, dt_start, dt_end, min_id, max_id, note: str | None):
@@ -276,7 +244,8 @@ def main():
             if not schema_src or not table_src:
                 raise SystemExit("Não encontrei tabela fonte para descobrir limites (tickets_resolvidos_detail).")
 
-            min_id, max_id, min_dt, max_dt = compute_limits_from_source(cur, schema_src, table_src)
+            cols = get_columns(cur, schema_src, table_src)
+            max_id, min_id, min_dt, max_dt = compute_limits_from_source(cur, schema_src, table_src, cols, logger)
 
             dt_start_env = parse_iso(os.getenv("DT_START"))
             dt_end_env = parse_iso(os.getenv("DT_END"))
