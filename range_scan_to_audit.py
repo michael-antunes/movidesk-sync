@@ -11,16 +11,22 @@ NEON_DSN = os.environ["NEON_DSN"]
 MOVIDESK_TOKEN = os.environ["MOVIDESK_TOKEN"]
 
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "5"))
+HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "1.2"))
+
 BULK_TOP = int(os.getenv("BULK_TOP", "1000"))
 MAX_LOOPS = int(os.getenv("MAX_LOOPS", "25"))
 SLEEP_BETWEEN_LOOPS = float(os.getenv("SLEEP_BETWEEN_LOOPS", "0.2"))
+
+FAIL_OPEN = os.getenv("FAIL_OPEN", "true").lower() in ("1", "true", "yes", "y")
 
 RANGE_SCAN_LOCK_NAME = os.getenv("RANGE_SCAN_LOCK_NAME", f"{SCHEMA}.range_scan_control")
 USE_DB_ADVISORY_LOCK = os.getenv("USE_DB_ADVISORY_LOCK", "true").lower() in ("1", "true", "yes", "y")
 
 
-def as_aware_utc(dt: datetime | None) -> datetime | None:
+def as_aware_utc(dt):
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -83,16 +89,34 @@ def set_ultima_validada(cur, nv: datetime, expected) -> int:
     return cur.rowcount
 
 
-def http_get(url, params):
-    for attempt in (1, 2, 3):
-        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-        if r.status_code == 200:
-            return r.json()
-        time.sleep(0.8 * attempt)
-    r.raise_for_status()
+def parse_last_update(s: str) -> datetime:
+    s = str(s).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    return as_aware_utc(dt)
 
 
-def fetch_hits(data_fim: datetime, ultima: datetime):
+def http_get_json(session: requests.Session, url: str, params: dict):
+    last_err = None
+    for i in range(HTTP_RETRIES):
+        try:
+            r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(HTTP_BACKOFF * (i + 1))
+                continue
+            r.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            time.sleep(HTTP_BACKOFF * (i + 1))
+    if FAIL_OPEN:
+        return None
+    raise last_err
+
+
+def fetch_hits(session: requests.Session, data_fim: datetime, ultima: datetime):
     flt = (
         f"lastUpdate ge {iso_z(data_fim)} and lastUpdate le {iso_z(ultima)} and "
         "(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')"
@@ -105,18 +129,13 @@ def fetch_hits(data_fim: datetime, ultima: datetime):
         "$orderby": "lastUpdate desc",
         "$top": str(BULK_TOP),
     }
-    return http_get(url, params) or []
+    data = http_get_json(session, url, params)
+    if data is None:
+        return None
+    return data or []
 
 
-def parse_last_update(s: str) -> datetime:
-    s = str(s).strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    return as_aware_utc(dt)
-
-
-def do_one_cycle():
+def do_one_cycle(session: requests.Session) -> int:
     with closing(psycopg2.connect(NEON_DSN)) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -130,7 +149,9 @@ def do_one_cycle():
             if ultima <= data_fim:
                 return 0
 
-            hits = fetch_hits(data_fim, ultima)
+            hits = fetch_hits(session, data_fim, ultima)
+            if hits is None:
+                return 0
 
             if not hits:
                 nv = data_fim
@@ -148,26 +169,38 @@ def do_one_cycle():
 
 
 def main():
-    if USE_DB_ADVISORY_LOCK:
-        with closing(psycopg2.connect(NEON_DSN)) as conn:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                if not try_advisory_lock(cur):
-                    return
+    locked = False
+    try:
+        if USE_DB_ADVISORY_LOCK:
+            with closing(psycopg2.connect(NEON_DSN)) as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    if not try_advisory_lock(cur):
+                        return
+                    locked = True
 
-    loops = 0
-    while loops < MAX_LOOPS:
-        hits = do_one_cycle()
-        loops += 1
-        if hits == 0:
-            break
-        time.sleep(SLEEP_BETWEEN_LOOPS)
+        session = requests.Session()
+        session.headers.update({"Accept": "application/json"})
 
-    if USE_DB_ADVISORY_LOCK:
-        with closing(psycopg2.connect(NEON_DSN)) as conn:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                advisory_unlock(cur)
+        loops = 0
+        while loops < MAX_LOOPS:
+            try:
+                hits = do_one_cycle(session)
+            except requests.exceptions.RequestException:
+                if FAIL_OPEN:
+                    break
+                raise
+            loops += 1
+            if hits == 0:
+                break
+            time.sleep(SLEEP_BETWEEN_LOOPS)
+
+    finally:
+        if USE_DB_ADVISORY_LOCK and locked:
+            with closing(psycopg2.connect(NEON_DSN)) as conn:
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    advisory_unlock(cur)
 
 
 if __name__ == "__main__":
