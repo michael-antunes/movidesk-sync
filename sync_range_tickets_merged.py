@@ -254,8 +254,12 @@ def main():
         if id_ptr is None:
             id_ptr = id_inicial
 
-        if id_ptr < id_final:
-            conn.rollback()
+        if id_ptr <= id_final:
+            if not dry_run and id_ptr != id_final:
+                update_control(conn, schema, control_table, id_atual_merged=id_final)
+                conn.commit()
+            else:
+                conn.rollback()
             return
 
         batch = fetch_batch_ids(conn, schema, resolved_table, id_ptr, id_final, limit)
@@ -288,7 +292,7 @@ def main():
     last_ticket_id = batch[-1]
     new_ptr = last_ticket_id - 1
     if new_ptr < id_final:
-        new_ptr = id_final - 1
+        new_ptr = id_final
 
     if dry_run:
         log.info("checked=%d merged_found=%d upsert=%d id_ptr=%s->%s", checked, merged_found, 0, id_ptr, new_ptr)
