@@ -1,9 +1,10 @@
-import json
 import os
+import re
 import time
+import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
 import psycopg2.extras
@@ -49,7 +50,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-def _now():
+def _dt_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -64,130 +65,72 @@ def pg_connect():
     return psycopg2.connect(dsn)
 
 
-def session():
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_ids(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out = []
+        for x in value:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+    s = str(value)
+    return [int(x) for x in re.findall(r"\d+", s)]
+
+
+def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"Accept": "application/json"})
     return s
 
 
-def movidesk_get_merged(s: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int = 30) -> Optional[Dict[str, Any]]:
+def movidesk_get_merged(session: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int = 30) -> Optional[Dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
     params = {"token": token, "id": str(ticket_id)}
-    r = s.get(url, params=params, timeout=timeout)
-    if r.status_code == 404:
+    resp = session.get(url, params=params, timeout=timeout)
+    if resp.status_code == 404:
         return None
-    if r.status_code != 200:
-        raise RuntimeError(f"Movidesk {r.status_code}: {r.text[:500]}")
-    data = r.json()
+    if resp.status_code != 200:
+        raise RuntimeError(f"Movidesk {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
     return data if isinstance(data, dict) else None
-
-
-def normalize(raw: Dict[str, Any]) -> Optional[Tuple[int, int, str, List[int], Optional[datetime]]]:
-    tid = raw.get("ticketId") or raw.get("ticketID") or raw.get("id")
-    if tid is None:
-        return None
-    ticket_id = int(tid)
-
-    merged_tickets = raw.get("mergedTickets")
-    if merged_tickets is None:
-        return None
-    merged_tickets = int(merged_tickets)
-    if merged_tickets <= 0:
-        return None
-
-    ids = raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList")
-    merged_ids: List[int] = []
-    if isinstance(ids, list):
-        for x in ids:
-            try:
-                merged_ids.append(int(x))
-            except Exception:
-                pass
-    else:
-        s = str(ids).strip() if ids is not None else ""
-        parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
-        for p in parts:
-            if p.isdigit():
-                merged_ids.append(int(p))
-
-    if not merged_ids:
-        return None
-
-    merged_ids_text = json.dumps(merged_ids, ensure_ascii=False)
-    lu = raw.get("lastUpdate") or raw.get("last_update")
-    last_update = None
-    if lu:
-        try:
-            sdt = str(lu).replace("Z", "+00:00")
-            last_update = datetime.fromisoformat(sdt)
-            if last_update.tzinfo is None:
-                last_update = last_update.replace(tzinfo=timezone.utc)
-        except Exception:
-            last_update = None
-
-    return (ticket_id, merged_tickets, merged_ids_text, merged_ids, last_update)
-
-
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, str, List[int], Optional[datetime]]]) -> int:
-    if not rows:
-        return 0
-    sql = f"""
-        INSERT INTO {qname(schema, table)}
-            (ticket_id, merged_tickets, merged_tickets_ids, merged_ticket_ids_arr, last_update, synced_at)
-        VALUES %s
-        ON CONFLICT (ticket_id) DO UPDATE SET
-            merged_tickets = EXCLUDED.merged_tickets,
-            merged_tickets_ids = EXCLUDED.merged_tickets_ids,
-            merged_ticket_ids_arr = EXCLUDED.merged_ticket_ids_arr,
-            last_update = EXCLUDED.last_update,
-            synced_at = EXCLUDED.synced_at
-    """
-    values = [(a, b, c, d, e, _now()) for (a, b, c, d, e) in rows]
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, values, page_size=500)
-    return len(values)
 
 
 def read_control(conn, schema: str, control_table: str):
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT id_inicial, id_final, id_atual_merged
-            FROM {qname(schema, control_table)}
-            LIMIT 1
-            """
-        )
+        cur.execute(f"SELECT id_inicial, id_final, id_atual_merged FROM {qname(schema, control_table)} LIMIT 1")
         r = cur.fetchone()
         if not r:
             return None
         return {"id_inicial": r[0], "id_final": r[1], "id_atual_merged": r[2]}
 
 
-def update_control(conn, schema: str, control_table: str, *, id_inicial=None, id_final=None, id_atual_merged=None):
-    sets = []
-    params = []
-    if id_inicial is not None:
-        sets.append("id_inicial=%s")
-        params.append(id_inicial)
-    if id_final is not None:
-        sets.append("id_final=%s")
-        params.append(id_final)
-    if id_atual_merged is not None:
-        sets.append("id_atual_merged=%s")
-        params.append(id_atual_merged)
-    if not sets:
-        return
+def update_control(conn, schema: str, control_table: str, id_atual_merged: int):
     with conn.cursor() as cur:
-        cur.execute(f"UPDATE {qname(schema, control_table)} SET {', '.join(sets)}", params)
-
-
-def bootstrap_bounds(conn, schema: str, resolved_table: str):
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT MAX(ticket_id)::bigint, MIN(ticket_id)::bigint FROM {qname(schema, resolved_table)}")
-        mx, mn = cur.fetchone()
-        if mx is None or mn is None:
-            return None, None
-        return int(mx), int(mn)
+        cur.execute(f"UPDATE {qname(schema, control_table)} SET id_atual_merged=%s", (id_atual_merged,))
 
 
 def fetch_batch_ids(conn, schema: str, resolved_table: str, from_id: int, to_id: int, limit: int) -> List[int]:
@@ -203,13 +146,49 @@ def fetch_batch_ids(conn, schema: str, resolved_table: str, from_id: int, to_id:
             """,
             (from_id, to_id, limit),
         )
-        rows = cur.fetchall()
-        return [int(x[0]) for x in rows]
+        return [int(x[0]) for x in cur.fetchall()]
+
+
+def delete_wrong_principals(conn, schema: str, table: str, principals: Sequence[int]):
+    if not principals:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            DELETE FROM {qname(schema, table)}
+            WHERE ticket_id = ANY(%s)
+              AND merged_into_id IS NULL
+            """,
+            (list(principals),),
+        )
+
+
+def upsert_merged(conn, schema: str, table: str, rows: Sequence[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]]) -> int:
+    if not rows:
+        return 0
+    sql = f"""
+        INSERT INTO {qname(schema, table)}
+            (ticket_id, merged_into_id, merged_at, situacao_mesclado, raw_payload, imported_at, last_update)
+        VALUES %s
+        ON CONFLICT (ticket_id) DO UPDATE SET
+            merged_into_id = EXCLUDED.merged_into_id,
+            merged_at = EXCLUDED.merged_at,
+            situacao_mesclado = EXCLUDED.situacao_mesclado,
+            raw_payload = EXCLUDED.raw_payload,
+            last_update = EXCLUDED.last_update,
+            imported_at = COALESCE({qname(schema, table)}.imported_at, EXCLUDED.imported_at)
+    """
+    values = []
+    for ticket_id, merged_into_id, merged_at, situacao, raw_payload, imported_at, last_update in rows:
+        values.append((ticket_id, merged_into_id, merged_at, situacao, psycopg2.extras.Json(raw_payload), imported_at, last_update))
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, values, page_size=500)
+    return len(values)
 
 
 def main():
     logging.basicConfig(level=_env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-    log = logging.getLogger("merged-range")
+    log = logging.getLogger("range-merged")
 
     token = _env_str("MOVIDESK_TOKEN")
     if not token:
@@ -234,32 +213,13 @@ def main():
             conn.rollback()
             return
 
-        id_inicial = ctrl["id_inicial"]
-        id_final = ctrl["id_final"]
+        id_inicial = int(ctrl["id_inicial"])
+        id_final = int(ctrl["id_final"])
         id_ptr = ctrl["id_atual_merged"]
-
-        if id_inicial is None or id_final is None:
-            mx, mn = bootstrap_bounds(conn, schema, resolved_table)
-            if mx is None or mn is None:
-                conn.rollback()
-                return
-            id_inicial = mx
-            id_final = mn
-            if id_ptr is None:
-                id_ptr = id_inicial
-            if not dry_run:
-                update_control(conn, schema, control_table, id_inicial=id_inicial, id_final=id_final, id_atual_merged=id_ptr)
-                conn.commit()
-
-        if id_ptr is None:
-            id_ptr = id_inicial
+        id_ptr = int(id_ptr) if id_ptr is not None else id_inicial
 
         if id_ptr <= id_final:
-            if not dry_run and id_ptr != id_final:
-                update_control(conn, schema, control_table, id_atual_merged=id_final)
-                conn.commit()
-            else:
-                conn.rollback()
+            conn.rollback()
             return
 
         batch = fetch_batch_ids(conn, schema, resolved_table, id_ptr, id_final, limit)
@@ -273,19 +233,24 @@ def main():
     if not batch:
         return
 
-    s = session()
-    to_upsert = []
+    sess = _session()
+    principals_with_merges: List[int] = []
+    merged_rows: List[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]] = []
     checked = 0
-    merged_found = 0
 
-    for ticket_id in batch:
+    for principal_id in batch:
         checked += 1
-        raw = movidesk_get_merged(s, base_url, token, ticket_id)
+        raw = movidesk_get_merged(sess, base_url, token, principal_id)
         if raw:
-            norm = normalize(raw)
-            if norm:
-                to_upsert.append(norm)
-                merged_found += 1
+            merged_ids = _extract_ids(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
+            if merged_ids:
+                principals_with_merges.append(principal_id)
+                last_update = _parse_dt(raw.get("lastUpdate") or raw.get("last_update"))
+                merged_at = last_update
+                imported_at = _dt_now()
+                for mid in merged_ids:
+                    payload = {"ticket_id": mid, "merged_into_id": principal_id, "movidesk": raw}
+                    merged_rows.append((mid, principal_id, merged_at, "Sim", payload, imported_at, last_update))
         if throttle > 0:
             time.sleep(throttle)
 
@@ -295,16 +260,17 @@ def main():
         new_ptr = id_final
 
     if dry_run:
-        log.info("checked=%d merged_found=%d upsert=%d id_ptr=%s->%s", checked, merged_found, 0, id_ptr, new_ptr)
+        log.info("checked=%d principals_with_merges=%d inserts=%d id_ptr=%s->%s", checked, len(set(principals_with_merges)), len(merged_rows), id_ptr, new_ptr)
         return
 
     conn2 = pg_connect()
     conn2.autocommit = False
     try:
-        upserted = upsert_rows(conn2, schema, table, to_upsert)
-        update_control(conn2, schema, control_table, id_atual_merged=new_ptr)
+        delete_wrong_principals(conn2, schema, table, list(set(principals_with_merges)))
+        upserted = upsert_merged(conn2, schema, table, merged_rows)
+        update_control(conn2, schema, control_table, new_ptr)
         conn2.commit()
-        log.info("checked=%d merged_found=%d upsert=%d id_ptr=%s->%s", checked, merged_found, upserted, id_ptr, new_ptr)
+        log.info("checked=%d principals_with_merges=%d upserted=%d id_ptr=%s->%s", checked, len(set(principals_with_merges)), upserted, id_ptr, new_ptr)
     finally:
         try:
             conn2.close()
