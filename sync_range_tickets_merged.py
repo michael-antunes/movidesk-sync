@@ -50,7 +50,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-def _dt_now() -> datetime:
+def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -107,10 +107,10 @@ def _session() -> requests.Session:
     return s
 
 
-def movidesk_get_merged(session: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int = 30) -> Optional[Dict[str, Any]]:
+def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int = 30) -> Optional[Dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
     params = {"token": token, "id": str(ticket_id)}
-    resp = session.get(url, params=params, timeout=timeout)
+    resp = sess.get(url, params=params, timeout=timeout)
     if resp.status_code == 404:
         return None
     if resp.status_code != 200:
@@ -125,7 +125,7 @@ def read_control(conn, schema: str, control_table: str):
         r = cur.fetchone()
         if not r:
             return None
-        return {"id_inicial": r[0], "id_final": r[1], "id_atual_merged": r[2]}
+        return {"id_inicial": int(r[0]), "id_final": int(r[1]), "id_atual_merged": int(r[2]) if r[2] is not None else None}
 
 
 def update_control(conn, schema: str, control_table: str, id_atual_merged: int):
@@ -133,42 +133,19 @@ def update_control(conn, schema: str, control_table: str, id_atual_merged: int):
         cur.execute(f"UPDATE {qname(schema, control_table)} SET id_atual_merged=%s", (id_atual_merged,))
 
 
-def fetch_batch_ids(conn, schema: str, resolved_table: str, from_id: int, to_id: int, limit: int) -> List[int]:
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT ticket_id::bigint
-            FROM {qname(schema, resolved_table)}
-            WHERE ticket_id::bigint <= %s
-              AND ticket_id::bigint >= %s
-            ORDER BY ticket_id::bigint DESC
-            LIMIT %s
-            """,
-            (from_id, to_id, limit),
-        )
-        return [int(x[0]) for x in cur.fetchall()]
+def build_batch(start_id: int, end_id: int, limit: int) -> List[int]:
+    if start_id <= end_id:
+        return []
+    stop = max(end_id, start_id - limit + 1)
+    return list(range(start_id, stop - 1, -1))
 
 
-def delete_wrong_principals(conn, schema: str, table: str, principals: Sequence[int]):
-    if not principals:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            DELETE FROM {qname(schema, table)}
-            WHERE ticket_id = ANY(%s)
-              AND merged_into_id IS NULL
-            """,
-            (list(principals),),
-        )
-
-
-def upsert_merged(conn, schema: str, table: str, rows: Sequence[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]]) -> int:
+def upsert_children(conn, schema: str, table: str, rows: Sequence[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]]) -> int:
     if not rows:
         return 0
     sql = f"""
         INSERT INTO {qname(schema, table)}
-            (ticket_id, merged_into_id, merged_at, situacao_mesclado, raw_payload, imported_at, last_update)
+            (ticket_id, merged_into_id, merged_at, situacao_mesclado, raw_payload, imported_at, last_update, synced_at)
         VALUES %s
         ON CONFLICT (ticket_id) DO UPDATE SET
             merged_into_id = EXCLUDED.merged_into_id,
@@ -176,11 +153,11 @@ def upsert_merged(conn, schema: str, table: str, rows: Sequence[Tuple[int, int, 
             situacao_mesclado = EXCLUDED.situacao_mesclado,
             raw_payload = EXCLUDED.raw_payload,
             last_update = EXCLUDED.last_update,
-            imported_at = COALESCE({qname(schema, table)}.imported_at, EXCLUDED.imported_at)
+            synced_at = EXCLUDED.synced_at
     """
     values = []
     for ticket_id, merged_into_id, merged_at, situacao, raw_payload, imported_at, last_update in rows:
-        values.append((ticket_id, merged_into_id, merged_at, situacao, psycopg2.extras.Json(raw_payload), imported_at, last_update))
+        values.append((ticket_id, merged_into_id, merged_at, situacao, psycopg2.extras.Json(raw_payload), imported_at, last_update, _now()))
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, values, page_size=500)
     return len(values)
@@ -198,7 +175,6 @@ def main():
     schema = _env_str("DB_SCHEMA", "visualizacao_resolvidos")
     table = _env_str("TABLE_NAME", "tickets_mesclados")
     control_table = _env_str("CONTROL_TABLE", "range_scan_control")
-    resolved_table = _env_str("RESOLVED_TABLE", "tickets_resolvidos_detail")
 
     limit = _env_int("LIMIT", 80)
     rpm = _env_float("RPM", 9.0)
@@ -213,16 +189,11 @@ def main():
             conn.rollback()
             return
 
-        id_inicial = int(ctrl["id_inicial"])
-        id_final = int(ctrl["id_final"])
-        id_ptr = ctrl["id_atual_merged"]
-        id_ptr = int(id_ptr) if id_ptr is not None else id_inicial
+        id_inicial = ctrl["id_inicial"]
+        id_final = ctrl["id_final"]
+        id_ptr = ctrl["id_atual_merged"] if ctrl["id_atual_merged"] is not None else id_inicial
 
-        if id_ptr <= id_final:
-            conn.rollback()
-            return
-
-        batch = fetch_batch_ids(conn, schema, resolved_table, id_ptr, id_final, limit)
+        batch = build_batch(id_ptr, id_final, limit)
         conn.rollback()
     finally:
         try:
@@ -234,9 +205,10 @@ def main():
         return
 
     sess = _session()
-    principals_with_merges: List[int] = []
-    merged_rows: List[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]] = []
+    imported_at = _now()
     checked = 0
+    principals_with_merges = 0
+    child_rows: List[Tuple[int, int, Optional[datetime], str, Dict[str, Any], datetime, Optional[datetime]]] = []
 
     for principal_id in batch:
         checked += 1
@@ -244,33 +216,29 @@ def main():
         if raw:
             merged_ids = _extract_ids(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
             if merged_ids:
-                principals_with_merges.append(principal_id)
+                principals_with_merges += 1
                 last_update = _parse_dt(raw.get("lastUpdate") or raw.get("last_update"))
                 merged_at = last_update
-                imported_at = _dt_now()
                 for mid in merged_ids:
-                    payload = {"ticket_id": mid, "merged_into_id": principal_id, "movidesk": raw}
-                    merged_rows.append((mid, principal_id, merged_at, "Sim", payload, imported_at, last_update))
+                    child_rows.append((int(mid), int(principal_id), merged_at, "Sim", raw, imported_at, last_update))
         if throttle > 0:
             time.sleep(throttle)
 
-    last_ticket_id = batch[-1]
-    new_ptr = last_ticket_id - 1
+    new_ptr = batch[-1] - 1
     if new_ptr < id_final:
         new_ptr = id_final
 
     if dry_run:
-        log.info("checked=%d principals_with_merges=%d inserts=%d id_ptr=%s->%s", checked, len(set(principals_with_merges)), len(merged_rows), id_ptr, new_ptr)
+        log.info("checked=%d principals_with_merges=%d upserted=0 id_ptr=%s->%s", checked, principals_with_merges, batch[0], new_ptr)
         return
 
     conn2 = pg_connect()
     conn2.autocommit = False
     try:
-        delete_wrong_principals(conn2, schema, table, list(set(principals_with_merges)))
-        upserted = upsert_merged(conn2, schema, table, merged_rows)
+        upserted = upsert_children(conn2, schema, table, child_rows)
         update_control(conn2, schema, control_table, new_ptr)
         conn2.commit()
-        log.info("checked=%d principals_with_merges=%d upserted=%d id_ptr=%s->%s", checked, len(set(principals_with_merges)), upserted, id_ptr, new_ptr)
+        log.info("checked=%d principals_with_merges=%d upserted=%d id_ptr=%s->%s", checked, principals_with_merges, upserted, batch[0], new_ptr)
     finally:
         try:
             conn2.close()
