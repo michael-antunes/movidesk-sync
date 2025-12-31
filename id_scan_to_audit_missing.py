@@ -89,7 +89,7 @@ def ensure_run_table(cur):
     cur.execute(
         f"""
         create table if not exists {SCHEMA}.audit_recent_run (
-            run_id bigint primary key,
+            run_id bigint,
             created_at timestamptz default now(),
             api_total bigint default 0,
             inserted_total bigint default 0,
@@ -97,6 +97,15 @@ def ensure_run_table(cur):
         )
         """
     )
+    try:
+        cur.execute(
+            f"""
+            create unique index if not exists ux_audit_recent_run_run_id
+            on {SCHEMA}.audit_recent_run (run_id)
+            """
+        )
+    except Exception:
+        pass
 
 
 def insert_run(cur, run_id):
@@ -105,7 +114,7 @@ def insert_run(cur, run_id):
         f"""
         insert into {SCHEMA}.audit_recent_run (run_id)
         values (%s)
-        on conflict (run_id) do nothing
+        on conflict do nothing
         """,
         (int(run_id),),
     )
@@ -204,7 +213,11 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
             sets.append("updated_at=now()")
         if "attempts" in cols:
             sets.append("attempts=arm.attempts+1")
-        conflict = f" on conflict (table_name, ticket_id) do update set {', '.join(sets)}" if sets else " on conflict (table_name, ticket_id) do nothing"
+        conflict = (
+            f" on conflict (table_name, ticket_id) do update set {', '.join(sets)}"
+            if sets
+            else " on conflict (table_name, ticket_id) do nothing"
+        )
 
     sql = f"insert into {SCHEMA}.audit_recent_missing as arm ({', '.join(base_cols)}) values %s{conflict}"
     template = f"({', '.join(base_vals)})"
@@ -279,7 +292,14 @@ def main():
                     set_scan_cursor(cur2, low_id - 1)
                     c2.commit()
 
-            logging.info("range=%s..%s api=%s missing_upsert=%s cursor->%s", low_id, high_id, len(api_ids), inserted, low_id - 1)
+            logging.info(
+                "range=%s..%s api=%s missing_upsert=%s cursor->%s",
+                low_id,
+                high_id,
+                len(api_ids),
+                inserted,
+                low_id - 1,
+            )
             cursor = low_id - 1
 
         with conn() as c3:
