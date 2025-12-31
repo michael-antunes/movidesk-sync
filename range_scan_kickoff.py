@@ -48,7 +48,8 @@ def ensure_control_table(cur):
           id_inicial bigint NOT NULL,
           id_final bigint NOT NULL,
           id_atual bigint,
-          id_atual_merged bigint
+          id_atual_merged bigint,
+          id_atual_excluido bigint
         )
         """
     )
@@ -59,6 +60,7 @@ def ensure_control_table(cur):
     cur.execute(f"ALTER TABLE {qname(SCHEMA, CONTROL_TABLE)} ADD COLUMN IF NOT EXISTS id_final bigint")
     cur.execute(f"ALTER TABLE {qname(SCHEMA, CONTROL_TABLE)} ADD COLUMN IF NOT EXISTS id_atual bigint")
     cur.execute(f"ALTER TABLE {qname(SCHEMA, CONTROL_TABLE)} ADD COLUMN IF NOT EXISTS id_atual_merged bigint")
+    cur.execute(f"ALTER TABLE {qname(SCHEMA, CONTROL_TABLE)} ADD COLUMN IF NOT EXISTS id_atual_excluido bigint")
 
 
 def get_bounds(cur):
@@ -74,13 +76,49 @@ def get_bounds(cur):
     return int(mx), int(mn)
 
 
+def get_prev_ptrs(cur):
+    cur.execute(
+        f"""
+        SELECT id_atual_merged, id_atual_excluido
+        FROM {qname(SCHEMA, CONTROL_TABLE)}
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
 def main():
     logger = setup_logger()
     with pg_connect() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
             ensure_control_table(cur)
-            id_inicial, id_final = get_bounds(cur)
+
+            prev_merged, prev_excluido = get_prev_ptrs(cur)
+
+            mx, mn = get_bounds(cur)
+            id_final = mn
+
+            id_inicial = int(prev_excluido) if prev_excluido is not None else mx
+            if id_inicial > mx:
+                id_inicial = mx
+            if id_inicial < id_final:
+                id_inicial = id_final
+
+            id_atual_merged = int(prev_merged) if prev_merged is not None else id_inicial
+            if id_atual_merged > mx:
+                id_atual_merged = mx
+            if id_atual_merged < id_final:
+                id_atual_merged = id_final
+
+            id_atual_excluido = int(prev_excluido) if prev_excluido is not None else id_inicial
+            if id_atual_excluido > mx:
+                id_atual_excluido = mx
+            if id_atual_excluido < id_final:
+                id_atual_excluido = id_final
 
             data_inicio = now_utc()
             data_fim = DATA_FIM_FIXA
@@ -89,21 +127,22 @@ def main():
             cur.execute(
                 f"""
                 INSERT INTO {qname(SCHEMA, CONTROL_TABLE)}
-                  (data_fim, data_inicio, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged)
+                  (data_fim, data_inicio, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged, id_atual_excluido)
                 VALUES
-                  (%s,%s,%s,%s,%s,%s,%s)
+                  (%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (data_fim, data_inicio, None, id_inicial, id_final, None, id_inicial),
+                (data_fim, data_inicio, None, id_inicial, id_final, None, id_atual_merged, id_atual_excluido),
             )
 
             logger.info(
-                "OK range_scan_control: data_inicio=%s data_fim=%s id_inicial=%s id_final=%s id_atual=%s id_atual_merged=%s",
+                "OK range_scan_control: data_inicio=%s data_fim=%s id_inicial=%s id_final=%s id_atual=%s id_atual_merged=%s id_atual_excluido=%s",
                 data_inicio,
                 data_fim,
                 id_inicial,
                 id_final,
                 None,
-                id_inicial,
+                id_atual_merged,
+                id_atual_excluido,
             )
 
 
