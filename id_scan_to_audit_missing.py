@@ -13,15 +13,53 @@ SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
 TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
-LOOPS = int(os.getenv("LOOPS", "2"))
-TOP = int(os.getenv("TOP", "1000"))
-THROTTLE = float(os.getenv("THROTTLE", "0.20"))
+LOOPS = int(os.getenv("LOOPS", "200000"))
+THROTTLE = float(os.getenv("THROTTLE", "0.05"))
+
+TOP = int(os.getenv("TOP", "500"))
+TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def conn():
     return psycopg2.connect(DSN)
+
+
+def api_get(path, params):
+    url = f"{API_BASE}/{path}"
+    params = dict(params or {})
+    params["token"] = TOKEN
+    r = requests.get(url, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_list_ids(path, id_start, id_end):
+    ids = set()
+    skip = 0
+    while True:
+        data = api_get(
+            path,
+            {
+                "$select": "id",
+                "$filter": f"id ge {int(id_start)} and id le {int(id_end)}",
+                "$top": TOP,
+                "$skip": skip,
+            },
+        )
+        if isinstance(data, dict) and "items" in data:
+            data = data["items"]
+        if not isinstance(data, list):
+            break
+        for row in data:
+            if isinstance(row, dict) and "id" in row:
+                ids.add(int(row["id"]))
+        if len(data) < TOP:
+            break
+        skip += TOP
+        time.sleep(THROTTLE)
+    return ids
 
 
 def table_cols(cur, schema, table):
@@ -40,7 +78,7 @@ def ensure_missing_unique(cur):
     try:
         cur.execute(
             f"""
-            create unique index if not exists ux_audit_recent_missing_uniq
+            create unique index if not exists audit_recent_missing_table_ticket_uniq
             on {SCHEMA}.audit_recent_missing (table_name, ticket_id)
             """
         )
@@ -48,113 +86,57 @@ def ensure_missing_unique(cur):
         pass
 
 
-def insert_run(cur, run_id):
-    cols = table_cols(cur, SCHEMA, "audit_recent_run")
-    ins_cols = []
-    ins_vals = []
-    params = []
-
-    def add_expr(col, expr):
-        if col in cols:
-            ins_cols.append(col)
-            ins_vals.append(expr)
-
-    def add_param(col, val):
-        if col in cols:
-            ins_cols.append(col)
-            ins_vals.append("%s")
-            params.append(val)
-
-    add_param("run_id", run_id)
-    add_expr("started_at", "now()")
-    add_expr("window_start", "now()")
-    add_expr("window_end", "now()")
-    add_expr("run_at", "now()")
-    add_expr("total_api", "0")
-    add_expr("missing_total", "0")
-    add_expr("api_ids", "0")
-    add_expr("inserted_missing", "0")
-    add_expr("range_count", "0")
-    add_param("table_name", TABLE_NAME)
-    add_param("notes", "id-scan")
-
-    if not ins_cols:
-        return
-
-    sql = f"insert into {SCHEMA}.audit_recent_run ({', '.join(ins_cols)}) values ({', '.join(ins_vals)})"
-    cur.execute(sql, params)
-
-
-def update_run(cur, run_id, api_ids, inserted, range_count):
-    cols = table_cols(cur, SCHEMA, "audit_recent_run")
-    sets = []
-    params = []
-
-    def set_expr(col, expr):
-        if col in cols:
-            sets.append(f"{col}={expr}")
-
-    def set_param(col, val):
-        if col in cols:
-            sets.append(f"{col}=%s")
-            params.append(val)
-
-    set_expr("finished_at", "now()")
-    set_param("api_ids", api_ids)
-    set_param("inserted_missing", inserted)
-    set_param("range_count", range_count)
-    set_param("missing_total", inserted)
-    set_param("total_api", api_ids)
-
-    if "run_id" not in cols or not sets:
-        return
-
-    params.append(run_id)
+def ensure_run_table(cur):
     cur.execute(
-        f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where run_id=%s",
-        params,
+        f"""
+        create table if not exists {SCHEMA}.audit_recent_runs (
+            run_id bigint primary key,
+            created_at timestamptz default now(),
+            api_total bigint default 0,
+            inserted_total bigint default 0,
+            range_total bigint default 0
+        )
+        """
+    )
+
+
+def insert_run(cur, run_id):
+    ensure_run_table(cur)
+    cur.execute(
+        f"""
+        insert into {SCHEMA}.audit_recent_runs (run_id)
+        values (%s)
+        on conflict (run_id) do nothing
+        """,
+        (int(run_id),),
+    )
+
+
+def update_run(cur, run_id, api_total, inserted_total, range_total):
+    ensure_run_table(cur)
+    cur.execute(
+        f"""
+        update {SCHEMA}.audit_recent_runs
+        set api_total=%s, inserted_total=%s, range_total=%s
+        where run_id=%s
+        """,
+        (int(api_total), int(inserted_total), int(range_total), int(run_id)),
     )
 
 
 def get_scan_cursor(cur):
-    cur.execute(f"select id_final, id_inicial, id_atual from {SCHEMA}.range_scan_control limit 1")
-    id_final, id_inicial, id_atual = cur.fetchone()
-    if id_atual is None:
-        id_atual = id_inicial
-    return int(id_final), int(id_inicial), int(id_atual)
+    cur.execute(f"select coalesce(max(ticket_id), 0) from {SCHEMA}.tickets_resolvidos_detail")
+    id_inicial = int(cur.fetchone()[0] or 0)
 
+    cur.execute("select coalesce(min(ticket_id), 0) from visualizacao_atual.tickets_abertos")
+    id_abertos_min = int(cur.fetchone()[0] or 0)
 
-def set_scan_cursor(cur, new_cursor):
-    cur.execute(f"update {SCHEMA}.range_scan_control set id_atual=%s", (int(new_cursor),))
+    cur.execute(f"select coalesce(max(ticket_id), 0) from {SCHEMA}.tickets_mesclados")
+    id_mesclados_max = int(cur.fetchone()[0] or 0)
 
-
-def api_list_ids(endpoint, low_id, high_id):
-    ids = set()
-    skip = 0
-    while True:
-        params = {
-            "token": TOKEN,
-            "$select": "id",
-            "$filter": f"id ge {low_id} and id le {high_id}",
-            "$orderby": "id asc",
-            "$top": TOP,
-            "$skip": skip,
-        }
-        r = requests.get(f"{API_BASE}/{endpoint}", params=params, timeout=60)
-        if r.status_code == 400:
-            raise RuntimeError(f"Movidesk 400 em {endpoint}: {r.text[:400]}")
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            break
-        for row in data:
-            if isinstance(row, dict) and "id" in row:
-                ids.add(int(row["id"]))
-        if len(data) < TOP:
-            break
-        skip += TOP
-        time.sleep(THROTTLE)
-    return ids
+    id_final = min(x for x in [id_inicial, id_abertos_min] if x > 0) if (id_inicial > 0 or id_abertos_min > 0) else 0
+    cursor = max(id_inicial, id_mesclados_max)
+    return id_final, id_inicial, cursor
 
 
 def upsert_missing(cur, run_id, table_name, missing_ids):
@@ -263,21 +245,24 @@ def main():
                     )
                     in_mesclados = {int(r[0]) for r in cur2.fetchall()}
 
-                    missing = {i for i in api_ids if i not in in_detail and i not in in_abertos and i not in in_mesclados}
+                    known = set()
+                    known |= api_ids
+                    known |= in_detail
+                    known |= in_abertos
+                    known |= in_mesclados
+
+                    missing = set(range(low_id, high_id + 1)) - known
 
                     inserted = upsert_missing(cur2, run_id, TABLE_NAME, missing)
                     inserted_total += inserted
-
-                    set_scan_cursor(cur2, low_id - 1)
                     c2.commit()
 
-            logging.info("range=%s..%s api=%s missing_upsert=%s cursor->%s", low_id, high_id, len(api_ids), inserted, low_id - 1)
             cursor = low_id - 1
 
-        with conn() as c3:
-            with c3.cursor() as cur3:
-                update_run(cur3, run_id, api_total, inserted_total, range_total)
-                c3.commit()
+            with conn() as c3:
+                with c3.cursor() as cur3:
+                    update_run(cur3, run_id, api_total, inserted_total, range_total)
+                    c3.commit()
 
     logging.info("done api_total=%s inserted_total=%s range_total=%s", api_total, inserted_total, range_total)
 
