@@ -76,18 +76,44 @@ def get_bounds(cur):
     return int(mx), int(mn)
 
 
-def get_prev_ptrs(cur):
+def control_exists(cur):
+    cur.execute(f"SELECT 1 FROM {qname(SCHEMA, CONTROL_TABLE)} LIMIT 1")
+    return cur.fetchone() is not None
+
+
+def update_control(cur, mx, mn):
     cur.execute(
         f"""
-        SELECT id_atual_merged, id_atual_excluido
-        FROM {qname(SCHEMA, CONTROL_TABLE)}
-        LIMIT 1
-        """
+        UPDATE {qname(SCHEMA, CONTROL_TABLE)}
+        SET
+          id_inicial = %s,
+          id_final = LEAST(COALESCE(id_final, %s), %s),
+          id_atual_merged = CASE
+            WHEN id_atual_merged IS NULL OR id_atual_merged < %s THEN %s
+            ELSE id_atual_merged
+          END,
+          id_atual_excluido = CASE
+            WHEN id_atual_excluido IS NULL OR id_atual_excluido < %s THEN %s
+            ELSE id_atual_excluido
+          END
+        """,
+        (mx, mn, mn, mx, mx, mx, mx),
     )
-    row = cur.fetchone()
-    if not row:
-        return None, None
-    return row[0], row[1]
+
+
+def insert_control(cur, mx, mn):
+    data_inicio = now_utc()
+    data_fim = DATA_FIM_FIXA
+    cur.execute(
+        f"""
+        INSERT INTO {qname(SCHEMA, CONTROL_TABLE)}
+          (data_fim, data_inicio, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged, id_atual_excluido)
+        VALUES
+          (%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (data_fim, data_inicio, None, mx, mn, None, mx, mx),
+    )
+    return data_inicio, data_fim
 
 
 def main():
@@ -96,54 +122,26 @@ def main():
         conn.autocommit = True
         with conn.cursor() as cur:
             ensure_control_table(cur)
-
-            prev_merged, prev_excluido = get_prev_ptrs(cur)
-
             mx, mn = get_bounds(cur)
-            id_final = mn
 
-            id_inicial = int(prev_excluido) if prev_excluido is not None else mx
-            if id_inicial > mx:
-                id_inicial = mx
-            if id_inicial < id_final:
-                id_inicial = id_final
-
-            id_atual_merged = int(prev_merged) if prev_merged is not None else id_inicial
-            if id_atual_merged > mx:
-                id_atual_merged = mx
-            if id_atual_merged < id_final:
-                id_atual_merged = id_final
-
-            id_atual_excluido = int(prev_excluido) if prev_excluido is not None else id_inicial
-            if id_atual_excluido > mx:
-                id_atual_excluido = mx
-            if id_atual_excluido < id_final:
-                id_atual_excluido = id_final
-
-            data_inicio = now_utc()
-            data_fim = DATA_FIM_FIXA
-
-            cur.execute(f"DELETE FROM {qname(SCHEMA, CONTROL_TABLE)}")
-            cur.execute(
-                f"""
-                INSERT INTO {qname(SCHEMA, CONTROL_TABLE)}
-                  (data_fim, data_inicio, ultima_data_validada, id_inicial, id_final, id_atual, id_atual_merged, id_atual_excluido)
-                VALUES
-                  (%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (data_fim, data_inicio, None, id_inicial, id_final, None, id_atual_merged, id_atual_excluido),
-            )
-
-            logger.info(
-                "OK range_scan_control: data_inicio=%s data_fim=%s id_inicial=%s id_final=%s id_atual=%s id_atual_merged=%s id_atual_excluido=%s",
-                data_inicio,
-                data_fim,
-                id_inicial,
-                id_final,
-                None,
-                id_atual_merged,
-                id_atual_excluido,
-            )
+            if control_exists(cur):
+                update_control(cur, mx, mn)
+                logger.info(
+                    "OK range_scan_control atualizado: id_inicial=%s id_final(min)=%s id_atual_merged>=id_inicial id_atual_excluido>=id_inicial",
+                    mx,
+                    mn,
+                )
+            else:
+                data_inicio, data_fim = insert_control(cur, mx, mn)
+                logger.info(
+                    "OK range_scan_control inserido: data_inicio=%s data_fim=%s id_inicial=%s id_final=%s id_atual_merged=%s id_atual_excluido=%s",
+                    data_inicio,
+                    data_fim,
+                    mx,
+                    mn,
+                    mx,
+                    mx,
+                )
 
 
 if __name__ == "__main__":
