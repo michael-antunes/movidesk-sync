@@ -161,7 +161,6 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
     cols = table_cols(cur, SCHEMA, "audit_recent_missing")
     base_cols = ["table_name", "ticket_id"]
     base_vals = ["%s", "%s"]
-    params = []
 
     if "run_id" in cols:
         base_cols.append("run_id")
@@ -205,11 +204,12 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
         if "updated_at" in cols:
             sets.append("updated_at=now()")
         if "attempts" in cols:
-            sets.append("attempts=audit_recent_missing.attempts+1")
+            sets.append("attempts=attempts+1")
         conflict = f" on conflict (table_name, ticket_id) do update set {', '.join(sets)}" if sets else " on conflict (table_name, ticket_id) do nothing"
 
     sql = f"insert into {SCHEMA}.audit_recent_missing ({', '.join(base_cols)}) values %s{conflict}"
-    psycopg2.extras.execute_values(cur, sql, values, page_size=500)
+    template = f"({', '.join(base_vals)})"
+    psycopg2.extras.execute_values(cur, sql, values, template=template, page_size=500)
     return len(values)
 
 
