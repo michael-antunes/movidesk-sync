@@ -1,0 +1,29 @@
+name: Movidesk - Tickets excluídos (range)
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: movidesk-excluidos-range-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tickets-excluidos-range:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests psycopg2-binary
+      - name: Sync tickets excluídos
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          EXCLUIDOS_BATCH_SIZE: "50"
+          MOVIDESK_THROTTLE: "0.25"
+        run: python sync_tickets_excluidos.py
