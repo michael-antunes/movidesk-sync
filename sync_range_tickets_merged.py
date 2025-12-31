@@ -42,7 +42,7 @@ def env_bool(k: str, default: bool = False) -> bool:
     v = env_str(k)
     if v is None:
         return default
-    return v.lower() in ("1", "true", "yes", "y", "on")
+    return v.lower() in ("1", "true", "yes", "y", "on", "sim")
 
 
 def qident(s: str) -> str:
@@ -94,9 +94,68 @@ def to_int_list(v: Any) -> List[int]:
     parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
     out = []
     for p in parts:
-        if p.isdigit():
+        try:
             out.append(int(p))
+        except Exception:
+            pass
     return out
+
+
+def ensure_table(conn, schema: str, table: str):
+    with conn.cursor() as cur:
+        cur.execute(f"create schema if not exists {qident(schema)}")
+        cur.execute(
+            f"""
+            create table if not exists {qname(schema, table)} (
+              ticket_id bigint primary key,
+              merged_into_id bigint not null,
+              merged_at timestamptz,
+              raw_payload jsonb
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            do $$
+            begin
+              if exists (
+                select 1
+                from information_schema.columns
+                where table_schema='{schema}'
+                  and table_name='{table}'
+                  and column_name='raw_paylcad'
+              ) then
+                execute 'alter table {qname(schema, table)} rename column raw_paylcad to raw_payload';
+              end if;
+            end $$;
+            """
+        )
+        cur.execute(f"alter table {qname(schema, table)} add column if not exists merged_into_id bigint")
+        cur.execute(f"alter table {qname(schema, table)} add column if not exists merged_at timestamptz")
+        cur.execute(f"alter table {qname(schema, table)} add column if not exists raw_payload jsonb")
+        cur.execute(f"delete from {qname(schema, table)} where merged_into_id is null")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists situacao_mesclado")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_tickets")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_tickets_ids")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_ticket_ids_arr")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists last_update")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists synced_at")
+        cur.execute(f"alter table {qname(schema, table)} drop column if exists updated_at")
+        cur.execute(
+            f"""
+            do $$
+            begin
+              if not exists (
+                select 1
+                from pg_constraint
+                where conrelid='{schema}.{table}'::regclass
+                  and contype='p'
+              ) then
+                execute 'alter table {qname(schema, table)} add primary key (ticket_id)';
+              end if;
+            end $$;
+            """
+        )
 
 
 def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, principal_id: int, timeout: int) -> Optional[Dict[str, Any]]:
@@ -123,9 +182,9 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[int, int, int]:
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT id_inicial::bigint, id_final::bigint, id_atual_merged::bigint
-            FROM {qname(schema, control_table)}
-            LIMIT 1
+            select id_inicial::bigint, id_final::bigint, id_atual_merged::bigint
+            from {qname(schema, control_table)}
+            limit 1
             """
         )
         r = cur.fetchone()
@@ -139,7 +198,7 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[int, int, int]:
 
 def update_ptr(conn, schema: str, control_table: str, new_ptr: int):
     with conn.cursor() as cur:
-        cur.execute(f"UPDATE {qname(schema, control_table)} SET id_atual_merged=%s", (new_ptr,))
+        cur.execute(f"update {qname(schema, control_table)} set id_atual_merged=%s", (new_ptr,))
 
 
 def build_batch(id_ptr: int, id_final: int, limit: int) -> List[int]:
@@ -153,13 +212,12 @@ def upsert_mesclados(conn, schema: str, table: str, rows: List[Tuple[int, int, O
     if not rows:
         return 0
     sql = f"""
-        INSERT INTO {qname(schema, table)}
-            (ticket_id, merged_into_id, merged_at, raw_payload)
-        VALUES %s
-        ON CONFLICT (ticket_id) DO UPDATE SET
-            merged_into_id = EXCLUDED.merged_into_id,
-            merged_at = COALESCE(EXCLUDED.merged_at, {qname(schema, table)}.merged_at),
-            raw_payload = EXCLUDED.raw_payload
+        insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+        values %s
+        on conflict (ticket_id) do update set
+          merged_into_id = excluded.merged_into_id,
+          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
+          raw_payload = excluded.raw_payload
     """
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
@@ -171,8 +229,8 @@ def delete_from_other_tables(conn, resolvidos_schema: str, resolvidos_table: str
         return
     uniq = sorted(set(int(x) for x in ids))
     with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {qname(resolvidos_schema, resolvidos_table)} WHERE ticket_id = ANY(%s)", (uniq,))
-        cur.execute(f"DELETE FROM {qname(abertos_schema, abertos_table)} WHERE ticket_id = ANY(%s)", (uniq,))
+        cur.execute(f"delete from {qname(resolvidos_schema, resolvidos_table)} where ticket_id = any(%s)", (uniq,))
+        cur.execute(f"delete from {qname(abertos_schema, abertos_table)} where ticket_id = any(%s)", (uniq,))
 
 
 def main():
@@ -204,8 +262,12 @@ def main():
     conn = pg_connect()
     conn.autocommit = False
     try:
+        ensure_table(conn, schema, table_mesclados)
         _, id_final, id_ptr = read_control(conn, schema, control_table)
+        conn.commit()
+    except Exception:
         conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -250,6 +312,7 @@ def main():
     conn2 = pg_connect()
     conn2.autocommit = False
     try:
+        ensure_table(conn2, schema, table_mesclados)
         upserted = upsert_mesclados(conn2, schema, table_mesclados, rows)
         delete_from_other_tables(conn2, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, all_mesclados)
         update_ptr(conn2, schema, control_table, new_ptr)
