@@ -3,12 +3,11 @@ name: Kickoff (range/date)
 on:
   workflow_dispatch: {}
   schedule:
-    # todo dia 03:10 UTC (ajuste se quiser)
     - cron: "10 3 * * *"
 
 permissions:
   contents: read
-  actions: write   # <- necessário para disparar outros workflows via API
+  actions: write
 
 concurrency:
   group: range-scan-kickoff
@@ -36,7 +35,16 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python range_scan_kickoff.py
 
-      # 1) merged
+      - name: Dispatch sync_tickets_excluidos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_tickets_excluidos.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'
+
       - name: Dispatch sync_range_tickets_merged
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,7 +55,6 @@ jobs:
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'
 
-      # 2) audit (range -> audit)
       - name: Dispatch range_scan_to_audit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,7 +65,6 @@ jobs:
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'
 
-      # 3) id (id -> audit_missing)
       - name: Dispatch id_scan_to_audit_missing
         env:
           GH_TOKEN: ${{ github.token }}
