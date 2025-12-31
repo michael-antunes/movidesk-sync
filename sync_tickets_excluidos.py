@@ -36,6 +36,23 @@ def qname(schema, table):
     return f'"{schema}"."{table}"'
 
 
+def parse_dt(s):
+    if not s:
+        return None
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+    s = str(s).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def req(url, params):
     last_err = None
     for i in range(ATTEMPTS):
@@ -43,7 +60,7 @@ def req(url, params):
             r = http.get(url, params=params, timeout=TIMEOUT)
             if r.status_code == 200:
                 return r.json() if r.text else []
-            if r.status_code in (404,):
+            if r.status_code == 404:
                 return []
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(min(2**i, 30) + THROTTLE)
@@ -64,14 +81,15 @@ def ensure_tables(conn):
             f"""
             create table if not exists {qname(SCHEMA, TABLE_EXCLUIDOS)} (
               ticket_id bigint primary key,
-              last_update timestamptz,
-              raw jsonb not null,
-              updated_at timestamptz not null default now()
+              date_excluido timestamptz,
+              raw jsonb not null
             )
             """
         )
+        cur.execute(f'alter table {qname(SCHEMA, TABLE_EXCLUIDOS)} add column if not exists date_excluido timestamptz')
+        cur.execute(f'alter table {qname(SCHEMA, TABLE_EXCLUIDOS)} add column if not exists raw jsonb')
         cur.execute(
-            f"create index if not exists idx_{TABLE_EXCLUIDOS}_last_update on {qname(SCHEMA, TABLE_EXCLUIDOS)} (last_update)"
+            f"create index if not exists idx_{TABLE_EXCLUIDOS}_date_excluido on {qname(SCHEMA, TABLE_EXCLUIDOS)} (date_excluido)"
         )
     conn.commit()
 
@@ -80,7 +98,7 @@ def read_control(conn):
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            select id_inicial, id_final, id_atual_excluido
+            select id_inicial, id_final, id_atual, id_atual_excluido
             from {qname(SCHEMA, CONTROL_TABLE)}
             limit 1
             """
@@ -88,7 +106,13 @@ def read_control(conn):
         row = cur.fetchone()
         if not row:
             raise RuntimeError("range_scan_control vazio")
-        return int(row[0]), int(row[1]), (int(row[2]) if row[2] is not None else None)
+        id_inicial, id_final, id_atual, id_atual_excluido = row
+        return (
+            int(id_inicial),
+            int(id_final),
+            int(id_atual) if id_atual is not None else None,
+            int(id_atual_excluido) if id_atual_excluido is not None else None,
+        )
 
 
 def write_ptr(conn, new_ptr):
@@ -129,22 +153,21 @@ def fetch_by_id(ticket_id):
 def upsert_excluidos(conn, items):
     if not items:
         return 0
-    ts = now_utc()
     values = []
     for t in items:
         tid = t.get("id")
         if tid is None:
             continue
-        values.append((int(tid), t.get("lastUpdate"), Json(t), ts))
+        dt = parse_dt(t.get("lastUpdate")) or now_utc()
+        values.append((int(tid), dt, Json(t)))
     if not values:
         return 0
     sql = f"""
-        insert into {qname(SCHEMA, TABLE_EXCLUIDOS)} (ticket_id, last_update, raw, updated_at)
+        insert into {qname(SCHEMA, TABLE_EXCLUIDOS)} (ticket_id, date_excluido, raw)
         values %s
         on conflict (ticket_id) do update set
-          last_update=excluded.last_update,
-          raw=excluded.raw,
-          updated_at=excluded.updated_at
+          date_excluido=excluded.date_excluido,
+          raw=excluded.raw
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, values, page_size=1000)
@@ -161,9 +184,14 @@ def main():
     with psycopg2.connect(DSN) as conn:
         ensure_tables(conn)
 
-        id_inicial, id_final, ptr = read_control(conn)
+        id_inicial, id_final, id_atual, id_atual_excluido = read_control(conn)
+
+        ptr = id_atual_excluido if id_atual_excluido is not None else id_inicial
+        if ptr is None and id_atual is not None:
+            ptr = id_atual
+
         if ptr is None:
-            ptr = id_inicial
+            raise RuntimeError("Ponteiro inicial não definido (id_inicial/id_atual_excluido/id_atual)")
 
         if ptr < id_final:
             log.info("Fim: id_atual_excluido=%s < id_final=%s", ptr, id_final)
@@ -185,7 +213,7 @@ def main():
         new_ptr = to_id - 1
         write_ptr(conn, new_ptr)
 
-        log.info("OK: checked=%s deleted_found=%s upserted=%s ptr=%s->%s", checked, len(encontrados), up, ptr, new_ptr)
+        log.info("OK: checked=%s deleted_found=%s upserted=%s id_atual_excluido=%s->%s", checked, len(encontrados), up, ptr, new_ptr)
 
 
 if __name__ == "__main__":
