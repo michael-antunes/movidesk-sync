@@ -9,134 +9,142 @@ from psycopg2.extras import execute_values, Json
 
 
 API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
-DEFAULT_SCHEMA = "visualizacao_resolvidos"
-CONTROL_TABLE = "range_scan_control"
-TARGET_TABLE = "tickets_excluidos"
+TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+DSN = os.getenv("NEON_DSN")
 
+SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
+CONTROL_TABLE = os.getenv("CONTROL_TABLE", "range_scan_control")
+TABLE_EXCLUIDOS = os.getenv("TABLE_EXCLUIDOS", "tickets_excluidos")
 
-def setup_logger():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
-    return logging.getLogger("tickets_excluidos")
+BATCH = int(os.getenv("EXCLUIDOS_BATCH", "50"))
+THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
+TIMEOUT = int(os.getenv("MOVIDESK_TIMEOUT", "30"))
+ATTEMPTS = int(os.getenv("MOVIDESK_ATTEMPTS", "6"))
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("sync_tickets_excluidos")
+
+http = requests.Session()
+http.headers.update({"Accept": "application/json"})
 
 
 def now_utc():
     return datetime.now(timezone.utc)
 
 
-def pg_connect(dsn: str):
-    return psycopg2.connect(
-        dsn,
-        connect_timeout=int(os.getenv("PGCONNECT_TIMEOUT", "10")),
-        application_name=os.getenv("PGAPPNAME", "movidesk-excluidos"),
-        keepalives=1,
-        keepalives_idle=int(os.getenv("PGKEEPALIVES_IDLE", "30")),
-        keepalives_interval=int(os.getenv("PGKEEPALIVES_INTERVAL", "10")),
-        keepalives_count=int(os.getenv("PGKEEPALIVES_COUNT", "5")),
-    )
+def qname(schema, table):
+    return f'"{schema}"."{table}"'
 
 
-def req(session: requests.Session, url: str, params: dict, attempts: int, timeout: int, throttle: float):
+def req(url, params):
     last_err = None
-    for i in range(attempts):
+    for i in range(ATTEMPTS):
         try:
-            r = session.get(url, params=params, timeout=timeout)
+            r = http.get(url, params=params, timeout=TIMEOUT)
             if r.status_code == 200:
-                return r.json()
+                return r.json() if r.text else []
+            if r.status_code in (404,):
+                return []
             if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(min(2 ** i, 30) + throttle)
+                time.sleep(min(2**i, 30) + THROTTLE)
                 continue
             last_err = f"{r.status_code} {r.text}"
             break
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            time.sleep(min(2 ** i, 30) + throttle)
+            time.sleep(min(2**i, 30) + THROTTLE)
     raise RuntimeError(last_err or "request failed")
 
 
-def ensure_tables(conn, schema: str):
+def ensure_tables(conn):
     with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {schema}")
+        cur.execute(f'create schema if not exists "{SCHEMA}"')
+        cur.execute(f'alter table {qname(SCHEMA, CONTROL_TABLE)} add column if not exists id_atual_excluido bigint')
         cur.execute(
             f"""
-            create table if not exists {schema}.{TARGET_TABLE} (
+            create table if not exists {qname(SCHEMA, TABLE_EXCLUIDOS)} (
               ticket_id bigint primary key,
               last_update timestamptz,
               raw jsonb not null,
-              synced_at timestamptz not null default now()
+              updated_at timestamptz not null default now()
             )
             """
         )
-        cur.execute(f"create index if not exists idx_{TARGET_TABLE}_last_update on {schema}.{TARGET_TABLE}(last_update)")
-        cur.execute(f"alter table {schema}.{CONTROL_TABLE} add column if not exists id_atual_excluido bigint")
-        cur.execute(f"update {schema}.{CONTROL_TABLE} set id_atual_excluido = coalesce(id_atual_excluido, id_inicial)")
+        cur.execute(
+            f"create index if not exists idx_{TABLE_EXCLUIDOS}_last_update on {qname(SCHEMA, TABLE_EXCLUIDOS)} (last_update)"
+        )
     conn.commit()
 
 
-def read_control(conn, schema: str):
+def read_control(conn):
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            select ctid::text, id_inicial, id_final, id_atual_excluido
-            from {schema}.{CONTROL_TABLE}
-            order by created_at desc nulls last, updated_at desc nulls last
+            select id_inicial, id_final, id_atual_excluido
+            from {qname(SCHEMA, CONTROL_TABLE)}
             limit 1
             """
         )
         row = cur.fetchone()
         if not row:
-            return None
-        return {"ctid": row[0], "id_inicial": row[1], "id_final": row[2], "id_atual_excluido": row[3]}
+            raise RuntimeError("range_scan_control vazio")
+        return int(row[0]), int(row[1]), (int(row[2]) if row[2] is not None else None)
 
 
-def update_ptr(conn, schema: str, ctid: str, new_ptr: int):
+def write_ptr(conn, new_ptr):
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            update {schema}.{CONTROL_TABLE}
-            set id_atual_excluido=%s, updated_at=now()
-            where ctid::text=%s
+            update {qname(SCHEMA, CONTROL_TABLE)}
+            set id_atual_excluido=%s
             """,
-            [new_ptr, ctid],
+            (int(new_ptr),),
         )
     conn.commit()
 
 
-def fetch_ticket(session: requests.Session, token: str, ticket_id: int, endpoint: str, attempts: int, timeout: int, throttle: float):
+def fetch_ticket(ticket_id, endpoint):
     url = f"{API_BASE}/{endpoint}"
     params = {
-        "token": token,
+        "token": TOKEN,
         "includeDeletedItems": "true",
-        "$filter": f"id eq {ticket_id}",
+        "$filter": f"id eq {int(ticket_id)}",
         "$top": 1,
         "$select": "id,protocol,subject,status,baseStatus,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,ownerTeam,lastUpdate,isDeleted,createdDate,origin,category,urgency,justification",
         "$expand": "clients($expand=organization)",
     }
-    data = req(session, url, params, attempts, timeout, throttle)
+    data = req(url, params)
     if isinstance(data, list) and data:
         return data[0]
     return None
 
 
-def upsert_deleted(conn, schema: str, rows: list[dict]):
-    if not rows:
+def fetch_by_id(ticket_id):
+    t = fetch_ticket(ticket_id, "tickets")
+    if t is not None:
+        return t
+    return fetch_ticket(ticket_id, "tickets/past")
+
+
+def upsert_excluidos(conn, items):
+    if not items:
         return 0
+    ts = now_utc()
     values = []
-    for t in rows:
+    for t in items:
         tid = t.get("id")
         if tid is None:
             continue
-        lu = t.get("lastUpdate")
-        values.append((int(tid), lu, Json(t), now_utc()))
+        values.append((int(tid), t.get("lastUpdate"), Json(t), ts))
     if not values:
         return 0
     sql = f"""
-        insert into {schema}.{TARGET_TABLE} (ticket_id, last_update, raw, synced_at)
+        insert into {qname(SCHEMA, TABLE_EXCLUIDOS)} (ticket_id, last_update, raw, updated_at)
         values %s
         on conflict (ticket_id) do update set
           last_update=excluded.last_update,
           raw=excluded.raw,
-          synced_at=excluded.synced_at
+          updated_at=excluded.updated_at
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, values, page_size=1000)
@@ -145,57 +153,39 @@ def upsert_deleted(conn, schema: str, rows: list[dict]):
 
 
 def main():
-    log = setup_logger()
+    if not DSN:
+        raise RuntimeError("NEON_DSN ausente")
+    if not TOKEN:
+        raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN ausente")
 
-    dsn = os.getenv("NEON_DSN")
-    token = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
-    if not dsn:
-        raise SystemExit("NEON_DSN é obrigatório")
-    if not token:
-        raise SystemExit("MOVIDESK_TOKEN é obrigatório")
+    with psycopg2.connect(DSN) as conn:
+        ensure_tables(conn)
 
-    schema = os.getenv("SCAN_SCHEMA", DEFAULT_SCHEMA)
-    batch_size = int(os.getenv("EXCLUIDOS_BATCH_SIZE", "50"))
-    throttle = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-    timeout = int(os.getenv("MOVIDESK_TIMEOUT", "30"))
-    attempts = int(os.getenv("MOVIDESK_ATTEMPTS", "6"))
-
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
-
-    with pg_connect(dsn) as conn:
-        ensure_tables(conn, schema)
-        control = read_control(conn, schema)
-        if not control:
-            raise SystemExit("range_scan_control não encontrado")
-
-        id_inicial = int(control["id_inicial"])
-        id_final = int(control["id_final"])
-        ptr = int(control["id_atual_excluido"] or id_inicial)
+        id_inicial, id_final, ptr = read_control(conn)
+        if ptr is None:
+            ptr = id_inicial
 
         if ptr < id_final:
-            log.info("scanner_excluidos: fim (ptr < id_final)")
+            log.info("Fim: id_atual_excluido=%s < id_final=%s", ptr, id_final)
             return
 
-        to_id = max(id_final, ptr - batch_size + 1)
+        to_id = max(id_final, ptr - BATCH + 1)
 
-        deleted = []
+        encontrados = []
         checked = 0
         for tid in range(ptr, to_id - 1, -1):
-            t = fetch_ticket(session, token, tid, "tickets", attempts, timeout, throttle)
-            if t is None:
-                t = fetch_ticket(session, token, tid, "tickets/past", attempts, timeout, throttle)
+            t = fetch_by_id(tid)
             if t is not None and t.get("isDeleted") is True:
-                deleted.append(t)
+                encontrados.append(t)
             checked += 1
-            time.sleep(throttle)
+            time.sleep(THROTTLE)
 
-        upserted = upsert_deleted(conn, schema, deleted)
+        up = upsert_excluidos(conn, encontrados)
 
         new_ptr = to_id - 1
-        update_ptr(conn, schema, control["ctid"], new_ptr)
+        write_ptr(conn, new_ptr)
 
-        log.info(f"scanner_excluidos: checked={checked} deleted_found={len(deleted)} upserted={upserted} ptr {ptr}->{new_ptr}")
+        log.info("OK: checked=%s deleted_found=%s upserted=%s ptr=%s->%s", checked, len(encontrados), up, ptr, new_ptr)
 
 
 if __name__ == "__main__":
