@@ -14,52 +14,15 @@ TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 LOOPS = int(os.getenv("LOOPS", "200000"))
-THROTTLE = float(os.getenv("THROTTLE", "0.05"))
 
-TOP = int(os.getenv("TOP", "500"))
-TIMEOUT = int(os.getenv("TIMEOUT", "60"))
+TOP = int(os.getenv("TOP", os.getenv("MOVIDESK_TOP", "500")))
+THROTTLE = float(os.getenv("THROTTLE", os.getenv("MOVIDESK_THROTTLE", "0.05")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def conn():
     return psycopg2.connect(DSN)
-
-
-def api_get(path, params):
-    url = f"{API_BASE}/{path}"
-    params = dict(params or {})
-    params["token"] = TOKEN
-    r = requests.get(url, params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def api_list_ids(path, id_start, id_end):
-    ids = set()
-    skip = 0
-    while True:
-        data = api_get(
-            path,
-            {
-                "$select": "id",
-                "$filter": f"id ge {int(id_start)} and id le {int(id_end)}",
-                "$top": TOP,
-                "$skip": skip,
-            },
-        )
-        if isinstance(data, dict) and "items" in data:
-            data = data["items"]
-        if not isinstance(data, list):
-            break
-        for row in data:
-            if isinstance(row, dict) and "id" in row:
-                ids.add(int(row["id"]))
-        if len(data) < TOP:
-            break
-        skip += TOP
-        time.sleep(THROTTLE)
-    return ids
 
 
 def table_cols(cur, schema, table):
@@ -75,15 +38,12 @@ def table_cols(cur, schema, table):
 
 
 def ensure_missing_unique(cur):
-    try:
-        cur.execute(
-            f"""
-            create unique index if not exists audit_recent_missing_table_ticket_uniq
-            on {SCHEMA}.audit_recent_missing (table_name, ticket_id)
-            """
-        )
-    except Exception:
-        pass
+    cur.execute(
+        f"""
+        create unique index if not exists audit_recent_missing_table_ticket_uniq
+        on {SCHEMA}.audit_recent_missing (table_name, ticket_id)
+        """
+    )
 
 
 def ensure_run_table(cur):
@@ -124,19 +84,100 @@ def update_run(cur, run_id, api_total, inserted_total, range_total):
     )
 
 
-def get_scan_cursor(cur):
-    cur.execute(f"select coalesce(max(ticket_id), 0) from {SCHEMA}.tickets_resolvidos_detail")
-    id_inicial = int(cur.fetchone()[0] or 0)
+def ensure_cursor_table(cur):
+    cur.execute(
+        f"""
+        create table if not exists {SCHEMA}.range_scan_control (
+            table_name text primary key,
+            cursor_id bigint,
+            updated_at timestamptz default now()
+        )
+        """
+    )
 
-    cur.execute("select coalesce(min(ticket_id), 0) from visualizacao_atual.tickets_abertos")
-    id_abertos_min = int(cur.fetchone()[0] or 0)
+
+def get_scan_cursor(cur):
+    ensure_cursor_table(cur)
+    cur.execute(
+        f"""
+        select cursor_id
+        from {SCHEMA}.range_scan_control
+        where table_name=%s
+        """,
+        (TABLE_NAME,),
+    )
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return int(row[0])
+
+    cur.execute(f"select coalesce(max(ticket_id), 0) from {SCHEMA}.tickets_resolvidos_detail")
+    cursor = int(cur.fetchone()[0] or 0)
 
     cur.execute(f"select coalesce(max(ticket_id), 0) from {SCHEMA}.tickets_mesclados")
-    id_mesclados_max = int(cur.fetchone()[0] or 0)
+    merged_max = int(cur.fetchone()[0] or 0)
 
-    id_final = min(x for x in [id_inicial, id_abertos_min] if x > 0) if (id_inicial > 0 or id_abertos_min > 0) else 0
-    cursor = max(id_inicial, id_mesclados_max)
-    return id_final, id_inicial, cursor
+    cursor = max(cursor, merged_max)
+
+    cur.execute(
+        f"""
+        insert into {SCHEMA}.range_scan_control (table_name, cursor_id)
+        values (%s, %s)
+        on conflict (table_name) do update set cursor_id=excluded.cursor_id, updated_at=now()
+        """,
+        (TABLE_NAME, cursor),
+    )
+    return int(cursor)
+
+
+def set_scan_cursor(cur, cursor_id):
+    ensure_cursor_table(cur)
+    cur.execute(
+        f"""
+        insert into {SCHEMA}.range_scan_control (table_name, cursor_id)
+        values (%s, %s)
+        on conflict (table_name) do update set cursor_id=excluded.cursor_id, updated_at=now()
+        """,
+        (TABLE_NAME, int(cursor_id)),
+    )
+
+
+def get_floor_id(cur):
+    cur.execute("select coalesce(min(ticket_id), 0) from visualizacao_atual.tickets_abertos")
+    abertos_min = int(cur.fetchone()[0] or 0)
+
+    cur.execute(f"select coalesce(min(ticket_id), 0) from {SCHEMA}.tickets_resolvidos_detail")
+    detail_min = int(cur.fetchone()[0] or 0)
+
+    candidates = [x for x in (abertos_min, detail_min) if x > 0]
+    return min(candidates) if candidates else 0
+
+
+def movidesk_list_ids(endpoint, low_id, high_id):
+    ids = set()
+    skip = 0
+    while True:
+        params = {
+            "token": TOKEN,
+            "$select": "id",
+            "$filter": f"id ge {int(low_id)} and id le {int(high_id)}",
+            "$top": TOP,
+            "$skip": skip,
+        }
+        r = requests.get(f"{API_BASE}/{endpoint}", params=params, timeout=60)
+        if r.status_code == 400:
+            raise RuntimeError(f"Movidesk 400 em {endpoint}: {r.text[:400]}")
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            break
+        for row in data:
+            if isinstance(row, dict) and "id" in row:
+                ids.add(int(row["id"]))
+        if len(data) < TOP:
+            break
+        skip += TOP
+        time.sleep(THROTTLE)
+    return ids
 
 
 def upsert_missing(cur, run_id, table_name, missing_ids):
@@ -186,10 +227,14 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
         if "updated_at" in cols:
             sets.append("updated_at=now()")
         if "attempts" in cols:
-            sets.append("attempts=attempts+1")
-        conflict = f" on conflict (table_name, ticket_id) do update set {', '.join(sets)}" if sets else " on conflict (table_name, ticket_id) do nothing"
+            sets.append("attempts=arm.attempts+1")
+        conflict = (
+            f" on conflict (table_name, ticket_id) do update set {', '.join(sets)}"
+            if sets
+            else " on conflict (table_name, ticket_id) do nothing"
+        )
 
-    sql = f"insert into {SCHEMA}.audit_recent_missing ({', '.join(base_cols)}) values %s{conflict}"
+    sql = f"insert into {SCHEMA}.audit_recent_missing as arm ({', '.join(base_cols)}) values %s{conflict}"
     template = f"({', '.join(base_vals)})"
     psycopg2.extras.execute_values(cur, sql, values, template=template, page_size=500)
     return len(values)
@@ -210,19 +255,29 @@ def main():
         range_total = 0
 
         with c.cursor() as cur:
-            id_final, id_inicial, cursor = get_scan_cursor(cur)
+            cursor = get_scan_cursor(cur)
+            floor_id = get_floor_id(cur)
+
+        done = 0
 
         for _ in range(LOOPS):
-            if cursor < id_final:
+            if cursor <= 0:
+                done = 1
+                break
+            if floor_id > 0 and cursor < floor_id:
+                done = 1
                 break
 
             high_id = cursor
-            low_id = max(id_final, cursor - BATCH_SIZE + 1)
+            low_id = max(1, cursor - BATCH_SIZE + 1)
+            if floor_id > 0:
+                low_id = max(low_id, floor_id)
+
             range_total += (high_id - low_id + 1)
 
             api_ids = set()
-            api_ids |= api_list_ids("tickets", low_id, high_id)
-            api_ids |= api_list_ids("tickets/past", low_id, high_id)
+            api_ids |= movidesk_list_ids("tickets", low_id, high_id)
+            api_ids |= movidesk_list_ids("tickets/past", low_id, high_id)
             api_total += len(api_ids)
 
             with conn() as c2:
@@ -245,26 +300,31 @@ def main():
                     )
                     in_mesclados = {int(r[0]) for r in cur2.fetchall()}
 
-                    known = set()
-                    known |= api_ids
-                    known |= in_detail
-                    known |= in_abertos
-                    known |= in_mesclados
-
-                    missing = set(range(low_id, high_id + 1)) - known
+                    missing = {i for i in api_ids if i not in in_detail and i not in in_abertos and i not in in_mesclados}
 
                     inserted = upsert_missing(cur2, run_id, TABLE_NAME, missing)
                     inserted_total += inserted
+
+                    set_scan_cursor(cur2, low_id - 1)
                     c2.commit()
 
+            logging.info(
+                "range=%s..%s api=%s missing_upsert=%s cursor->%s",
+                low_id,
+                high_id,
+                len(api_ids),
+                inserted,
+                low_id - 1,
+            )
             cursor = low_id - 1
 
-            with conn() as c3:
-                with c3.cursor() as cur3:
-                    update_run(cur3, run_id, api_total, inserted_total, range_total)
-                    c3.commit()
+        with conn() as c3:
+            with c3.cursor() as cur3:
+                update_run(cur3, run_id, api_total, inserted_total, range_total)
+                c3.commit()
 
-    logging.info("done api_total=%s inserted_total=%s range_total=%s", api_total, inserted_total, range_total)
+    logging.info("done api_total=%s inserted_total=%s range_total=%s done=%s", api_total, inserted_total, range_total, done)
+    print(f"done={done}")
 
 
 if __name__ == "__main__":
