@@ -21,7 +21,7 @@ on:
         default: 0.2
 
 concurrency:
-  group: movidesk-id-scan-to-audit-missing
+  group: movidesk-db-write
   cancel-in-progress: false
 
 permissions:
@@ -55,6 +55,10 @@ jobs:
           MOVIDESK_TOP: ${{ inputs.top }}
           MOVIDESK_THROTTLE: ${{ inputs.throttle }}
           TABLE_NAME: tickets_resolvidos
+          DB_LOCK_TIMEOUT_MS: 5000
+          DB_STATEMENT_TIMEOUT_MS: 300000
+          DB_TXN_RETRIES: 6
+          DB_UPSERT_PAGE_SIZE: 200
 
       - name: Dispatch self if not done
         env:
