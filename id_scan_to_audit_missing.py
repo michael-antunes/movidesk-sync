@@ -5,9 +5,9 @@ import requests
 import psycopg2
 import psycopg2.extras
 
-API_BASE = "https://api.movidesk.com/public/v1"
-TOKEN = os.environ["MOVIDESK_TOKEN"]
-DSN = os.environ["NEON_DSN"]
+API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
+DSN = os.getenv("NEON_DSN")
 
 SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
 TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
@@ -53,11 +53,15 @@ def api_list_ids(path, id_start, id_end):
             break
         for row in data:
             if isinstance(row, dict) and "id" in row:
-                ids.add(int(row["id"]))
+                try:
+                    ids.add(int(row["id"]))
+                except Exception:
+                    pass
         if len(data) < TOP:
             break
         skip += TOP
-        time.sleep(THROTTLE)
+        if THROTTLE > 0:
+            time.sleep(THROTTLE)
     return ids
 
 
@@ -89,63 +93,125 @@ def ensure_run_table(cur):
     cur.execute(
         f"""
         create table if not exists {SCHEMA}.audit_recent_run (
+            id bigserial primary key,
+            started_at timestamptz not null default now(),
+            window_start timestamptz not null,
+            window_end timestamptz not null,
+            total_api integer not null,
+            missing_total integer not null default 0,
+            run_at timestamptz,
+            window_from timestamptz,
+            window_to timestamptz,
+            total_local integer,
+            notes text,
             run_id bigint,
-            created_at timestamptz default now(),
-            api_total bigint default 0,
-            inserted_total bigint default 0,
-            range_total bigint default 0
+            created_at timestamptz,
+            table_name text,
+            external_run_id bigint,
+            workflow text,
+            job text,
+            ref text,
+            sha text,
+            repo text,
+            max_actions integer,
+            window_start_id bigint,
+            window_end_id bigint,
+            window_center_id bigint
         )
         """
     )
-    try:
-        cur.execute(
-            f"""
-            create unique index if not exists ux_audit_recent_run_run_id
-            on {SCHEMA}.audit_recent_run (run_id)
-            """
-        )
-    except Exception:
-        pass
 
 
-def insert_run(cur, run_id):
-    ensure_run_table(cur)
-    cur.execute(
-        f"""
-        insert into {SCHEMA}.audit_recent_run (run_id)
-        values (%s)
-        on conflict do nothing
-        """,
-        (int(run_id),),
-    )
-
-
-def update_run(cur, run_id, api_total, inserted_total, range_total):
+def create_run(cur, external_run_id):
     ensure_run_table(cur)
     cols = table_cols(cur, SCHEMA, "audit_recent_run")
+
+    ins_cols = []
+    ins_vals = []
+    params = []
+
+    def add_expr(col, expr):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append(expr)
+
+    def add_param(col, val):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append("%s")
+            params.append(val)
+
+    add_expr("started_at", "now()")
+    add_expr("window_start", "now()")
+    add_expr("window_end", "now()")
+    add_expr("run_at", "now()")
+    add_expr("total_api", "0")
+    add_expr("missing_total", "0")
+    add_expr("created_at", "now()")
+    add_param("table_name", TABLE_NAME)
+    add_param("notes", "id-scan")
+    if "external_run_id" in cols:
+        add_param("external_run_id", int(external_run_id))
+    elif "run_id" in cols:
+        add_param("run_id", int(external_run_id))
+    add_param("workflow", os.getenv("GITHUB_WORKFLOW"))
+    add_param("job", os.getenv("GITHUB_JOB"))
+    add_param("ref", os.getenv("GITHUB_REF_NAME") or os.getenv("GITHUB_REF"))
+    add_param("sha", os.getenv("GITHUB_SHA"))
+    add_param("repo", os.getenv("GITHUB_REPOSITORY"))
+
+    returning = " returning id" if "id" in cols else ""
+    cur.execute(
+        f"insert into {SCHEMA}.audit_recent_run ({', '.join(ins_cols)}) values ({', '.join(ins_vals)}){returning}",
+        tuple(params),
+    )
+    if "id" in cols:
+        return int(cur.fetchone()[0])
+    return int(external_run_id)
+
+
+def update_run(cur, run_pk, total_api, inserted_total, range_total):
+    cols = table_cols(cur, SCHEMA, "audit_recent_run")
     sets = []
-    vals = []
-    if "api_total" in cols:
-        sets.append("api_total=%s")
-        vals.append(int(api_total))
-    if "inserted_total" in cols:
-        sets.append("inserted_total=%s")
-        vals.append(int(inserted_total))
+    params = []
+
+    if "window_end" in cols:
+        sets.append("window_end=now()")
+    if "total_api" in cols:
+        sets.append("total_api=%s")
+        params.append(int(total_api))
+    if "missing_total" in cols:
+        sets.append("missing_total=%s")
+        params.append(int(inserted_total))
+    if "api_ids" in cols:
+        sets.append("api_ids=%s")
+        params.append(int(total_api))
+    if "inserted_missing" in cols:
+        sets.append("inserted_missing=%s")
+        params.append(int(inserted_total))
+    if "range_count" in cols:
+        sets.append("range_count=%s")
+        params.append(int(range_total))
     if "range_total" in cols:
         sets.append("range_total=%s")
-        vals.append(int(range_total))
-    if not sets:
+        params.append(int(range_total))
+
+    key_col = "id" if "id" in cols else ("run_id" if "run_id" in cols else None)
+    if not sets or not key_col:
         return
-    vals.append(int(run_id))
-    cur.execute(
-        f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where run_id=%s",
-        tuple(vals),
-    )
+
+    params.append(int(run_pk))
+    cur.execute(f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where {key_col}=%s", tuple(params))
 
 
 def get_scan_cursor(cur):
     cur.execute(f"select id_final, id_inicial, id_atual from {SCHEMA}.range_scan_control limit 1")
-    id_final, id_inicial, id_atual = cur.fetchone()
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"{SCHEMA}.range_scan_control sem linhas")
+    id_final, id_inicial, id_atual = row
+    if id_final is None or id_inicial is None:
+        raise RuntimeError(f"{SCHEMA}.range_scan_control precisa de id_inicial e id_final")
     if id_atual is None:
         id_atual = id_inicial
     return int(id_final), int(id_inicial), int(id_atual)
@@ -165,7 +231,7 @@ def set_scan_cursor(cur, new_cursor):
     cur.execute(f"update {SCHEMA}.range_scan_control set {', '.join(sets)}", tuple(vals))
 
 
-def upsert_missing(cur, run_id, table_name, missing_ids):
+def upsert_missing(cur, run_pk, table_name, missing_ids):
     cols = table_cols(cur, SCHEMA, "audit_recent_missing")
     base_cols = ["table_name", "ticket_id"]
     base_vals = ["%s", "%s"]
@@ -198,7 +264,7 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
     for tid in sorted(missing_ids):
         row_params = [table_name, int(tid)]
         if "run_id" in cols:
-            row_params.append(int(run_id))
+            row_params.append(int(run_pk))
         values.append(tuple(row_params))
 
     if not values:
@@ -226,86 +292,87 @@ def upsert_missing(cur, run_id, table_name, missing_ids):
 
 
 def main():
-    run_id = int(time.time())
-    logging.info("run_id=%s table_name=%s", run_id, TABLE_NAME)
+    external_run_id = int(time.time())
+    logging.info("external_run_id=%s table_name=%s", external_run_id, TABLE_NAME)
 
     with conn() as c:
         with c.cursor() as cur:
             ensure_missing_unique(cur)
-            insert_run(cur, run_id)
+            run_pk = create_run(cur, external_run_id)
             c.commit()
 
-        api_total = 0
-        inserted_total = 0
-        range_total = 0
+    api_total = 0
+    inserted_total = 0
+    range_total = 0
 
+    with conn() as c:
         with c.cursor() as cur:
             id_final, id_inicial, cursor = get_scan_cursor(cur)
 
-        done = 0
+    done = 0
 
-        for _ in range(LOOPS):
-            if cursor < id_final:
-                done = 1
-                break
+    for _ in range(LOOPS):
+        if cursor < id_final:
+            done = 1
+            break
 
-            high_id = cursor
-            low_id = max(id_final, cursor - BATCH_SIZE + 1)
-            range_total += (high_id - low_id + 1)
+        high_id = cursor
+        low_id = max(id_final, cursor - BATCH_SIZE + 1)
+        range_total += (high_id - low_id + 1)
 
-            api_ids = set()
-            api_ids |= api_list_ids("tickets", low_id, high_id)
-            api_ids |= api_list_ids("tickets/past", low_id, high_id)
-            api_total += len(api_ids)
+        api_ids = set()
+        api_ids |= api_list_ids("tickets", low_id, high_id)
+        api_ids |= api_list_ids("tickets/past", low_id, high_id)
+        api_total += len(api_ids)
 
-            with conn() as c2:
-                with c2.cursor() as cur2:
-                    cur2.execute(
-                        f"select ticket_id from {SCHEMA}.tickets_resolvidos_detail where ticket_id between %s and %s",
-                        (low_id, high_id),
-                    )
-                    in_detail = {int(r[0]) for r in cur2.fetchall()}
+        with conn() as c2:
+            with c2.cursor() as cur2:
+                cur2.execute(
+                    f"select ticket_id from {SCHEMA}.tickets_resolvidos_detail where ticket_id between %s and %s",
+                    (low_id, high_id),
+                )
+                in_detail = {int(r[0]) for r in cur2.fetchall()}
 
-                    cur2.execute(
-                        "select ticket_id from visualizacao_atual.tickets_abertos where ticket_id between %s and %s",
-                        (low_id, high_id),
-                    )
-                    in_abertos = {int(r[0]) for r in cur2.fetchall()}
+                cur2.execute(
+                    "select ticket_id from visualizacao_atual.tickets_abertos where ticket_id between %s and %s",
+                    (low_id, high_id),
+                )
+                in_abertos = {int(r[0]) for r in cur2.fetchall()}
 
-                    cur2.execute(
-                        f"select ticket_id from {SCHEMA}.tickets_mesclados where ticket_id between %s and %s",
-                        (low_id, high_id),
-                    )
-                    in_mesclados = {int(r[0]) for r in cur2.fetchall()}
+                cur2.execute(
+                    f"select ticket_id from {SCHEMA}.tickets_mesclados where ticket_id between %s and %s",
+                    (low_id, high_id),
+                )
+                in_mesclados = {int(r[0]) for r in cur2.fetchall()}
 
-                    known = set()
-                    known |= api_ids
-                    known |= in_detail
-                    known |= in_abertos
-                    known |= in_mesclados
+                known = set()
+                known |= api_ids
+                known |= in_detail
+                known |= in_abertos
+                known |= in_mesclados
 
-                    missing = set(range(low_id, high_id + 1)) - known
+                missing = set(range(low_id, high_id + 1)) - known
 
-                    inserted = upsert_missing(cur2, run_id, TABLE_NAME, missing)
-                    inserted_total += inserted
+                inserted = upsert_missing(cur2, run_pk, TABLE_NAME, missing)
+                inserted_total += inserted
 
-                    set_scan_cursor(cur2, low_id - 1)
-                    c2.commit()
+                set_scan_cursor(cur2, low_id - 1)
+                c2.commit()
 
-            logging.info(
-                "range=%s..%s api=%s missing_upsert=%s cursor->%s",
-                low_id,
-                high_id,
-                len(api_ids),
-                inserted,
-                low_id - 1,
-            )
-            cursor = low_id - 1
+        logging.info(
+            "range=%s..%s api=%s missing_upsert=%s cursor->%s",
+            low_id,
+            high_id,
+            len(api_ids),
+            inserted,
+            low_id - 1,
+        )
+        cursor = low_id - 1
 
-        with conn() as c3:
-            with c3.cursor() as cur3:
-                update_run(cur3, run_id, api_total, inserted_total, range_total)
-                c3.commit()
+    with conn() as c3:
+        with c3.cursor() as cur3:
+            update_run(cur3, run_pk, api_total, inserted_total, range_total)
+            c3.commit()
 
     logging.info("done api_total=%s inserted_total=%s range_total=%s", api_total, inserted_total, range_total)
     print(f"done={done}")
