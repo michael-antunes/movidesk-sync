@@ -12,7 +12,7 @@ TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
 SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
-TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
+TABLE_NAME = "tickets_resolvidos"
 
 BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", os.getenv("BATCH_SIZE", "1000")))
 LOOPS = int(os.getenv("ID_SCAN_ITERATIONS", os.getenv("LOOPS", "200000")))
@@ -107,7 +107,9 @@ def ensure_missing_unique():
     try:
         c.autocommit = True
         with c.cursor() as cur:
-            cur.execute(f"create unique index concurrently {index_name} on {SCHEMA}.audit_recent_missing (table_name, ticket_id)")
+            cur.execute(
+                f"create unique index concurrently {index_name} on {SCHEMA}.audit_recent_missing (table_name, ticket_id)"
+            )
     except Exception:
         pass
     finally:
@@ -410,13 +412,23 @@ def main():
             )
             in_mesclados = {int(r[0]) for r in cur.fetchall()}
 
-            known = set()
-            known |= api_ids
-            known |= in_detail
-            known |= in_abertos
-            known |= in_mesclados
+            in_excluidos = set()
+            try:
+                cur.execute(
+                    f"select ticket_id from {SCHEMA}.tickets_excluidos where ticket_id between %s and %s",
+                    (low_id, high_id),
+                )
+                in_excluidos = {int(r[0]) for r in cur.fetchall()}
+            except Exception:
+                in_excluidos = set()
 
-            missing = set(range(low_id, high_id + 1)) - known
+            local_present = set()
+            local_present |= in_detail
+            local_present |= in_abertos
+            local_present |= in_mesclados
+            local_present |= in_excluidos
+
+            missing = set(api_ids) - local_present
 
             inserted = upsert_missing(cur, run_pk, TABLE_NAME, missing)
             set_scan_cursor(cur, low_id - 1)
