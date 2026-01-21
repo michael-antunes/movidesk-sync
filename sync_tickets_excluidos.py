@@ -134,7 +134,7 @@ def fetch_ticket(ticket_id, endpoint):
         "includeDeletedItems": "true",
         "$filter": f"id eq {int(ticket_id)}",
         "$top": 1,
-        "$select": "id,protocol,subject,status,baseStatus,serviceFirstLevel,serviceSecondLevel,serviceThirdLevel,ownerTeam,lastUpdate,isDeleted,createdDate,origin,category,urgency,justification",
+        "$select": "id,protocol,subject,status,baseStatus,isDeleted,createdDate,origin,category,urgency,justification,lastUpdate",
         "$expand": "clients($expand=organization)",
     }
     data = req(url, params)
@@ -186,10 +186,9 @@ def main():
 
         id_inicial, id_final, id_atual, id_atual_excluido = read_control(conn)
 
-        ptr = id_atual_excluido if id_atual_excluido is not None else id_inicial
-        if ptr is None and id_atual is not None:
+        ptr = id_atual_excluido
+        if ptr is None:
             ptr = id_atual
-
         if ptr is None:
             raise RuntimeError("Ponteiro inicial não definido (id_inicial/id_atual_excluido/id_atual)")
 
@@ -201,10 +200,17 @@ def main():
 
         encontrados = []
         checked = 0
+        deleted_found = 0
+        not_found = 0
+
         for tid in range(ptr, to_id - 1, -1):
             t = fetch_by_id(tid)
             if t is not None and t.get("isDeleted") is True:
                 encontrados.append(t)
+                deleted_found += 1
+            elif t is None:
+                encontrados.append({"id": int(tid), "api_not_found": True, "checkedAt": now_utc().isoformat()})
+                not_found += 1
             checked += 1
             time.sleep(THROTTLE)
 
@@ -213,7 +219,15 @@ def main():
         new_ptr = to_id - 1
         write_ptr(conn, new_ptr)
 
-        log.info("OK: checked=%s deleted_found=%s upserted=%s id_atual_excluido=%s->%s", checked, len(encontrados), up, ptr, new_ptr)
+        log.info(
+            "OK: checked=%s deleted_found=%s not_found=%s upserted=%s id_atual_excluido=%s->%s",
+            checked,
+            deleted_found,
+            not_found,
+            up,
+            ptr,
+            new_ptr,
+        )
 
 
 if __name__ == "__main__":
