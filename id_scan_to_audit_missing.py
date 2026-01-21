@@ -412,23 +412,12 @@ def main():
             )
             in_mesclados = {int(r[0]) for r in cur.fetchall()}
 
-            in_excluidos = set()
-            try:
-                cur.execute(
-                    f"select ticket_id from {SCHEMA}.tickets_excluidos where ticket_id between %s and %s",
-                    (low_id, high_id),
-                )
-                in_excluidos = {int(r[0]) for r in cur.fetchall()}
-            except Exception:
-                in_excluidos = set()
-
             local_present = set()
             local_present |= in_detail
             local_present |= in_abertos
             local_present |= in_mesclados
-            local_present |= in_excluidos
 
-            missing = set(api_ids) - local_present
+            missing = api_ids - local_present
 
             inserted = upsert_missing(cur, run_pk, TABLE_NAME, missing)
             set_scan_cursor(cur, low_id - 1)
