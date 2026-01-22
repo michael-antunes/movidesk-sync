@@ -2,8 +2,6 @@ name: Movidesk - Tickets abertos (index)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "* * * * *"
 
 concurrency:
   group: movidesk-abertos-index-${{ github.ref }}
@@ -11,6 +9,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   tickets-abertos-index:
@@ -19,16 +18,12 @@ jobs:
 
     steps:
       - run: date -u && echo "Branch=$GITHUB_REF"
-
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Instalar dependências
         run: pip install requests psycopg2-binary
-
       - name: Sync open tickets index enriquecido
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -36,3 +31,18 @@ jobs:
           MOVIDESK_PAGE_SIZE: "500"
           MOVIDESK_THROTTLE: "0.25"
         run: python sync_tickets_abertos.py
+
+  call-raw:
+    needs: tickets-abertos-index
+    if: ${{ needs.tickets-abertos-index.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'sync_tickets_abertos_raw.yml',
+              ref: 'main'
+            })
