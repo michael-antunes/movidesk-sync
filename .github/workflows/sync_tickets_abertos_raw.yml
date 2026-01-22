@@ -2,8 +2,6 @@ name: Movidesk - Tickets abertos (raw)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "* * * * *"   # se quiser aliviar, troca pra "*/5 * * * *"
 
 concurrency:
   group: movidesk-abertos-raw-${{ github.ref }}
@@ -11,6 +9,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   tickets-abertos-raw:
@@ -19,15 +18,11 @@ jobs:
 
     steps:
       - run: date -u && echo "Branch=$GITHUB_REF"
-
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - run: pip install requests psycopg2-binary
-
       - name: Sync open tickets raw
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -35,3 +30,18 @@ jobs:
           ABERTOS_RAW_BATCH: "20"
           THROTTLE_SEC: "0.25"
         run: python sync_tickets_abertos_raw.py
+
+  call-index:
+    needs: tickets-abertos-raw
+    if: ${{ needs.tickets-abertos-raw.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'sync_tickets_abertos.yml',
+              ref: 'main'
+            })
