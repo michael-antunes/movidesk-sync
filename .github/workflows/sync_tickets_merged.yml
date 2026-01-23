@@ -2,22 +2,25 @@ name: Movidesk - Tickets mesclados (merged)
 
 on:
   workflow_call:
+    inputs:
+      lookback_days:
+        required: false
+        type: string
+        default: "2"
+      window_days:
+        required: false
+        type: string
+        default: "1"
   workflow_dispatch:
     inputs:
       lookback_days:
-        description: "Quantos dias para trás buscar (padrão 30)"
+        description: "Quantos dias para trás buscar (padrão 2)"
         required: false
-        default: "30"
+        default: "2"
       window_days:
         description: "Tamanho da janela em dias (padrão 1)"
         required: false
         default: "1"
-
-  workflow_run:
-    workflows:
-      - Movidesk - Tickets resolvidos (detail)
-    types:
-      - completed
 
 concurrency:
   group: movidesk-detail-${{ github.ref }}
@@ -29,7 +32,6 @@ permissions:
 
 jobs:
   merged:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -48,6 +50,7 @@ jobs:
           MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
           DB_SCHEMA: "visualizacao_resolvidos"
           TABLE_NAME: "tickets_mesclados"
-          LOOKBACK_DAYS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.lookback_days) || '30' }}
-          WINDOW_DAYS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.window_days) || '1' }}
+
+          LOOKBACK_DAYS: ${{ inputs.lookback_days || github.event.inputs.lookback_days || '2' }}
+          WINDOW_DAYS:   ${{ inputs.window_days   || github.event.inputs.window_days   || '1' }}
         run: python sync_tickets_merged.py
