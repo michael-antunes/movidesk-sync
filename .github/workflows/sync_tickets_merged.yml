@@ -1,6 +1,12 @@
 name: Movidesk - Tickets mesclados (merged)
 
 on:
+  # Roda automaticamente quando o DETAIL terminar
+  workflow_run:
+    workflows: ["Movidesk - Tickets resolvidos (detail)"]
+    types: [completed]
+
+  # Mantém igual ao DETAIL: pode ser chamado por outro workflow
   workflow_call:
     inputs:
       lookback_days:
@@ -14,6 +20,7 @@ on:
         default: 1
         type: number
 
+  # Mantém botão manual com inputs
   workflow_dispatch:
     inputs:
       lookback_days:
@@ -28,9 +35,9 @@ on:
 permissions:
   contents: read
 
-# Mesma ideia do DETAIL: não cancela, e serializa pelo mesmo grupo
+# Não usa o MESMO group do detail (senão vira briga de fila e cancelamentos)
 concurrency:
-  group: movidesk-detail-${{ github.ref }}
+  group: movidesk-merged-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -38,8 +45,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    # Se vier do workflow_run, só roda quando o DETAIL concluiu com sucesso
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+
     steps:
-      - run: date -u && echo "Branch=$GITHUB_REF"
+      - run: date -u && echo "Branch=$GITHUB_REF" && echo "Event=$GITHUB_EVENT_NAME"
 
       - uses: actions/checkout@v4
 
@@ -56,6 +66,9 @@ jobs:
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
-          WINDOW_DAYS: ${{ inputs.window_days }}
+
+          # workflow_run não tem inputs -> usa defaults fixos
+          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_run' && 2 || inputs.lookback_days }}
+          WINDOW_DAYS:  ${{ github.event_name == 'workflow_run' && 1 || inputs.window_days }}
+
         run: python sync_tickets_merged.py
