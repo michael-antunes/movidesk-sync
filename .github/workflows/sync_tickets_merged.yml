@@ -4,13 +4,16 @@ on:
   workflow_call:
     inputs:
       lookback_days:
+        description: "Quantos dias para trás buscar (padrão 2)"
         required: false
-        type: string
-        default: "2"
+        default: 2
+        type: number
       window_days:
+        description: "Tamanho da janela em dias (padrão 1)"
         required: false
-        type: string
-        default: "1"
+        default: 1
+        type: number
+
   workflow_dispatch:
     inputs:
       lookback_days:
@@ -22,13 +25,13 @@ on:
         required: false
         default: "1"
 
+permissions:
+  contents: read
+
+# Mesma ideia do DETAIL: não cancela, e serializa pelo mesmo grupo
 concurrency:
   group: movidesk-detail-${{ github.ref }}
   cancel-in-progress: false
-
-permissions:
-  contents: read
-  actions: write
 
 jobs:
   merged:
@@ -37,20 +40,22 @@ jobs:
 
     steps:
       - run: date -u && echo "Branch=$GITHUB_REF"
+
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
 
-      - name: Sync tickets merged
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Run sync_tickets_merged.py
         env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
-          DB_SCHEMA: "visualizacao_resolvidos"
-          TABLE_NAME: "tickets_mesclados"
-
-          LOOKBACK_DAYS: ${{ inputs.lookback_days || github.event.inputs.lookback_days || '2' }}
-          WINDOW_DAYS:   ${{ inputs.window_days   || github.event.inputs.window_days   || '1' }}
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          WINDOW_DAYS: ${{ inputs.window_days }}
         run: python sync_tickets_merged.py
