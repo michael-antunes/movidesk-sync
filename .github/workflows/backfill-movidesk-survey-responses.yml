@@ -1,24 +1,48 @@
-name: Backfill Movidesk -> Pesquisa de satisfação (Faces) diário
+name: Backfill Movidesk -> Survey responses (raw)
+
 on:
   schedule:
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *"   # 03:00 UTC
   workflow_dispatch:
+    inputs:
+      days_back:
+        description: "Dias pra trás (padrão 120)"
+        required: false
+        default: "120"
+
+concurrency:
+  group: movidesk-survey-backfill-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
+      - run: date -u && echo "Branch=$GITHUB_REF"
+
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install requests psycopg2-binary
-      - env:
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run backfill survey responses (120d)
+        env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_PAGE_SIZE: "100"
-          MOVIDESK_THROTTLE: "0.3"
-          MOVIDESK_TICKETS_CHUNK: "12"
-          FORCE_BACKFILL_DAYS: "15"
-        run: python sync_survey_responses.py
 
+          MOVIDESK_SURVEY_DAYS: ${{ inputs.days_back || '120' }}
+          MOVIDESK_OVERLAP_MIN: "172800"  # 120 dias em minutos
+
+          MOVIDESK_PAGE_SIZE: "100"
+          MOVIDESK_THROTTLE: "0.2"
+          TICKETS_CHUNK: "5000"
+        run: python sync_survey_responses.py
