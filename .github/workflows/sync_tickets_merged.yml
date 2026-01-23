@@ -1,6 +1,7 @@
-name: Sync Tickets Merged (Movidesk)
+name: Movidesk - Tickets mesclados (merged)
 
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
       lookback_days:
@@ -8,62 +9,45 @@ on:
         required: false
         default: "30"
       window_days:
-        description: "Tamanho da janela em dias (padrão 7)"
+        description: "Tamanho da janela em dias (padrão 1)"
         required: false
-        default: "7"
-  schedule:
-    - cron: "*/50 * * * *"
+        default: "1"
+
+  workflow_run:
+    workflows:
+      - Movidesk - Tickets resolvidos (detail)
+    types:
+      - completed
 
 concurrency:
-  group: sync-tickets-merged
-  cancel-in-progress: true
+  group: movidesk-detail-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  run:
+  merged:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-      MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
-
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      NEON_DSN: ${{ secrets.NEON_DSN }}
-
-      PGHOST: ${{ secrets.PGHOST }}
-      PGDATABASE: ${{ secrets.PGDATABASE }}
-      PGUSER: ${{ secrets.PGUSER }}
-      PGPASSWORD: ${{ secrets.PGPASSWORD }}
-      PGPORT: ${{ secrets.PGPORT }}
-
-      DB_SCHEMA: "visualizacao_resolvidos"
-      TABLE_NAME: "tickets_mesclados"
-
-      LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '30' }}
-      WINDOW_DAYS: ${{ github.event.inputs.window_days || '7' }}
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - run: date -u && echo "Branch=$GITHUB_REF"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: pip install requests psycopg2-binary
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests psycopg2-binary
-
-      - name: Sanity env (sem vazar secrets)
-        run: |
-          python - <<'PY'
-          import os
-          keys = ["MOVIDESK_TOKEN","DATABASE_URL","NEON_DSN","PGHOST","PGDATABASE","PGUSER","PGPASSWORD","PGPORT"]
-          for k in keys:
-            print(f"{k} set? {bool(os.getenv(k))}")
-          PY
-
-      - name: Run sync
+      - name: Sync tickets merged
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_BASE_URL: "https://api.movidesk.com/public/v1"
+          DB_SCHEMA: "visualizacao_resolvidos"
+          TABLE_NAME: "tickets_mesclados"
+          LOOKBACK_DAYS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.lookback_days) || '30' }}
+          WINDOW_DAYS: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.window_days) || '1' }}
         run: python sync_tickets_merged.py
