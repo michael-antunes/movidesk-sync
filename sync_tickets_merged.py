@@ -66,7 +66,7 @@ class SyncCfg:
     statement_timeout_ms: int = 120000
 
 
-def parse_semicolon_ids(v: Any) -> List[int]:
+def parse_ids_any(v: Any) -> List[int]:
     if v is None:
         return []
     if isinstance(v, list):
@@ -80,7 +80,8 @@ def parse_semicolon_ids(v: Any) -> List[int]:
     s = str(v).strip()
     if not s:
         return []
-    parts = [p.strip() for p in s.split(";") if p.strip()]
+    s = s.replace("[", "").replace("]", "")
+    parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
     out = []
     for p in parts:
         try:
@@ -104,23 +105,7 @@ def normalize_dt(s: Any) -> Optional[dt.datetime]:
             x = x.replace(tzinfo=dt.timezone.utc)
         return x.astimezone(dt.timezone.utc)
     except Exception:
-        pass
-    fmts = [
-        "%Y-%m-%d %H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d",
-    ]
-    for f in fmts:
-        try:
-            x = dt.datetime.strptime(st, f)
-            if x.tzinfo is None:
-                x = x.replace(tzinfo=dt.timezone.utc)
-            return x.astimezone(dt.timezone.utc)
-        except Exception:
-            continue
-    return None
+        return None
 
 
 class MovideskClient:
@@ -278,7 +263,7 @@ def main():
             ensure_table(cur, cfg)
         conn.commit()
 
-        end = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        end = utc_now()
         start = end - dt.timedelta(days=cfg.lookback_days)
 
         cur_dt = start
@@ -293,21 +278,31 @@ def main():
 
             for rec in client.iter_merged(cur_dt, nxt):
                 fetched += 1
-                ticket_id = rec.get("id") or rec.get("ticketId") or rec.get("ticket_id")
-                if ticket_id is None:
+                principal_id = rec.get("id") or rec.get("ticketId") or rec.get("ticket_id")
+                if principal_id is None:
                     continue
                 try:
-                    ticket_id_int = int(ticket_id)
+                    principal_id_int = int(principal_id)
                 except Exception:
                     continue
 
-                merged_ids = parse_semicolon_ids(rec.get("mergedTicketsIds"))
-                if not merged_ids:
-                    continue
-                merged_into_id = merged_ids[0]
-                merged_at = normalize_dt(rec.get("mergedAt") or rec.get("mergedDate") or rec.get("merged_at"))
+                merged_ids = parse_ids_any(rec.get("mergedTicketsIds") or rec.get("mergedTicketsIDs") or rec.get("mergedTicketsIdsList"))
+                merged_at = normalize_dt(rec.get("mergedAt") or rec.get("mergedDate") or rec.get("merged_at") or rec.get("date") or rec.get("performedAt"))
 
-                batch.append((ticket_id_int, merged_into_id, merged_at, Json(rec)))
+                if merged_ids:
+                    for mid in merged_ids:
+                        try:
+                            mid_int = int(mid)
+                        except Exception:
+                            continue
+                        batch.append((mid_int, principal_id_int, merged_at, Json(rec)))
+                else:
+                    merged_into = rec.get("mergedIntoId") or rec.get("mergedIntoTicketId") or rec.get("mainTicketId") or rec.get("principalTicketId")
+                    if merged_into is not None:
+                        try:
+                            batch.append((principal_id_int, int(merged_into), merged_at, Json(rec)))
+                        except Exception:
+                            pass
 
                 if len(batch) >= cfg.batch_size:
                     upsert_rows(conn, batch, cfg)
@@ -319,10 +314,9 @@ def main():
                 upserted += len(batch)
                 batch.clear()
 
-            logging.info("janela=%s..%s fetched=%s upserted=%s", cur_dt.date(), nxt.date(), fetched, upserted)
+            logging.info("janela=%s..%s fetched=%s upserted=%s", cur_dt.isoformat(), nxt.isoformat(), fetched, upserted)
             total_fetched += fetched
             total_upserted += upserted
-
             cur_dt = nxt
 
         logging.info("total fetched=%s upserted=%s", total_fetched, total_upserted)
