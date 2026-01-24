@@ -47,6 +47,17 @@ def qname(schema: str, table: str) -> str:
     return f"{qident(schema)}.{qident(table)}"
 
 
+def pg_connect(dsn: str):
+    return psycopg2.connect(
+        dsn,
+        connect_timeout=15,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+
+
 def parse_dt(v: Any) -> Optional[dt.datetime]:
     if not v:
         return None
@@ -88,38 +99,90 @@ def to_int_list(v: Any) -> List[int]:
     return out
 
 
-def ensure_table(conn, schema: str, table: str):
-    with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {qident(schema)}")
-        cur.execute(
-            f"""
-            create table if not exists {qname(schema, table)} (
-              ticket_id bigint primary key,
-              merged_into_id bigint not null,
-              merged_at timestamptz,
-              raw_payload jsonb
+def ensure_table(dsn: str, schema: str, table: str):
+    conn = pg_connect(dsn)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"create schema if not exists {qident(schema)}")
+            cur.execute(
+                f"""
+                create table if not exists {qname(schema, table)} (
+                  ticket_id bigint primary key,
+                  merged_into_id bigint not null,
+                  merged_at timestamptz,
+                  raw_payload jsonb
+                )
+                """
             )
-            """
-        )
-        cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
+            cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def fetch_candidate_ids(conn, src_schema: str, src_table: str, src_date_col: str, since_utc: dt.datetime, max_ids: int) -> List[int]:
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            select ticket_id::bigint
-            from {qname(src_schema, src_table)}
-            where {qident(src_date_col)} >= %s
-            order by ticket_id desc
-            limit %s
-            """,
-            (since_utc, max_ids),
-        )
-        return [int(r[0]) for r in cur.fetchall()]
+def fetch_candidate_ids(dsn: str, src_schema: str, src_table: str, src_date_col: str, since_utc: dt.datetime, max_ids: int) -> List[int]:
+    conn = pg_connect(dsn)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select ticket_id::bigint
+                from {qname(src_schema, src_table)}
+                where {qident(src_date_col)} >= %s
+                order by ticket_id desc
+                limit %s
+                """,
+                (since_utc, max_ids),
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.close()
 
 
-def movidesk_get_merged_by_ticket(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+def upsert_rows(dsn: str, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]) -> int:
+    if not rows:
+        return 0
+    sql = f"""
+        insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+        values %s
+        on conflict (ticket_id) do update set
+          merged_into_id = excluded.merged_into_id,
+          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
+          raw_payload = excluded.raw_payload
+    """
+    for attempt in range(6):
+        conn = None
+        try:
+            conn = pg_connect(dsn)
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
+            conn.commit()
+            conn.close()
+            return len(rows)
+        except psycopg2.OperationalError:
+            try:
+                if conn is not None and getattr(conn, "closed", 1) == 0:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
+            time.sleep(2 * (attempt + 1))
+            continue
+        except Exception:
+            try:
+                if conn is not None and getattr(conn, "closed", 1) == 0:
+                    conn.rollback()
+                    conn.close()
+            except Exception:
+                pass
+            raise
+    raise RuntimeError("Falha ao gravar no Neon após retries (SSL/OperationalError)")
+
+
+def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
     for key in ("ticketId", "id"):
         params = {"token": token, key: str(ticket_id)}
@@ -187,22 +250,6 @@ def extract_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, O
     return rows
 
 
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]):
-    if not rows:
-        return 0
-    sql = f"""
-        insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
-        values %s
-        on conflict (ticket_id) do update set
-          merged_into_id = excluded.merged_into_id,
-          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
-          raw_payload = excluded.raw_payload
-    """
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
-    return len(rows)
-
-
 def main():
     logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("merged-by-ids")
@@ -224,67 +271,76 @@ def main():
     rpm = env_float("RPM", 9.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
     http_timeout = env_int("HTTP_TIMEOUT", 60)
-    commit_every = env_int("COMMIT_EVERY", 50)
+
+    flush_rows = env_int("FLUSH_ROWS", 500)
+    log_every = env_int("LOG_EVERY", 50)
 
     since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
 
-    conn = psycopg2.connect(neon_dsn)
-    conn.autocommit = False
-    try:
-        ensure_table(conn, schema, table)
-        conn.commit()
+    ensure_table(neon_dsn, schema, table)
 
-        ids = fetch_candidate_ids(conn, src_schema, src_table, src_date_col, since_utc, max_ids)
-        if not ids:
-            log.info("scan_ids_begin empty")
-            return
+    ids = fetch_candidate_ids(neon_dsn, src_schema, src_table, src_date_col, since_utc, max_ids)
+    if not ids:
+        log.info("scan_ids_begin empty since_utc=%s", since_utc.isoformat())
+        return
 
-        start_id = ids[0]
-        end_id = ids[-1]
-        log.info("scan_ids_begin start_id=%s end_id=%s count=%s since_utc=%s", start_id, end_id, len(ids), since_utc.isoformat())
+    start_id = ids[0]
+    end_id = ids[-1]
 
-        sess = requests.Session()
-        sess.headers.update({"Accept": "application/json"})
+    sess = requests.Session()
+    sess.headers.update({"Accept": "application/json"})
 
-        checked = 0
-        found = 0
-        upserted_total = 0
-        rows_buf: List[Tuple[int, int, Optional[dt.datetime], Any]] = []
-        status_counts: Dict[int, int] = {}
+    checked = 0
+    found = 0
+    upserted_total = 0
+    rows_buf: List[Tuple[int, int, Optional[dt.datetime], Any]] = []
+    status_counts: Dict[int, int] = {}
 
-        for ticket_id in ids:
-            checked += 1
-            raw, st = movidesk_get_merged_by_ticket(sess, base_url, token, int(ticket_id), http_timeout)
-            if st is not None:
-                status_counts[st] = status_counts.get(st, 0) + 1
-            if raw:
-                rows = extract_rows(int(ticket_id), raw)
-                if rows:
-                    found += len(rows)
-                    rows_buf.extend(rows)
+    first_checked = None
+    last_checked = None
 
-            if throttle > 0:
-                time.sleep(throttle)
+    log.info("scan_ids_begin start_id=%s end_id=%s count=%s since_utc=%s", start_id, end_id, len(ids), since_utc.isoformat())
 
-            if len(rows_buf) >= 2000 or checked % commit_every == 0:
-                if rows_buf:
-                    upserted_total += upsert_rows(conn, schema, table, rows_buf)
-                    rows_buf.clear()
-                conn.commit()
-                log.info("progress checked=%s found=%s upserted=%s last_id=%s", checked, found, upserted_total, ticket_id)
+    for ticket_id in ids:
+        if first_checked is None:
+            first_checked = int(ticket_id)
+        last_checked = int(ticket_id)
 
-        if rows_buf:
-            upserted_total += upsert_rows(conn, schema, table, rows_buf)
+        checked += 1
+        raw, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout)
+        if st is not None:
+            status_counts[st] = status_counts.get(st, 0) + 1
+        if raw:
+            rows = extract_rows(int(ticket_id), raw)
+            if rows:
+                found += len(rows)
+                rows_buf.extend(rows)
+
+        if throttle > 0:
+            time.sleep(throttle)
+
+        if len(rows_buf) >= flush_rows:
+            upserted_total += upsert_rows(neon_dsn, schema, table, rows_buf)
             rows_buf.clear()
-        conn.commit()
 
-        log.info("scan_ids_end start_id=%s end_id=%s checked=%s found=%s upserted=%s statuses=%s", start_id, end_id, checked, found, upserted_total, json.dumps(status_counts, ensure_ascii=False))
+        if checked % log_every == 0:
+            log.info("progress checked=%s found=%s upserted=%s last_id=%s", checked, found, upserted_total, ticket_id)
 
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if rows_buf:
+        upserted_total += upsert_rows(neon_dsn, schema, table, rows_buf)
+        rows_buf.clear()
+
+    log.info(
+        "scan_ids_end start_id=%s end_id=%s first_checked=%s last_checked=%s checked=%s found=%s upserted=%s statuses=%s",
+        start_id,
+        end_id,
+        first_checked,
+        last_checked,
+        checked,
+        found,
+        upserted_total,
+        json.dumps(status_counts, ensure_ascii=False),
+    )
 
 
 if __name__ == "__main__":
