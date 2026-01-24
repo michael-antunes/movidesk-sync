@@ -1,53 +1,73 @@
 import os
+import json
 import time
 import logging
 import datetime as dt
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
-from psycopg2.extras import execute_values, Json
-from zoneinfo import ZoneInfo
+import psycopg2.extras
 
 
-def env_str(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name)
-    if v is None or v == "":
+def env_str(k: str, default: Optional[str] = None) -> str:
+    v = os.getenv(k)
+    if v is None or v.strip() == "":
         if default is None:
-            raise RuntimeError(f"Missing env {name}")
+            raise RuntimeError(f"Missing env {k}")
         return default
-    return v
+    return v.strip()
 
 
-def env_int(name: str, default: Optional[int] = None) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        if default is None:
-            raise RuntimeError(f"Missing env {name}")
-        return int(default)
-    return int(v)
+def env_int(k: str, default: int) -> int:
+    v = os.getenv(k)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return int(v.strip())
+    except Exception:
+        return default
 
 
-def parse_total_pages(page_number: Any) -> Optional[int]:
-    if page_number is None:
+def env_float(k: str, default: float) -> float:
+    v = os.getenv(k)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return float(v.strip())
+    except Exception:
+        return default
+
+
+def qident(s: str) -> str:
+    return '"' + s.replace('"', '""') + '"'
+
+
+def qname(schema: str, table: str) -> str:
+    return f"{qident(schema)}.{qident(table)}"
+
+
+def parse_dt(v: Any) -> Optional[dt.datetime]:
+    if not v:
         return None
-    s = str(page_number).strip()
-    import re
-    m = re.search(r"(\d+)\s*(?:of|de|/)\s*(\d+)", s, flags=re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(2))
-        except Exception:
-            return None
-    return None
+    if isinstance(v, dt.datetime):
+        return v if v.tzinfo else v.replace(tzinfo=dt.timezone.utc)
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    try:
+        x = dt.datetime.fromisoformat(s)
+        return x if x.tzinfo else x.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
 
 
-def parse_ids(v: Any) -> List[int]:
+def to_int_list(v: Any) -> List[int]:
     if v is None:
         return []
     if isinstance(v, list):
-        out: List[int] = []
+        out = []
         for x in v:
             try:
                 out.append(int(x))
@@ -59,7 +79,7 @@ def parse_ids(v: Any) -> List[int]:
         return []
     s = s.replace("[", "").replace("]", "")
     parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
-    out: List[int] = []
+    out = []
     for p in parts:
         try:
             out.append(int(p))
@@ -68,224 +88,203 @@ def parse_ids(v: Any) -> List[int]:
     return out
 
 
-def normalize_dt(v: Any, tz: dt.tzinfo) -> Optional[dt.datetime]:
-    if not v:
-        return None
-    if isinstance(v, dt.datetime):
-        return v if v.tzinfo else v.replace(tzinfo=tz)
-    s = str(v).strip()
-    if not s:
-        return None
-    s = s.replace("Z", "+00:00")
-    try:
-        x = dt.datetime.fromisoformat(s)
-        if x.tzinfo is None:
-            x = x.replace(tzinfo=tz)
-        return x.astimezone(dt.timezone.utc)
-    except Exception:
-        return None
-
-
-@dataclass
-class SyncCfg:
-    token: str
-    base_url: str
-    neon_dsn: str
-    schema: str = "visualizacao_resolvidos"
-    table: str = "tickets_mesclados"
-    lookback_days: int = 2
-    window_days: int = 1
-    rpm: int = 9
-    page_size: int = 100
-    batch_size: int = 2000
-    max_depth: int = 3000
-
-
-class MovideskClient:
-    def __init__(self, cfg: SyncCfg):
-        self.cfg = cfg
-        self.sess = requests.Session()
-        self.throttle_s = 60.0 / max(1, cfg.rpm)
-
-    def _sleep_throttle(self):
-        if self.throttle_s > 0:
-            time.sleep(self.throttle_s)
-
-    def get_merged_period(self, start_dt: dt.datetime, end_dt: dt.datetime, page: int) -> Dict[str, Any]:
-        url = self.cfg.base_url.rstrip("/") + "/tickets/merged"
-        params = {
-            "token": self.cfg.token,
-            "startDate": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            "endDate": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            "page": page,
-            "pageSize": self.cfg.page_size,
-        }
-        last_err = None
-        for _ in range(6):
-            try:
-                r = self.sess.get(url, params=params, timeout=60)
-                if r.status_code == 200:
-                    self._sleep_throttle()
-                    return r.json()
-                if r.status_code == 404:
-                    self._sleep_throttle()
-                    return {"mergedTickets": [], "pageNumber": "1 of 1"}
-                if r.status_code in (429, 503, 502, 504):
-                    time.sleep(10)
-                    last_err = f"{r.status_code} {r.text[:200]}"
-                    continue
-                last_err = f"{r.status_code} {r.text[:500]}"
-                break
-            except Exception as e:
-                last_err = str(e)
-                time.sleep(5)
-        raise RuntimeError(last_err or "Falha Movidesk")
-
-    def iter_merged(self, start_dt: dt.datetime, end_dt: dt.datetime) -> Iterator[Dict[str, Any]]:
-        page = 1
-        total_pages: Optional[int] = None
-        while page <= self.cfg.max_depth:
-            data = self.get_merged_period(start_dt, end_dt, page)
-            items = data.get("mergedTickets") or data.get("items") or []
-            if not items:
-                break
-            for it in items:
-                yield it
-            if total_pages is None:
-                total_pages = parse_total_pages(data.get("pageNumber"))
-            if total_pages is not None and page >= total_pages:
-                break
-            if self.cfg.page_size and len(items) < self.cfg.page_size:
-                break
-            page += 1
-
-
-def ensure_table(conn, cfg: SyncCfg):
+def ensure_table(conn, schema: str, table: str):
     with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {cfg.schema}")
+        cur.execute(f"create schema if not exists {qident(schema)}")
         cur.execute(
             f"""
-            create table if not exists {cfg.schema}.{cfg.table}(
-                ticket_id bigint primary key,
-                merged_into_id bigint not null,
-                merged_at timestamptz,
-                raw_payload jsonb
+            create table if not exists {qname(schema, table)} (
+              ticket_id bigint primary key,
+              merged_into_id bigint not null,
+              merged_at timestamptz,
+              raw_payload jsonb
             )
             """
         )
-        cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {cfg.schema}.{cfg.table}(merged_into_id)")
-    conn.commit()
+        cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
 
 
-def upsert_rows(conn, cfg: SyncCfg, rows: List[Tuple[Any, ...]]):
+def fetch_candidate_ids(conn, src_schema: str, src_table: str, src_date_col: str, since_utc: dt.datetime, max_ids: int) -> List[int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select ticket_id::bigint
+            from {qname(src_schema, src_table)}
+            where {qident(src_date_col)} >= %s
+            order by ticket_id desc
+            limit %s
+            """,
+            (since_utc, max_ids),
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+
+
+def movidesk_get_merged_by_ticket(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    url = f"{base_url.rstrip('/')}/tickets/merged"
+    for key in ("ticketId", "id"):
+        params = {"token": token, key: str(ticket_id)}
+        last_status = None
+        for i in range(5):
+            try:
+                r = sess.get(url, params=params, timeout=timeout)
+                last_status = r.status_code
+                if r.status_code == 404:
+                    break
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(2 * (i + 1))
+                    continue
+                if r.status_code != 200:
+                    return None, r.status_code
+                data = r.json()
+                return (data if isinstance(data, dict) else None), 200
+            except Exception:
+                time.sleep(2 * (i + 1))
+        if last_status == 404:
+            continue
+    return None, 404
+
+
+def extract_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, Optional[dt.datetime], Any]]:
+    principal_id = raw.get("ticketId") or raw.get("id") or raw.get("ticket_id")
+    try:
+        principal_id_int = int(principal_id) if principal_id is not None else int(queried_id)
+    except Exception:
+        principal_id_int = int(queried_id)
+
+    merged_at = parse_dt(raw.get("mergedDate") or raw.get("mergedAt") or raw.get("performedAt") or raw.get("date") or raw.get("lastUpdate") or raw.get("last_update"))
+    payload = psycopg2.extras.Json(raw, dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+    merged_ids = to_int_list(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
+    if not merged_ids:
+        mt = raw.get("mergedTickets") or raw.get("mergedTicketsList")
+        if isinstance(mt, list):
+            tmp = []
+            for it in mt:
+                if isinstance(it, dict):
+                    mid = it.get("id") or it.get("ticketId") or it.get("ticket_id")
+                    if mid is not None:
+                        try:
+                            tmp.append(int(mid))
+                        except Exception:
+                            pass
+            merged_ids = tmp
+
+    rows: List[Tuple[int, int, Optional[dt.datetime], Any]] = []
+    if merged_ids:
+        for mid in merged_ids:
+            try:
+                rows.append((int(mid), principal_id_int, merged_at, payload))
+            except Exception:
+                pass
+        return rows
+
+    merged_into = raw.get("mergedIntoId") or raw.get("mergedIntoTicketId") or raw.get("mainTicketId") or raw.get("principalTicketId") or raw.get("principalId") or raw.get("mergedInto")
+    if merged_into is not None:
+        try:
+            rows.append((int(queried_id), int(merged_into), merged_at, payload))
+        except Exception:
+            pass
+    return rows
+
+
+def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]):
+    if not rows:
+        return 0
     sql = f"""
-    insert into {cfg.schema}.{cfg.table}
-      (ticket_id, merged_into_id, merged_at, raw_payload)
-    values %s
-    on conflict (ticket_id) do update set
-      merged_into_id = excluded.merged_into_id,
-      merged_at = excluded.merged_at,
-      raw_payload = excluded.raw_payload
+        insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+        values %s
+        on conflict (ticket_id) do update set
+          merged_into_id = excluded.merged_into_id,
+          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
+          raw_payload = excluded.raw_payload
     """
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=1000)
-    conn.commit()
+        psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
+    return len(rows)
 
 
 def main():
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("merged-by-ids")
 
     token = env_str("MOVIDESK_TOKEN")
-    base_url = os.getenv("MOVIDESK_BASE_URL") or os.getenv("MOVIDESK_API_BASE") or "https://api.movidesk.com/public/v1"
+    base_url = env_str("MOVIDESK_BASE_URL", env_str("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1"))
     neon_dsn = env_str("NEON_DSN")
 
-    lookback_days = env_int("LOOKBACK_DAYS", env_int("DIAS_ATRAS", 2))
-    window_days = env_int("WINDOW_DAYS", env_int("JANELA_DIAS", 1))
-    rpm = env_int("RPM", 9)
-    page_size = env_int("PAGE_SIZE", 100)
-    batch_size = env_int("BATCH_SIZE", 2000)
+    schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
+    table = env_str("TABLE_NAME", "tickets_mesclados")
 
-    cfg = SyncCfg(
-        token=token,
-        base_url=base_url,
-        neon_dsn=neon_dsn,
-        lookback_days=lookback_days,
-        window_days=window_days,
-        rpm=rpm,
-        page_size=page_size,
-        batch_size=batch_size,
-    )
+    src_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
+    src_table = env_str("SOURCE_TABLE", "tickets_suporte")
+    src_date_col = env_str("SOURCE_DATE_COL", "updated_at")
 
-    tz = ZoneInfo("America/Sao_Paulo")
-    now_local = dt.datetime.now(tz)
-    start_day = (now_local - dt.timedelta(days=cfg.lookback_days)).date()
-    start = dt.datetime.combine(start_day, dt.time(0, 0, 0), tzinfo=tz)
-    end = now_local
+    lookback_days = env_int("LOOKBACK_DAYS", 2)
+    max_ids = env_int("MAX_IDS", 20000)
 
-    client = MovideskClient(cfg)
+    rpm = env_float("RPM", 9.0)
+    throttle = 60.0 / rpm if rpm > 0 else 0.0
+    http_timeout = env_int("HTTP_TIMEOUT", 60)
+    commit_every = env_int("COMMIT_EVERY", 50)
 
-    with psycopg2.connect(cfg.neon_dsn) as conn:
-        ensure_table(conn, cfg)
+    since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
 
-        cur_dt = start
-        total_fetched = 0
-        total_upserted = 0
+    conn = psycopg2.connect(neon_dsn)
+    conn.autocommit = False
+    try:
+        ensure_table(conn, schema, table)
+        conn.commit()
 
-        while cur_dt < end:
-            nxt = min(end, cur_dt + dt.timedelta(days=cfg.window_days))
+        ids = fetch_candidate_ids(conn, src_schema, src_table, src_date_col, since_utc, max_ids)
+        if not ids:
+            log.info("scan_ids_begin empty")
+            return
 
-            fetched = 0
-            upserted = 0
-            batch: List[Tuple[Any, ...]] = []
+        start_id = ids[0]
+        end_id = ids[-1]
+        log.info("scan_ids_begin start_id=%s end_id=%s count=%s since_utc=%s", start_id, end_id, len(ids), since_utc.isoformat())
 
-            logging.info("janela=%s..%s", cur_dt.isoformat(), nxt.isoformat())
+        sess = requests.Session()
+        sess.headers.update({"Accept": "application/json"})
 
-            for rec in client.iter_merged(cur_dt, nxt):
-                fetched += 1
+        checked = 0
+        found = 0
+        upserted_total = 0
+        rows_buf: List[Tuple[int, int, Optional[dt.datetime], Any]] = []
+        status_counts: Dict[int, int] = {}
 
-                principal_id = rec.get("id") or rec.get("ticketId") or rec.get("ticket_id")
-                if principal_id is None:
-                    continue
-                try:
-                    principal_id_int = int(principal_id)
-                except Exception:
-                    continue
+        for ticket_id in ids:
+            checked += 1
+            raw, st = movidesk_get_merged_by_ticket(sess, base_url, token, int(ticket_id), http_timeout)
+            if st is not None:
+                status_counts[st] = status_counts.get(st, 0) + 1
+            if raw:
+                rows = extract_rows(int(ticket_id), raw)
+                if rows:
+                    found += len(rows)
+                    rows_buf.extend(rows)
 
-                merged_ids = parse_ids(rec.get("mergedTicketsIds") or rec.get("mergedTicketsIDs") or rec.get("mergedTicketsIdsList"))
-                merged_at = normalize_dt(rec.get("mergedAt") or rec.get("mergedDate") or rec.get("merged_at") or rec.get("date") or rec.get("performedAt"), tz)
+            if throttle > 0:
+                time.sleep(throttle)
 
-                if merged_ids:
-                    for mid in merged_ids:
-                        batch.append((int(mid), principal_id_int, merged_at, Json(rec)))
-                else:
-                    merged_tickets = rec.get("mergedTickets")
-                    if isinstance(merged_tickets, list):
-                        for it in merged_tickets:
-                            if isinstance(it, dict):
-                                mid = it.get("id") or it.get("ticketId") or it.get("ticket_id")
-                                if mid is not None:
-                                    try:
-                                        batch.append((int(mid), principal_id_int, merged_at, Json(rec)))
-                                    except Exception:
-                                        pass
+            if len(rows_buf) >= 2000 or checked % commit_every == 0:
+                if rows_buf:
+                    upserted_total += upsert_rows(conn, schema, table, rows_buf)
+                    rows_buf.clear()
+                conn.commit()
+                log.info("progress checked=%s found=%s upserted=%s last_id=%s", checked, found, upserted_total, ticket_id)
 
-                if len(batch) >= cfg.batch_size:
-                    upsert_rows(conn, cfg, batch)
-                    upserted += len(batch)
-                    batch.clear()
+        if rows_buf:
+            upserted_total += upsert_rows(conn, schema, table, rows_buf)
+            rows_buf.clear()
+        conn.commit()
 
-            if batch:
-                upsert_rows(conn, cfg, batch)
-                upserted += len(batch)
-                batch.clear()
+        log.info("scan_ids_end start_id=%s end_id=%s checked=%s found=%s upserted=%s statuses=%s", start_id, end_id, checked, found, upserted_total, json.dumps(status_counts, ensure_ascii=False))
 
-            logging.info("janela_result fetched=%s upserted=%s", fetched, upserted)
-
-            total_fetched += fetched
-            total_upserted += upserted
-            cur_dt = nxt
-
-        logging.info("total fetched=%s upserted=%s", total_fetched, total_upserted)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
