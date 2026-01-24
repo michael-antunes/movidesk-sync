@@ -15,8 +15,6 @@ on:
         description: "Se true, não grava no banco"
         required: false
         default: "false"
-  schedule:
-    - cron: "*/10 * * * *"
 
 concurrency:
   group: movidesk-range-scan-tickets-merged-loop
@@ -29,7 +27,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -58,10 +56,14 @@ jobs:
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
           CONTROL_TABLE: range_scan_control
-          RESOLVED_TABLE: tickets_resolvidos_detail
+          RESOLVIDOS_SCHEMA: visualizacao_resolvidos
+          RESOLVIDOS_TABLE: tickets_resolvidos_detail
           LIMIT: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.limit) || '80' }}
           RPM: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.rpm) || '9' }}
           DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run) || 'false' }}
+          MAX_RUNTIME_SEC: "1100"
+          COMMIT_EVERY: "10"
+          LOG_LEVEL: "INFO"
         run: python sync_range_tickets_merged.py | tee scan_out.txt
 
       - name: Check done
