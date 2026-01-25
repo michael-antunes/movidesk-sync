@@ -128,9 +128,13 @@ def fetch_candidate_ids(dsn: str, src_schema: str, src_table: str, src_date_col:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                select ticket_id::bigint
-                from {qname(src_schema, src_table)}
-                where {qident(src_date_col)} >= %s
+                select ticket_id
+                from (
+                  select ticket_id::bigint as ticket_id
+                  from {qname(src_schema, src_table)}
+                  where {qident(src_date_col)} >= %s
+                  group by ticket_id
+                ) t
                 order by ticket_id desc
                 limit %s
                 """,
@@ -179,7 +183,7 @@ def upsert_rows(dsn: str, schema: str, table: str, rows: List[Tuple[int, int, Op
             except Exception:
                 pass
             raise
-    raise RuntimeError("Falha ao gravar no Neon após retries (SSL/OperationalError)")
+    raise RuntimeError("Falha ao gravar no Neon após retries")
 
 
 def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
@@ -250,6 +254,18 @@ def extract_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, O
     return rows
 
 
+def pick_row(old: Optional[Tuple[int, int, Optional[dt.datetime], Any]], new: Tuple[int, int, Optional[dt.datetime], Any]):
+    if old is None:
+        return new
+    old_at = old[2]
+    new_at = new[2]
+    if old_at is None and new_at is not None:
+        return new
+    if old_at is not None and new_at is not None and new_at > old_at:
+        return new
+    return old
+
+
 def main():
     logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("merged-by-ids")
@@ -272,7 +288,7 @@ def main():
     throttle = 60.0 / rpm if rpm > 0 else 0.0
     http_timeout = env_int("HTTP_TIMEOUT", 60)
 
-    flush_rows = env_int("FLUSH_ROWS", 500)
+    flush_unique = env_int("FLUSH_UNIQUE", 500)
     log_every = env_int("LOG_EVERY", 50)
 
     since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
@@ -293,11 +309,12 @@ def main():
     checked = 0
     found = 0
     upserted_total = 0
-    rows_buf: List[Tuple[int, int, Optional[dt.datetime], Any]] = []
     status_counts: Dict[int, int] = {}
 
     first_checked = None
     last_checked = None
+
+    rows_map: Dict[int, Tuple[int, int, Optional[dt.datetime], Any]] = {}
 
     log.info("scan_ids_begin start_id=%s end_id=%s count=%s since_utc=%s", start_id, end_id, len(ids), since_utc.isoformat())
 
@@ -310,25 +327,27 @@ def main():
         raw, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout)
         if st is not None:
             status_counts[st] = status_counts.get(st, 0) + 1
+
         if raw:
             rows = extract_rows(int(ticket_id), raw)
             if rows:
                 found += len(rows)
-                rows_buf.extend(rows)
+                for r in rows:
+                    rows_map[r[0]] = pick_row(rows_map.get(r[0]), r)
 
         if throttle > 0:
             time.sleep(throttle)
 
-        if len(rows_buf) >= flush_rows:
-            upserted_total += upsert_rows(neon_dsn, schema, table, rows_buf)
-            rows_buf.clear()
+        if len(rows_map) >= flush_unique:
+            upserted_total += upsert_rows(neon_dsn, schema, table, list(rows_map.values()))
+            rows_map.clear()
 
         if checked % log_every == 0:
-            log.info("progress checked=%s found=%s upserted=%s last_id=%s", checked, found, upserted_total, ticket_id)
+            log.info("progress checked=%s found=%s upserted=%s unique_buf=%s last_id=%s", checked, found, upserted_total, len(rows_map), ticket_id)
 
-    if rows_buf:
-        upserted_total += upsert_rows(neon_dsn, schema, table, rows_buf)
-        rows_buf.clear()
+    if rows_map:
+        upserted_total += upsert_rows(neon_dsn, schema, table, list(rows_map.values()))
+        rows_map.clear()
 
     log.info(
         "scan_ids_end start_id=%s end_id=%s first_checked=%s last_checked=%s checked=%s found=%s upserted=%s statuses=%s",
