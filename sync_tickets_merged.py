@@ -281,7 +281,7 @@ def main():
     src_table = env_str("SOURCE_TABLE", "tickets_suporte")
     src_date_col = env_str("SOURCE_DATE_COL", "updated_at")
 
-    lookback_days = env_int("LOOKBACK_DAYS", 2)
+    lookback_hours = env_int("LOOKBACK_HOURS", 10)
     max_ids = env_int("MAX_IDS", 20000)
 
     rpm = env_float("RPM", 9.0)
@@ -291,7 +291,7 @@ def main():
     flush_unique = env_int("FLUSH_UNIQUE", 500)
     log_every = env_int("LOG_EVERY", 50)
 
-    since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
+    since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lookback_hours)
 
     ensure_table(neon_dsn, schema, table)
 
