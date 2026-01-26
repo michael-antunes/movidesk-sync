@@ -114,48 +114,10 @@ def ensure_table(conn, schema: str, table: str):
             )
             """
         )
-        cur.execute(
-            f"""
-            do $$
-            begin
-              if exists (
-                select 1
-                from information_schema.columns
-                where table_schema='{schema}'
-                  and table_name='{table}'
-                  and column_name='raw_paylcad'
-              ) then
-                execute 'alter table {qname(schema, table)} rename column raw_paylcad to raw_payload';
-              end if;
-            end $$;
-            """
-        )
         cur.execute(f"alter table {qname(schema, table)} add column if not exists merged_into_id bigint")
         cur.execute(f"alter table {qname(schema, table)} add column if not exists merged_at timestamptz")
         cur.execute(f"alter table {qname(schema, table)} add column if not exists raw_payload jsonb")
-        cur.execute(f"delete from {qname(schema, table)} where merged_into_id is null")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists situacao_mesclado")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_tickets")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_tickets_ids")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists merged_ticket_ids_arr")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists last_update")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists synced_at")
-        cur.execute(f"alter table {qname(schema, table)} drop column if exists updated_at")
-        cur.execute(
-            f"""
-            do $$
-            begin
-              if not exists (
-                select 1
-                from pg_constraint
-                where conrelid='{schema}.{table}'::regclass
-                  and contype='p'
-              ) then
-                execute 'alter table {qname(schema, table)} add primary key (ticket_id)';
-              end if;
-            end $$;
-            """
-        )
+        cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
 
 
 def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
@@ -203,12 +165,14 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, 
         return ctid, id_inicial, id_final, last_processed, next_id
 
 
-def update_last_processed(conn, schema: str, control_table: str, ctid_text: str, last_processed: int):
+def update_last_processed(conn, schema: str, control_table: str, ctid_text: str, last_processed: int) -> str:
     with conn.cursor() as cur:
         cur.execute(
-            f"update {qname(schema, control_table)} set id_atual_merged=%s where ctid=%s::tid",
+            f"update {qname(schema, control_table)} set id_atual_merged=%s where ctid=%s::tid returning ctid::text",
             (int(last_processed), ctid_text),
         )
+        r = cur.fetchone()
+        return r[0] if r else ctid_text
 
 
 def build_batch(next_id: int, id_final: int, limit: int) -> List[int]:
@@ -345,7 +309,6 @@ def main():
             deleted = 0
 
             last_processed_run: Optional[int] = None
-            last_flush_processed: Optional[int] = None
 
             for ticket_id in batch:
                 if time.monotonic() >= deadline:
@@ -370,15 +333,13 @@ def main():
                     time.sleep(throttle)
 
                 if checked % max(1, commit_every) == 0:
-                    last_flush_processed = int(ticket_id)
-
                     if dry_run:
-                        log.info("partial checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), last_flush_processed)
+                        log.info("partial checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), ticket_id)
                     else:
                         ensure_table(conn, schema, table_mesclados)
                         upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
                         deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
-                        update_last_processed(conn, schema, control_table, ctid_text, last_flush_processed)
+                        ctid_text = update_last_processed(conn, schema, control_table, ctid_text, int(ticket_id))
                         conn.commit()
 
                     rows_map.clear()
@@ -395,7 +356,7 @@ def main():
             ensure_table(conn, schema, table_mesclados)
             upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
             deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
-            update_last_processed(conn, schema, control_table, ctid_text, int(last_processed_run))
+            ctid_text = update_last_processed(conn, schema, control_table, ctid_text, int(last_processed_run))
             conn.commit()
 
             total_checked += checked
