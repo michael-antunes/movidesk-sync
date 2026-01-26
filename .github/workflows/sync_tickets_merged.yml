@@ -5,16 +5,16 @@ on:
     inputs:
       lookback_hours:
         description: "Quantas horas para tras buscar"
-        required: false
-        default: "10"
+        required: true
+        default: "2"
       rpm:
         description: "Requests por minuto"
-        required: false
-        default: "9"
+        required: true
+        default: "10"
       max_ids:
         description: "Limite de IDs candidatos no Neon"
-        required: false
-        default: "20000"
+        required: true
+        default: "10"
 
 concurrency:
   group: movidesk-sync-tickets-merged
