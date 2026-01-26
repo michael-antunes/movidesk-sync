@@ -47,17 +47,6 @@ def qname(schema: str, table: str) -> str:
     return f"{qident(schema)}.{qident(table)}"
 
 
-def pg_connect(dsn: str):
-    return psycopg2.connect(
-        dsn,
-        connect_timeout=15,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-    )
-
-
 def parse_dt(v: Any) -> Optional[dt.datetime]:
     if not v:
         return None
@@ -99,11 +88,62 @@ def to_int_list(v: Any) -> List[int]:
     return out
 
 
-def ensure_table(dsn: str, schema: str, table: str):
-    conn = pg_connect(dsn)
-    conn.autocommit = False
-    try:
-        with conn.cursor() as cur:
+class NeonDB:
+    def __init__(self, dsn: str, log: logging.Logger):
+        self.dsn = dsn
+        self.log = log
+        self.conn: Optional[psycopg2.extensions.connection] = None
+        self.last_ping = 0.0
+
+    def connect(self):
+        if self.conn is not None and getattr(self.conn, "closed", 1) == 0:
+            return
+        self.conn = psycopg2.connect(
+            self.dsn,
+            connect_timeout=20,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+        self.conn.autocommit = False
+        self.last_ping = time.monotonic()
+
+    def close(self):
+        try:
+            if self.conn is not None and getattr(self.conn, "closed", 1) == 0:
+                self.conn.close()
+        finally:
+            self.conn = None
+
+    def ping_if_needed(self, ping_every_sec: int):
+        if ping_every_sec <= 0:
+            return
+        now = time.monotonic()
+        if now - self.last_ping < ping_every_sec:
+            return
+        try:
+            self.connect()
+            with self.conn.cursor() as cur:
+                cur.execute("select 1")
+            self.conn.commit()
+            self.last_ping = now
+        except Exception:
+            try:
+                if self.conn is not None:
+                    self.conn.rollback()
+            except Exception:
+                pass
+            self.close()
+            self.connect()
+            with self.conn.cursor() as cur:
+                cur.execute("select 1")
+            self.conn.commit()
+            self.last_ping = now
+
+    def ensure_table(self, schema: str, table: str):
+        self.connect()
+        with self.conn.cursor() as cur:
             cur.execute(f"create schema if not exists {qident(schema)}")
             cur.execute(
                 f"""
@@ -116,16 +156,11 @@ def ensure_table(dsn: str, schema: str, table: str):
                 """
             )
             cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
-        conn.commit()
-    finally:
-        conn.close()
+        self.conn.commit()
 
-
-def fetch_candidate_ids(dsn: str, src_schema: str, src_table: str, src_date_col: str, since_utc: dt.datetime, max_ids: int) -> List[int]:
-    conn = pg_connect(dsn)
-    conn.autocommit = True
-    try:
-        with conn.cursor() as cur:
+    def fetch_candidate_ids(self, src_schema: str, src_table: str, src_date_col: str, since_utc: dt.datetime, max_ids: int) -> List[int]:
+        self.connect()
+        with self.conn.cursor() as cur:
             cur.execute(
                 f"""
                 select ticket_id
@@ -140,50 +175,39 @@ def fetch_candidate_ids(dsn: str, src_schema: str, src_table: str, src_date_col:
                 """,
                 (since_utc, max_ids),
             )
-            return [int(r[0]) for r in cur.fetchall()]
-    finally:
-        conn.close()
+            ids = [int(r[0]) for r in cur.fetchall()]
+        self.conn.commit()
+        return ids
 
-
-def upsert_rows(dsn: str, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]) -> int:
-    if not rows:
-        return 0
-    sql = f"""
-        insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
-        values %s
-        on conflict (ticket_id) do update set
-          merged_into_id = excluded.merged_into_id,
-          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
-          raw_payload = excluded.raw_payload
-    """
-    for attempt in range(6):
-        conn = None
-        try:
-            conn = pg_connect(dsn)
-            conn.autocommit = False
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
-            conn.commit()
-            conn.close()
-            return len(rows)
-        except psycopg2.OperationalError:
+    def upsert_rows(self, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]) -> int:
+        if not rows:
+            return 0
+        sql = f"""
+            insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+            values %s
+            on conflict (ticket_id) do update set
+              merged_into_id = excluded.merged_into_id,
+              merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
+              raw_payload = excluded.raw_payload
+        """
+        last_err = None
+        for attempt in range(8):
             try:
-                if conn is not None and getattr(conn, "closed", 1) == 0:
-                    conn.rollback()
-                    conn.close()
-            except Exception:
-                pass
-            time.sleep(2 * (attempt + 1))
-            continue
-        except Exception:
-            try:
-                if conn is not None and getattr(conn, "closed", 1) == 0:
-                    conn.rollback()
-                    conn.close()
-            except Exception:
-                pass
-            raise
-    raise RuntimeError("Falha ao gravar no Neon após retries")
+                self.connect()
+                with self.conn.cursor() as cur:
+                    psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
+                self.conn.commit()
+                return len(rows)
+            except Exception as e:
+                last_err = repr(e)
+                try:
+                    if self.conn is not None:
+                        self.conn.rollback()
+                except Exception:
+                    pass
+                self.close()
+                time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"Falha ao gravar no Neon após retries: {last_err}")
 
 
 def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
@@ -286,16 +310,18 @@ def main():
 
     rpm = env_float("RPM", 9.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
-    http_timeout = env_int("HTTP_TIMEOUT", 60)
+    http_timeout = env_int("HTTP_TIMEOUT", 45)
 
-    flush_unique = env_int("FLUSH_UNIQUE", 500)
-    log_every = env_int("LOG_EVERY", 50)
+    flush_unique = env_int("FLUSH_UNIQUE", 200)
+    log_every = env_int("LOG_EVERY", 5)
+    ping_every = env_int("DB_PING_EVERY", 30)
 
     since_utc = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lookback_hours)
 
-    ensure_table(neon_dsn, schema, table)
+    db = NeonDB(neon_dsn, log)
+    db.ensure_table(schema, table)
 
-    ids = fetch_candidate_ids(neon_dsn, src_schema, src_table, src_date_col, since_utc, max_ids)
+    ids = db.fetch_candidate_ids(src_schema, src_table, src_date_col, since_utc, max_ids)
     if not ids:
         log.info("scan_ids_begin empty since_utc=%s", since_utc.isoformat())
         return
@@ -338,15 +364,17 @@ def main():
         if throttle > 0:
             time.sleep(throttle)
 
+        db.ping_if_needed(ping_every)
+
         if len(rows_map) >= flush_unique:
-            upserted_total += upsert_rows(neon_dsn, schema, table, list(rows_map.values()))
+            upserted_total += db.upsert_rows(schema, table, list(rows_map.values()))
             rows_map.clear()
 
         if checked % log_every == 0:
             log.info("progress checked=%s found=%s upserted=%s unique_buf=%s last_id=%s", checked, found, upserted_total, len(rows_map), ticket_id)
 
     if rows_map:
-        upserted_total += upsert_rows(neon_dsn, schema, table, list(rows_map.values()))
+        upserted_total += db.upsert_rows(schema, table, list(rows_map.values()))
         rows_map.clear()
 
     log.info(
@@ -360,6 +388,7 @@ def main():
         upserted_total,
         json.dumps(status_counts, ensure_ascii=False),
     )
+    db.close()
 
 
 if __name__ == "__main__":
