@@ -120,7 +120,9 @@ def ensure_table(conn, schema: str, table: str):
         cur.execute(f"create index if not exists ix_tickets_mesclados_merged_into on {qname(schema, table)} (merged_into_id)")
 
 
-def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+def movidesk_get_merged(
+    sess: requests.Session, base_url: str, token: str, ticket_id: int, timeout: int
+) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
     params = {"token": token, "id": str(ticket_id)}
     last_status = None
@@ -183,7 +185,14 @@ def build_batch(next_id: int, id_final: int, limit: int) -> List[int]:
 
 
 def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, Optional[datetime], Any]]:
-    merged_at = parse_dt(raw.get("mergedDate") or raw.get("performedAt") or raw.get("date") or raw.get("lastUpdate") or raw.get("last_update") or raw.get("mergedAt"))
+    merged_at = parse_dt(
+        raw.get("mergedDate")
+        or raw.get("performedAt")
+        or raw.get("date")
+        or raw.get("lastUpdate")
+        or raw.get("last_update")
+        or raw.get("mergedAt")
+    )
     payload = psycopg2.extras.Json(raw, dumps=lambda o: json.dumps(o, ensure_ascii=False))
 
     merged_ids = to_int_list(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
@@ -208,7 +217,15 @@ def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, 
             rows.append((int(mid), int(queried_id), merged_at, payload))
         return rows
 
-    merged_into = raw.get("mergedIntoId") or raw.get("mergedIntoTicketId") or raw.get("mainTicketId") or raw.get("mainTicketID") or raw.get("principalTicketId") or raw.get("principalId") or raw.get("mergedInto")
+    merged_into = (
+        raw.get("mergedIntoId")
+        or raw.get("mergedIntoTicketId")
+        or raw.get("mainTicketId")
+        or raw.get("mainTicketID")
+        or raw.get("principalTicketId")
+        or raw.get("principalId")
+        or raw.get("mergedInto")
+    )
     if merged_into is not None:
         try:
             rows.append((int(queried_id), int(merged_into), merged_at, payload))
@@ -233,7 +250,9 @@ def upsert_mesclados(conn, schema: str, table: str, rows: List[Tuple[int, int, O
     return len(rows)
 
 
-def delete_from_other_tables(conn, resolvidos_schema: str, resolvidos_table: str, abertos_schema: str, abertos_table: str, ids: List[int]) -> int:
+def delete_from_other_tables(
+    conn, resolvidos_schema: str, resolvidos_table: str, abertos_schema: str, abertos_table: str, ids: List[int]
+) -> int:
     if not ids:
         return 0
     uniq = sorted(set(int(x) for x in ids))
@@ -264,8 +283,8 @@ def main():
     abertos_schema = env_str("ABERTOS_SCHEMA", "visualizacao_atual")
     abertos_table = env_str("ABERTOS_TABLE", "tickets_abertos")
 
-    limit = env_int("LIMIT", 80)
-    rpm = env_float("RPM", 9.0)
+    limit = env_int("LIMIT", 10)
+    rpm = env_float("RPM", 10.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
     dry_run = env_bool("DRY_RUN", False)
     commit_every = env_int("COMMIT_EVERY", 10)
@@ -282,7 +301,13 @@ def main():
         ctid_text, id_inicial, id_final, last_processed_db, next_id = read_control(conn, schema, control_table)
         conn.commit()
 
-        log.info("begin id_inicial=%s id_final=%s last_processed=%s next_id=%s", id_inicial, id_final, last_processed_db, next_id)
+        log.info(
+            "begin id_inicial=%s id_final=%s last_processed=%s next_id=%s",
+            id_inicial,
+            id_final,
+            last_processed_db,
+            next_id,
+        )
 
         if next_id < id_final:
             log.info("done id_inicial=%s id_final=%s last_processed=%s", id_inicial, id_final, last_processed_db)
@@ -334,11 +359,19 @@ def main():
 
                 if checked % max(1, commit_every) == 0:
                     if dry_run:
-                        log.info("partial checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), ticket_id)
+                        log.info(
+                            "partial checked=%d rel=%d unique=%d last_processed=%s",
+                            checked,
+                            rel,
+                            len(rows_map),
+                            ticket_id,
+                        )
                     else:
                         ensure_table(conn, schema, table_mesclados)
                         upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
-                        deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
+                        deleted += delete_from_other_tables(
+                            conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids
+                        )
                         ctid_text = update_last_processed(conn, schema, control_table, ctid_text, int(ticket_id))
                         conn.commit()
 
@@ -349,7 +382,13 @@ def main():
                 break
 
             if dry_run:
-                log.info("batch checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), last_processed_run)
+                log.info(
+                    "batch checked=%d rel=%d unique=%d last_processed=%s",
+                    checked,
+                    rel,
+                    len(rows_map),
+                    last_processed_run,
+                )
                 next_id = last_processed_run - 1
                 continue
 
@@ -365,7 +404,14 @@ def main():
             total_deleted += deleted
 
             next_id = last_processed_run - 1
-            log.info("progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d", next_id, last_processed_run, checked, upserted, deleted)
+            log.info(
+                "progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d",
+                next_id,
+                last_processed_run,
+                checked,
+                upserted,
+                deleted,
+            )
 
         log.info(
             "end checked=%d rel=%d upsert=%d deleted=%d next_id=%s statuses=%s",
