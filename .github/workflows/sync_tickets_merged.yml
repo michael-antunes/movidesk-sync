@@ -4,21 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       lookback_hours:
-        description: "Quantas horas para trás buscar (padrão 10)"
+        description: "Quantas horas para tras buscar"
         required: false
         default: "10"
       rpm:
-        description: "Requests por minuto (padrão 9)"
+        description: "Requests por minuto"
         required: false
         default: "9"
       max_ids:
-        description: "Limite de IDs candidatos (padrão 20000)"
+        description: "Limite de IDs candidatos no Neon"
         required: false
         default: "20000"
+
+concurrency:
+  group: movidesk-sync-tickets-merged
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -32,8 +37,18 @@ jobs:
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
+          MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
           LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours }}
           RPM: ${{ github.event.inputs.rpm }}
           MAX_IDS: ${{ github.event.inputs.max_ids }}
+          DB_SCHEMA: visualizacao_resolvidos
+          TABLE_NAME: tickets_mesclados
+          SOURCE_SCHEMA: dados_gerais
+          SOURCE_TABLE: tickets_suporte
+          SOURCE_DATE_COL: updated_at
           LOG_LEVEL: INFO
+          LOG_EVERY: "1"
+          DB_PING_EVERY: "30"
+          FLUSH_UNIQUE: "50"
+          HTTP_TIMEOUT: "45"
         run: python sync_tickets_merged.py
