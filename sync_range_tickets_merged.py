@@ -70,8 +70,8 @@ def parse_dt(v: Any) -> Optional[datetime]:
         return None
     s = s.replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(s)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        d = datetime.fromisoformat(s)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
@@ -180,7 +180,7 @@ def movidesk_get_merged(sess: requests.Session, base_url: str, token: str, ticke
     return None, last_status
 
 
-def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, int]:
+def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, Optional[int], int]:
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -196,22 +196,26 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, 
         ctid = str(r[0])
         id_inicial = int(r[1])
         id_final = int(r[2])
-        id_ptr = int(r[3]) if r[3] is not None else id_inicial
-        if id_ptr < id_inicial:
-            id_ptr = id_inicial
-        return ctid, id_inicial, id_final, id_ptr
+        last_processed = int(r[3]) if r[3] is not None else None
+        next_id = id_inicial if last_processed is None else (last_processed - 1)
+        if next_id > id_inicial:
+            next_id = id_inicial
+        return ctid, id_inicial, id_final, last_processed, next_id
 
 
-def update_ptr(conn, schema: str, control_table: str, ctid_text: str, new_ptr: int):
+def update_last_processed(conn, schema: str, control_table: str, ctid_text: str, last_processed: int):
     with conn.cursor() as cur:
-        cur.execute(f"update {qname(schema, control_table)} set id_atual_merged=%s where ctid=%s::tid", (new_ptr, ctid_text))
+        cur.execute(
+            f"update {qname(schema, control_table)} set id_atual_merged=%s where ctid=%s::tid",
+            (int(last_processed), ctid_text),
+        )
 
 
-def build_batch(id_ptr: int, id_final: int, limit: int) -> List[int]:
-    if id_ptr <= id_final:
+def build_batch(next_id: int, id_final: int, limit: int) -> List[int]:
+    if next_id < id_final:
         return []
-    stop = max(id_final, id_ptr - limit + 1)
-    return list(range(id_ptr, stop - 1, -1))
+    stop = max(id_final, next_id - limit + 1)
+    return list(range(next_id, stop - 1, -1))
 
 
 def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, Optional[datetime], Any]]:
@@ -237,8 +241,7 @@ def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, 
     rows: List[Tuple[int, int, Optional[datetime], Any]] = []
     if merged_ids:
         for mid in merged_ids:
-            mid_i = int(mid)
-            rows.append((mid_i, int(queried_id), merged_at, payload))
+            rows.append((int(mid), int(queried_id), merged_at, payload))
         return rows
 
     merged_into = raw.get("mergedIntoId") or raw.get("mergedIntoTicketId") or raw.get("mainTicketId") or raw.get("mainTicketID") or raw.get("principalTicketId") or raw.get("principalId") or raw.get("mergedInto")
@@ -266,13 +269,14 @@ def upsert_mesclados(conn, schema: str, table: str, rows: List[Tuple[int, int, O
     return len(rows)
 
 
-def delete_from_other_tables(conn, resolvidos_schema: str, resolvidos_table: str, abertos_schema: str, abertos_table: str, ids: List[int]):
+def delete_from_other_tables(conn, resolvidos_schema: str, resolvidos_table: str, abertos_schema: str, abertos_table: str, ids: List[int]) -> int:
     if not ids:
-        return
+        return 0
     uniq = sorted(set(int(x) for x in ids))
     with conn.cursor() as cur:
         cur.execute(f"delete from {qname(resolvidos_schema, resolvidos_table)} where ticket_id = any(%s)", (uniq,))
         cur.execute(f"delete from {qname(abertos_schema, abertos_table)} where ticket_id = any(%s)", (uniq,))
+    return len(uniq)
 
 
 def main():
@@ -311,38 +315,48 @@ def main():
 
     try:
         ensure_table(conn, schema, table_mesclados)
-        ctid_text, id_inicial, id_final, id_ptr = read_control(conn, schema, control_table)
+        ctid_text, id_inicial, id_final, last_processed_db, next_id = read_control(conn, schema, control_table)
         conn.commit()
+
+        log.info("begin id_inicial=%s id_final=%s last_processed=%s next_id=%s", id_inicial, id_final, last_processed_db, next_id)
+
+        if next_id < id_final:
+            log.info("done id_inicial=%s id_final=%s last_processed=%s", id_inicial, id_final, last_processed_db)
+            return
 
         deadline = time.monotonic() + max(60, max_runtime_sec)
         total_checked = 0
         total_rel = 0
         total_upserted = 0
         total_deleted = 0
-        last_status_counts: Dict[int, int] = {}
-        id_ptr_start = id_ptr
+        status_counts: Dict[int, int] = {}
 
-        while id_ptr > id_final and time.monotonic() < deadline:
-            batch = build_batch(id_ptr, id_final, limit)
+        while next_id >= id_final and time.monotonic() < deadline:
+            batch = build_batch(next_id, id_final, limit)
             if not batch:
                 break
 
             rows_map: Dict[int, Tuple[int, int, Optional[datetime], Any]] = {}
             del_ids: List[int] = []
+
             checked = 0
             rel = 0
-            last_processed = None
+            upserted = 0
+            deleted = 0
+
+            last_processed_run: Optional[int] = None
+            last_flush_processed: Optional[int] = None
 
             for ticket_id in batch:
                 if time.monotonic() >= deadline:
                     break
 
                 checked += 1
-                last_processed = int(ticket_id)
+                last_processed_run = int(ticket_id)
 
                 raw, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout)
                 if st is not None:
-                    last_status_counts[st] = last_status_counts.get(st, 0) + 1
+                    status_counts[st] = status_counts.get(st, 0) + 1
 
                 if raw:
                     rows = extract_merge_rows(int(ticket_id), raw)
@@ -356,56 +370,51 @@ def main():
                     time.sleep(throttle)
 
                 if checked % max(1, commit_every) == 0:
-                    new_ptr = int(ticket_id) - 1
-                    if new_ptr < id_final:
-                        new_ptr = id_final
+                    last_flush_processed = int(ticket_id)
 
                     if dry_run:
-                        log.info("partial checked=%d rel=%d upsert=%d id_ptr=%s->%s", checked, rel, len(rows_map), id_ptr, new_ptr)
+                        log.info("partial checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), last_flush_processed)
                     else:
                         ensure_table(conn, schema, table_mesclados)
-                        upserted = upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
-                        delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
-                        update_ptr(conn, schema, control_table, ctid_text, new_ptr)
+                        upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
+                        deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
+                        update_last_processed(conn, schema, control_table, ctid_text, last_flush_processed)
                         conn.commit()
-                        total_upserted += upserted
-                        total_deleted += len(set(del_ids))
-                        total_rel += rel
-                        total_checked += checked
 
                     rows_map.clear()
                     del_ids.clear()
 
-            if last_processed is None:
+            if last_processed_run is None:
                 break
 
-            new_ptr = int(last_processed) - 1
-            if new_ptr < id_final:
-                new_ptr = id_final
-
             if dry_run:
-                log.info("batch checked=%d rel=%d upsert=%d id_ptr=%s->%s", checked, rel, len(rows_map), id_ptr, new_ptr)
-                id_ptr = new_ptr
+                log.info("batch checked=%d rel=%d unique=%d last_processed=%s", checked, rel, len(rows_map), last_processed_run)
+                next_id = last_processed_run - 1
                 continue
 
             ensure_table(conn, schema, table_mesclados)
-            upserted = upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
-            delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
-            update_ptr(conn, schema, control_table, ctid_text, new_ptr)
+            upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
+            deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
+            update_last_processed(conn, schema, control_table, ctid_text, int(last_processed_run))
             conn.commit()
 
-            total_upserted += upserted
-            total_deleted += len(set(del_ids))
-            total_rel += rel
             total_checked += checked
+            total_rel += rel
+            total_upserted += upserted
+            total_deleted += deleted
 
-            id_ptr = new_ptr
-            log.info("progress id_ptr=%s", id_ptr)
+            next_id = last_processed_run - 1
+            log.info("progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d", next_id, last_processed_run, checked, upserted, deleted)
 
-        if dry_run:
-            log.info("done checked=%d rel=%d id_ptr=%s->%s", total_checked, total_rel, id_ptr_start, id_ptr)
-        else:
-            log.info("done checked=%d rel=%d upsert=%d deleted=%d id_ptr=%s->%s statuses=%s", total_checked, total_rel, total_upserted, total_deleted, id_ptr_start, id_ptr, json.dumps(last_status_counts, ensure_ascii=False))
+        log.info(
+            "end checked=%d rel=%d upsert=%d deleted=%d next_id=%s statuses=%s",
+            total_checked,
+            total_rel,
+            total_upserted,
+            total_deleted,
+            next_id,
+            json.dumps(status_counts, ensure_ascii=False),
+        )
 
     except Exception:
         conn.rollback()
