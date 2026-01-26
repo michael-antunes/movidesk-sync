@@ -1,30 +1,16 @@
 name: Movidesk - Range scan (tickets merged) (loop)
 
 on:
-  workflow_call:
-    inputs:
-      limit:
-        required: false
-        type: string
-        default: "80"
-      rpm:
-        required: false
-        type: string
-        default: "9"
-      dry_run:
-        required: false
-        type: string
-        default: "false"
   workflow_dispatch:
     inputs:
       limit:
         description: "Quantos tickets validar por execução"
         required: true
-        default: "80"
+        default: "10"
       rpm:
         description: "Requests por minuto (API Movidesk)"
         required: true
-        default: "9"
+        default: "10"
       dry_run:
         description: "Se true, não grava no banco"
         required: true
@@ -61,9 +47,9 @@ jobs:
           RESOLVIDOS_TABLE: tickets_resolvidos_detail
           ABERTOS_SCHEMA: visualizacao_atual
           ABERTOS_TABLE: tickets_abertos
-          LIMIT: ${{ github.event.inputs.limit || inputs.limit || '80' }}
-          RPM: ${{ github.event.inputs.rpm || inputs.rpm || '9' }}
-          DRY_RUN: ${{ github.event.inputs.dry_run || inputs.dry_run || 'false' }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          RPM: ${{ github.event.inputs.rpm }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
           MAX_RUNTIME_SEC: "1100"
           COMMIT_EVERY: "10"
           HTTP_TIMEOUT: "60"
@@ -75,13 +61,18 @@ jobs:
     if: ${{ needs.run.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip psycopg2-binary
       - name: Check done
         id: done
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: |
           python - <<'PY' >> $GITHUB_OUTPUT
-          import os, psycopg2
+          import os
+          import psycopg2
           dsn=os.environ["NEON_DSN"]
           schema="visualizacao_resolvidos"
           ctl="range_scan_control"
@@ -94,7 +85,8 @@ jobs:
             limit 1
           """)
           r=cur.fetchone()
-          cur.close(); c.close()
+          cur.close()
+          c.close()
           if not r:
             print("done=1")
           else:
@@ -114,8 +106,8 @@ jobs:
               workflow_id: 'sync_range_tickets_merged.yml',
               ref: 'main',
               inputs: {
-                limit: inputs.limit || '80',
-                rpm: inputs.rpm || '9',
+                limit: inputs.limit || '10',
+                rpm: inputs.rpm || '10',
                 dry_run: inputs.dry_run || 'false'
               }
             })
