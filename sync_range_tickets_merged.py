@@ -144,11 +144,11 @@ def movidesk_get_merged(
     return None, last_status
 
 
-def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, Optional[int], int]:
+def read_control(conn, schema: str, control_table: str) -> Tuple[int, int, Optional[int], int]:
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            select ctid::text, id_inicial::bigint, id_final::bigint, id_atual_merged::bigint
+            select id_inicial::bigint, id_final::bigint, id_atual_merged::bigint
             from {qname(schema, control_table)}
             order by data_fim desc nulls last, data_inicio desc nulls last, id_inicial desc nulls last
             limit 1
@@ -157,24 +157,34 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[str, int, int, 
         r = cur.fetchone()
         if not r:
             raise RuntimeError("range_scan_control vazio")
-        ctid = str(r[0])
-        id_inicial = int(r[1])
-        id_final = int(r[2])
-        last_processed = int(r[3]) if r[3] is not None else None
+        id_inicial = int(r[0])
+        id_final = int(r[1])
+        last_processed = int(r[2]) if r[2] is not None else None
         next_id = id_inicial if last_processed is None else (last_processed - 1)
         if next_id > id_inicial:
             next_id = id_inicial
-        return ctid, id_inicial, id_final, last_processed, next_id
+        return id_inicial, id_final, last_processed, next_id
 
 
-def update_last_processed(conn, schema: str, control_table: str, ctid_text: str, last_processed: int) -> str:
+def update_last_processed(conn, schema: str, control_table: str, last_processed: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            f"update {qname(schema, control_table)} set id_atual_merged=%s where ctid=%s::tid returning ctid::text",
-            (int(last_processed), ctid_text),
+            f"""
+            update {qname(schema, control_table)}
+               set id_atual_merged = %s
+             where ctid = (
+               select ctid
+                 from {qname(schema, control_table)}
+                order by data_fim desc nulls last,
+                         data_inicio desc nulls last,
+                         id_inicial desc nulls last
+                limit 1
+             )
+            """,
+            (int(last_processed),),
         )
-        r = cur.fetchone()
-        return r[0] if r else ctid_text
+        if cur.rowcount == 0:
+            raise RuntimeError("Não consegui atualizar id_atual_merged (0 rows).")
 
 
 def build_batch(next_id: int, id_final: int, limit: int) -> List[int]:
@@ -287,7 +297,6 @@ def main():
     rpm = env_float("RPM", 10.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
     dry_run = env_bool("DRY_RUN", False)
-    commit_every = env_int("COMMIT_EVERY", 10)
     max_runtime_sec = env_int("MAX_RUNTIME_SEC", 1100)
 
     sess = requests.Session()
@@ -298,27 +307,21 @@ def main():
 
     try:
         ensure_table(conn, schema, table_mesclados)
-        ctid_text, id_inicial, id_final, last_processed_db, next_id = read_control(conn, schema, control_table)
+        id_inicial, id_final, last_processed_db, next_id = read_control(conn, schema, control_table)
         conn.commit()
 
-        log.info(
-            "begin id_inicial=%s id_final=%s last_processed=%s next_id=%s",
-            id_inicial,
-            id_final,
-            last_processed_db,
-            next_id,
-        )
+        log.info("begin id_inicial=%s id_final=%s last_processed=%s next_id=%s", id_inicial, id_final, last_processed_db, next_id)
 
         if next_id < id_final:
             log.info("done id_inicial=%s id_final=%s last_processed=%s", id_inicial, id_final, last_processed_db)
             return
 
         deadline = time.monotonic() + max(60, max_runtime_sec)
+        status_counts: Dict[int, int] = {}
         total_checked = 0
         total_rel = 0
         total_upserted = 0
         total_deleted = 0
-        status_counts: Dict[int, int] = {}
 
         while next_id >= id_final and time.monotonic() < deadline:
             batch = build_batch(next_id, id_final, limit)
@@ -330,9 +333,6 @@ def main():
 
             checked = 0
             rel = 0
-            upserted = 0
-            deleted = 0
-
             last_processed_run: Optional[int] = None
 
             for ticket_id in batch:
@@ -357,61 +357,33 @@ def main():
                 if throttle > 0:
                     time.sleep(throttle)
 
-                if checked % max(1, commit_every) == 0:
-                    if dry_run:
-                        log.info(
-                            "partial checked=%d rel=%d unique=%d last_processed=%s",
-                            checked,
-                            rel,
-                            len(rows_map),
-                            ticket_id,
-                        )
-                    else:
-                        ensure_table(conn, schema, table_mesclados)
-                        upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
-                        deleted += delete_from_other_tables(
-                            conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids
-                        )
-                        ctid_text = update_last_processed(conn, schema, control_table, ctid_text, int(ticket_id))
-                        conn.commit()
-
-                    rows_map.clear()
-                    del_ids.clear()
-
             if last_processed_run is None:
                 break
 
             if dry_run:
-                log.info(
-                    "batch checked=%d rel=%d unique=%d last_processed=%s",
-                    checked,
-                    rel,
-                    len(rows_map),
-                    last_processed_run,
-                )
                 next_id = last_processed_run - 1
+                total_checked += checked
+                total_rel += rel
+                log.info("progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d", next_id, last_processed_run, checked, 0, 0)
                 continue
+
+            upserted = 0
+            deleted = 0
 
             ensure_table(conn, schema, table_mesclados)
             upserted += upsert_mesclados(conn, schema, table_mesclados, list(rows_map.values()))
             deleted += delete_from_other_tables(conn, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table, del_ids)
-            ctid_text = update_last_processed(conn, schema, control_table, ctid_text, int(last_processed_run))
+            update_last_processed(conn, schema, control_table, int(last_processed_run))
             conn.commit()
+
+            next_id = last_processed_run - 1
 
             total_checked += checked
             total_rel += rel
             total_upserted += upserted
             total_deleted += deleted
 
-            next_id = last_processed_run - 1
-            log.info(
-                "progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d",
-                next_id,
-                last_processed_run,
-                checked,
-                upserted,
-                deleted,
-            )
+            log.info("progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d", next_id, last_processed_run, checked, upserted, deleted)
 
         log.info(
             "end checked=%d rel=%d upsert=%d deleted=%d next_id=%s statuses=%s",
