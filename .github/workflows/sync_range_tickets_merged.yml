@@ -15,9 +15,24 @@ on:
         description: "Se true, não grava no banco"
         required: true
         default: "false"
+      debug_ticket_ids:
+        description: "Opcional: IDs para logar o JSON bruto (ex: 302353;302752)"
+        required: false
+        default: ""
+      lock_timeout_ms:
+        description: "Timeout de lock no Postgres (ms) para evitar travar"
+        required: true
+        default: "5000"
+      write_retries:
+        description: "Quantas tentativas quando der lock/deadlock"
+        required: true
+        default: "6"
 
+# IMPORTANTE:
+# Use o mesmo 'group' em TODOS os workflows que escrevem no mesmo banco,
+# assim você evita concorrência e lock_timeout em triggers.
 concurrency:
-  group: movidesk-range-merged-${{ github.ref }}
+  group: movidesk-db
   cancel-in-progress: false
 
 permissions:
@@ -40,18 +55,25 @@ jobs:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
+
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
           CONTROL_TABLE: range_scan_control
+
           RESOLVIDOS_SCHEMA: visualizacao_resolvidos
           RESOLVIDOS_TABLE: tickets_resolvidos_detail
           ABERTOS_SCHEMA: visualizacao_atual
           ABERTOS_TABLE: tickets_abertos
+
           LIMIT: ${{ github.event.inputs.limit }}
           RPM: ${{ github.event.inputs.rpm }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
+          DEBUG_TICKET_IDS: ${{ github.event.inputs.debug_ticket_ids }}
+
+          LOCK_TIMEOUT_MS: ${{ github.event.inputs.lock_timeout_ms }}
+          WRITE_RETRIES: ${{ github.event.inputs.write_retries }}
+
           MAX_RUNTIME_SEC: "1100"
-          COMMIT_EVERY: "10"
           HTTP_TIMEOUT: "60"
           LOG_LEVEL: "INFO"
         run: python sync_range_tickets_merged.py
@@ -73,20 +95,21 @@ jobs:
           python - <<'PY' >> $GITHUB_OUTPUT
           import os
           import psycopg2
-          dsn=os.environ["NEON_DSN"]
-          schema="visualizacao_resolvidos"
-          ctl="range_scan_control"
-          c=psycopg2.connect(dsn)
-          cur=c.cursor()
-          cur.execute(f"""
+
+          dsn = os.environ["NEON_DSN"]
+
+          c = psycopg2.connect(dsn)
+          cur = c.cursor()
+          cur.execute("""
             select id_final::bigint, id_atual_merged::bigint
-            from {schema}.{ctl}
+            from visualizacao_resolvidos.range_scan_control
             order by data_fim desc nulls last, data_inicio desc nulls last, id_inicial desc nulls last
             limit 1
           """)
-          r=cur.fetchone()
+          r = cur.fetchone()
           cur.close()
           c.close()
+
           if not r:
             print("done=1")
           else:
@@ -108,6 +131,9 @@ jobs:
               inputs: {
                 limit: inputs.limit || '10',
                 rpm: inputs.rpm || '10',
-                dry_run: inputs.dry_run || 'false'
+                dry_run: inputs.dry_run || 'false',
+                debug_ticket_ids: inputs.debug_ticket_ids || '',
+                lock_timeout_ms: inputs.lock_timeout_ms || '5000',
+                write_retries: inputs.write_retries || '6'
               }
-            })
+            });
