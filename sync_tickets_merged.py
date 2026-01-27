@@ -3,18 +3,18 @@ import json
 import time
 import logging
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_api_candidates_v1_2026-01-27"
+SCRIPT_VERSION = "sync_tickets_merged_anchor_db_max_updated_at_candidates_api_top50_v1_2026-01-27"
 
 
 # -------------------------
-# env helpers
+# Env helpers
 # -------------------------
 def env_str(k: str, default: Optional[str] = None) -> str:
     v = os.getenv(k)
@@ -69,15 +69,68 @@ def parse_dt(v: Any) -> Optional[dt.datetime]:
         return None
 
 
+def to_int_list(v: Any) -> List[int]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[int] = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+    s = str(v).strip()
+    if not s:
+        return []
+    s = s.replace("[", "").replace("]", "")
+    parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
+    out: List[int] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
+
+def json_payload(x: Any) -> psycopg2.extras.Json:
+    return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
+def odata_dt_variants(ts: dt.datetime) -> List[str]:
+    # formatos comuns que às vezes o OData aceita
+    z = ts.astimezone(dt.timezone.utc).replace(microsecond=0)
+    iso = z.isoformat().replace("+00:00", "Z")
+    return [
+        iso,  # 2026-01-27T12:34:56Z
+        f"datetimeoffset'{iso}'",
+        f"datetime'{iso}'",
+    ]
+
+
+def normalize_list_response(data: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    Algumas APIs retornam lista direta; outras retornam {"value": [...]}
+    """
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        v = data.get("value")
+        if isinstance(v, list):
+            return [x for x in v if isinstance(x, dict)]
+    return None
+
+
 # -------------------------
 # DB
 # -------------------------
-def ensure_tables(conn, merged_schema: str, merged_table: str, ctl_schema: str, ctl_table: str) -> None:
+def ensure_mesclados_table(conn, schema: str, table: str) -> None:
     with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {qident(merged_schema)}")
+        cur.execute(f"create schema if not exists {qident(schema)}")
         cur.execute(
             f"""
-            create table if not exists {qname(merged_schema, merged_table)} (
+            create table if not exists {qname(schema, table)} (
               ticket_id bigint primary key,
               merged_into_id bigint not null,
               merged_at timestamptz,
@@ -85,61 +138,28 @@ def ensure_tables(conn, merged_schema: str, merged_table: str, ctl_schema: str, 
             )
             """
         )
-        cur.execute(
-            f"create index if not exists ix_{merged_table}_merged_into_id on {qname(merged_schema, merged_table)} (merged_into_id)"
-        )
-        cur.execute(
-            f"create index if not exists ix_{merged_table}_merged_at on {qname(merged_schema, merged_table)} (merged_at)"
-        )
-
-        cur.execute(f"create schema if not exists {qident(ctl_schema)}")
-        cur.execute(
-            f"""
-            create table if not exists {qname(ctl_schema, ctl_table)} (
-              id smallint primary key default 1,
-              cursor_ts timestamptz,
-              cursor_ticket_id bigint,
-              updated_at timestamptz not null default now()
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            insert into {qname(ctl_schema, ctl_table)} (id, cursor_ts, cursor_ticket_id)
-            values (1, null, null)
-            on conflict (id) do nothing
-            """
-        )
+        cur.execute(f"create index if not exists ix_{table}_merged_into_id on {qname(schema, table)} (merged_into_id)")
+        cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
 
 
-def get_cursor(conn, ctl_schema: str, ctl_table: str) -> Tuple[Optional[dt.datetime], Optional[int]]:
+def get_anchor_max_updated_at(conn, src_schema: str, src_table: str, src_date_col: str) -> dt.datetime:
     with conn.cursor() as cur:
-        cur.execute(f"select cursor_ts, cursor_ticket_id from {qname(ctl_schema, ctl_table)} where id=1")
+        cur.execute(f"select max({qident(src_date_col)}) from {qname(src_schema, src_table)}")
         row = cur.fetchone()
-        if not row:
-            return None, None
-        ts = row[0]
-        tid = row[1]
-        if ts is not None and isinstance(ts, dt.datetime) and ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
-        return ts, int(tid) if tid is not None else None
+        if not row or row[0] is None:
+            raise RuntimeError(f"Não achei max({src_date_col}) em {src_schema}.{src_table}")
+        max_ts = row[0]
+        if isinstance(max_ts, dt.datetime) and max_ts.tzinfo is None:
+            max_ts = max_ts.replace(tzinfo=dt.timezone.utc)
+        return max_ts
 
 
-def set_cursor(conn, ctl_schema: str, ctl_table: str, ts: dt.datetime, ticket_id: int) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            update {qname(ctl_schema, ctl_table)}
-               set cursor_ts=%s,
-                   cursor_ticket_id=%s,
-                   updated_at=now()
-             where id=1
-            """,
-            (ts, ticket_id),
-        )
-
-
-def upsert_mesclados(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[dt.datetime], Any]]) -> int:
+def upsert_mesclados(
+    conn,
+    schema: str,
+    table: str,
+    rows: List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]],
+) -> int:
     if not rows:
         return 0
     sql = f"""
@@ -155,169 +175,195 @@ def upsert_mesclados(conn, schema: str, table: str, rows: List[Tuple[int, int, O
     return len(rows)
 
 
-# -------------------------
-# Movidesk API helpers
-# -------------------------
-def odata_dt_variants(ts: dt.datetime) -> List[str]:
-    # tenta alguns formatos comuns de OData
-    z = ts.astimezone(dt.timezone.utc).replace(microsecond=0)
-    iso = z.isoformat().replace("+00:00", "Z")
-    return [
-        iso,  # 2026-01-27T12:34:56Z
-        f"datetimeoffset'{iso}'",
-        f"datetime'{iso}'",
-    ]
+def pick_row(
+    old: Optional[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]],
+    new: Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json],
+) -> Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]:
+    if old is None:
+        return new
+    old_at = old[2]
+    new_at = new[2]
+    if old_at is None and new_at is not None:
+        return new
+    if old_at is not None and new_at is not None and new_at > old_at:
+        return new
+    return old
 
 
-def movidesk_get_json(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int) -> Tuple[Any, int, str]:
+# -------------------------
+# Movidesk API
+# -------------------------
+def movidesk_get_json(
+    sess: requests.Session,
+    url: str,
+    params: Dict[str, Any],
+    timeout: int,
+) -> Tuple[Any, int, str]:
     r = sess.get(url, params=params, timeout=timeout)
     txt = r.text or ""
     if r.status_code != 200:
-        return None, r.status_code, txt[:4000]
+        return None, r.status_code, txt[:2000]
     try:
         return r.json(), 200, ""
     except Exception:
-        return None, 200, txt[:4000]
+        return None, 200, txt[:2000]
 
 
-def list_updated_tickets_from_api(
+def list_recent_tickets_from_api_up_to_anchor(
     sess: requests.Session,
     base_url: str,
     token: str,
-    since_ts: dt.datetime,
+    anchor_ts: dt.datetime,
     limit: int,
     timeout: int,
     log: logging.Logger,
-) -> Tuple[List[Tuple[int, dt.datetime]], str, str]:
+) -> Tuple[List[Tuple[int, Optional[dt.datetime]]], str, str]:
     """
-    Retorna lista de (ticket_id, updated_ts) vindo da API /tickets
-    - tenta descobrir qual campo é o "updated" com fallback.
-    - tenta alguns formatos de datetime no $filter.
+    Busca TOP N tickets mais recentes na API, com lastUpdate <= anchor_ts.
+    Tenta /tickets e (fallback) /tickets/past.
+
+    Retorna: [(ticket_id, lastUpdate)], chosen, last_err
     """
-    tickets_url = f"{base_url.rstrip('/')}/tickets"
+    endpoints = [
+        f"{base_url.rstrip('/')}/tickets",
+        f"{base_url.rstrip('/')}/tickets/past",
+    ]
 
     id_fields = ["id", "ticketId", "ticket_id"]
-    upd_fields = ["lastUpdate", "updatedDate", "updatedAt", "lastUpdateDate", "lastUpdated"]
-
-    # paging OData
-    top = max(1, min(100, limit))
-    skip = 0
+    upd_fields = ["lastUpdate", "lastupdate", "updatedAt", "updatedDate", "lastUpdateDate", "lastUpdated"]
 
     last_err = ""
     chosen = ""
 
-    # vamos tentar combinações até uma funcionar
-    for idf in id_fields:
-        for upf in upd_fields:
-            for dt_expr in odata_dt_variants(since_ts):
+    for url in endpoints:
+        for idf in id_fields:
+            for upf in upd_fields:
+                for dt_expr in odata_dt_variants(anchor_ts):
+                    params = {
+                        "token": token,
+                        "$select": f"{idf},{upf}",
+                        "$orderby": f"{upf} desc,{idf} desc",
+                        "$top": str(min(100, max(1, limit))),
+                        "$skip": "0",
+                        "$filter": f"{upf} le {dt_expr}",
+                    }
+
+                    data, status, errtxt = movidesk_get_json(sess, url, params, timeout)
+                    if status != 200:
+                        last_err = f"url={url} status={status} err={errtxt}"
+                        continue
+
+                    items = normalize_list_response(data)
+                    if items is None:
+                        last_err = f"url={url} status=200 but not list-like (type={type(data)})"
+                        continue
+
+                    out: List[Tuple[int, Optional[dt.datetime]]] = []
+                    for it in items:
+                        tid_raw = it.get(idf)
+                        try:
+                            tid = int(tid_raw)
+                        except Exception:
+                            continue
+                        upd = parse_dt(it.get(upf))
+                        out.append((tid, upd))
+
+                    chosen = f"url={url} id_field={idf} upd_field={upf} filter='{upf} le {dt_expr}'"
+                    return out[:limit], chosen, last_err
+
+        # fallback ultra-safe: sem filter (se OData filter der ruim)
+        # ainda assim respeita "mais recentes"
+        for idf in id_fields:
+            for upf in upd_fields:
                 params = {
                     "token": token,
                     "$select": f"{idf},{upf}",
-                    "$orderby": f"{upf} asc,{idf} asc",
-                    "$top": str(top),
-                    "$skip": str(skip),
-                    "$filter": f"{upf} ge {dt_expr}",
+                    "$orderby": f"{upf} desc,{idf} desc",
+                    "$top": str(min(100, max(1, limit))),
+                    "$skip": "0",
                 }
-
-                data, status, errtxt = movidesk_get_json(sess, tickets_url, params, timeout)
+                data, status, errtxt = movidesk_get_json(sess, url, params, timeout)
                 if status != 200:
-                    last_err = f"status={status} err={errtxt}"
+                    last_err = f"url={url} status={status} err={errtxt}"
                     continue
-
-                if not isinstance(data, list):
-                    last_err = f"status=200 but not list (type={type(data)})"
+                items = normalize_list_response(data)
+                if items is None:
+                    last_err = f"url={url} status=200 but not list-like (type={type(data)})"
                     continue
-
-                out: List[Tuple[int, dt.datetime]] = []
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    tid_raw = item.get(idf)
-                    upd_raw = item.get(upf)
+                out: List[Tuple[int, Optional[dt.datetime]]] = []
+                for it in items:
+                    tid_raw = it.get(idf)
                     try:
                         tid = int(tid_raw)
                     except Exception:
                         continue
-                    upd = parse_dt(upd_raw)
-                    if upd is None:
-                        # se não vier data, ignora (mas mantém o tid pra debug)
-                        continue
+                    upd = parse_dt(it.get(upf))
                     out.append((tid, upd))
-
-                chosen = f"id_field={idf} upd_field={upf} filter='{upf} ge {dt_expr}'"
+                chosen = f"url={url} id_field={idf} upd_field={upf} NO_FILTER"
                 return out[:limit], chosen, last_err
 
     return [], chosen, last_err
 
 
-def fetch_merged_for_ticket(
+def movidesk_get_merged(
     sess: requests.Session,
     base_url: str,
     token: str,
     ticket_id: int,
     timeout: int,
     query_keys: List[str],
-) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+) -> Tuple[Any, Optional[int]]:
+    """
+    Chama /tickets/merged tentando query param:
+      - ticketId
+      - id
+      - q
+    """
     url = f"{base_url.rstrip('/')}/tickets/merged"
-    last_status = None
-    last_err = ""
+    last_status: Optional[int] = None
 
     for key in query_keys:
         params = {"token": token, key: str(ticket_id)}
-        # retry leve
         for i in range(5):
             try:
                 r = sess.get(url, params=params, timeout=timeout)
                 last_status = r.status_code
+
                 if r.status_code == 404:
                     break
+
                 if r.status_code in (429, 500, 502, 503, 504):
                     time.sleep(2 * (i + 1))
                     continue
+
                 if r.status_code != 200:
-                    last_err = (r.text or "")[:4000]
                     return None, r.status_code
-                data = r.json()
-                return data if isinstance(data, dict) else None, 200
-            except Exception as e:
-                last_err = repr(e)
+
+                try:
+                    return r.json(), 200
+                except Exception:
+                    return None, 200
+            except Exception:
                 time.sleep(2 * (i + 1))
-        # tenta próxima key
-        continue
 
     return None, last_status
 
 
-def to_int_list(v: Any) -> List[int]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        out = []
-        for x in v:
-            try:
-                out.append(int(x))
-            except Exception:
-                pass
-        return out
-    s = str(v).strip()
-    if not s:
-        return []
-    s = s.replace("[", "").replace("]", "")
-    parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
-    out = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
-    return out
-
-
-def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, int, Optional[dt.datetime], Any]]:
+def extract_merge_rows(
+    queried_id: int,
+    raw: Dict[str, Any],
+) -> List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]]:
     """
-    Sempre grava: (ticket_id_filho, merged_into_id_pai, merged_at, raw_payload)
+    Saída sempre no formato:
+      (ticket_id_filho, merged_into_id_pai, merged_at, raw_payload)
     """
-    payload = psycopg2.extras.Json(raw, dumps=lambda o: json.dumps(o, ensure_ascii=False))
+    payload = json_payload(raw)
+
+    principal_id = raw.get("ticketId") or raw.get("id") or raw.get("ticket_id")
+    try:
+        principal_id_int = int(principal_id) if principal_id is not None else int(queried_id)
+    except Exception:
+        principal_id_int = int(queried_id)
 
     merged_at = parse_dt(
         raw.get("mergedDate")
@@ -328,141 +374,162 @@ def extract_merge_rows(queried_id: int, raw: Dict[str, Any]) -> List[Tuple[int, 
         or raw.get("last_update")
     )
 
-    # cenário: consultou o pai e veio lista de filhos
-    merged_ids = to_int_list(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTickets"))
-    if merged_ids:
-        dest = raw.get("ticketId") or raw.get("id") or queried_id
-        try:
-            dest_i = int(dest)
-        except Exception:
-            dest_i = int(queried_id)
-        out = []
-        for mid in merged_ids:
-            out.append((int(mid), dest_i, merged_at, payload))
-        return out
+    # Caso 1: consultou o "pai" e veio lista de filhos mesclados
+    merged_ids = to_int_list(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
+    if not merged_ids:
+        mt = raw.get("mergedTickets") or raw.get("mergedTicketsList")
+        if isinstance(mt, list):
+            tmp: List[int] = []
+            for it in mt:
+                if isinstance(it, dict):
+                    for k in ("id", "ticketId", "ticketID", "ticket_id"):
+                        if k in it:
+                            try:
+                                tmp.append(int(it[k]))
+                            except Exception:
+                                pass
+                            break
+            merged_ids = tmp
 
-    # cenário: consultou o filho e veio mergedIntoId
-    merged_into = raw.get("mergedIntoId") or raw.get("mergedIntoTicketId") or raw.get("mainTicketId") or raw.get("principalTicketId")
+    rows: List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = []
+    if merged_ids:
+        for mid in merged_ids:
+            try:
+                rows.append((int(mid), principal_id_int, merged_at, payload))
+            except Exception:
+                pass
+        return rows
+
+    # Caso 2: consultou o "filho" e veio quem é o "pai"
+    merged_into = (
+        raw.get("mergedIntoId")
+        or raw.get("mergedIntoTicketId")
+        or raw.get("mainTicketId")
+        or raw.get("mainTicketID")
+        or raw.get("principalTicketId")
+        or raw.get("principalId")
+        or raw.get("mergedInto")
+    )
     if merged_into is not None:
         try:
-            return [(int(queried_id), int(merged_into), merged_at, payload)]
+            rows.append((int(queried_id), int(merged_into), merged_at, payload))
         except Exception:
-            return []
+            pass
 
-    # cenário: layout tipo ticketId + mergedTicketId
-    if raw.get("ticketId") is not None and (raw.get("mergedTicketId") is not None or raw.get("mergedTicketID") is not None):
-        try:
-            dest = int(raw.get("ticketId"))
-            src = int(raw.get("mergedTicketId") or raw.get("mergedTicketID"))
-            return [(src, dest, merged_at, payload)]
-        except Exception:
-            return []
+    return rows
 
-    return []
+
+def extract_rows_from_any(data: Any, queried_id: int) -> List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]]:
+    if data is None:
+        return []
+    out: List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = []
+    if isinstance(data, dict):
+        out.extend(extract_merge_rows(queried_id, data))
+    elif isinstance(data, list):
+        for it in data:
+            if isinstance(it, dict):
+                out.extend(extract_merge_rows(queried_id, it))
+    # dedup por ticket_id (filho)
+    dedup: Dict[int, Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = {}
+    for r in out:
+        dedup[int(r[0])] = r
+    return list(dedup.values())
 
 
 # -------------------------
-# main
+# Main
 # -------------------------
-def main() -> None:
-    log_level = env_str("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
-    log = logging.getLogger("sync_tickets_merged")
+def main():
+    logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("sync-tickets-merged")
 
     token = env_str("MOVIDESK_TOKEN")
-    dsn = env_str("NEON_DSN")
     base_url = env_str("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+    neon_dsn = env_str("NEON_DSN")
 
-    merged_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
-    merged_table = env_str("TABLE_NAME", "tickets_mesclados")
-    ctl_schema = env_str("CONTROL_SCHEMA", merged_schema)
-    ctl_table = env_str("CONTROL_TABLE", "sync_control_tickets_merged_api")
+    # destino
+    dst_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
+    dst_table = env_str("TABLE_NAME", "tickets_mesclados")
 
-    tickets_per_run = env_int("TICKETS_PER_RUN", 50)
+    # origem (só pra âncora)
+    src_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
+    src_table = env_str("SOURCE_TABLE", "tickets_suporte")
+    src_date_col = env_str("SOURCE_DATE_COL", "updated_at")
 
-    # cursor/overlap: evita perder evento que chegou "atrasado"
-    bootstrap_lookback_hours = env_int("BOOTSTRAP_LOOKBACK_HOURS", 48)
-    overlap_minutes = env_int("OVERLAP_MINUTES", 60)
-
-    # rate limit (Movidesk default 10 rpm)
+    # execução
+    limit = env_int("MAX_IDS", 50)  # mantive o nome MAX_IDS pra não quebrar seu yml antigo
+    limit = max(1, min(100, limit))  # API lista no máximo 100 por página (Movidesk)
     rpm = env_float("RPM", 10.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
-
     http_timeout = env_int("HTTP_TIMEOUT", 45)
-    query_keys = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if k.strip()]
 
-    log.info("script_version=%s tickets_per_run=%d rpm=%.2f", SCRIPT_VERSION, tickets_per_run, rpm)
+    merged_query_keys = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if k.strip()]
+
+    log.info("script_version=%s limit=%d rpm=%.2f", SCRIPT_VERSION, limit, rpm)
 
     sess = requests.Session()
     sess.headers.update({"Accept": "application/json"})
 
-    conn = psycopg2.connect(dsn)
+    conn = psycopg2.connect(neon_dsn)
     conn.autocommit = False
     try:
-        ensure_tables(conn, merged_schema, merged_table, ctl_schema, ctl_table)
+        ensure_mesclados_table(conn, dst_schema, dst_table)
         conn.commit()
 
-        cursor_ts, cursor_tid = get_cursor(conn, ctl_schema, ctl_table)
-        if cursor_ts is None:
-            cursor_ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=bootstrap_lookback_hours)
-            cursor_tid = 0
+        anchor_ts = get_anchor_max_updated_at(conn, src_schema, src_table, src_date_col)
+        conn.commit()
 
-        since_ts = cursor_ts - dt.timedelta(minutes=overlap_minutes)
+        log.info("anchor_ts_db_max=%s (%s.%s.%s)", anchor_ts.isoformat(), src_schema, src_table, src_date_col)
 
-        # 1) pega candidatos direto da API /tickets (não do banco)
-        candidates, chosen, last_err = list_updated_tickets_from_api(
+        # 2) pega 50 tickets mais recentes da API até a âncora
+        candidates, chosen, last_err = list_recent_tickets_from_api_up_to_anchor(
             sess=sess,
             base_url=base_url,
             token=token,
-            since_ts=since_ts,
-            limit=tickets_per_run,
+            anchor_ts=anchor_ts,
+            limit=limit,
             timeout=http_timeout,
             log=log,
         )
 
-        log.info("candidates_from_api n=%d since_ts=%s chosen=%s last_err=%s",
-                 len(candidates), since_ts.isoformat(), chosen, (last_err or ""))
+        log.info("api_candidates=%d chosen=%s last_err=%s", len(candidates), chosen, (last_err or ""))
 
         if not candidates:
-            # nada novo; mantém cursor e encerra (workflow rerun chama de novo)
-            conn.commit()
+            log.info("done_no_candidates")
             return
 
-        # 2) para cada ticket, chama /tickets/merged
+        # 3) consulta merged para cada candidato e grava
         status_counts: Dict[int, int] = {}
-        rows_map: Dict[int, Tuple[int, int, Optional[dt.datetime], Any]] = {}
+        rows_map: Dict[int, Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = {}
 
         checked = 0
         found = 0
 
-        for tid, upd_ts in candidates:
+        for (ticket_id, upd) in candidates:
             checked += 1
 
-            raw, st = fetch_merged_for_ticket(sess, base_url, token, int(tid), http_timeout, query_keys)
+            data, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout, merged_query_keys)
             if st is not None:
                 status_counts[st] = status_counts.get(st, 0) + 1
 
-            if raw:
-                rows = extract_merge_rows(int(tid), raw)
-                for r in rows:
-                    rows_map[r[0]] = r
+            rows = extract_rows_from_any(data, int(ticket_id))
+            if rows:
                 found += len(rows)
+                for r in rows:
+                    # dedup por ticket_id filho + pick_row por data
+                    old = rows_map.get(int(r[0]))
+                    rows_map[int(r[0])] = pick_row(old, r)
 
             if throttle > 0:
                 time.sleep(throttle)
 
-        # 3) grava no banco
-        upserted = upsert_mesclados(conn, merged_schema, merged_table, list(rows_map.values()))
-
-        # 4) avança cursor pro maior updated_ts que vimos (tie-break por ticket_id)
-        candidates_sorted = sorted(candidates, key=lambda x: (x[1], x[0]))
-        new_cursor_tid, new_cursor_ts = candidates_sorted[-1][0], candidates_sorted[-1][1]
-        set_cursor(conn, ctl_schema, ctl_table, new_cursor_ts, int(new_cursor_tid))
-
+        upserted = upsert_mesclados(conn, dst_schema, dst_table, list(rows_map.values()))
         conn.commit()
 
-        log.info("done checked=%d merges_found=%d upserted=%d new_cursor_ts=%s statuses=%s",
-                 checked, found, upserted, new_cursor_ts.isoformat(), json.dumps(status_counts, ensure_ascii=False))
+        log.info(
+            "done checked=%d merges_found=%d upserted=%d statuses=%s",
+            checked, found, upserted, json.dumps(status_counts, ensure_ascii=False),
+        )
 
     except Exception:
         conn.rollback()
