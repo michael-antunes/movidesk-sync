@@ -10,14 +10,11 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_top_window_by_max_id_v1_2026-01-27"
+SCRIPT_VERSION = "sync_tickets_merged_top_window_by_max_id_v2_autodetect_idcol_logs_2026-01-27"
 
 MovideskResponse = Union[Dict[str, Any], List[Any], None]
 
 
-# -------------------------
-# Env helpers
-# -------------------------
 def env_str(k: str, default: Optional[str] = None) -> str:
     v = os.getenv(k)
     if v is None or v.strip() == "":
@@ -47,13 +44,6 @@ def env_float(k: str, default: float) -> float:
         return default
 
 
-def env_bool(k: str, default: bool = False) -> bool:
-    v = os.getenv(k)
-    if v is None or v.strip() == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on", "sim")
-
-
 def qident(s: str) -> str:
     return '"' + s.replace('"', '""') + '"'
 
@@ -67,7 +57,6 @@ def parse_dt(v: Any) -> Optional[datetime]:
         return None
     if isinstance(v, datetime):
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
-
     s = str(v).strip()
     if not s:
         return None
@@ -90,7 +79,6 @@ def to_int_list(v: Any) -> List[int]:
             except Exception:
                 pass
         return out
-
     s = str(v).strip()
     if not s:
         return []
@@ -110,33 +98,13 @@ def json_payload(x: Any) -> psycopg2.extras.Json:
 
 
 # -------------------------
-# DB helpers
+# DB
 # -------------------------
 def set_session_timeouts(conn, lock_timeout_ms: int) -> None:
     if lock_timeout_ms <= 0:
         return
     with conn.cursor() as cur:
         cur.execute(f"set lock_timeout = '{int(lock_timeout_ms)}ms'")
-
-
-def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
-    for attempt in range(max_retries):
-        try:
-            result = fn()
-            conn.commit()
-            return result
-        except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DeadlockDetected) as e:
-            conn.rollback()
-            wait = min(30, 2 ** attempt)
-            log.warning(
-                "DB lock/deadlock (%s). Retry em %ss (tentativa %d/%d).",
-                e.__class__.__name__,
-                wait,
-                attempt + 1,
-                max_retries,
-            )
-            time.sleep(wait)
-    raise RuntimeError("Falhou por lock/deadlock muitas vezes. Tente novamente com o DB mais livre.")
 
 
 def ensure_table(conn, schema: str, table: str) -> None:
@@ -156,6 +124,48 @@ def ensure_table(conn, schema: str, table: str) -> None:
         cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
 
 
+def list_columns(conn, schema: str, table: str) -> List[str]:
+    schema_l = schema.lower()
+    table_l = table.lower()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select column_name
+            from information_schema.columns
+            where lower(table_schema) = %s
+              and lower(table_name) = %s
+            order by ordinal_position
+            """,
+            (schema_l, table_l),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def resolve_id_column(conn, schema: str, table: str, preferred: str, log: logging.Logger) -> str:
+    cols = list_columns(conn, schema, table)
+    cols_lower = {c.lower(): c for c in cols}
+
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    # fallback comuns
+    candidates.extend(["ticket_id", "ticketid", "ticketId", "id"])
+
+    for cand in candidates:
+        if not cand:
+            continue
+        key = cand.lower()
+        if key in cols_lower:
+            chosen = cols_lower[key]
+            log.info("SOURCE_ID_COL resolved: preferred=%s chosen=%s available_cols=%s", preferred, chosen, cols)
+            return chosen
+
+    raise RuntimeError(
+        f"Não achei coluna de ID em {schema}.{table}. "
+        f"Preferido='{preferred}'. Colunas disponíveis={cols}"
+    )
+
+
 def get_max_updated_at(conn, schema: str, table: str, col: str) -> Optional[datetime]:
     with conn.cursor() as cur:
         cur.execute(f"select max({qident(col)}) from {qname(schema, table)}")
@@ -173,10 +183,9 @@ def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
         return None
 
 
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]):
+def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
     if not rows:
         return 0
-
     sql = f"""
     insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
     values %s
@@ -190,6 +199,20 @@ def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Option
     return len(rows)
 
 
+def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
+    for attempt in range(max_retries):
+        try:
+            result = fn()
+            conn.commit()
+            return result
+        except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DeadlockDetected) as e:
+            conn.rollback()
+            wait = min(30, 2 ** attempt)
+            log.warning("DB lock/deadlock (%s). Retry em %ss (tentativa %d/%d).", e.__class__.__name__, wait, attempt + 1, max_retries)
+            time.sleep(wait)
+    raise RuntimeError("Falhou por lock/deadlock muitas vezes.")
+
+
 # -------------------------
 # Movidesk API (/tickets/merged)
 # -------------------------
@@ -200,7 +223,6 @@ def movidesk_get(
     params: Dict[str, Any],
     timeout: int,
 ) -> Tuple[MovideskResponse, Optional[int], str]:
-    """Retorna (json|None, status, text_snippet)"""
     url = f"{base_url.rstrip('/')}/tickets/merged"
     p = {"token": token, **params}
     last_status: Optional[int] = None
@@ -236,9 +258,6 @@ def movidesk_get(
 def extract_relations_from_obj(
     obj: Dict[str, Any], fallback_queried_id: int
 ) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
-    """
-    Normaliza 1 objeto em relações (source_ticket -> dest_ticket).
-    """
     payload = json_payload(obj)
     merged_at = parse_dt(
         obj.get("mergedDate")
@@ -253,7 +272,7 @@ def extract_relations_from_obj(
 
     out: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
 
-    # Caso 1: ticketId(destino) + mergedTicketId(origem)
+    # formato: ticketId(destino) + mergedTicketId(origem)
     if obj.get("ticketId") is not None and (obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None):
         try:
             dest = int(obj.get("ticketId"))
@@ -263,7 +282,7 @@ def extract_relations_from_obj(
         except Exception:
             pass
 
-    # Caso 2: consulta pelo "filho" retorna mergedIntoId (destino)
+    # formato: mergedIntoId(destino) quando consulta pelo filho
     merged_into = (
         obj.get("mergedIntoId")
         or obj.get("mergedIntoTicketId")
@@ -283,27 +302,12 @@ def extract_relations_from_obj(
         except Exception:
             pass
 
-    # Caso 3: lista de filhos mergedTicketsIds (consulta pelo destino)
+    # formato: lista de filhos mergedTicketsIds (consulta pelo destino)
     merged_ids: List[int] = []
     for key in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTicketsIdsList"):
         if key in obj:
             merged_ids = to_int_list(obj.get(key))
             break
-
-    if not merged_ids:
-        mt = obj.get("mergedTickets") or obj.get("mergedTicketsList")
-        if isinstance(mt, list):
-            tmp: List[int] = []
-            for it in mt:
-                if isinstance(it, dict):
-                    for k in ("id", "ticketId", "ticketID", "ticket_id"):
-                        if k in it:
-                            try:
-                                tmp.append(int(it[k]))
-                            except Exception:
-                                pass
-                            break
-            merged_ids = tmp
 
     if merged_ids:
         dest_guess = obj.get("ticketId") or obj.get("ticketID") or fallback_queried_id
@@ -321,7 +325,6 @@ def extract_relations_from_obj(
 def extract_relations(data: MovideskResponse, queried_id: int) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
     if data is None:
         return []
-
     out: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
     if isinstance(data, dict):
         out.extend(extract_relations_from_obj(data, queried_id))
@@ -330,7 +333,6 @@ def extract_relations(data: MovideskResponse, queried_id: int) -> List[Tuple[int
             if isinstance(it, dict):
                 out.extend(extract_relations_from_obj(it, queried_id))
 
-    # Dedup por ticket_id (source)
     dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
     for (src, dest, merged_at, payload) in out:
         dedup[int(src)] = (int(src), int(dest), merged_at, payload)
@@ -345,30 +347,21 @@ def fetch_merged_relations(
     timeout: int,
     query_keys: List[str],
 ) -> Tuple[List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], Optional[int], Optional[str], int]:
-    """
-    Tenta chaves na ordem (ticketId -> id -> q).
-    Retorna: (rows, status, key_usada, tries_count)
-    """
     last_status: Optional[int] = None
     tries = 0
     for key in query_keys:
         tries += 1
-        params = {key: str(ticket_id)}
-        data, st, txt = movidesk_get(sess, base_url, token, params, timeout)
+        data, st, _txt = movidesk_get(sess, base_url, token, {key: str(ticket_id)}, timeout)
         last_status = st
 
-        # 404: tenta próximo key
         if st == 404:
             continue
 
-        # 200 (ou outro): decide aqui
         rows = extract_relations(data, ticket_id)
 
-        # se 200, já vale (mesmo vazio)
         if st == 200:
             return rows, st, key, tries
 
-        # outros erros: devolve pra log e para
         return rows, st, key, tries
 
     return [], last_status, None, tries
@@ -392,28 +385,21 @@ def main():
     source_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
     source_table = env_str("SOURCE_TABLE", "tickets_suporte")
     source_date_col = env_str("SOURCE_DATE_COL", "updated_at")
-    source_id_col = env_str("SOURCE_ID_COL", "id")
+    source_id_col_pref = env_str("SOURCE_ID_COL", "ticket_id")  # <- default já corrigido
 
     window_size = env_int("WINDOW_SIZE", 50)
     rpm = env_float("RPM", 10.0)
-    pause_seconds = env_int("PAUSE_SECONDS", 0)
+    pause_seconds = env_int("PAUSE_SECONDS", 20)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
 
     lock_timeout_ms = env_int("PG_LOCK_TIMEOUT_MS", 5000)
     lock_retries = env_int("PG_LOCK_RETRIES", 6)
 
     query_keys = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if k.strip()]
-
     delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
 
-    log.info(
-        "script_version=%s window_size=%d rpm=%.2f pause_seconds=%d query_keys=%s",
-        SCRIPT_VERSION,
-        window_size,
-        rpm,
-        pause_seconds,
-        query_keys,
-    )
+    log.info("script_version=%s window_size=%d rpm=%.2f pause_seconds=%d query_keys=%s",
+             SCRIPT_VERSION, window_size, rpm, pause_seconds, query_keys)
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -422,16 +408,15 @@ def main():
     ensure_table(conn, db_schema, table_name)
     conn.commit()
 
+    # resolve coluna de ID automaticamente
+    source_id_col = resolve_id_column(conn, source_schema, source_table, source_id_col_pref, log)
+
     anchor_ts = get_max_updated_at(conn, source_schema, source_table, source_date_col)
     max_id = get_max_id(conn, source_schema, source_table, source_id_col)
 
-    log.info(
-        "anchor_ts_db_max=%s (%s.%s.%s) max_id_db=%s (%s.%s.%s)",
-        anchor_ts.isoformat() if anchor_ts else None,
-        source_schema, source_table, source_date_col,
-        max_id,
-        source_schema, source_table, source_id_col,
-    )
+    log.info("anchor_ts_db_max=%s (%s.%s.%s) max_id_db=%s (%s.%s.%s)",
+             anchor_ts.isoformat() if anchor_ts else None, source_schema, source_table, source_date_col,
+             max_id, source_schema, source_table, source_id_col)
 
     if not max_id or max_id <= 0:
         log.warning("max_id_db veio vazio/0. Abortando.")
@@ -446,8 +431,6 @@ def main():
     total_checked = 0
     total_upsert = 0
     total_rows_found = 0
-
-    # acumula em batch pra reduzir commits
     batch: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
 
     for idx, tid in enumerate(ids, start=1):
@@ -466,30 +449,16 @@ def main():
 
         total_rows_found += len(rows)
 
-        log.info(
-            "resultado_ticket ticket_id=%d status=%s key=%s tries=%d rows=%d",
-            tid,
-            st,
-            key_used,
-            tries,
-            len(rows),
-        )
+        log.info("resultado_ticket ticket_id=%d status=%s key=%s tries=%d rows=%d",
+                 tid, st, key_used, tries, len(rows))
 
-        # log detalhado de cada relação encontrada (pra você bater o olho)
         for (src, dest, merged_at, _payload) in rows:
-            log.info(
-                "merge_encontrada source_ticket=%d merged_into=%d merged_at=%s (query_ticket=%d)",
-                src,
-                dest,
-                merged_at.isoformat() if merged_at else None,
-                tid,
-            )
+            log.info("merge_encontrada source_ticket=%d merged_into=%d merged_at=%s (query_ticket=%d)",
+                     src, dest, merged_at.isoformat() if merged_at else None, tid)
 
-        # acumula batch
         if rows:
             batch.extend(rows)
 
-        # flush a cada 200 relações (ou no fim)
         if len(batch) >= 200:
             def do_upsert():
                 return upsert_rows(conn, db_schema, table_name, batch)
@@ -501,7 +470,6 @@ def main():
         if delay_between_requests > 0:
             time.sleep(delay_between_requests)
 
-    # flush final
     if batch:
         def do_upsert_final():
             return upsert_rows(conn, db_schema, table_name, batch)
@@ -510,14 +478,8 @@ def main():
         total_upsert += n
         batch.clear()
 
-    log.info(
-        "fim checked=%d total_rows_found=%d upsert=%d window=[%d..%d]",
-        total_checked,
-        total_rows_found,
-        total_upsert,
-        start_id,
-        end_id,
-    )
+    log.info("fim checked=%d total_rows_found=%d upsert=%d window=[%d..%d]",
+             total_checked, total_rows_found, total_upsert, start_id, end_id)
 
     if pause_seconds > 0:
         log.info("pausando %ds antes de finalizar...", pause_seconds)
