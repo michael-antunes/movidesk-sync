@@ -550,7 +550,7 @@ def run_context(max_actions: int):
         external_run_id = int(time.time())
     return {
         "external_run_id": int(external_run_id),
-        "table_name": "tickets_resolvidos_detail",
+        "table_name": "tickets_resolvidos",
         "workflow": os.getenv("GITHUB_WORKFLOW", "") or "",
         "job": os.getenv("GITHUB_JOB", "") or "",
         "ref": os.getenv("GITHUB_REF", "") or "",
