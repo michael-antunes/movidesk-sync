@@ -1,30 +1,32 @@
-name: Movidesk - Tickets mesclados (merged)
+name: Movidesk - Tickets mesclados (merged) (top N loop)
 
 on:
-  workflow_call:
   workflow_dispatch:
     inputs:
-      rpm:
-        description: "Requests por minuto (limite Movidesk normalmente 10)"
-        required: true
-        default: "10"
-      page_size:
-        description: "Tamanho da página na API /tickets (max 100)"
+      window_size:
+        description: "Quantos IDs do topo validar por execução"
         required: true
         default: "50"
-      pages:
-        description: "Quantidade de páginas (skip=page_size*n). Ex.: 2 => 0..49 e 50..99"
+      rpm:
+        description: "Requests por minuto (limite de chamadas no /tickets/merged)"
         required: true
-        default: "2"
-      log_every_ticket:
-        description: "Logar cada ticket validado (true/false)"
+        default: "10"
+      pause_seconds:
+        description: "Pausa (segundos) no final de cada execução"
         required: true
-        default: "true"
-
-# ✅ grupo próprio: não espera outros workflows
-concurrency:
-  group: movidesk-merged-independent-${{ github.ref }}
-  cancel-in-progress: false
+        default: "20"
+      http_timeout:
+        description: "Timeout HTTP (segundos)"
+        required: true
+        default: "45"
+      pg_lock_timeout_ms:
+        description: "Timeout de lock no Postgres (ms)"
+        required: true
+        default: "5000"
+      pg_lock_retries:
+        description: "Tentativas em caso de lock/deadlock"
+        required: true
+        default: "6"
 
 permissions:
   contents: read
@@ -37,11 +39,9 @@ jobs:
     steps:
       - run: date -u && echo "Branch=$GITHUB_REF"
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - run: python -m pip install --upgrade pip requests psycopg2-binary
 
       - name: Run sync_tickets_merged.py
@@ -50,24 +50,27 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
 
+          WINDOW_SIZE: ${{ github.event.inputs.window_size || '50' }}
           RPM: ${{ github.event.inputs.rpm || '10' }}
-          PAGE_SIZE: ${{ github.event.inputs.page_size || '50' }}
-          PAGES: ${{ github.event.inputs.pages || '2' }}
+          PAUSE_SECONDS: ${{ github.event.inputs.pause_seconds || '20' }}
+          HTTP_TIMEOUT: ${{ github.event.inputs.http_timeout || '45' }}
+
+          PG_LOCK_TIMEOUT_MS: ${{ github.event.inputs.pg_lock_timeout_ms || '5000' }}
+          PG_LOCK_RETRIES: ${{ github.event.inputs.pg_lock_retries || '6' }}
 
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
 
-          # âncora (apenas data) vem daqui
+          # fonte do max_id e do max(updated_at)
           SOURCE_SCHEMA: dados_gerais
           SOURCE_TABLE: tickets_suporte
           SOURCE_DATE_COL: updated_at
+          SOURCE_ID_COL: id
 
+          # ordem de tentativa na API /tickets/merged
           MERGED_QUERY_KEYS: ticketId,id,q
-          HTTP_TIMEOUT: "45"
 
           LOG_LEVEL: INFO
-          LOG_EVERY_TICKET: ${{ github.event.inputs.log_every_ticket || 'true' }}
-
         run: python sync_tickets_merged.py
 
   rerun:
@@ -85,9 +88,11 @@ jobs:
               workflow_id: 'sync_tickets_merged.yml',
               ref: 'main',
               inputs: {
+                window_size: inputs.window_size || '50',
                 rpm: inputs.rpm || '10',
-                page_size: inputs.page_size || '50',
-                pages: inputs.pages || '2',
-                log_every_ticket: inputs.log_every_ticket || 'true'
+                pause_seconds: inputs.pause_seconds || '20',
+                http_timeout: inputs.http_timeout || '45',
+                pg_lock_timeout_ms: inputs.pg_lock_timeout_ms || '5000',
+                pg_lock_retries: inputs.pg_lock_retries || '6'
               }
-            })
+            });
