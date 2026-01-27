@@ -16,11 +16,11 @@ on:
         required: true
         default: "false"
       debug_ticket_ids:
-        description: "Opcional: IDs para logar o JSON bruto (ex: 302353;302752)"
+        description: "Opcional: IDs para logar debug da consulta (ex: 302446;302353)"
         required: false
         default: ""
       lock_timeout_ms:
-        description: "Timeout de lock no Postgres (ms) para evitar travar"
+        description: "Timeout de lock no Postgres (ms)"
         required: true
         default: "5000"
       write_retries:
@@ -28,9 +28,6 @@ on:
         required: true
         default: "6"
 
-# IMPORTANTE:
-# Use o mesmo 'group' em TODOS os workflows que escrevem no mesmo banco,
-# assim você evita concorrência e lock_timeout em triggers.
 concurrency:
   group: movidesk-db
   cancel-in-progress: false
@@ -77,63 +74,3 @@ jobs:
           HTTP_TIMEOUT: "60"
           LOG_LEVEL: "INFO"
         run: python sync_range_tickets_merged.py
-
-  rerun:
-    needs: run
-    if: ${{ needs.run.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: python -m pip install --upgrade pip psycopg2-binary
-      - name: Check done
-        id: done
-        env:
-          NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: |
-          python - <<'PY' >> $GITHUB_OUTPUT
-          import os
-          import psycopg2
-
-          dsn = os.environ["NEON_DSN"]
-
-          c = psycopg2.connect(dsn)
-          cur = c.cursor()
-          cur.execute("""
-            select id_final::bigint, id_atual_merged::bigint
-            from visualizacao_resolvidos.range_scan_control
-            order by data_fim desc nulls last, data_inicio desc nulls last, id_inicial desc nulls last
-            limit 1
-          """)
-          r = cur.fetchone()
-          cur.close()
-          c.close()
-
-          if not r:
-            print("done=1")
-          else:
-            id_final, id_atual_merged = r[0], r[1]
-            done = (id_atual_merged is not None) and (int(id_atual_merged) <= int(id_final))
-            print(f"done={'1' if done else '0'}")
-          PY
-
-      - uses: actions/github-script@v7
-        if: ${{ steps.done.outputs.done != '1' }}
-        with:
-          script: |
-            const inputs = (context.payload && context.payload.inputs) ? context.payload.inputs : {};
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'sync_range_tickets_merged.yml',
-              ref: 'main',
-              inputs: {
-                limit: inputs.limit || '10',
-                rpm: inputs.rpm || '10',
-                dry_run: inputs.dry_run || 'false',
-                debug_ticket_ids: inputs.debug_ticket_ids || '',
-                lock_timeout_ms: inputs.lock_timeout_ms || '5000',
-                write_retries: inputs.write_retries || '6'
-              }
-            });
