@@ -1,37 +1,29 @@
-name: Movidesk - Tickets mesclados (merged) (top 20 loop)
+name: Movidesk - Tickets mesclados (merged) (top loop)
 
 on:
   workflow_call:
   workflow_dispatch:
     inputs:
-      tickets_per_run:
-        description: "Quantos tickets consultar por execução"
-        required: true
-        default: "20"
       lookback_hours:
-        description: "Quantas horas para tras buscar candidatos (updated_at)"
+        description: "Quantas horas para tras buscar (com base no updated_at do tickets_suporte)"
         required: true
-        default: "48"
+        default: "2"
       rpm:
-        description: "Requests por minuto"
+        description: "Requests por minuto (limite Movidesk normalmente é 10)"
         required: true
         default: "10"
-      pause_seconds:
-        description: "Pausa (segundos) ao final de cada execução"
+      max_ids:
+        description: "Quantos tickets candidatos buscar por execução"
         required: true
-        default: "20"
-      lock_timeout_ms:
-        description: "Timeout de lock no Postgres (ms)"
-        required: true
-        default: "5000"
-      lock_retries:
-        description: "Tentativas ao pegar lock/deadlock"
-        required: true
-        default: "6"
+        default: "50"
+      merged_query_keys:
+        description: 'Chaves para consultar /tickets/merged (ex: "ticketId" ou "ticketId,id")'
+        required: false
+        default: "ticketId"
 
-# IMPORTANTE: grupo único para não conflitar com o range-scan
+# IMPORTANTE: grupo de concorrência próprio, para NÃO bloquear outros workflows
 concurrency:
-  group: movidesk-merged-top20-${{ github.ref }}
+  group: movidesk-tickets-merged-toploop-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -49,32 +41,29 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip requests psycopg2-binary
-
       - name: Run sync_tickets_merged.py
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
 
+          LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '2' }}
+          RPM: ${{ github.event.inputs.rpm || '10' }}
+          MAX_IDS: ${{ github.event.inputs.max_ids || '50' }}
+          MERGED_QUERY_KEYS: ${{ github.event.inputs.merged_query_keys || 'ticketId' }}
+
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
 
+          # regra que você pediu: max_id/candidatos saem daqui
           SOURCE_SCHEMA: dados_gerais
           SOURCE_TABLE: tickets_suporte
-          SOURCE_ID_COL: ticket_id
           SOURCE_DATE_COL: updated_at
-
-          TICKETS_PER_RUN: ${{ github.event.inputs.tickets_per_run || '20' }}
-          LOOKBACK_HOURS: ${{ github.event.inputs.lookback_hours || '48' }}
-          RPM: ${{ github.event.inputs.rpm || '10' }}
-          PAUSE_SECONDS: ${{ github.event.inputs.pause_seconds || '20' }}
-
-          LOCK_TIMEOUT_MS: ${{ github.event.inputs.lock_timeout_ms || '5000' }}
-          LOCK_RETRIES: ${{ github.event.inputs.lock_retries || '6' }}
 
           LOG_LEVEL: INFO
           LOG_EVERY: "1"
           DB_PING_EVERY: "30"
+          FLUSH_UNIQUE: "50"
           HTTP_TIMEOUT: "45"
         run: python sync_tickets_merged.py
 
@@ -91,13 +80,11 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'sync_tickets_merged.yml',
-              ref: 'main',
+              ref: context.ref.replace('refs/heads/', '') || 'main',
               inputs: {
-                tickets_per_run: inputs.tickets_per_run || '20',
-                lookback_hours: inputs.lookback_hours || '48',
+                lookback_hours: inputs.lookback_hours || '2',
                 rpm: inputs.rpm || '10',
-                pause_seconds: inputs.pause_seconds || '20',
-                lock_timeout_ms: inputs.lock_timeout_ms || '5000',
-                lock_retries: inputs.lock_retries || '6',
+                max_ids: inputs.max_ids || '50',
+                merged_query_keys: inputs.merged_query_keys || 'ticketId',
               }
-            });
+            })
