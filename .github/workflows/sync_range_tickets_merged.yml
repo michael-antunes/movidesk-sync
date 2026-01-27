@@ -34,6 +34,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   run:
@@ -74,3 +75,15 @@ jobs:
           HTTP_TIMEOUT: "60"
           LOG_LEVEL: "INFO"
         run: python sync_range_tickets_merged.py
+
+      - name: Dispatch self
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}","inputs":{"limit":"${{ github.event.inputs.limit }}","rpm":"${{ github.event.inputs.rpm }}","dry_run":"${{ github.event.inputs.dry_run }}","debug_ticket_ids":"${{ github.event.inputs.debug_ticket_ids }}","lock_timeout_ms":"${{ github.event.inputs.lock_timeout_ms }}","write_retries":"${{ github.event.inputs.write_retries }}"}}'
