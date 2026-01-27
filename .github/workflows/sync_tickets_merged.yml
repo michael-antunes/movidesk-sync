@@ -8,7 +8,7 @@ on:
         required: true
         default: "50"
       rpm:
-        description: "Requests por minuto (limite de chamadas no /tickets/merged)"
+        description: "Requests por minuto no /tickets/merged"
         required: true
         default: "10"
       pause_seconds:
@@ -61,15 +61,14 @@ jobs:
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
 
-          # fonte do max_id e do max(updated_at)
           SOURCE_SCHEMA: dados_gerais
           SOURCE_TABLE: tickets_suporte
           SOURCE_DATE_COL: updated_at
-          SOURCE_ID_COL: id
 
-          # ordem de tentativa na API /tickets/merged
+          # ✅ agora default é ticket_id (e o .py ainda auto-detecta)
+          SOURCE_ID_COL: ticket_id
+
           MERGED_QUERY_KEYS: ticketId,id,q
-
           LOG_LEVEL: INFO
         run: python sync_tickets_merged.py
 
