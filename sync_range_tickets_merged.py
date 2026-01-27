@@ -11,7 +11,7 @@ import psycopg2.extras
 
 
 # -------------------------
-# Helpers (env / quoting)
+# Env helpers
 # -------------------------
 
 def env_str(k: str, default: Optional[str] = None) -> Optional[str]:
@@ -57,31 +57,6 @@ def qname(schema: str, table: str) -> str:
     return f"{qident(schema)}.{qident(table)}"
 
 
-def to_int_list(v: Any) -> List[int]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        out: List[int] = []
-        for x in v:
-            try:
-                out.append(int(x))
-            except Exception:
-                pass
-        return out
-    s = str(v).strip()
-    if not s:
-        return []
-    s = s.replace("[", "").replace("]", "")
-    parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
-    out: List[int] = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
-    return out
-
-
 def parse_dt(v: Any) -> Optional[datetime]:
     if not v:
         return None
@@ -98,16 +73,41 @@ def parse_dt(v: Any) -> Optional[datetime]:
         return None
 
 
+def to_int_list(v: Any) -> List[int]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        out: List[int] = []
+        for x in v:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out
+
+    s = str(v).strip()
+    if not s:
+        return []
+    s = s.replace("[", "").replace("]", "")
+    parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
+    out: List[int] = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            pass
+    return out
+
+
 def json_payload(x: Any) -> psycopg2.extras.Json:
     return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
 
 
 # -------------------------
-# DB setup / retry logic
+# DB helpers (lock retry)
 # -------------------------
 
 def set_session_timeouts(conn, lock_timeout_ms: int) -> None:
-    """Define lock_timeout na sessão pra não travar indefinidamente."""
     if lock_timeout_ms <= 0:
         return
     with conn.cursor() as cur:
@@ -115,10 +115,6 @@ def set_session_timeouts(conn, lock_timeout_ms: int) -> None:
 
 
 def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
-    """
-    Executa fn() + commit.
-    Se bater lock timeout/deadlock, faz rollback e retry com backoff.
-    """
     for attempt in range(max_retries):
         try:
             result = fn()
@@ -135,7 +131,7 @@ def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
                 max_retries,
             )
             time.sleep(wait)
-    raise RuntimeError("Falhou por lock/deadlock muitas vezes. Tente novamente quando o DB estiver livre.")
+    raise RuntimeError("Falhou por lock/deadlock muitas vezes. Tente novamente com o DB mais livre.")
 
 
 def ensure_table(conn, schema: str, table: str) -> None:
@@ -151,7 +147,6 @@ def ensure_table(conn, schema: str, table: str) -> None:
             )
             """
         )
-        # índices úteis
         cur.execute(f"create index if not exists ix_{table}_merged_into_id on {qname(schema, table)} (merged_into_id)")
         cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
 
@@ -177,7 +172,7 @@ def read_control(conn, schema: str, control_table: str) -> Tuple[int, int, Optio
         id_final = int(r[1])
         last_processed = int(r[2]) if r[2] is not None else None
 
-        # Regra do seu loop: next_id = id_atual_merged - 1
+        # seu loop: next_id = id_atual_merged - 1
         next_id = id_inicial if last_processed is None else (last_processed - 1)
         if next_id > id_inicial:
             next_id = id_inicial
@@ -220,74 +215,42 @@ def build_batch(next_id: int, id_final: int, limit: int) -> List[int]:
 MovideskMergedResponse = Union[Dict[str, Any], List[Any]]
 
 
-def movidesk_get_merged(
+def movidesk_call(
     sess: requests.Session,
     base_url: str,
     token: str,
-    ticket_id: int,
+    params: Dict[str, Any],
     timeout: int,
 ) -> Tuple[Optional[MovideskMergedResponse], Optional[int]]:
-    """
-    Consulta o endpoint /tickets/merged.
-
-    IMPORTANTÍSSIMO:
-      - o parâmetro "oficial" é ticketId
-      - alguns ambientes aceitam id (mas nem sempre significa id do ticket)
-
-    A resposta pode vir como dict OU como list.
-    """
     url = f"{base_url.rstrip('/')}/tickets/merged"
+    p = {"token": token, **params}
 
-    for key in ("ticketId", "id"):
-        params = {"token": token, key: str(ticket_id)}
-        last_status: Optional[int] = None
+    last_status: Optional[int] = None
+    for i in range(5):
+        try:
+            r = sess.get(url, params=p, timeout=timeout)
+            last_status = r.status_code
 
-        for i in range(5):
-            try:
-                r = sess.get(url, params=params, timeout=timeout)
-                last_status = r.status_code
+            if r.status_code == 404:
+                return None, 404
 
-                if r.status_code == 404:
-                    break
-
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(2 * (i + 1))
-                    continue
-
-                if r.status_code != 200:
-                    return None, r.status_code
-
-                data = r.json()  # pode ser list ou dict
-                return data, 200
-
-            except Exception:
+            if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 * (i + 1))
+                continue
 
-        if last_status == 404:
-            continue
+            if r.status_code != 200:
+                return None, r.status_code
 
-        return None, last_status
+            return r.json(), 200
+        except Exception:
+            time.sleep(2 * (i + 1))
 
-    return None, 404
+    return None, last_status
 
-
-# -------------------------
-# Parse de "merged" (várias variações)
-# -------------------------
 
 def extract_rows_from_item(
-    queried_id: int,
     item: Dict[str, Any],
 ) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
-    """
-    Converte um item retornado pela API em linhas (ticket_id, merged_into_id, merged_at, raw_payload).
-
-    Casos cobertos:
-      A) {ticketId: <principal>, mergedTicketId: <mesclado>}
-      B) {ticketId: <mesclado>, mergedIntoTicketId: <principal>} (ou mergedIntoId)
-      C) payload com mergedTicketsIds (lista) dentro do ticket principal
-      D) payload com mergedIntoId dentro do ticket mesclado
-    """
     merged_at = parse_dt(
         item.get("mergedDate")
         or item.get("mergedAt")
@@ -299,97 +262,136 @@ def extract_rows_from_item(
         or item.get("last_update")
     )
     payload = json_payload(item)
-
     rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
 
-    # A) principal + mesclado
+    # Formato comum: { ticketId: <destino>, mergedTicketId: <origem> }
     if item.get("ticketId") is not None and item.get("mergedTicketId") is not None:
         try:
-            principal = int(item["ticketId"])
-            merged_ticket = int(item["mergedTicketId"])
-            rows.append((merged_ticket, principal, merged_at, payload))
+            dest = int(item["ticketId"])
+            src = int(item["mergedTicketId"])
+            rows.append((src, dest, merged_at, payload))
             return rows
         except Exception:
             pass
 
-    # B) mesclado -> principal
+    # Outro formato: { ticketId: <origem>, mergedIntoTicketId/mergedIntoId: <destino> }
     if item.get("ticketId") is not None and (item.get("mergedIntoTicketId") is not None or item.get("mergedIntoId") is not None):
         try:
-            merged_ticket = int(item["ticketId"])
-            principal = int(item.get("mergedIntoTicketId") or item.get("mergedIntoId"))
-            rows.append((merged_ticket, principal, merged_at, payload))
+            src = int(item["ticketId"])
+            dest = int(item.get("mergedIntoTicketId") or item.get("mergedIntoId"))
+            rows.append((src, dest, merged_at, payload))
             return rows
         except Exception:
             pass
 
-    # C) lista de mesclados dentro do principal
+    # Formato: { ticketId:<destino>, mergedTicketsIds:[...] }
     merged_ids = to_int_list(item.get("mergedTicketsIds") or item.get("mergedTicketsIDs") or item.get("mergedTicketsIdsList"))
-    if not merged_ids:
-        mt = item.get("mergedTickets") or item.get("mergedTicketsList")
-        if isinstance(mt, list):
-            tmp: List[int] = []
-            for it in mt:
-                if isinstance(it, dict):
-                    for k in ("id", "ticketId", "ticketID", "ticket_id"):
-                        if k in it:
-                            try:
-                                tmp.append(int(it[k]))
-                            except Exception:
-                                pass
-                            break
-            merged_ids = tmp
-
     if merged_ids:
-        principal_guess = item.get("ticketId") or item.get("principalTicketId") or item.get("principalId") or item.get("mainTicketId") or queried_id
+        dest_guess = item.get("ticketId") or item.get("principalTicketId") or item.get("principalId") or item.get("mainTicketId")
         try:
-            principal = int(principal_guess)
+            dest = int(dest_guess)
         except Exception:
-            principal = int(queried_id)
-
+            return []
         for mid in merged_ids:
-            rows.append((int(mid), principal, merged_at, payload))
+            rows.append((int(mid), dest, merged_at, payload))
         return rows
-
-    # D) este ticket foi mesclado em outro
-    merged_into = (
-        item.get("mergedIntoId")
-        or item.get("mergedIntoTicketId")
-        or item.get("mainTicketId")
-        or item.get("principalTicketId")
-        or item.get("principalId")
-        or item.get("mergedInto")
-    )
-    if merged_into is not None:
-        try:
-            rows.append((int(queried_id), int(merged_into), merged_at, payload))
-        except Exception:
-            pass
 
     return rows
 
 
-def extract_merge_rows_any(
+def normalize_rows_for_ticket(
     queried_id: int,
     raw_any: MovideskMergedResponse,
+    mode: str,
 ) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
     """
-    Aceita resposta da API como dict OU list.
-    Retorna lista de linhas.
+    mode:
+      - "ticketId": estamos consultando o DESTINO (ticket principal)
+      - "q": estamos consultando a ORIGEM (ticket que foi mesclado)
     """
     if raw_any is None:
         return []
 
-    if isinstance(raw_any, list):
-        out: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
-        for it in raw_any:
-            if isinstance(it, dict):
-                out.extend(extract_rows_from_item(queried_id, it))
-        return out
-
+    items: List[Dict[str, Any]] = []
     if isinstance(raw_any, dict):
-        return extract_rows_from_item(queried_id, raw_any)
+        items = [raw_any]
+    elif isinstance(raw_any, list):
+        items = [x for x in raw_any if isinstance(x, dict)]
+    else:
+        return []
 
-    return []
+    out: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+    qid = int(queried_id)
+
+    for it in items:
+        rows = extract_rows_from_item(it)
+        if not rows:
+            # também pode vir como dict "direto" de ORIGEM -> DESTINO
+            merged_into = (
+                it.get("mergedIntoId")
+                or it.get("mergedIntoTicketId")
+                or it.get("mainTicketId")
+                or it.get("principalTicketId")
+                or it.get("principalId")
+                or it.get("mergedInto")
+            )
+            if merged_into is not None and it.get("ticketId") is not None:
+                try:
+                    src = int(it.get("ticketId"))
+                    dest = int(merged_into)
+                    rows = [(src, dest, parse_dt(it.get("mergedDate") or it.get("mergedAt") or it.get("date")), json_payload(it))]
+                except Exception:
+                    rows = []
+
+        for (src, dest, merged_at, payload) in rows:
+            # FILTRO/VALIDAÇÃO pra não gravar lixo:
+            if mode == "ticketId":
+                # a consulta foi pelo DESTINO, então dest tem que ser o queried_id
+                if int(dest) != qid:
+                    continue
+            elif mode == "q":
+                # a consulta foi pela ORIGEM, então src tem que ser o queried_id
+                if int(src) != qid:
+                    continue
+            out.append((int(src), int(dest), merged_at, payload))
+
+    return out
+
+
+def fetch_merges_for_ticket(
+    sess: requests.Session,
+    base_url: str,
+    token: str,
+    ticket_id: int,
+    timeout: int,
+) -> Tuple[List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], Dict[str, Any]]:
+    """
+    Tenta:
+      1) ticketId=<ticket_id>  (destino/principal)
+      2) q=<ticket_id>         (origem/mesclado)
+    Retorna rows e um debug_info simples.
+    """
+    debug: Dict[str, Any] = {"ticket_id": int(ticket_id), "used": None, "status": None}
+
+    raw, st = movidesk_call(sess, base_url, token, {"ticketId": str(ticket_id)}, timeout)
+    debug["status_ticketId"] = st
+    rows = normalize_rows_for_ticket(ticket_id, raw, mode="ticketId")
+    if rows:
+        debug["used"] = "ticketId"
+        debug["status"] = st
+        return rows, debug
+
+    raw2, st2 = movidesk_call(sess, base_url, token, {"q": str(ticket_id)}, timeout)
+    debug["status_q"] = st2
+    rows2 = normalize_rows_for_ticket(ticket_id, raw2, mode="q")
+    if rows2:
+        debug["used"] = "q"
+        debug["status"] = st2
+        return rows2, debug
+
+    debug["used"] = "none"
+    debug["status"] = st2 if st2 is not None else st
+    return [], debug
 
 
 # -------------------------
@@ -467,7 +469,7 @@ def main() -> None:
     max_runtime_sec = env_int("MAX_RUNTIME_SEC", 1100)
     http_timeout = env_int("HTTP_TIMEOUT", 60)
 
-    lock_timeout_ms = env_int("LOCK_TIMEOUT_MS", 5000)  # resolve teu erro do log
+    lock_timeout_ms = env_int("LOCK_TIMEOUT_MS", 5000)
     write_retries = env_int("WRITE_RETRIES", 6)
 
     debug_ids = set(to_int_list(env_str("DEBUG_TICKET_IDS") or ""))
@@ -494,7 +496,6 @@ def main() -> None:
 
         deadline = time.monotonic() + max(60, max_runtime_sec)
 
-        status_counts: Dict[int, int] = {}
         total_checked = 0
         total_rel = 0
         total_upserted = 0
@@ -519,22 +520,17 @@ def main() -> None:
                 checked += 1
                 last_processed_run = int(ticket_id)
 
-                raw_any, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout)
-                if st is not None:
-                    status_counts[st] = status_counts.get(st, 0) + 1
+                rows, dbg = fetch_merges_for_ticket(sess, base_url, token, int(ticket_id), http_timeout)
 
                 if ticket_id in debug_ids:
-                    t = type(raw_any).__name__ if raw_any is not None else "None"
-                    log.info("DEBUG ticket_id=%s status=%s type=%s raw=%s", ticket_id, st, t, json.dumps(raw_any, ensure_ascii=False)[:4000])
+                    log.info("DEBUG ticket_id=%s dbg=%s", ticket_id, json.dumps(dbg, ensure_ascii=False))
 
-                if raw_any is not None:
-                    rows = extract_merge_rows_any(int(ticket_id), raw_any)
-                    if rows:
-                        rel += len(rows)
-                        for t_id, merged_into_id, merged_at, payload in rows:
-                            # 1 registro por ticket_id (upsert)
-                            rows_map[int(t_id)] = (int(t_id), int(merged_into_id), merged_at, payload)
-                            del_ids.append(int(t_id))
+                if rows:
+                    rel += len(rows)
+                    for (src, dest, merged_at, payload) in rows:
+                        # 1 registro por ticket_id (src)
+                        rows_map[int(src)] = (int(src), int(dest), merged_at, payload)
+                        del_ids.append(int(src))
 
                 if throttle > 0:
                     time.sleep(throttle)
@@ -566,15 +562,7 @@ def main() -> None:
 
             log.info("progress next_id=%s last_processed=%s checked=%d upsert=%d deleted=%d", next_id, last_processed_run, checked, upserted, deleted)
 
-        log.info(
-            "end checked=%d rel=%d upsert=%d deleted=%d next_id=%s statuses=%s",
-            total_checked,
-            total_rel,
-            total_upserted,
-            total_deleted,
-            next_id,
-            json.dumps(status_counts, ensure_ascii=False),
-        )
+        log.info("end checked=%d rel=%d upsert=%d deleted=%d next_id=%s", total_checked, total_rel, total_upserted, total_deleted, next_id)
 
     except Exception:
         conn.rollback()
