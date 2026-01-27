@@ -16,7 +16,7 @@ on:
         required: true
         default: "false"
       debug_ticket_ids:
-        description: "Opcional: IDs para logar debug da consulta (ex: 302446;302353)"
+        description: "IDs para debugar no log (ex: 302353;302446)"
         required: false
         default: ""
       lock_timeout_ms:
@@ -34,7 +34,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   run:
@@ -47,6 +46,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip requests psycopg2-binary
+
       - name: Run sync_range_tickets_merged.py
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
