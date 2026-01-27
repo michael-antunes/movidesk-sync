@@ -24,8 +24,10 @@ on:
         required: true
         default: "6"
 
+# ✅ NÃO BLOQUEIA outros workflows
+# (só impede duas execuções desse MESMO workflow ao mesmo tempo)
 concurrency:
-  group: movidesk-db
+  group: movidesk-sync-tickets-merged-top50
   cancel-in-progress: false
 
 permissions:
@@ -42,7 +44,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip requests psycopg2-binary
-      - name: Run sync_top_tickets_merged.py
+      - name: Run sync_tickets_merged.py
         env:
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
           NEON_DSN: ${{ secrets.NEON_DSN }}
@@ -65,7 +67,7 @@ jobs:
 
           HTTP_TIMEOUT: "60"
           LOG_LEVEL: "INFO"
-        run: python sync_top_tickets_merged.py
+        run: python sync_tickets_merged.py
 
   rerun:
     needs: run
@@ -81,7 +83,7 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              workflow_id: 'sync_top_tickets_merged.yml',
+              workflow_id: 'sync_tickets_merged.yml',
               ref: 'main',
               inputs: {
                 batch_size: inputs.batch_size || '50',
