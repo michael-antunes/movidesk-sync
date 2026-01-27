@@ -3,19 +3,16 @@ import json
 import time
 import logging
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_anchor_db_max_updated_at_candidates_api_top50_v1_2026-01-27"
+SCRIPT_VERSION = "sync_tickets_merged_anchor_db_max_updated_at_api_candidates_paged_v3_logs_per_ticket_2026-01-27"
 
 
-# -------------------------
-# Env helpers
-# -------------------------
 def env_str(k: str, default: Optional[str] = None) -> str:
     v = os.getenv(k)
     if v is None or v.strip() == "":
@@ -45,6 +42,13 @@ def env_float(k: str, default: float) -> float:
         return default
 
 
+def env_bool(k: str, default: bool = False) -> bool:
+    v = os.getenv(k)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on", "sim")
+
+
 def qident(s: str) -> str:
     return '"' + s.replace('"', '""') + '"'
 
@@ -69,16 +73,27 @@ def parse_dt(v: Any) -> Optional[dt.datetime]:
         return None
 
 
+def to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return None
+
+
 def to_int_list(v: Any) -> List[int]:
     if v is None:
         return []
     if isinstance(v, list):
         out: List[int] = []
         for x in v:
-            try:
-                out.append(int(x))
-            except Exception:
-                pass
+            xi = to_int(x)
+            if xi is not None:
+                out.append(xi)
         return out
     s = str(v).strip()
     if not s:
@@ -87,10 +102,9 @@ def to_int_list(v: Any) -> List[int]:
     parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
     out: List[int] = []
     for p in parts:
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
+        xi = to_int(p)
+        if xi is not None:
+            out.append(xi)
     return out
 
 
@@ -99,20 +113,12 @@ def json_payload(x: Any) -> psycopg2.extras.Json:
 
 
 def odata_dt_variants(ts: dt.datetime) -> List[str]:
-    # formatos comuns que às vezes o OData aceita
     z = ts.astimezone(dt.timezone.utc).replace(microsecond=0)
     iso = z.isoformat().replace("+00:00", "Z")
-    return [
-        iso,  # 2026-01-27T12:34:56Z
-        f"datetimeoffset'{iso}'",
-        f"datetime'{iso}'",
-    ]
+    return [iso, f"datetimeoffset'{iso}'", f"datetime'{iso}'"]
 
 
 def normalize_list_response(data: Any) -> Optional[List[Dict[str, Any]]]:
-    """
-    Algumas APIs retornam lista direta; outras retornam {"value": [...]}
-    """
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
     if isinstance(data, dict):
@@ -175,30 +181,10 @@ def upsert_mesclados(
     return len(rows)
 
 
-def pick_row(
-    old: Optional[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]],
-    new: Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json],
-) -> Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]:
-    if old is None:
-        return new
-    old_at = old[2]
-    new_at = new[2]
-    if old_at is None and new_at is not None:
-        return new
-    if old_at is not None and new_at is not None and new_at > old_at:
-        return new
-    return old
-
-
 # -------------------------
 # Movidesk API
 # -------------------------
-def movidesk_get_json(
-    sess: requests.Session,
-    url: str,
-    params: Dict[str, Any],
-    timeout: int,
-) -> Tuple[Any, int, str]:
+def movidesk_get_json(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int) -> Tuple[Any, int, str]:
     r = sess.get(url, params=params, timeout=timeout)
     txt = r.text or ""
     if r.status_code != 200:
@@ -209,28 +195,22 @@ def movidesk_get_json(
         return None, 200, txt[:2000]
 
 
-def list_recent_tickets_from_api_up_to_anchor(
+def list_recent_tickets_paged_up_to_anchor(
     sess: requests.Session,
     base_url: str,
     token: str,
     anchor_ts: dt.datetime,
-    limit: int,
+    page_size: int,
+    pages: int,
     timeout: int,
     log: logging.Logger,
 ) -> Tuple[List[Tuple[int, Optional[dt.datetime]]], str, str]:
-    """
-    Busca TOP N tickets mais recentes na API, com lastUpdate <= anchor_ts.
-    Tenta /tickets e (fallback) /tickets/past.
-
-    Retorna: [(ticket_id, lastUpdate)], chosen, last_err
-    """
     endpoints = [
         f"{base_url.rstrip('/')}/tickets",
         f"{base_url.rstrip('/')}/tickets/past",
     ]
-
     id_fields = ["id", "ticketId", "ticket_id"]
-    upd_fields = ["lastUpdate", "lastupdate", "updatedAt", "updatedDate", "lastUpdateDate", "lastUpdated"]
+    upd_fields = ["lastUpdate", "updatedAt", "updatedDate", "lastUpdateDate", "lastUpdated"]
 
     last_err = ""
     chosen = ""
@@ -239,90 +219,72 @@ def list_recent_tickets_from_api_up_to_anchor(
         for idf in id_fields:
             for upf in upd_fields:
                 for dt_expr in odata_dt_variants(anchor_ts):
-                    params = {
-                        "token": token,
-                        "$select": f"{idf},{upf}",
-                        "$orderby": f"{upf} desc,{idf} desc",
-                        "$top": str(min(100, max(1, limit))),
-                        "$skip": "0",
-                        "$filter": f"{upf} le {dt_expr}",
-                    }
+                    all_items: List[Tuple[int, Optional[dt.datetime]]] = []
+                    ok = True
 
-                    data, status, errtxt = movidesk_get_json(sess, url, params, timeout)
-                    if status != 200:
-                        last_err = f"url={url} status={status} err={errtxt}"
-                        continue
+                    for page in range(max(1, pages)):
+                        skip = page * page_size
+                        params = {
+                            "token": token,
+                            "$select": f"{idf},{upf}",
+                            "$orderby": f"{upf} desc,{idf} desc",
+                            "$top": str(page_size),
+                            "$skip": str(skip),
+                            "$filter": f"{upf} le {dt_expr}",
+                        }
 
-                    items = normalize_list_response(data)
-                    if items is None:
-                        last_err = f"url={url} status=200 but not list-like (type={type(data)})"
-                        continue
+                        data, status, errtxt = movidesk_get_json(sess, url, params, timeout)
+                        if status != 200:
+                            ok = False
+                            last_err = f"url={url} status={status} err={errtxt}"
+                            break
 
-                    out: List[Tuple[int, Optional[dt.datetime]]] = []
-                    for it in items:
-                        tid_raw = it.get(idf)
-                        try:
-                            tid = int(tid_raw)
-                        except Exception:
-                            continue
-                        upd = parse_dt(it.get(upf))
-                        out.append((tid, upd))
+                        items = normalize_list_response(data)
+                        if items is None:
+                            ok = False
+                            last_err = f"url={url} status=200 but not list-like (type={type(data)})"
+                            break
 
-                    chosen = f"url={url} id_field={idf} upd_field={upf} filter='{upf} le {dt_expr}'"
-                    return out[:limit], chosen, last_err
+                        log.info("list_tickets page=%d skip=%d top=%d got=%d url=%s", page + 1, skip, page_size, len(items), url)
 
-        # fallback ultra-safe: sem filter (se OData filter der ruim)
-        # ainda assim respeita "mais recentes"
-        for idf in id_fields:
-            for upf in upd_fields:
-                params = {
-                    "token": token,
-                    "$select": f"{idf},{upf}",
-                    "$orderby": f"{upf} desc,{idf} desc",
-                    "$top": str(min(100, max(1, limit))),
-                    "$skip": "0",
-                }
-                data, status, errtxt = movidesk_get_json(sess, url, params, timeout)
-                if status != 200:
-                    last_err = f"url={url} status={status} err={errtxt}"
-                    continue
-                items = normalize_list_response(data)
-                if items is None:
-                    last_err = f"url={url} status=200 but not list-like (type={type(data)})"
-                    continue
-                out: List[Tuple[int, Optional[dt.datetime]]] = []
-                for it in items:
-                    tid_raw = it.get(idf)
-                    try:
-                        tid = int(tid_raw)
-                    except Exception:
-                        continue
-                    upd = parse_dt(it.get(upf))
-                    out.append((tid, upd))
-                chosen = f"url={url} id_field={idf} upd_field={upf} NO_FILTER"
-                return out[:limit], chosen, last_err
+                        for it in items:
+                            tid = to_int(it.get(idf))
+                            if tid is None:
+                                continue
+                            upd = parse_dt(it.get(upf))
+                            all_items.append((tid, upd))
+
+                        if len(items) < page_size:
+                            break
+
+                    if ok:
+                        chosen = f"url={url} id_field={idf} upd_field={upf} filter='{upf} le {dt_expr}' pages={pages} page_size={page_size}"
+                        seen = set()
+                        dedup: List[Tuple[int, Optional[dt.datetime]]] = []
+                        for tid, upd in all_items:
+                            if tid in seen:
+                                continue
+                            seen.add(tid)
+                            dedup.append((tid, upd))
+                        return dedup, chosen, last_err
 
     return [], chosen, last_err
 
 
-def movidesk_get_merged(
+def movidesk_get_merged_raw(
     sess: requests.Session,
     base_url: str,
     token: str,
     ticket_id: int,
     timeout: int,
     query_keys: List[str],
-) -> Tuple[Any, Optional[int]]:
-    """
-    Chama /tickets/merged tentando query param:
-      - ticketId
-      - id
-      - q
-    """
+) -> Tuple[Any, Optional[int], str]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
     last_status: Optional[int] = None
+    last_key = ""
 
     for key in query_keys:
+        last_key = key
         params = {"token": token, key: str(ticket_id)}
         for i in range(5):
             try:
@@ -337,99 +299,96 @@ def movidesk_get_merged(
                     continue
 
                 if r.status_code != 200:
-                    return None, r.status_code
+                    return None, r.status_code, key
 
                 try:
-                    return r.json(), 200
+                    return r.json(), 200, key
                 except Exception:
-                    return None, 200
+                    return None, 200, key
             except Exception:
                 time.sleep(2 * (i + 1))
 
-    return None, last_status
+    return None, last_status, last_key
 
 
-def extract_merge_rows(
+def extract_rows_from_merge_payload(
     queried_id: int,
-    raw: Dict[str, Any],
+    payload_any: Any,
 ) -> List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]]:
-    """
-    Saída sempre no formato:
-      (ticket_id_filho, merged_into_id_pai, merged_at, raw_payload)
-    """
-    payload = json_payload(raw)
-
-    principal_id = raw.get("ticketId") or raw.get("id") or raw.get("ticket_id")
-    try:
-        principal_id_int = int(principal_id) if principal_id is not None else int(queried_id)
-    except Exception:
-        principal_id_int = int(queried_id)
-
-    merged_at = parse_dt(
-        raw.get("mergedDate")
-        or raw.get("mergedAt")
-        or raw.get("performedAt")
-        or raw.get("date")
-        or raw.get("lastUpdate")
-        or raw.get("last_update")
-    )
-
-    # Caso 1: consultou o "pai" e veio lista de filhos mesclados
-    merged_ids = to_int_list(raw.get("mergedTicketsIds") or raw.get("mergedTicketsIDs") or raw.get("mergedTicketsIdsList"))
-    if not merged_ids:
-        mt = raw.get("mergedTickets") or raw.get("mergedTicketsList")
-        if isinstance(mt, list):
-            tmp: List[int] = []
-            for it in mt:
-                if isinstance(it, dict):
-                    for k in ("id", "ticketId", "ticketID", "ticket_id"):
-                        if k in it:
-                            try:
-                                tmp.append(int(it[k]))
-                            except Exception:
-                                pass
-                            break
-            merged_ids = tmp
-
-    rows: List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = []
-    if merged_ids:
-        for mid in merged_ids:
-            try:
-                rows.append((int(mid), principal_id_int, merged_at, payload))
-            except Exception:
-                pass
-        return rows
-
-    # Caso 2: consultou o "filho" e veio quem é o "pai"
-    merged_into = (
-        raw.get("mergedIntoId")
-        or raw.get("mergedIntoTicketId")
-        or raw.get("mainTicketId")
-        or raw.get("mainTicketID")
-        or raw.get("principalTicketId")
-        or raw.get("principalId")
-        or raw.get("mergedInto")
-    )
-    if merged_into is not None:
-        try:
-            rows.append((int(queried_id), int(merged_into), merged_at, payload))
-        except Exception:
-            pass
-
-    return rows
-
-
-def extract_rows_from_any(data: Any, queried_id: int) -> List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]]:
-    if data is None:
+    if payload_any is None:
         return []
+
     out: List[Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = []
-    if isinstance(data, dict):
-        out.extend(extract_merge_rows(queried_id, data))
-    elif isinstance(data, list):
-        for it in data:
+
+    def add_row(child_id: int, parent_id: int, merged_at: Optional[dt.datetime], raw_obj: Any) -> None:
+        # filtro de relevância
+        if int(child_id) != int(queried_id) and int(parent_id) != int(queried_id):
+            return
+        out.append((int(child_id), int(parent_id), merged_at, json_payload(raw_obj)))
+
+    def handle_obj(obj: Dict[str, Any]) -> None:
+        merged_at = parse_dt(
+            obj.get("mergedDate")
+            or obj.get("mergedAt")
+            or obj.get("performedAt")
+            or obj.get("date")
+            or obj.get("createdAt")
+            or obj.get("createdDate")
+            or obj.get("lastUpdate")
+            or obj.get("last_update")
+        )
+
+        # formato ticketId (pai) + mergedTicketId (filho)
+        if obj.get("ticketId") is not None and (obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None):
+            parent_id = to_int(obj.get("ticketId"))
+            child_id = to_int(obj.get("mergedTicketId") or obj.get("mergedTicketID"))
+            if parent_id is not None and child_id is not None:
+                add_row(child_id, parent_id, merged_at, obj)
+            return
+
+        # formato mergedIntoId (pai)
+        merged_into = (
+            obj.get("mergedIntoId")
+            or obj.get("mergedIntoTicketId")
+            or obj.get("mainTicketId")
+            or obj.get("mainTicketID")
+            or obj.get("principalTicketId")
+            or obj.get("principalId")
+            or obj.get("mergedInto")
+        )
+        if merged_into is not None:
+            parent_id = to_int(merged_into)
+            child_guess = to_int(obj.get("ticketId")) or to_int(obj.get("id")) or int(queried_id)
+            if parent_id is not None and child_guess is not None:
+                add_row(int(child_guess), int(parent_id), merged_at, obj)
+            return
+
+        # formato lista de filhos no pai
+        merged_ids = to_int_list(obj.get("mergedTicketsIds") or obj.get("mergedTicketsIDs") or obj.get("mergedTicketsIdsList"))
+        if not merged_ids:
+            mt = obj.get("mergedTickets") or obj.get("mergedTicketsList")
+            if isinstance(mt, list):
+                tmp: List[int] = []
+                for it in mt:
+                    if isinstance(it, dict):
+                        tid = to_int(it.get("id") or it.get("ticketId") or it.get("ticketID") or it.get("ticket_id"))
+                        if tid is not None:
+                            tmp.append(tid)
+                merged_ids = tmp
+
+        if merged_ids:
+            parent_guess = to_int(obj.get("ticketId") or obj.get("id") or obj.get("ticket_id")) or int(queried_id)
+            for child_id in merged_ids:
+                add_row(int(child_id), int(parent_guess), merged_at, obj)
+            return
+
+    if isinstance(payload_any, dict):
+        handle_obj(payload_any)
+    elif isinstance(payload_any, list):
+        for it in payload_any:
             if isinstance(it, dict):
-                out.extend(extract_merge_rows(queried_id, it))
-    # dedup por ticket_id (filho)
+                handle_obj(it)
+
     dedup: Dict[int, Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = {}
     for r in out:
         dedup[int(r[0])] = r
@@ -439,7 +398,7 @@ def extract_rows_from_any(data: Any, queried_id: int) -> List[Tuple[int, int, Op
 # -------------------------
 # Main
 # -------------------------
-def main():
+def main() -> None:
     logging.basicConfig(level=env_str("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("sync-tickets-merged")
 
@@ -447,25 +406,27 @@ def main():
     base_url = env_str("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
     neon_dsn = env_str("NEON_DSN")
 
-    # destino
     dst_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
     dst_table = env_str("TABLE_NAME", "tickets_mesclados")
 
-    # origem (só pra âncora)
     src_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
     src_table = env_str("SOURCE_TABLE", "tickets_suporte")
     src_date_col = env_str("SOURCE_DATE_COL", "updated_at")
 
-    # execução
-    limit = env_int("MAX_IDS", 50)  # mantive o nome MAX_IDS pra não quebrar seu yml antigo
-    limit = max(1, min(100, limit))  # API lista no máximo 100 por página (Movidesk)
+    page_size = env_int("PAGE_SIZE", 50)
+    pages = env_int("PAGES", 2)
+    page_size = max(1, min(100, page_size))
+    pages = max(1, min(10, pages))
+
     rpm = env_float("RPM", 10.0)
     throttle = 60.0 / rpm if rpm > 0 else 0.0
     http_timeout = env_int("HTTP_TIMEOUT", 45)
-
     merged_query_keys = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if k.strip()]
 
-    log.info("script_version=%s limit=%d rpm=%.2f", SCRIPT_VERSION, limit, rpm)
+    log_every_ticket = env_bool("LOG_EVERY_TICKET", True)
+
+    log.info("script_version=%s page_size=%d pages=%d rpm=%.2f log_every_ticket=%s",
+             SCRIPT_VERSION, page_size, pages, rpm, log_every_ticket)
 
     sess = requests.Session()
     sess.headers.update({"Accept": "application/json"})
@@ -481,44 +442,54 @@ def main():
 
         log.info("anchor_ts_db_max=%s (%s.%s.%s)", anchor_ts.isoformat(), src_schema, src_table, src_date_col)
 
-        # 2) pega 50 tickets mais recentes da API até a âncora
-        candidates, chosen, last_err = list_recent_tickets_from_api_up_to_anchor(
+        candidates, chosen, last_err = list_recent_tickets_paged_up_to_anchor(
             sess=sess,
             base_url=base_url,
             token=token,
             anchor_ts=anchor_ts,
-            limit=limit,
+            page_size=page_size,
+            pages=pages,
             timeout=http_timeout,
             log=log,
         )
-
         log.info("api_candidates=%d chosen=%s last_err=%s", len(candidates), chosen, (last_err or ""))
 
         if not candidates:
             log.info("done_no_candidates")
             return
 
-        # 3) consulta merged para cada candidato e grava
         status_counts: Dict[int, int] = {}
         rows_map: Dict[int, Tuple[int, int, Optional[dt.datetime], psycopg2.extras.Json]] = {}
 
         checked = 0
         found = 0
 
-        for (ticket_id, upd) in candidates:
-            checked += 1
+        total = len(candidates)
 
-            data, st = movidesk_get_merged(sess, base_url, token, int(ticket_id), http_timeout, merged_query_keys)
+        for idx, (ticket_id, upd) in enumerate(candidates, start=1):
+            checked += 1
+            if log_every_ticket:
+                log.info("checking_ticket %d/%d ticket_id=%s api_lastUpdate=%s", idx, total, ticket_id, upd.isoformat() if upd else None)
+
+            payload, st, used_key = movidesk_get_merged_raw(
+                sess=sess,
+                base_url=base_url,
+                token=token,
+                ticket_id=int(ticket_id),
+                timeout=http_timeout,
+                query_keys=merged_query_keys,
+            )
             if st is not None:
                 status_counts[st] = status_counts.get(st, 0) + 1
 
-            rows = extract_rows_from_any(data, int(ticket_id))
+            rows = extract_rows_from_merge_payload(int(ticket_id), payload)
+            if log_every_ticket:
+                log.info("merged_result ticket_id=%s status=%s key=%s rows=%d", ticket_id, st, used_key, len(rows))
+
             if rows:
                 found += len(rows)
                 for r in rows:
-                    # dedup por ticket_id filho + pick_row por data
-                    old = rows_map.get(int(r[0]))
-                    rows_map[int(r[0])] = pick_row(old, r)
+                    rows_map[int(r[0])] = r
 
             if throttle > 0:
                 time.sleep(throttle)
@@ -528,7 +499,10 @@ def main():
 
         log.info(
             "done checked=%d merges_found=%d upserted=%d statuses=%s",
-            checked, found, upserted, json.dumps(status_counts, ensure_ascii=False),
+            checked,
+            found,
+            upserted,
+            json.dumps(status_counts, ensure_ascii=False),
         )
 
     except Exception:
