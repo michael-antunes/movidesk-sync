@@ -1,28 +1,24 @@
-name: Movidesk - Tickets mesclados (merged) (API candidates loop)
+name: Movidesk - Tickets mesclados (merged)
 
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
-      tickets_per_run:
-        description: "Quantos tickets (atualizados) puxar da API por execução"
+      lookback_hours:
+        description: "LEGADO (não usado). A âncora agora é max(updated_at) do banco."
         required: true
-        default: "50"
+        default: "2"
       rpm:
-        description: "Requests por minuto (Movidesk normalmente 10)"
+        description: "Requests por minuto"
         required: true
         default: "10"
-      overlap_minutes:
-        description: "Overlap (min) pra não perder atualizações"
+      max_ids:
+        description: "Quantos tickets mais recentes buscar na API (top N)"
         required: true
-        default: "60"
-      bootstrap_lookback_hours:
-        description: "Se não existir cursor, busca desde (horas atrás)"
-        required: true
-        default: "48"
+        default: "50"
 
-# grupo único => não espera outros workflows
 concurrency:
-  group: movidesk-merged-api-candidates-${{ github.ref }}
+  group: movidesk-merged-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -30,10 +26,11 @@ permissions:
   actions: write
 
 jobs:
-  run:
+  merged:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - run: date -u && echo "Branch=$GITHUB_REF"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -45,28 +42,26 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_API_BASE: https://api.movidesk.com/public/v1
 
+          RPM: ${{ github.event.inputs.rpm || '10' }}
+          MAX_IDS: ${{ github.event.inputs.max_ids || '50' }}
+
           DB_SCHEMA: visualizacao_resolvidos
           TABLE_NAME: tickets_mesclados
 
-          CONTROL_SCHEMA: visualizacao_resolvidos
-          CONTROL_TABLE: sync_control_tickets_merged_api
-
-          TICKETS_PER_RUN: ${{ github.event.inputs.tickets_per_run }}
-          RPM: ${{ github.event.inputs.rpm }}
-          OVERLAP_MINUTES: ${{ github.event.inputs.overlap_minutes }}
-          BOOTSTRAP_LOOKBACK_HOURS: ${{ github.event.inputs.bootstrap_lookback_hours }}
+          SOURCE_SCHEMA: dados_gerais
+          SOURCE_TABLE: tickets_suporte
+          SOURCE_DATE_COL: updated_at
 
           MERGED_QUERY_KEYS: "ticketId,id,q"
           HTTP_TIMEOUT: "45"
-          LOG_LEVEL: "INFO"
+
+          LOG_LEVEL: INFO
         run: python sync_tickets_merged.py
 
   rerun:
-    needs: run
-    if: ${{ needs.run.result == 'success' }}
+    needs: merged
+    if: ${{ needs.merged.result == 'success' }}
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
     steps:
       - uses: actions/github-script@v7
         with:
@@ -78,9 +73,8 @@ jobs:
               workflow_id: 'sync_tickets_merged.yml',
               ref: 'main',
               inputs: {
-                tickets_per_run: inputs.tickets_per_run || '50',
+                lookback_hours: inputs.lookback_hours || '2',
                 rpm: inputs.rpm || '10',
-                overlap_minutes: inputs.overlap_minutes || '60',
-                bootstrap_lookback_hours: inputs.bootstrap_lookback_hours || '48'
+                max_ids: inputs.max_ids || '50'
               }
-            });
+            })
