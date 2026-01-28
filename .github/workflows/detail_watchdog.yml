@@ -5,8 +5,13 @@ on:
     - cron: "*/20 * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: detail-watchdog-loop
+  cancel-in-progress: false
+
 permissions:
   contents: read
+  actions: write
 
 jobs:
   detail_watchdog:
@@ -26,9 +31,36 @@ jobs:
         run: pip install requests psycopg2-binary
 
       - name: Sync resolved/closed/cancelled detail (watchdog)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python sync_resolved_detail.py | tee detail_out.txt
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
+          MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN || secrets.MOVIDESK_API_TOKEN }}
           DETAIL_BULK_LIMIT: "200"
           DETAIL_MISSING_LIMIT: "10"
-        run: python sync_resolved_detail.py
+
+      - name: Check done
+        shell: bash
+        env:
+          NEON_DSN: ${{ secrets.NEON_DSN }}
+        run: |
+          set -euo pipefail
+          DONE=$(python -c 'import os,psycopg2; dsn=os.environ["NEON_DSN"]; c=psycopg2.connect(dsn); cur=c.cursor(); cur.execute("select case when count(*)=0 then 1 else 0 end from visualizacao_resolvidos.audit_recent_missing"); r=cur.fetchone(); cur.close(); c.close(); print(r[0] if r else 1)')
+          echo "done=${DONE}" | tee done_out.txt
+
+      - name: Dispatch self if not done
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q "done=1" done_out.txt; then
+            exit 0
+          fi
+          curl -L -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/detail_watchdog.yml/dispatches \
+            -d '{"ref":"${{ github.ref_name }}"}'
