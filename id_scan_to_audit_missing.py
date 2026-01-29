@@ -214,24 +214,30 @@ def update_run(cur, run_id, total_api, missing_total):
     )
 
 def read_control(cur):
-    cur.execute(f"SELECT id_final, id_inicial, id_atual FROM {SCHEMA}.range_scan_control LIMIT 1")
+    cur.execute(f"SELECT id_inicial, id_final, id_atual FROM {SCHEMA}.range_scan_control LIMIT 1")
     row = cur.fetchone()
     if not row:
         raise RuntimeError(f"{SCHEMA}.range_scan_control sem linhas")
-    id_final, id_inicial, id_atual = row
-    if id_final is None or id_inicial is None:
-        raise RuntimeError(f"{SCHEMA}.range_scan_control precisa de id_inicial e id_final preenchidos")
-    id_final = int(id_final)
-    id_inicial = int(id_inicial)
+    id_inicial, id_final, id_atual = row
+    if id_inicial is None or id_final is None:
+        raise RuntimeError(f"{SCHEMA}.range_scan_control precisa de id_inicial (maior) e id_final (menor)")
+    high_bound = int(id_inicial)
+    low_bound = int(id_final)
+
+    if high_bound < low_bound:
+        raise RuntimeError("range_scan_control inválido: id_inicial (maior) < id_final (menor)")
+
     if id_atual is None:
-        id_atual = id_final
+        cursor = high_bound
     else:
-        id_atual = int(id_atual)
-    if id_atual > id_final:
-        id_atual = id_final
-    if id_atual < id_inicial:
-        id_atual = id_inicial
-    return id_final, id_inicial, id_atual
+        cursor = int(id_atual)
+
+    if cursor > high_bound:
+        cursor = high_bound
+    if cursor < low_bound:
+        cursor = high_bound
+
+    return high_bound, low_bound, cursor
 
 def set_cursor(cur, new_cursor):
     cur.execute(f"UPDATE {SCHEMA}.range_scan_control SET id_atual=%s", (int(new_cursor),))
@@ -260,7 +266,7 @@ def main():
     ensure_missing_unique_index()
 
     run_id = run_db_txn(create_run)
-    id_final, id_inicial, cursor = run_db_txn(read_control)
+    high_bound, low_bound, cursor = run_db_txn(read_control)
 
     session = requests.Session()
     session.headers.update({"Accept": "application/json"})
@@ -269,10 +275,12 @@ def main():
     missing_upserts = 0
     loops = 0
 
-    while loops < LOOPS and cursor >= id_inicial:
+    logger.info("control high=%s low=%s cursor=%s batch=%s", high_bound, low_bound, cursor, BATCH_SIZE)
+
+    while loops < LOOPS and cursor >= low_bound:
         loops += 1
         high_id = cursor
-        low_id = max(id_inicial, cursor - BATCH_SIZE + 1)
+        low_id = max(low_bound, cursor - BATCH_SIZE + 1)
 
         meta = {}
         meta.update(api_list_meta(session, "tickets", low_id, high_id))
@@ -320,6 +328,7 @@ def main():
 
             missing = set(missing_new) | set(stale)
             upserted = upsert_missing(cur, run_id, missing)
+
             new_cursor = low_id - 1
             set_cursor(cur, new_cursor)
 
@@ -338,7 +347,7 @@ def main():
         logger.info(msg)
 
         cursor = new_cursor
-        if cursor < id_inicial:
+        if cursor < low_bound:
             break
 
     run_db_txn(lambda cur: update_run(cur, run_id, api_total, missing_upserts))
