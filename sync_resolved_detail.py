@@ -64,9 +64,6 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
-# -----------------------
-# DB helpers
-# -----------------------
 def pg_connect(dsn: str):
     return psycopg2.connect(
         dsn,
@@ -115,6 +112,18 @@ def db_try(logger: logging.Logger, dsn: str, fn, label: str) -> bool:
     except Exception as e:
         logger.info(f"detail: DB falhou em {label}: {type(e).__name__}: {e}")
         return False
+
+
+
+
+def db_try_err(logger: logging.Logger, dsn: str, fn, label: str):
+    try:
+        db_run(dsn, fn)
+        return True, None
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        logger.info(f"detail: DB falhou em {label}: {msg}")
+        return False, msg
 
 
 def should_send_to_excluidos(status_code: int | None, err: str | None) -> bool:
@@ -220,7 +229,6 @@ def get_primary_key_columns(conn, schema: str, table: str):
 
 
 def get_fk_target_column(conn, schema: str, table: str, column: str) -> str | None:
-    # Descobre a coluna referenciada pelo FK do (schema.table.column)
     row = pg_one(
         conn,
         """
@@ -245,9 +253,6 @@ def get_fk_target_column(conn, schema: str, table: str, column: str) -> str | No
     return (row[0] if row else None)
 
 
-# -----------------------
-# HTTP helpers
-# -----------------------
 def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
     last_exc = None
     last_resp = None
@@ -384,9 +389,6 @@ def is_timeout_like(status_code: int | None, err: str | None):
     return ("readtimeout" in e) or ("timed out" in e) or ("timeout" in e)
 
 
-# -----------------------
-# Detail table helpers
-# -----------------------
 def get_detail_table_info(conn):
     schema = "visualizacao_resolvidos"
     table = "tickets_resolvidos_detail"
@@ -486,16 +488,12 @@ def upsert_too_big(conn, ticket_id: int, base_status: str | None, last_update: s
         cur.execute(sql, values)
 
 
-# -----------------------
-# Audit tables
-# -----------------------
 def ensure_audit_tables(conn, logger: logging.Logger):
     schema = os.getenv("AUDIT_SCHEMA", "visualizacao_resolvidos")
 
     with conn.cursor() as cur:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
-        # Se não existir, cria com window_start/window_end como timestamptz (igual seu erro mostrou)
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {schema}.audit_recent_run
@@ -603,7 +601,6 @@ def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
     cols = set(info.keys())
     ext = int(ctx["external_run_id"])
 
-    # tenta achar um registro existente deste run_id
     if "run_id" in cols:
         row = pg_one(conn, f"SELECT id FROM {schema}.{table} WHERE run_id=%s ORDER BY id DESC LIMIT 1", [ext])
         if row:
@@ -622,7 +619,6 @@ def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
         insert_cols.append(col)
         insert_vals.append("now()")
 
-    # básicos
     if "created_at" in cols:
         add_now("created_at")
     if "run_id" in cols:
@@ -642,7 +638,6 @@ def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
     if "max_actions" in cols:
         add_param("max_actions", int(ctx.get("max_actions") or 0))
 
-    # window_start/window_end: se forem timestamp => now(); se forem numéricos => usa ids
     for colname, id_key in (("window_start", "window_start_id"), ("window_end", "window_end_id")):
         if colname in cols:
             dt = (info[colname]["data_type"] or "").lower()
@@ -653,7 +648,6 @@ def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
             else:
                 add_param(colname, str(ctx.get(id_key) or ""))
 
-    # ids separados (se existirem)
     if "window_start_id" in cols:
         add_param("window_start_id", int(ctx.get("window_start_id") or 0))
     if "window_end_id" in cols:
@@ -661,7 +655,6 @@ def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
     if "window_center_id" in cols:
         add_param("window_center_id", int(ctx.get("window_center_id") or 0))
 
-    # preenche qualquer NOT NULL sem default que ainda falte
     for col, meta in info.items():
         if col in insert_cols:
             continue
@@ -715,7 +708,6 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     if "ticket_id" in cols:
         add_param("ticket_id", int(ticket_id))
 
-    # decide o valor correto de run_id conforme FK (audit_recent_missing.run_id -> audit_recent_run.id OU run_id)
     run_id_value = None
     fk_target = ctx.get("missing_fk_target")
     if fk_target == "id":
@@ -723,7 +715,6 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     elif fk_target == "run_id":
         run_id_value = ctx.get("external_run_id")
     else:
-        # fallback seguro
         run_id_value = ctx.get("run_db_id") or ctx.get("external_run_id")
 
     if "run_id" in cols and run_id_value is not None:
@@ -748,7 +739,6 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     if "last_error" in cols:
         add_param("last_error", error_text)
 
-    # preenche NOT NULL sem default
     for col, meta in info.items():
         if col in insert_cols:
             continue
@@ -784,7 +774,6 @@ def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: i
     if "table_name" in cols:
         updates.append("table_name=EXCLUDED.table_name")
 
-    # tenta usar PK se existir; se não existir, usa ticket_id como conflito
     pk = get_primary_key_columns(conn, schema, table)
     conflict_cols = pk if pk else (["ticket_id"] if "ticket_id" in cols else [])
 
@@ -809,9 +798,6 @@ def audit_delete(conn, audit_fqn: str, ticket_id: int):
         cur.execute(f"DELETE FROM {schema}.{table} WHERE ticket_id=%s", [int(ticket_id)])
 
 
-# -----------------------
-# main
-# -----------------------
 def main():
     logger = setup_logger()
 
@@ -837,7 +823,6 @@ def main():
     meta_read_timeout = _env_int("DETAIL_META_READ_TIMEOUT", 20)
     meta_timeout = (connect_timeout, meta_read_timeout)
 
-    # default 150 como você pediu
     max_actions = _env_int("DETAIL_MAX_ACTIONS", 150)
     big_after_attempts = _env_int("DETAIL_BIG_AFTER_ATTEMPTS", 2)
 
@@ -883,7 +868,6 @@ def main():
             [missing_limit],
         )
 
-        # descobre FK do missing.run_id
         fk_target = get_fk_target_column(conn, schema, table, "run_id") if "run_id" in get_table_columns(conn, schema, table) else None
         return run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows, fk_target
 
@@ -895,7 +879,6 @@ def main():
     ctx["window_center_id"] = last_id
     ctx["missing_fk_target"] = fk_target  # pode ser 'id' ou 'run_id' ou None
 
-    # garante run no banco (e pega id se existir)
     ctx["run_db_id"] = db_run(dsn, lambda conn: audit_run_ensure(conn, run_fqn, ctx))
 
     session = requests.Session()
@@ -906,9 +889,6 @@ def main():
     total_missing = 0
     total_big = 0
 
-    # -----------------------
-    # Janela
-    # -----------------------
     flt_window = (
         f"id gt {lower} and id le {upper} and "
         f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
@@ -951,14 +931,15 @@ def main():
             total_missing += 1
             continue
 
-        db_try(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(window)")
-        db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(window)")
-        total_ok += 1
-        total_window += 1
+        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(window)")
+        if ok_db:
+            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(window)")
+            total_ok += 1
+            total_window += 1
+        else:
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_window)")
+            total_missing += 1
 
-    # -----------------------
-    # Novos (id > last_id)
-    # -----------------------
     flt_new = (
         f"id gt {last_id} and "
         f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
@@ -999,14 +980,15 @@ def main():
             total_missing += 1
             continue
 
-        db_try(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(new)")
-        db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(new)")
-        total_ok += 1
-        total_new += 1
+        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(new)")
+        if ok_db:
+            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(new)")
+            total_ok += 1
+            total_new += 1
+        else:
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_new)")
+            total_missing += 1
 
-    # -----------------------
-    # Pendentes (audit_recent_missing)
-    # -----------------------
     pend_ids = [(int(r[0]), int(r[1] or 0), str(r[2] or "")) for r in pend_rows]
     logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
 
@@ -1055,9 +1037,13 @@ def main():
             total_missing += 1
             continue
 
-        db_try(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(pending)")
-        db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending)")
-        total_ok += 1
+        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(pending)")
+        if ok_db:
+            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending)")
+            total_ok += 1
+        else:
+            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_pending)")
+            total_missing += 1
 
     logger.info(
         f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), "
