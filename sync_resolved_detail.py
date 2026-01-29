@@ -2,42 +2,17 @@ import os
 import sys
 import time
 import logging
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 import psycopg2
 from psycopg2.extras import Json
 
-from sync_tickets_excluidos import ensure_tables as excluidos_ensure_tables
-from sync_tickets_excluidos import upsert_excluidos as excluidos_upsert_excluidos
-from sync_tickets_excluidos import now_utc as excluidos_now_utc
-
 API_BASE = "https://api.movidesk.com/public/v1"
 
-BASE_STATUSES = ("Resolved", "Closed", "Canceled")
 
-SELECT_LIST = "id,baseStatus,lastUpdate,isDeleted,actionCount"
-SELECT_META = "id,baseStatus,lastUpdate,isDeleted,actionCount"
-SELECT_DETAIL = (
-    "id,protocol,type,subject,category,urgency,status,baseStatus,justification,origin,"
-    "createdDate,isDeleted,owner,ownerTeam,createdBy,serviceFull,serviceFirstLevel,"
-    "serviceSecondLevel,serviceThirdLevel,contactForm,tags,cc,resolvedIn,closedIn,"
-    "canceledIn,actionCount,reopenedIn,lastActionDate,lastUpdate,clients,statusHistories,"
-    "customFieldValues"
-)
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or str(v).strip() == "":
-        return default
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return default
-
-
-def mask_token(url: str) -> str:
+def mask_token(url):
     try:
         p = urlparse(url)
         qs = parse_qsl(p.query, keep_blank_values=True)
@@ -52,102 +27,52 @@ def mask_token(url: str) -> str:
         return url
 
 
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("detail")
+def env_int(name, default):
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def parse_ts(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def setup_logger():
+    logger = logging.getLogger("movidesk-detail")
     logger.setLevel(logging.INFO)
     h = logging.StreamHandler(sys.stdout)
     h.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    h.setFormatter(fmt)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     if not logger.handlers:
         logger.addHandler(h)
     return logger
 
 
-def pg_connect(dsn: str):
+def pg_connect(dsn):
     return psycopg2.connect(
         dsn,
-        connect_timeout=int(os.getenv("PGCONNECT_TIMEOUT", "15")),
+        connect_timeout=env_int("PGCONNECT_TIMEOUT", 15),
         application_name=os.getenv("PGAPPNAME", "movidesk-detail"),
-        keepalives=1,
-        keepalives_idle=int(os.getenv("PGKEEPALIVES_IDLE", "30")),
-        keepalives_interval=int(os.getenv("PGKEEPALIVES_INTERVAL", "10")),
-        keepalives_count=int(os.getenv("PGKEEPALIVES_COUNT", "5")),
     )
-
-
-def db_run(dsn: str, fn):
-    for i in (1, 2):
-        conn = None
-        try:
-            conn = pg_connect(dsn)
-            conn.autocommit = False
-            res = fn(conn)
-            try:
-                conn.commit()
-            except Exception:
-                pass
-            return res
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            if i == 1:
-                continue
-            raise
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-
-def db_try(logger: logging.Logger, dsn: str, fn, label: str) -> bool:
-    try:
-        db_run(dsn, fn)
-        return True
-    except Exception as e:
-        logger.info(f"detail: DB falhou em {label}: {type(e).__name__}: {e}")
-        return False
-
-
-
-
-def db_try_err(logger: logging.Logger, dsn: str, fn, label: str):
-    try:
-        db_run(dsn, fn)
-        return True, None
-    except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        logger.info(f"detail: DB falhou em {label}: {msg}")
-        return False, msg
-
-
-def should_send_to_excluidos(status_code: int | None, err: str | None) -> bool:
-    if status_code in (404, 410):
-        return True
-    if status_code == 200 and (err is None or str(err).strip() == ""):
-        return True
-    return False
-
-
-def send_to_excluidos(logger: logging.Logger, dsn: str, ticket_id: int, status_code: int | None, err: str | None) -> bool:
-    item = {
-        "id": int(ticket_id),
-        "lastUpdate": excluidos_now_utc().isoformat(),
-        "api_not_found": True,
-        "last_status": status_code,
-        "last_error": (err or ""),
-    }
-
-    def fn(conn):
-        excluidos_ensure_tables(conn)
-        excluidos_upsert_excluidos(conn, [item])
-
-    return db_try(logger, dsn, fn, "send_to_excluidos")
 
 
 def pg_one(conn, sql, params=None):
@@ -156,646 +81,136 @@ def pg_one(conn, sql, params=None):
         return cur.fetchone()
 
 
-def pg_all(conn, sql, params=None):
+def pg_exec(conn, sql, params=None):
     with conn.cursor() as cur:
         cur.execute(sql, params or [])
-        return cur.fetchall()
 
 
-def get_table_columns(conn, schema: str, table: str):
-    rows = pg_all(
-        conn,
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s
-        """,
-        [schema, table],
-    )
-    return {r[0] for r in rows}
-
-
-def get_columns_info(conn, schema: str, table: str):
-    rows = pg_all(
-        conn,
-        """
-        SELECT column_name, data_type, is_nullable, column_default
-        FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s
-        ORDER BY ordinal_position
-        """,
-        [schema, table],
-    )
-    info = {}
-    for name, dtype, is_nullable, coldef in rows:
-        info[name] = {
-            "data_type": (dtype or "").lower(),
-            "nullable": (is_nullable == "YES"),
-            "default": coldef,
-        }
-    return info
-
-
-def get_column_type(conn, schema: str, table: str, column: str) -> str | None:
-    row = pg_one(
-        conn,
-        """
-        SELECT data_type
-        FROM information_schema.columns
-        WHERE table_schema=%s AND table_name=%s AND column_name=%s
-        """,
-        [schema, table, column],
-    )
-    return (row[0] if row else None)
-
-
-def get_primary_key_columns(conn, schema: str, table: str):
-    rowset = pg_all(
-        conn,
-        """
-        SELECT a.attname
-        FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE n.nspname = %s
-          AND c.relname = %s
-          AND i.indisprimary
-        ORDER BY array_position(i.indkey, a.attnum)
-        """,
-        [schema, table],
-    )
-    return [r[0] for r in rowset]
-
-
-def get_fk_target_column(conn, schema: str, table: str, column: str) -> str | None:
-    row = pg_one(
-        conn,
-        """
-        SELECT att2.attname AS ref_column
-        FROM pg_constraint con
-        JOIN pg_class rel ON rel.oid = con.conrelid
-        JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
-        JOIN pg_class rel2 ON rel2.oid = con.confrelid
-        JOIN pg_namespace nsp2 ON nsp2.oid = rel2.relnamespace
-        JOIN unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord) ON TRUE
-        JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = ck.attnum
-        JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = ck.ord
-        JOIN pg_attribute att2 ON att2.attrelid = rel2.oid AND att2.attnum = fk.attnum
-        WHERE con.contype = 'f'
-          AND nsp.nspname = %s
-          AND rel.relname = %s
-          AND att.attname = %s
-        LIMIT 1
-        """,
-        [schema, table, column],
-    )
-    return (row[0] if row else None)
-
-
-def request_with_retry(session: requests.Session, logger: logging.Logger, method: str, url: str, params: dict, timeout: tuple, attempts: int):
-    last_exc = None
-    last_resp = None
+def request_with_retry(session, logger, url, params, attempts, timeout):
+    last = None
     for i in range(1, attempts + 1):
         try:
-            req = requests.Request(method=method, url=url, params=params)
+            req = requests.Request("GET", url, params=params)
             prepped = session.prepare_request(req)
-            masked = mask_token(prepped.url)
             resp = session.send(prepped, timeout=timeout)
-            last_resp = resp
-            logger.info(f"GET {masked} -> {resp.status_code} (attempt {i}/{attempts})")
+            logger.info(f"GET {mask_token(prepped.url)} -> {resp.status_code} (attempt {i}/{attempts})")
             if resp.status_code in (408, 429, 500, 502, 503, 504):
-                if i == attempts:
-                    return resp
-                time.sleep(min(30, 2 ** (i - 1)))
-                continue
+                if i < attempts:
+                    time.sleep(min(30, 2 ** (i - 1)))
+                    continue
             return resp
         except Exception as e:
-            last_exc = e
+            last = e
             logger.info(f"GET {mask_token(url)} -> EXC (attempt {i}/{attempts}): {type(e).__name__}: {e}")
-            if i == attempts:
-                break
-            time.sleep(min(30, 2 ** (i - 1)))
-            continue
-    if last_resp is not None:
-        return last_resp
-    raise last_exc if last_exc else RuntimeError("request failed")
+            if i < attempts:
+                time.sleep(min(30, 2 ** (i - 1)))
+                continue
+            raise
+    if last:
+        raise last
 
 
-def list_tickets(session: requests.Session, logger: logging.Logger, token: str, flt: str, select: str, timeout: tuple, attempts: int, top: int | None = None, orderby: str | None = None):
-    params = {"$filter": flt, "$select": select, "includeDeletedItems": "true", "token": token}
-    if top is not None:
-        params["$top"] = str(top)
-    if orderby:
-        params["$orderby"] = orderby
-    try:
-        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
-    except Exception as exc:
-        return [], None, f"{type(exc).__name__}: {exc}"
-    if resp is None:
-        return [], None, "request failed"
-    if resp.status_code != 200:
+def fetch_ticket_detail(session, logger, token, ticket_id, attempts, timeout):
+    params = {"id": str(ticket_id), "includeDeletedItems": "true", "token": token}
+    r = request_with_retry(session, logger, f"{API_BASE}/tickets", params, attempts, timeout)
+    if r.status_code == 200:
         try:
-            body = resp.text
+            data = r.json()
         except Exception:
-            body = ""
-        return [], resp.status_code, body
-    try:
-        data = resp.json()
-    except Exception:
-        return [], resp.status_code, resp.text
-    if isinstance(data, list):
-        return data, 200, None
-    return [], 200, None
-
-
-def get_ticket_meta(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
-    flt = f"id eq {int(ticket_id)}"
-    params = {"$filter": flt, "$select": SELECT_META, "includeDeletedItems": "true", "token": token, "$top": "1"}
-    try:
-        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
-    except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}"
-    if resp is None:
-        return None, None, "request failed"
-    if resp.status_code == 200:
+            return None, r.status_code, r.text
+        if isinstance(data, dict):
+            return data, 200, None
+        if isinstance(data, list) and data:
+            return data[0], 200, None
+        return None, 200, None
+    if r.status_code != 404:
         try:
-            data = resp.json()
+            return None, r.status_code, r.text
         except Exception:
-            return None, 200, resp.text
+            return None, r.status_code, None
+
+    params2 = {"$filter": f"id eq {int(ticket_id)}", "includeDeletedItems": "true", "token": token}
+    r2 = request_with_retry(session, logger, f"{API_BASE}/tickets/past", params2, attempts, timeout)
+    if r2.status_code == 200:
+        try:
+            data = r2.json()
+        except Exception:
+            return None, 200, r2.text
+        if isinstance(data, dict):
+            return data, 200, None
         if isinstance(data, list) and data:
             return data[0], 200, None
         return None, 200, None
     try:
-        return None, resp.status_code, resp.text
+        return None, r2.status_code, r2.text
     except Exception:
-        return None, resp.status_code, None
+        return None, r2.status_code, None
 
 
-def get_ticket_detail(session: requests.Session, logger: logging.Logger, token: str, ticket_id: int, timeout: tuple, attempts: int):
-    params = {"id": str(ticket_id), "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
-    try:
-        resp = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets", params, timeout, attempts)
-    except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}"
-
-    if resp is None:
-        return None, None, "request failed"
-
-    if resp.status_code == 200:
-        try:
-            return resp.json(), 200, None
-        except Exception:
-            return None, 200, resp.text
-
-    if resp.status_code != 404:
-        try:
-            return None, resp.status_code, resp.text
-        except Exception:
-            return None, resp.status_code, None
-
-    params2 = {"$filter": f"id eq {int(ticket_id)}", "$select": SELECT_DETAIL, "includeDeletedItems": "true", "token": token}
-    try:
-        resp2 = request_with_retry(session, logger, "GET", f"{API_BASE}/tickets/past", params2, timeout, attempts)
-    except Exception as exc:
-        return None, None, f"{type(exc).__name__}: {exc}"
-
-    if resp2 is None:
-        return None, None, "request failed"
-
-    if resp2.status_code != 200:
-        try:
-            return None, resp2.status_code, resp2.text
-        except Exception:
-            return None, resp2.status_code, None
-
-    try:
-        data = resp2.json()
-    except Exception:
-        return None, 200, resp2.text
-
-    if isinstance(data, list) and data:
-        return data[0], 200, None
-
-    return None, 404, None
-
-
-def is_timeout_like(status_code: int | None, err: str | None):
-    if status_code in (408, 429, 500, 502, 503, 504):
-        return True
-    if not err:
-        return False
-    e = err.lower()
-    return ("readtimeout" in e) or ("timed out" in e) or ("timeout" in e)
-
-
-def get_detail_table_info(conn):
-    schema = "visualizacao_resolvidos"
-    table = "tickets_resolvidos_detail"
-    cols = get_table_columns(conn, schema, table)
-
-    raw_col = None
-    for c in ("raw", "raw_json", "payload", "data"):
-        if c in cols:
-            raw_col = c
-            break
-    if raw_col is None:
-        raise RuntimeError(f"Nenhuma coluna de JSON encontrada em {schema}.{table} (raw/raw_json/payload/data)")
-
-    dt = (get_column_type(conn, schema, table, raw_col) or "").lower()
-    raw_is_json = dt in ("json", "jsonb")
-    return cols, raw_col, raw_is_json
-
-
-def upsert_detail(conn, ticket: dict, cols: set[str], raw_col: str, raw_is_json: bool):
-    schema = "visualizacao_resolvidos"
-    table = "tickets_resolvidos_detail"
-
-    insert_cols = ["ticket_id", raw_col]
-    placeholders = ["%s", "%s"]
-
-    raw_val = Json(ticket) if raw_is_json else str(ticket)
-    values = [int(ticket.get("id")), raw_val]
-
-    base_status = ticket.get("baseStatus")
-    last_update = ticket.get("lastUpdate")
-
-    if "base_status" in cols:
-        insert_cols.append("base_status")
-        placeholders.append("%s")
-        values.append(base_status)
-    if "last_update" in cols:
-        insert_cols.append("last_update")
-        placeholders.append("%s")
-        values.append(last_update)
-    if "updated_at" in cols:
-        insert_cols.append("updated_at")
-        placeholders.append("now()")
-
-    update_sets = [f"{raw_col}=EXCLUDED.{raw_col}"]
-    if "base_status" in cols:
-        update_sets.append("base_status=EXCLUDED.base_status")
-    if "last_update" in cols:
-        update_sets.append("last_update=EXCLUDED.last_update")
-    if "updated_at" in cols:
-        update_sets.append("updated_at=now()")
-
-    sql = f"""
-    INSERT INTO {schema}.{table} ({",".join(insert_cols)})
-    VALUES ({",".join(placeholders)})
-    ON CONFLICT (ticket_id) DO UPDATE SET {",".join(update_sets)}
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, values)
-
-
-def upsert_too_big(conn, ticket_id: int, base_status: str | None, last_update: str | None, cols: set[str], raw_col: str, raw_is_json: bool):
-    schema = "visualizacao_resolvidos"
-    table = "tickets_resolvidos_detail"
-
-    insert_cols = ["ticket_id", raw_col]
-    placeholders = ["%s", "%s"]
-
-    raw_val = Json("Ticket muito grande") if raw_is_json else "Ticket muito grande"
-    values = [int(ticket_id), raw_val]
-
-    if "base_status" in cols:
-        insert_cols.append("base_status")
-        placeholders.append("%s")
-        values.append(base_status)
-    if "last_update" in cols:
-        insert_cols.append("last_update")
-        placeholders.append("%s")
-        values.append(last_update)
-    if "updated_at" in cols:
-        insert_cols.append("updated_at")
-        placeholders.append("now()")
-
-    update_sets = [f"{raw_col}=EXCLUDED.{raw_col}"]
-    if "base_status" in cols:
-        update_sets.append("base_status=EXCLUDED.base_status")
-    if "last_update" in cols:
-        update_sets.append("last_update=EXCLUDED.last_update")
-    if "updated_at" in cols:
-        update_sets.append("updated_at=now()")
-
-    sql = f"""
-    INSERT INTO {schema}.{table} ({",".join(insert_cols)})
-    VALUES ({",".join(placeholders)})
-    ON CONFLICT (ticket_id) DO UPDATE SET {",".join(update_sets)}
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, values)
-
-
-def ensure_audit_tables(conn, logger: logging.Logger):
-    schema = os.getenv("AUDIT_SCHEMA", "visualizacao_resolvidos")
-
-    with conn.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {schema}.audit_recent_run
-            (
-              id bigserial PRIMARY KEY,
-              created_at timestamptz NOT NULL DEFAULT now(),
-              window_start timestamptz NOT NULL DEFAULT now(),
-              window_end timestamptz NOT NULL DEFAULT now(),
-              table_name text NOT NULL DEFAULT 'tickets_resolvidos_detail',
-              run_id bigint,
-              workflow text,
-              job text,
-              ref text,
-              sha text,
-              repo text,
-              max_actions integer,
-              window_start_id bigint,
-              window_end_id bigint,
-              window_center_id bigint
-            )
-            """
-        )
-
-        for col_ddl in (
-            "ADD COLUMN IF NOT EXISTS created_at timestamptz",
-            "ADD COLUMN IF NOT EXISTS window_start timestamptz",
-            "ADD COLUMN IF NOT EXISTS window_end timestamptz",
-            "ADD COLUMN IF NOT EXISTS table_name text",
-            "ADD COLUMN IF NOT EXISTS run_id bigint",
-            "ADD COLUMN IF NOT EXISTS workflow text",
-            "ADD COLUMN IF NOT EXISTS job text",
-            "ADD COLUMN IF NOT EXISTS ref text",
-            "ADD COLUMN IF NOT EXISTS sha text",
-            "ADD COLUMN IF NOT EXISTS repo text",
-            "ADD COLUMN IF NOT EXISTS max_actions integer",
-            "ADD COLUMN IF NOT EXISTS window_start_id bigint",
-            "ADD COLUMN IF NOT EXISTS window_end_id bigint",
-            "ADD COLUMN IF NOT EXISTS window_center_id bigint",
-        ):
-            cur.execute(f"ALTER TABLE {schema}.audit_recent_run {col_ddl}")
-
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {schema}.audit_recent_missing
-            (
-              ticket_id bigint PRIMARY KEY,
-              run_id bigint,
-              table_name text,
-              run_started_at timestamptz,
-              first_seen timestamptz NOT NULL DEFAULT now(),
-              last_seen timestamptz NOT NULL DEFAULT now(),
-              attempts integer NOT NULL DEFAULT 0,
-              last_attempt timestamptz,
-              last_status integer,
-              last_error text
-            )
-            """
-        )
-        for col_ddl in (
-            "ADD COLUMN IF NOT EXISTS ticket_id bigint",
-            "ADD COLUMN IF NOT EXISTS run_id bigint",
-            "ADD COLUMN IF NOT EXISTS table_name text",
-            "ADD COLUMN IF NOT EXISTS run_started_at timestamptz",
-            "ADD COLUMN IF NOT EXISTS first_seen timestamptz",
-            "ADD COLUMN IF NOT EXISTS last_seen timestamptz",
-            "ADD COLUMN IF NOT EXISTS attempts integer",
-            "ADD COLUMN IF NOT EXISTS last_attempt timestamptz",
-            "ADD COLUMN IF NOT EXISTS last_status integer",
-            "ADD COLUMN IF NOT EXISTS last_error text",
-        ):
-            cur.execute(f"ALTER TABLE {schema}.audit_recent_missing {col_ddl}")
-
-    logger.info(f"detail: audit_recent_missing em {schema}.audit_recent_missing")
-    return f"{schema}.audit_recent_run", f"{schema}.audit_recent_missing"
-
-
-def run_context(max_actions: int):
-    external_run_id = _env_int("GITHUB_RUN_ID", _env_int("RUN_ID", 0))
-    if external_run_id <= 0:
-        external_run_id = int(time.time())
-    return {
-        "external_run_id": int(external_run_id),
-        "table_name": "tickets_resolvidos_detail",
-        "workflow": os.getenv("GITHUB_WORKFLOW", "") or "",
-        "job": os.getenv("GITHUB_JOB", "") or "",
-        "ref": os.getenv("GITHUB_REF", "") or "",
-        "sha": os.getenv("GITHUB_SHA", "") or "",
-        "repo": os.getenv("GITHUB_REPOSITORY", "") or "",
-        "max_actions": int(max_actions),
-        "window_start_id": 0,
-        "window_end_id": 0,
-        "window_center_id": 0,
-        "run_db_id": None,     # id (PK) se existir
-        "missing_fk_target": None,  # 'id' ou 'run_id' (descoberto no DB)
-    }
-
-
-def audit_run_ensure(conn, run_fqn: str, ctx: dict) -> int | None:
-    """
-    Garante que existe um registro em audit_recent_run para este run.
-    Retorna o PK (id) se existir/for possível.
-    """
-    schema, table = run_fqn.split(".", 1)
-    info = get_columns_info(conn, schema, table)
-    cols = set(info.keys())
-    ext = int(ctx["external_run_id"])
-
-    if "run_id" in cols:
-        row = pg_one(conn, f"SELECT id FROM {schema}.{table} WHERE run_id=%s ORDER BY id DESC LIMIT 1", [ext])
-        if row:
-            return int(row[0]) if row[0] is not None else None
-
-    insert_cols = []
-    insert_vals = []
-    params = []
-
-    def add_param(col: str, val):
-        insert_cols.append(col)
-        insert_vals.append("%s")
-        params.append(val)
-
-    def add_now(col: str):
-        insert_cols.append(col)
-        insert_vals.append("now()")
-
-    if "created_at" in cols:
-        add_now("created_at")
-    if "run_id" in cols:
-        add_param("run_id", ext)
-    if "table_name" in cols:
-        add_param("table_name", ctx.get("table_name", "tickets_resolvidos_detail"))
-    if "workflow" in cols:
-        add_param("workflow", ctx.get("workflow", ""))
-    if "job" in cols:
-        add_param("job", ctx.get("job", ""))
-    if "ref" in cols:
-        add_param("ref", ctx.get("ref", ""))
-    if "sha" in cols:
-        add_param("sha", ctx.get("sha", ""))
-    if "repo" in cols:
-        add_param("repo", ctx.get("repo", ""))
-    if "max_actions" in cols:
-        add_param("max_actions", int(ctx.get("max_actions") or 0))
-
-    for colname, id_key in (("window_start", "window_start_id"), ("window_end", "window_end_id")):
-        if colname in cols:
-            dt = (info[colname]["data_type"] or "").lower()
-            if "timestamp" in dt or dt == "date":
-                add_now(colname)
-            elif dt in ("bigint", "integer", "smallint", "numeric", "real", "double precision"):
-                add_param(colname, int(ctx.get(id_key) or 0))
-            else:
-                add_param(colname, str(ctx.get(id_key) or ""))
-
-    if "window_start_id" in cols:
-        add_param("window_start_id", int(ctx.get("window_start_id") or 0))
-    if "window_end_id" in cols:
-        add_param("window_end_id", int(ctx.get("window_end_id") or 0))
-    if "window_center_id" in cols:
-        add_param("window_center_id", int(ctx.get("window_center_id") or 0))
-
-    for col, meta in info.items():
-        if col in insert_cols:
-            continue
-        if meta["nullable"]:
-            continue
-        if meta["default"] is not None:
-            continue
-        if col in ("id",):
-            continue
-        dt = (meta["data_type"] or "").lower()
-        if "timestamp" in dt or dt == "date":
-            add_now(col)
-        elif dt in ("integer", "bigint", "smallint", "numeric", "real", "double precision"):
-            add_param(col, 0)
-        elif dt == "boolean":
-            add_param(col, False)
-        elif dt in ("json", "jsonb"):
-            add_param(col, Json({}))
-        else:
-            add_param(col, "")
-
-    returning = "RETURNING id" if "id" in cols else ""
-    sql = f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)}) {returning}"
-
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        if returning:
-            row = cur.fetchone()
-            return int(row[0]) if row and row[0] is not None else None
+def pick_next_missing(conn, days):
+    row = pg_one(
+        conn,
+        """
+        select ticket_id
+        from visualizacao_resolvidos.audit_recent_missing
+        where last_seen >= now() - (%s * interval '1 day')
+        order by last_seen desc, ticket_id desc
+        limit 1
+        for update skip locked
+        """,
+        [int(days)],
+    )
+    if not row:
         return None
+    ticket_id = int(row[0])
+    pg_exec(
+        conn,
+        """
+        update visualizacao_resolvidos.audit_recent_missing
+        set attempts = coalesce(attempts,0) + 1,
+            last_attempt = now()
+        where ticket_id = %s
+        """,
+        [ticket_id],
+    )
+    return ticket_id
 
 
-def audit_upsert(conn, audit_fqn: str, ctx: dict, ticket_id: int, status_code: int | None, error_text: str | None):
-    schema, table = audit_fqn.split(".", 1)
-    info = get_columns_info(conn, schema, table)
-    cols = set(info.keys())
-
-    insert_cols = []
-    insert_vals = []
-    params = []
-
-    def add_param(col: str, val):
-        insert_cols.append(col)
-        insert_vals.append("%s")
-        params.append(val)
-
-    def add_now(col: str):
-        insert_cols.append(col)
-        insert_vals.append("now()")
-
-    if "ticket_id" in cols:
-        add_param("ticket_id", int(ticket_id))
-
-    run_id_value = None
-    fk_target = ctx.get("missing_fk_target")
-    if fk_target == "id":
-        run_id_value = ctx.get("run_db_id")
-    elif fk_target == "run_id":
-        run_id_value = ctx.get("external_run_id")
-    else:
-        run_id_value = ctx.get("run_db_id") or ctx.get("external_run_id")
-
-    if "run_id" in cols and run_id_value is not None:
-        add_param("run_id", int(run_id_value))
-
-    if "table_name" in cols:
-        add_param("table_name", ctx.get("table_name", "tickets_resolvidos_detail"))
-
-    if "run_started_at" in cols:
-        add_now("run_started_at")
-
-    if "first_seen" in cols:
-        add_now("first_seen")
-    if "last_seen" in cols:
-        add_now("last_seen")
-    if "attempts" in cols:
-        add_param("attempts", 1)
-    if "last_attempt" in cols:
-        add_now("last_attempt")
-    if "last_status" in cols:
-        add_param("last_status", status_code)
-    if "last_error" in cols:
-        add_param("last_error", error_text)
-
-    for col, meta in info.items():
-        if col in insert_cols:
-            continue
-        if meta["nullable"]:
-            continue
-        if meta["default"] is not None:
-            continue
-        dt = (meta["data_type"] or "").lower()
-        if "timestamp" in dt or dt == "date":
-            add_now(col)
-        elif dt in ("integer", "bigint", "smallint", "numeric", "real", "double precision"):
-            add_param(col, 0)
-        elif dt == "boolean":
-            add_param(col, False)
-        elif dt in ("json", "jsonb"):
-            add_param(col, Json({}))
-        else:
-            add_param(col, "")
-
-    updates = []
-    if "last_seen" in cols:
-        updates.append("last_seen=now()")
-    if "attempts" in cols:
-        updates.append(f"attempts=COALESCE({schema}.{table}.attempts,0) + 1")
-    if "last_attempt" in cols:
-        updates.append("last_attempt=now()")
-    if "last_status" in cols:
-        updates.append("last_status=EXCLUDED.last_status")
-    if "last_error" in cols:
-        updates.append("last_error=EXCLUDED.last_error")
-    if "run_id" in cols:
-        updates.append("run_id=EXCLUDED.run_id")
-    if "table_name" in cols:
-        updates.append("table_name=EXCLUDED.table_name")
-
-    pk = get_primary_key_columns(conn, schema, table)
-    conflict_cols = pk if pk else (["ticket_id"] if "ticket_id" in cols else [])
-
-    with conn.cursor() as cur:
-        if conflict_cols:
-            conflict = ",".join(conflict_cols)
-            cur.execute(
-                f"""
-                INSERT INTO {schema}.{table} ({",".join(insert_cols)})
-                VALUES ({",".join(insert_vals)})
-                ON CONFLICT ({conflict}) DO UPDATE SET {",".join(updates) if updates else "ticket_id=EXCLUDED.ticket_id"}
-                """,
-                params,
-            )
-        else:
-            cur.execute(f"INSERT INTO {schema}.{table} ({','.join(insert_cols)}) VALUES ({','.join(insert_vals)})", params)
+def update_missing_error(conn, ticket_id, status_code, err_text):
+    pg_exec(
+        conn,
+        """
+        update visualizacao_resolvidos.audit_recent_missing
+        set last_seen = now(),
+            last_status = %s,
+            last_error = %s
+        where ticket_id = %s
+        """,
+        [status_code, (err_text or "")[:4000] if err_text else None, int(ticket_id)],
+    )
 
 
-def audit_delete(conn, audit_fqn: str, ticket_id: int):
-    schema, table = audit_fqn.split(".", 1)
-    with conn.cursor() as cur:
-        cur.execute(f"DELETE FROM {schema}.{table} WHERE ticket_id=%s", [int(ticket_id)])
+def delete_missing(conn, ticket_id):
+    pg_exec(
+        conn,
+        "delete from visualizacao_resolvidos.audit_recent_missing where ticket_id=%s",
+        [int(ticket_id)],
+    )
+
+
+def upsert_detail(conn, ticket_id, raw_obj, last_update_dt):
+    pg_exec(
+        conn,
+        """
+        insert into visualizacao_resolvidos.tickets_resolvidos_detail (ticket_id, raw, updated_at, last_update)
+        values (%s, %s, now(), %s)
+        on conflict (ticket_id) do update
+        set raw = excluded.raw,
+            updated_at = now(),
+            last_update = excluded.last_update
+        """,
+        [int(ticket_id), Json(raw_obj), last_update_dt],
+    )
 
 
 def main():
@@ -806,249 +221,99 @@ def main():
     if not dsn or not token:
         raise SystemExit("NEON_DSN e MOVIDESK_TOKEN são obrigatórios")
 
-    bulk_limit = _env_int("DETAIL_BULK_LIMIT", 200)
-    missing_limit = _env_int("DETAIL_MISSING_LIMIT", 10)
-    window = _env_int("DETAIL_WINDOW", 50)
-
-    attempts = _env_int("DETAIL_ATTEMPTS", 6)
-    connect_timeout = _env_int("DETAIL_CONNECT_TIMEOUT", 10)
-    read_timeout = _env_int("DETAIL_READ_TIMEOUT", 120)
+    days = env_int("DETAIL_MISSING_DAYS", 2)
+    max_to_process = env_int("DETAIL_MISSING_LIMIT", 50)
+    api_attempts = env_int("DETAIL_API_ATTEMPTS", 4)
+    connect_timeout = env_int("DETAIL_CONNECT_TIMEOUT", 10)
+    read_timeout = env_int("DETAIL_READ_TIMEOUT", 120)
     timeout = (connect_timeout, read_timeout)
-
-    pending_attempts = _env_int("DETAIL_PENDING_ATTEMPTS", 2)
-    pending_read_timeout = _env_int("DETAIL_PENDING_READ_TIMEOUT", 45)
-    pending_timeout = (connect_timeout, pending_read_timeout)
-
-    meta_attempts = _env_int("DETAIL_META_ATTEMPTS", 2)
-    meta_read_timeout = _env_int("DETAIL_META_READ_TIMEOUT", 20)
-    meta_timeout = (connect_timeout, meta_read_timeout)
-
-    max_actions = _env_int("DETAIL_MAX_ACTIONS", 150)
-    big_after_attempts = _env_int("DETAIL_BIG_AFTER_ATTEMPTS", 2)
-
-    ctx = run_context(max_actions=max_actions)
-
-    logger.info(
-        f"detail: Iniciando sync (bulk={bulk_limit}, missing={missing_limit}, window={window}, "
-        f"timeout=({connect_timeout}s,{read_timeout}s), attempts={attempts}, max_actions={max_actions})."
-    )
-
-    def load_state(conn):
-        run_fqn, audit_fqn = ensure_audit_tables(conn, logger)
-        detail_cols, raw_col, raw_is_json = get_detail_table_info(conn)
-
-        last_row = pg_one(conn, "SELECT COALESCE(MAX(ticket_id),0) FROM visualizacao_resolvidos.tickets_resolvidos_detail")
-        last_id = int(last_row[0] if last_row else 0)
-
-        lower = max(0, last_id - window - 1)
-        upper = last_id + window
-
-        db_rows = pg_all(
-            conn,
-            """
-            SELECT ticket_id
-            FROM visualizacao_resolvidos.tickets_resolvidos_detail
-            WHERE ticket_id > %s AND ticket_id <= %s
-            """,
-            [lower, upper],
-        )
-        db_ids = {int(r[0]) for r in db_rows}
-
-        schema, table = audit_fqn.split(".", 1)
-        pend_rows = pg_all(
-            conn,
-            f"""
-            SELECT ticket_id,
-                   COALESCE(attempts,0) AS attempts,
-                   COALESCE(last_error,'') AS last_error
-            FROM {schema}.{table}
-            ORDER BY ticket_id DESC
-            LIMIT %s
-            """,
-            [missing_limit],
-        )
-
-        fk_target = get_fk_target_column(conn, schema, table, "run_id") if "run_id" in get_table_columns(conn, schema, table) else None
-        return run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows, fk_target
-
-    run_fqn, audit_fqn, detail_cols, raw_col, raw_is_json, last_id, lower, upper, db_ids, pend_rows, fk_target = db_run(dsn, load_state)
-    logger.info(f"detail: Último ticket_id em tickets_resolvidos_detail: {last_id}")
-
-    ctx["window_start_id"] = lower
-    ctx["window_end_id"] = upper
-    ctx["window_center_id"] = last_id
-    ctx["missing_fk_target"] = fk_target  # pode ser 'id' ou 'run_id' ou None
-
-    ctx["run_db_id"] = db_run(dsn, lambda conn: audit_run_ensure(conn, run_fqn, ctx))
 
     session = requests.Session()
 
-    total_ok = 0
-    total_new = 0
-    total_window = 0
-    total_missing = 0
-    total_big = 0
+    updated = []
+    failed = []
 
-    flt_window = (
-        f"id gt {lower} and id le {upper} and "
-        f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
-    )
-    logger.info(f"detail: Janela: /tickets com id > {lower} e <= {upper} (Resolved/Closed/Canceled)")
-    window_items, _, _ = list_tickets(session, logger, token, flt_window, SELECT_LIST, timeout, attempts, top=1000, orderby="id")
+    processed = 0
+    while processed < max_to_process:
+        conn = pg_connect(dsn)
+        try:
+            conn.autocommit = False
+            ticket_id = pick_next_missing(conn, days)
+            if ticket_id is None:
+                conn.commit()
+                break
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    meta_map = {}
-    api_ids = set()
-    for x in window_items:
-        if isinstance(x, dict) and x.get("id") is not None:
-            tid = int(x.get("id"))
-            api_ids.add(tid)
-            meta_map[tid] = x
-
-    to_fetch = sorted(list(api_ids - db_ids))
-    logger.info(f"detail: Janela (center={last_id}): encontrados={len(api_ids)}, já_existiam={len(db_ids)}, para_buscar={len(to_fetch)}")
-
-    for idx, tid in enumerate(to_fetch[: max(0, bulk_limit)], start=1):
-        m = meta_map.get(tid) or {}
-        ac = m.get("actionCount")
-        bs = m.get("baseStatus")
-        lu = m.get("lastUpdate")
-
-        if isinstance(ac, int) and ac > max_actions:
-            db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, bs, lu, detail_cols, raw_col, raw_is_json), "upsert_too_big(window)")
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(window)")
-            total_big += 1
-            total_window += 1
-            continue
-
-        logger.info(f"detail: Janela: buscando detalhe {idx}/{min(len(to_fetch), bulk_limit)} (ID={tid})")
-        ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
+        ticket, sc, err = fetch_ticket_detail(session, logger, token, ticket_id, api_attempts, timeout)
         if ticket is None:
-            if should_send_to_excluidos(sc, e):
-                send_to_excluidos(logger, dsn, tid, sc, e)
-                db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(excluido_window)")
-                continue
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(window)")
-            total_missing += 1
+            conn2 = pg_connect(dsn)
+            try:
+                conn2.autocommit = False
+                update_missing_error(conn2, ticket_id, sc, err or "ticket_none")
+                conn2.commit()
+            except Exception:
+                try:
+                    conn2.rollback()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn2.close()
+                except Exception:
+                    pass
+            failed.append(ticket_id)
+            processed += 1
             continue
 
-        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(window)")
-        if ok_db:
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(window)")
-            total_ok += 1
-            total_window += 1
-        else:
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_window)")
-            total_missing += 1
+        lu = ticket.get("lastUpdate") or ticket.get("lastUpdateDate") or ticket.get("lastUpdateAt")
+        last_update_dt = parse_ts(lu)
 
-    flt_new = (
-        f"id gt {last_id} and "
-        f"(baseStatus eq '{BASE_STATUSES[0]}' or baseStatus eq '{BASE_STATUSES[1]}' or baseStatus eq '{BASE_STATUSES[2]}')"
-    )
-    new_items, _, _ = list_tickets(session, logger, token, flt_new, SELECT_LIST, timeout, attempts, top=bulk_limit, orderby="id")
+        conn3 = pg_connect(dsn)
+        try:
+            conn3.autocommit = False
+            upsert_detail(conn3, ticket_id, ticket, last_update_dt)
+            delete_missing(conn3, ticket_id)
+            conn3.commit()
+            updated.append(ticket_id)
+        except Exception as e:
+            try:
+                conn3.rollback()
+            except Exception:
+                pass
+            conn4 = pg_connect(dsn)
+            try:
+                conn4.autocommit = False
+                update_missing_error(conn4, ticket_id, None, f"db_upsert_detail: {type(e).__name__}: {e}")
+                conn4.commit()
+            except Exception:
+                try:
+                    conn4.rollback()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    conn4.close()
+                except Exception:
+                    pass
+            failed.append(ticket_id)
+        finally:
+            try:
+                conn3.close()
+            except Exception:
+                pass
 
-    new_ids = []
-    new_meta = {}
-    for x in new_items:
-        if isinstance(x, dict) and x.get("id") is not None:
-            tid = int(x.get("id"))
-            new_ids.append(tid)
-            new_meta[tid] = x
+        processed += 1
 
-    logger.info(f"detail: {len(new_ids)} tickets em /tickets com id > {last_id} (Resolved/Closed/Canceled)")
-
-    for idx, tid in enumerate(new_ids, start=1):
-        m = new_meta.get(tid) or {}
-        ac = m.get("actionCount")
-        bs = m.get("baseStatus")
-        lu = m.get("lastUpdate")
-
-        if isinstance(ac, int) and ac > max_actions:
-            db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, bs, lu, detail_cols, raw_col, raw_is_json), "upsert_too_big(new)")
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(new)")
-            total_big += 1
-            total_new += 1
-            continue
-
-        logger.info(f"detail: Novo: buscando detalhe {idx}/{len(new_ids)} (ID={tid})")
-        ticket, sc, e = get_ticket_detail(session, logger, token, tid, timeout, attempts)
-        if ticket is None:
-            if should_send_to_excluidos(sc, e):
-                send_to_excluidos(logger, dsn, tid, sc, e)
-                db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(excluido_new)")
-                continue
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(new)")
-            total_missing += 1
-            continue
-
-        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(new)")
-        if ok_db:
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(new)")
-            total_ok += 1
-            total_new += 1
-        else:
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_new)")
-            total_missing += 1
-
-    pend_ids = [(int(r[0]), int(r[1] or 0), str(r[2] or "")) for r in pend_rows]
-    logger.info(f"detail: {len(pend_ids)} tickets pendentes na fila audit_recent_missing (limite={missing_limit}).")
-
-    for idx, (tid, prev_attempts, prev_err) in enumerate(pend_ids, start=1):
-        logger.info(f"detail: Processando ticket pendente {idx}/{len(pend_ids)} (ID={tid})")
-
-        if prev_attempts >= big_after_attempts and is_timeout_like(None, prev_err):
-            db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, None, None, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_by_attempts)")
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_by_attempts)")
-            total_big += 1
-            continue
-
-        meta_obj, msc, me = get_ticket_meta(session, logger, token, tid, meta_timeout, meta_attempts)
-        if isinstance(meta_obj, dict):
-            ac = meta_obj.get("actionCount")
-            bs = meta_obj.get("baseStatus")
-            lu = meta_obj.get("lastUpdate")
-            if isinstance(ac, int) and ac > max_actions:
-                db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, bs, lu, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_meta)")
-                db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_meta)")
-                total_big += 1
-                continue
-
-        if meta_obj is None and is_timeout_like(msc, me) and (prev_attempts + 1) >= big_after_attempts:
-            db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, None, None, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_meta_timeout)")
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_meta_timeout)")
-            total_big += 1
-            continue
-
-        ticket, sc, e = get_ticket_detail(session, logger, token, tid, pending_timeout, pending_attempts)
-        if ticket is None:
-            if is_timeout_like(sc, e) and (prev_attempts + 1) >= big_after_attempts:
-                bs = meta_obj.get("baseStatus") if isinstance(meta_obj, dict) else None
-                lu = meta_obj.get("lastUpdate") if isinstance(meta_obj, dict) else None
-                db_try(logger, dsn, lambda conn: upsert_too_big(conn, tid, bs, lu, detail_cols, raw_col, raw_is_json), "upsert_too_big(pending_detail_timeout)")
-                db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending_detail_timeout)")
-                total_big += 1
-                continue
-
-            if should_send_to_excluidos(sc, e):
-                send_to_excluidos(logger, dsn, tid, sc, e)
-                db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(excluido_pending)")
-                continue
-
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, sc, (e or "")[:4000] if e else None), "audit_upsert(pending)")
-            total_missing += 1
-            continue
-
-        ok_db, err_db = db_try_err(logger, dsn, lambda conn: upsert_detail(conn, ticket, detail_cols, raw_col, raw_is_json), "upsert_detail(pending)")
-        if ok_db:
-            db_try(logger, dsn, lambda conn: audit_delete(conn, audit_fqn, tid), "audit_delete(pending)")
-            total_ok += 1
-        else:
-            db_try(logger, dsn, lambda conn: audit_upsert(conn, audit_fqn, ctx, tid, 200, (f"db_upsert_detail: {err_db}" if err_db else "db_upsert_detail: unknown")[:4000]), "audit_upsert(db_fail_pending)")
-            total_missing += 1
-
-    logger.info(
-        f"detail: Finalizado. OK={total_ok} (janela={total_window}, novos={total_new}), "
-        f"Muito_grandes={total_big}, Falhas={total_missing}."
-    )
+    if updated:
+        logger.info("tickets_atualizados=" + ",".join(str(x) for x in updated))
+    if failed:
+        logger.info("tickets_falha=" + ",".join(str(x) for x in failed))
+    logger.info(f"processados={processed} atualizados={len(updated)} falhas={len(failed)}")
 
 
 if __name__ == "__main__":
