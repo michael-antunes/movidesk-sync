@@ -16,7 +16,7 @@ DSN = os.getenv("NEON_DSN")
 SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
 TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos_detail")
 
-BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "1000"))
+BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "50"))
 LOOPS = int(os.getenv("ID_SCAN_ITERATIONS", "200000"))
 TOP = int(os.getenv("MOVIDESK_TOP", "1000"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
@@ -121,14 +121,13 @@ def db_conn():
     return psycopg2.connect(DSN)
 
 def ensure_missing_unique_index():
-    idx_name = "ux_audit_recent_missing_table_ticket"
     c = db_conn()
     try:
         c.autocommit = True
         with c.cursor() as cur:
             cur.execute(
-                f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {idx_name} "
-                f"ON {SCHEMA}.audit_recent_missing (table_name, ticket_id)"
+                f"CREATE UNIQUE INDEX IF NOT EXISTS audit_recent_missing_ticket_id_uq "
+                f"ON {SCHEMA}.audit_recent_missing (ticket_id)"
             )
     except Exception:
         pass
@@ -223,20 +222,16 @@ def read_control(cur):
         raise RuntimeError(f"{SCHEMA}.range_scan_control precisa de id_inicial (maior) e id_final (menor)")
     high_bound = int(id_inicial)
     low_bound = int(id_final)
-
     if high_bound < low_bound:
         raise RuntimeError("range_scan_control inválido: id_inicial (maior) < id_final (menor)")
-
     if id_atual is None:
         cursor = high_bound
     else:
         cursor = int(id_atual)
-
     if cursor > high_bound:
         cursor = high_bound
     if cursor < low_bound:
-        cursor = high_bound
-
+        cursor = low_bound - 1
     return high_bound, low_bound, cursor
 
 def set_cursor(cur, new_cursor):
@@ -246,13 +241,17 @@ def upsert_missing(cur, run_id, ids):
     if not ids:
         return 0
     now = _now_utc()
-    rows = [(int(run_id), TABLE_NAME, int(tid), now, now, 0, now) for tid in sorted(ids)]
+    ids = sorted({int(x) for x in ids})
+    rows = [(int(run_id), TABLE_NAME, int(tid), now, now, 0, now) for tid in ids]
     sql = (
         f"INSERT INTO {SCHEMA}.audit_recent_missing "
         f"(run_id, table_name, ticket_id, first_seen, last_seen, attempts, run_started_at) "
         f"VALUES %s "
-        f"ON CONFLICT (table_name, ticket_id) DO UPDATE SET "
-        f"last_seen=EXCLUDED.last_seen, run_id=EXCLUDED.run_id"
+        f"ON CONFLICT (ticket_id) DO UPDATE SET "
+        f"table_name=EXCLUDED.table_name, "
+        f"last_seen=EXCLUDED.last_seen, "
+        f"run_id=EXCLUDED.run_id, "
+        f"run_started_at=EXCLUDED.run_started_at"
     )
     psycopg2.extras.execute_values(cur, sql, rows, page_size=UPSERT_PAGE_SIZE)
     return len(rows)
@@ -299,7 +298,7 @@ def main():
             detail_map = {int(r[0]): r[1] for r in detail_rows}
 
             cur.execute(
-                "SELECT ticket_id FROM visualizacao_atual.tickets_abertos WHERE ticket_id BETWEEN %s AND %s",
+                "SELECT ticket_id FROM dados_gerais.tickets_suporte WHERE ticket_id BETWEEN %s AND %s",
                 (low_id, high_id),
             )
             in_abertos = {int(r[0]) for r in cur.fetchall()}
