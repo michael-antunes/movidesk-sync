@@ -12,7 +12,7 @@ import psycopg2.extras
 import requests
 
 
-SCRIPT_VERSION = "sync_range_tickets_merged_v7_2026_01_30"
+SCRIPT_VERSION = "sync_range_tickets_merged_v8_2026_01_30"
 
 
 def env(name: str, default: Optional[str] = None) -> str:
@@ -26,14 +26,14 @@ def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or v.strip() == "":
         return default
-    return int(v)
+    return int(v.strip())
 
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
     if v is None or v.strip() == "":
         return default
-    return float(v)
+    return float(v.strip())
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -121,50 +121,31 @@ def advisory_unlock(conn, key: str) -> None:
         cur.execute("select pg_advisory_unlock(hashtext(%s))", (key,))
 
 
-def request_with_retry(url: str, params: Dict[str, Any], timeout: int, max_retries: int) -> requests.Response:
-    last_exc: Optional[BaseException] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return requests.get(url, params=params, timeout=timeout)
-        except Exception as e:
-            last_exc = e
-            sleep_s = min(2 ** (attempt - 1), 30)
-            logging.warning("http_error attempt=%s sleep=%ss err=%s", attempt, sleep_s, repr(e))
-            time.sleep(sleep_s)
-    raise RuntimeError(f"http failed after {max_retries} retries: {repr(last_exc)}")
-
-
-def movidesk_get_merged(
-    api_base: str,
-    token: str,
-    ticket_id: int,
-    query_keys: Sequence[str],
+def request_with_retry(
+    sess: requests.Session,
+    url: str,
+    params: Dict[str, Any],
     timeout: int,
     max_retries: int,
-    debug: bool,
-) -> Optional[Any]:
-    url = api_base.rstrip("/") + "/tickets/merged"
-    for key in query_keys:
-        params = {"token": token, key: ticket_id}
-        r = request_with_retry(url, params=params, timeout=timeout, max_retries=max_retries)
-        if debug:
-            logging.info("api_call url=%s key=%s ticket_id=%s status=%s", url, key, ticket_id, r.status_code)
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception as e:
-                raise RuntimeError(f"invalid json for ticket_id={ticket_id} key={key}: {repr(e)}")
-        if r.status_code in (400, 404):
-            continue
-        if r.status_code in (401, 403):
-            raise RuntimeError(f"movidesk auth error status={r.status_code} ticket_id={ticket_id}")
-        if 500 <= r.status_code <= 599:
-            if debug:
-                logging.warning("api_5xx ticket_id=%s status=%s body=%s", ticket_id, r.status_code, r.text[:500])
-            continue
-        if debug:
-            logging.warning("api_unexpected ticket_id=%s status=%s body=%s", ticket_id, r.status_code, r.text[:500])
-    return None
+) -> requests.Response:
+    last_exc: Optional[BaseException] = None
+    last_resp: Optional[requests.Response] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+            last_resp = r
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(min(2 * attempt, 30))
+                continue
+            return r
+        except Exception as e:
+            last_exc = e
+            time.sleep(min(2 ** (attempt - 1), 30))
+
+    if last_resp is not None:
+        return last_resp
+    raise RuntimeError(f"http failed after {max_retries} retries: {repr(last_exc)}")
 
 
 def parse_dt(v: Any) -> Optional[datetime.datetime]:
@@ -212,7 +193,7 @@ def ensure_jsonb(v: Dict[str, Any]) -> str:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
 
-def extract_relations_from_obj(obj: Dict[str, Any], queried_id: int) -> List[MergedRelation]:
+def extract_relations_from_obj(obj: Dict[str, Any]) -> List[MergedRelation]:
     merged_at = parse_dt(
         obj.get("mergedDate")
         or obj.get("mergedAt")
@@ -225,9 +206,7 @@ def extract_relations_from_obj(obj: Dict[str, Any], queried_id: int) -> List[Mer
         or obj.get("merged_on")
     )
 
-    if obj.get("ticketId") is not None and (
-        obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None
-    ):
+    if obj.get("ticketId") is not None and (obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None):
         try:
             dest = int(obj.get("ticketId"))
             src = int(obj.get("mergedTicketId") or obj.get("mergedTicketID"))
@@ -244,25 +223,23 @@ def extract_relations_from_obj(obj: Dict[str, Any], queried_id: int) -> List[Mer
         or obj.get("principalId")
         or obj.get("mergedInto")
     )
-    if merged_into is not None:
-        src_guess = obj.get("ticketId") or obj.get("id") or queried_id
+    if merged_into is not None and (obj.get("ticketId") is not None or obj.get("id") is not None):
         try:
-            src = int(src_guess)
+            src = int(obj.get("ticketId") or obj.get("id"))
             dest = int(merged_into)
             return [MergedRelation(merged_ticket_id=src, merged_into_id=dest, merged_at=merged_at, raw=obj)]
         except Exception:
             return []
 
     merged_ids: List[int] = []
-    for key in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTicketsIdsList"):
+    for key in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTicketsIdsList", "mergedTicketsIdsV2", "mergedTickets"):
         if key in obj:
             merged_ids = to_int_list(obj.get(key))
             break
 
-    if merged_ids:
-        dest_guess = obj.get("ticketId") or obj.get("ticketID") or queried_id
+    if merged_ids and (obj.get("ticketId") is not None or obj.get("ticketID") is not None):
         try:
-            dest = int(dest_guess)
+            dest = int(obj.get("ticketId") or obj.get("ticketID"))
             out: List[MergedRelation] = []
             for mid in merged_ids:
                 out.append(MergedRelation(merged_ticket_id=int(mid), merged_into_id=dest, merged_at=merged_at, raw=obj))
@@ -273,7 +250,7 @@ def extract_relations_from_obj(obj: Dict[str, Any], queried_id: int) -> List[Mer
     return []
 
 
-def extract_relations(payload: Any, queried_id: int) -> List[MergedRelation]:
+def extract_relations(payload: Any) -> List[MergedRelation]:
     out: List[MergedRelation] = []
     if payload is None:
         return out
@@ -282,23 +259,72 @@ def extract_relations(payload: Any, queried_id: int) -> List[MergedRelation]:
         if "data" in payload and isinstance(payload["data"], list):
             for it in payload["data"]:
                 if isinstance(it, dict):
-                    out.extend(extract_relations_from_obj(it, queried_id))
+                    out.extend(extract_relations_from_obj(it))
         elif "mergedTickets" in payload and isinstance(payload["mergedTickets"], list):
             for it in payload["mergedTickets"]:
                 if isinstance(it, dict):
-                    out.extend(extract_relations_from_obj(it, queried_id))
+                    out.extend(extract_relations_from_obj(it))
         else:
-            out.extend(extract_relations_from_obj(payload, queried_id))
+            if isinstance(payload, dict):
+                out.extend(extract_relations_from_obj(payload))
 
     elif isinstance(payload, list):
         for it in payload:
             if isinstance(it, dict):
-                out.extend(extract_relations_from_obj(it, queried_id))
+                out.extend(extract_relations_from_obj(it))
 
     dedup: Dict[int, MergedRelation] = {}
     for r in out:
         dedup[int(r.merged_ticket_id)] = r
     return list(dedup.values())
+
+
+def fetch_relevant_relations(
+    sess: requests.Session,
+    api_base: str,
+    token: str,
+    ticket_id: int,
+    query_keys: Sequence[str],
+    timeout: int,
+    max_retries: int,
+    debug: bool,
+) -> List[MergedRelation]:
+    url = api_base.rstrip("/") + "/tickets/merged"
+
+    rels_all: Dict[int, MergedRelation] = {}
+    last_status: Optional[int] = None
+
+    for key in query_keys:
+        params = {"token": token, key: str(ticket_id)}
+        r = request_with_retry(sess, url, params=params, timeout=timeout, max_retries=max_retries)
+        last_status = r.status_code
+
+        if debug:
+            logging.info("api_call url=%s key=%s ticket_id=%s status=%s", url, key, ticket_id, r.status_code)
+
+        if r.status_code in (400, 404):
+            continue
+
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"movidesk auth error status={r.status_code} ticket_id={ticket_id}")
+
+        if r.status_code != 200:
+            continue
+
+        try:
+            payload = r.json()
+        except Exception:
+            continue
+
+        rels = extract_relations(payload)
+        rels = [x for x in rels if x.merged_ticket_id == ticket_id or x.merged_into_id == ticket_id]
+        for x in rels:
+            rels_all[int(x.merged_ticket_id)] = x
+
+    if debug and last_status is not None:
+        logging.info("api_result ticket_id=%s rels=%s", ticket_id, len(rels_all))
+
+    return list(rels_all.values())
 
 
 def control_order_by(cols: Set[str]) -> str:
@@ -307,7 +333,7 @@ def control_order_by(cols: Set[str]) -> str:
         order.append("data_fim desc nulls last")
     if "data_inicio" in cols:
         order.append("data_inicio desc nulls last")
-    order.append("id_inicial desc")
+    order.append("id_inicial desc nulls last")
     order.append("ctid desc")
     return ", ".join(order)
 
@@ -413,12 +439,10 @@ def main() -> None:
 
     dsn = env("NEON_DSN")
     token = env("MOVIDESK_TOKEN")
-
-    api_base = env("MOVIDESK_API_BASE", os.getenv("MOVIDESK_BASE_URL", "https://api.movidesk.com/public/v1"))
+    api_base = env("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 
     schema = env("DB_SCHEMA", "visualizacao_resolvidos")
     control_table = env("CONTROL_TABLE", "range_scan_control")
-
     target_table = os.getenv("TARGET_TABLE") or os.getenv("TABLE_NAME") or "tickets_mesclados"
 
     resolvidos_schema = env("RESOLVIDOS_SCHEMA", "visualizacao_resolvidos")
@@ -435,18 +459,20 @@ def main() -> None:
 
     batch_size = env_int("BATCH_SIZE", 10)
     total_limit = env_int("LIMIT", batch_size)
-
     rpm = env_float("RPM", 0.0)
     throttle_s = (60.0 / rpm) if rpm and rpm > 0 else 0.0
-
     max_runtime = env_int("MAX_RUNTIME_SEC", 0)
 
     http_timeout = env_int("HTTP_TIMEOUT", 60)
-    http_retries = env_int("HTTP_RETRIES", 4)
+    http_retries = env_int("HTTP_RETRIES", 5)
 
-    query_keys = [s.strip() for s in env("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if s.strip()]
+    allow_keys = {"ticketId", "q"}
+    raw_keys = env("MERGED_QUERY_KEYS", "ticketId,q").split(",")
+    query_keys = [k.strip() for k in raw_keys if k.strip() in allow_keys]
+    if not query_keys:
+        query_keys = ["ticketId", "q"]
+
     debug_ids = parse_csv_ints(os.getenv("DEBUG_TICKET_IDS", ""))
-
     dry_run = env_bool("DRY_RUN", False)
 
     conn = connect_db(dsn)
@@ -455,9 +481,10 @@ def main() -> None:
     started = time.monotonic()
     last_req = 0.0
 
+    sess = requests.Session()
+
     try:
         if not try_advisory_lock(conn, lock_key):
-            logging.warning("another_run_detected exiting")
             conn.rollback()
             return
 
@@ -489,7 +516,6 @@ def main() -> None:
 
         while next_id >= id_final and total_checked < total_limit:
             if max_runtime and (time.monotonic() - started) >= max_runtime:
-                logging.info("stop_by_max_runtime checked=%s", total_checked)
                 break
 
             remaining = total_limit - total_checked
@@ -507,18 +533,21 @@ def main() -> None:
 
                 if throttle_s > 0:
                     now = time.monotonic()
-                    delta = now - last_req
-                    if last_req > 0 and delta < throttle_s:
-                        time.sleep(throttle_s - delta)
+                    if last_req > 0 and (now - last_req) < throttle_s:
+                        time.sleep(throttle_s - (now - last_req))
 
                 debug = tid in debug_ids
-                payload = movidesk_get_merged(api_base, token, tid, query_keys, http_timeout, http_retries, debug)
+                rels = fetch_relevant_relations(
+                    sess,
+                    api_base,
+                    token,
+                    tid,
+                    query_keys,
+                    http_timeout,
+                    http_retries,
+                    debug,
+                )
                 last_req = time.monotonic()
-
-                rels = extract_relations(payload, tid)
-
-                if debug:
-                    logging.info("debug_ticket ticket_id=%s relations=%s", tid, len(rels))
 
                 if not dry_run:
                     if rels:
@@ -570,12 +599,7 @@ def main() -> None:
             )
 
             if not ok:
-                logging.error("stopping_due_to_control_update_failure last_processed=%s", new_last_processed)
                 return
-
-            if max_runtime and (time.monotonic() - started) >= max_runtime:
-                logging.info("stop_by_max_runtime checked=%s", total_checked)
-                break
 
         logging.info(
             "done checked=%s upsert=%s deleted=%s removed_other=%s",
@@ -592,6 +616,10 @@ def main() -> None:
             pass
         try:
             conn.close()
+        except Exception:
+            pass
+        try:
+            sess.close()
         except Exception:
             pass
 
