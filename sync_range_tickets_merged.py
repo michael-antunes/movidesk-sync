@@ -5,14 +5,14 @@ import time
 import logging
 import datetime
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import psycopg2
 import psycopg2.extras
 import requests
 
 
-SCRIPT_VERSION = "sync_range_tickets_merged_v5_2026_01_30"
+SCRIPT_VERSION = "sync_range_tickets_merged_v6_2026_01_30"
 
 
 def env(name: str, default: Optional[str] = None) -> str:
@@ -40,8 +40,12 @@ def setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     logging.info("script_version=%s", SCRIPT_VERSION)
-    logging.info("run_context github_run_id=%s github_job=%s github_ref=%s",
-                 os.getenv("GITHUB_RUN_ID"), os.getenv("GITHUB_JOB"), os.getenv("GITHUB_REF"))
+    logging.info(
+        "run_context github_run_id=%s github_job=%s github_ref=%s",
+        os.getenv("GITHUB_RUN_ID"),
+        os.getenv("GITHUB_JOB"),
+        os.getenv("GITHUB_REF"),
+    )
 
 
 def qident(name: str) -> str:
@@ -74,7 +78,11 @@ class MergedRelation:
 
 
 def connect_db(dsn: str):
-    return psycopg2.connect(dsn, connect_timeout=15, application_name=os.getenv("APPLICATION_NAME", "sync_range_tickets_merged"))
+    return psycopg2.connect(
+        dsn,
+        connect_timeout=15,
+        application_name=os.getenv("APPLICATION_NAME", "sync_range_tickets_merged"),
+    )
 
 
 def get_table_columns(conn, schema: str, table: str) -> Set[str]:
@@ -115,8 +123,15 @@ def request_with_retry(url: str, params: Dict[str, Any], timeout: int, max_retri
     raise RuntimeError(f"http failed after {max_retries} retries: {repr(last_exc)}")
 
 
-def movidesk_get_merged(api_base: str, token: str, ticket_id: int, query_keys: Sequence[str],
-                       timeout: int, max_retries: int, debug: bool) -> Optional[Any]:
+def movidesk_get_merged(
+    api_base: str,
+    token: str,
+    ticket_id: int,
+    query_keys: Sequence[str],
+    timeout: int,
+    max_retries: int,
+    debug: bool,
+) -> Optional[Any]:
     url = api_base.rstrip("/") + "/tickets/merged"
     for key in query_keys:
         params = {"token": token, key: ticket_id}
@@ -201,20 +216,43 @@ def extract_relations_from_obj(obj: Dict[str, Any]) -> List[MergedRelation]:
             merged_ticket_id = as_int(obj.get(k))
             if merged_ticket_id is not None:
                 break
-    for k in ("mergedIntoTicketId", "merged_into_id", "mergedIntoId", "merged_into", "mergedToTicketId", "mergedToId"):
+    for k in (
+        "mergedIntoTicketId",
+        "merged_into_id",
+        "mergedIntoId",
+        "merged_into",
+        "mergedToTicketId",
+        "mergedToId",
+    ):
         if k in obj:
             merged_into_id = as_int(obj.get(k))
             if merged_into_id is not None:
                 break
     merged_at = None
-    for k in ("mergedAt", "merged_at", "mergedDate", "merged_date", "mergedOn", "merged_on", "createdDate", "created_date"):
+    for k in (
+        "mergedAt",
+        "merged_at",
+        "mergedDate",
+        "merged_date",
+        "mergedOn",
+        "merged_on",
+        "createdDate",
+        "created_date",
+    ):
         if k in obj:
             merged_at = parse_dt(obj.get(k))
             if merged_at is not None:
                 break
     if merged_ticket_id is None or merged_into_id is None:
         return []
-    return [MergedRelation(merged_ticket_id=merged_ticket_id, merged_into_id=merged_into_id, merged_at=merged_at, raw=obj)]
+    return [
+        MergedRelation(
+            merged_ticket_id=merged_ticket_id,
+            merged_into_id=merged_into_id,
+            merged_at=merged_at,
+            raw=obj,
+        )
+    ]
 
 
 def extract_relations(payload: Any) -> List[MergedRelation]:
@@ -246,23 +284,37 @@ def ensure_jsonb(v: Dict[str, Any]) -> str:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
 
-def read_control(conn, schema: str, control_table: str, id_col: str,
-                 start_override: Optional[int], end_override: Optional[int]) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
-    cols = get_table_columns(conn, schema, control_table)
-    where_active = ""
-    order_by = "ctid desc"
+def control_order_by(cols: Set[str]) -> str:
+    order: List[str] = []
     if "data_fim" in cols:
-        where_active = "where data_fim is null"
+        order.append("data_fim desc nulls last")
     if "data_inicio" in cols:
-        order_by = "data_inicio desc nulls last, " + order_by
+        order.append("data_inicio desc nulls last")
+    order.append("id_inicial desc nulls last")
+    order.append("ctid desc")
+    return ", ".join(order)
+
+
+def read_control(
+    conn,
+    schema: str,
+    control_table: str,
+    id_col: str,
+    start_override: Optional[int],
+    end_override: Optional[int],
+) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
+    cols = get_table_columns(conn, schema, control_table)
+    order_by = control_order_by(cols)
     select_cols = ["id_inicial", "id_final", id_col]
-    select_cols_sql = ", ".join(qident(c) for c in select_cols if c in cols or c in ("id_inicial", "id_final", id_col))
-    sql = f"select {select_cols_sql} from {qname(schema, control_table)} {where_active} order by {order_by} limit 1"
+    select_cols_sql = ", ".join(
+        qident(c) for c in select_cols if c in cols or c in ("id_inicial", "id_final", id_col)
+    )
+    sql = f"select {select_cols_sql} from {qname(schema, control_table)} order by {order_by} limit 1"
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql)
         row = cur.fetchone()
         if not row:
-            raise RuntimeError(f"control row not found in {schema}.{control_table} (active_only={bool(where_active)})")
+            raise RuntimeError(f"control row not found in {schema}.{control_table}")
         id_inicial = int(row.get("id_inicial"))
         id_final = int(row.get("id_final"))
         last_processed = row.get(id_col)
@@ -280,29 +332,35 @@ def read_control(conn, schema: str, control_table: str, id_col: str,
 
 def update_last_processed(conn, schema: str, control_table: str, id_col: str, new_value: int) -> bool:
     cols = get_table_columns(conn, schema, control_table)
-    where_active = ""
-    order_by = "ctid desc"
-    if "data_fim" in cols:
-        where_active = "where data_fim is null"
-    if "data_inicio" in cols:
-        order_by = "data_inicio desc nulls last, " + order_by
-    set_bits = [f"{qident(id_col)} = %s"]
-    if "updated_at" in cols:
-        set_bits.append("updated_at = now()")
-    sql = f"""
-        update {qname(schema, control_table)}
-        set {", ".join(set_bits)}
-        where ctid = (
-            select ctid from {qname(schema, control_table)}
-            {where_active}
-            order by {order_by}
-            limit 1
-        )
-    """
+    order_by = control_order_by(cols)
+
     with conn.cursor() as cur:
-        cur.execute(sql, (new_value,))
+        cur.execute(
+            f"select ctid from {qname(schema, control_table)} order by {order_by} limit 1 for update"
+        )
+        row = cur.fetchone()
+        if not row:
+            logging.error(
+                "control_update_failed_no_row table=%s.%s id_col=%s new_value=%s",
+                schema,
+                control_table,
+                id_col,
+                new_value,
+            )
+            return False
+        ctid = row[0]
+
+        set_bits = [f"{qident(id_col)} = %s"]
+        if "updated_at" in cols:
+            set_bits.append("updated_at = now()")
+
+        cur.execute(
+            f"update {qname(schema, control_table)} set {', '.join(set_bits)} where ctid = %s",
+            (new_value, ctid),
+        )
         if cur.rowcount == 1:
             return True
+
     logging.error("control_update_failed table=%s.%s id_col=%s new_value=%s", schema, control_table, id_col, new_value)
     return False
 
@@ -331,9 +389,14 @@ def delete_ticket_from_mesclados(conn, schema: str, table: str, ticket_id: int) 
         return cur.rowcount
 
 
-def delete_from_other_tables(conn, merged_ticket_id: int,
-                            resolvidos_schema: str, resolvidos_table: str,
-                            abertos_schema: str, abertos_table: str) -> Tuple[int, int]:
+def delete_from_other_tables(
+    conn,
+    merged_ticket_id: int,
+    resolvidos_schema: str,
+    resolvidos_table: str,
+    abertos_schema: str,
+    abertos_table: str,
+) -> Tuple[int, int]:
     deleted_resolvidos = 0
     deleted_abertos = 0
     with conn.cursor() as cur:
@@ -384,15 +447,25 @@ def main() -> None:
             conn.rollback()
             return
 
-        id_inicial, id_final, last_processed, meta = read_control(conn, schema, control_table, id_col, start_override_i, end_override_i)
+        id_inicial, id_final, last_processed, meta = read_control(
+            conn, schema, control_table, id_col, start_override_i, end_override_i
+        )
 
         if last_processed is None:
             next_id = id_inicial
         else:
             next_id = last_processed - 1
 
-        logging.info("begin id_inicial=%s id_final=%s last_processed=%s next_id=%s batch=%s query_keys=%s debug_ids=%s",
-                     id_inicial, id_final, last_processed, next_id, batch_size, ",".join(query_keys), ",".join(map(str, sorted(debug_ids))) if debug_ids else "")
+        logging.info(
+            "begin id_inicial=%s id_final=%s last_processed=%s next_id=%s batch=%s query_keys=%s debug_ids=%s",
+            id_inicial,
+            id_final,
+            last_processed,
+            next_id,
+            batch_size,
+            ",".join(query_keys),
+            ",".join(map(str, sorted(debug_ids))) if debug_ids else "",
+        )
 
         total_checked = 0
         total_upsert = 0
@@ -408,7 +481,7 @@ def main() -> None:
             batch_removed_other = 0
 
             for tid in batch_ids:
-                debug = (tid in debug_ids)
+                debug = tid in debug_ids
                 payload = movidesk_get_merged(api_base, token, tid, query_keys, http_timeout, http_retries, debug)
                 rels = extract_relations(payload)
 
@@ -418,7 +491,14 @@ def main() -> None:
                 if rels:
                     batch_upsert += upsert_mesclados(conn, schema, target_table, rels)
                     for r in rels:
-                        d1, d2 = delete_from_other_tables(conn, r.merged_ticket_id, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table)
+                        d1, d2 = delete_from_other_tables(
+                            conn,
+                            r.merged_ticket_id,
+                            resolvidos_schema,
+                            resolvidos_table,
+                            abertos_schema,
+                            abertos_table,
+                        )
                         batch_removed_other += d1 + d2
                 else:
                     batch_deleted += delete_ticket_from_mesclados(conn, schema, target_table, tid)
@@ -441,14 +521,27 @@ def main() -> None:
             elapsed = time.time() - loop_started
             logging.info(
                 "progress next_id=%s last_processed=%s checked=%s upsert=%s deleted=%s removed_other=%s elapsed_s=%.1f control_update=%s",
-                next_id, new_last_processed, total_checked, total_upsert, total_deleted, total_removed_other, elapsed, ok
+                next_id,
+                new_last_processed,
+                total_checked,
+                total_upsert,
+                total_deleted,
+                total_removed_other,
+                elapsed,
+                ok,
             )
 
             if not ok:
                 logging.error("stopping_due_to_control_update_failure last_processed=%s", new_last_processed)
                 return
 
-        logging.info("done checked=%s upsert=%s deleted=%s removed_other=%s", total_checked, total_upsert, total_deleted, total_removed_other)
+        logging.info(
+            "done checked=%s upsert=%s deleted=%s removed_other=%s",
+            total_checked,
+            total_upsert,
+            total_deleted,
+            total_removed_other,
+        )
 
     finally:
         try:
