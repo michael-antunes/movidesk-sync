@@ -187,18 +187,22 @@ def update_last_processed(conn, schema: str, control_table: str, last_processed:
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            update {qname(schema, control_table)}
-               set id_atual_merged = %s
-             where ctid = (
-               select ctid
-                 from {qname(schema, control_table)}
-                order by data_fim desc nulls last,
-                         data_inicio desc nulls last,
-                         id_inicial desc nulls last
-                limit 1
-             )
-            """,
-            (int(last_processed),),
+            select ctid
+              from {qname(schema, control_table)}
+             order by data_fim desc nulls last,
+                      data_inicio desc nulls last,
+                      id_inicial desc nulls last
+             limit 1
+             for update
+            """
+        )
+        r = cur.fetchone()
+        if not r:
+            raise RuntimeError("range_scan_control está vazio (update_last_processed).")
+        ctid = r[0]
+        cur.execute(
+            f"update {qname(schema, control_table)} set id_atual_merged = %s where ctid = %s",
+            (int(last_processed), ctid),
         )
         if cur.rowcount == 0:
             raise RuntimeError("Não consegui atualizar id_atual_merged (0 rows).")
