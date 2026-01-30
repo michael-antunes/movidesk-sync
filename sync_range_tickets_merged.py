@@ -5,7 +5,7 @@ import time
 import logging
 import datetime
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import psycopg2
 import psycopg2.extras
@@ -29,6 +29,10 @@ def env_int(name: str, default: int) -> int:
     return int(v)
 
 
+def now_utc_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
 def setup_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
@@ -36,12 +40,8 @@ def setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     logging.info("script_version=%s", SCRIPT_VERSION)
-    logging.info(
-        "run_context github_run_id=%s github_job=%s github_ref=%s",
-        os.getenv("GITHUB_RUN_ID"),
-        os.getenv("GITHUB_JOB"),
-        os.getenv("GITHUB_REF"),
-    )
+    logging.info("run_context github_run_id=%s github_job=%s github_ref=%s",
+                 os.getenv("GITHUB_RUN_ID"), os.getenv("GITHUB_JOB"), os.getenv("GITHUB_REF"))
 
 
 def qident(name: str) -> str:
@@ -74,11 +74,7 @@ class MergedRelation:
 
 
 def connect_db(dsn: str):
-    return psycopg2.connect(
-        dsn,
-        connect_timeout=15,
-        application_name=os.getenv("APPLICATION_NAME", "sync_range_tickets_merged"),
-    )
+    return psycopg2.connect(dsn, connect_timeout=15, application_name=os.getenv("APPLICATION_NAME", "sync_range_tickets_merged"))
 
 
 def get_table_columns(conn, schema: str, table: str) -> Set[str]:
@@ -119,15 +115,8 @@ def request_with_retry(url: str, params: Dict[str, Any], timeout: int, max_retri
     raise RuntimeError(f"http failed after {max_retries} retries: {repr(last_exc)}")
 
 
-def movidesk_get_merged(
-    api_base: str,
-    token: str,
-    ticket_id: int,
-    query_keys: Sequence[str],
-    timeout: int,
-    max_retries: int,
-    debug: bool,
-) -> Optional[Any]:
+def movidesk_get_merged(api_base: str, token: str, ticket_id: int, query_keys: Sequence[str],
+                       timeout: int, max_retries: int, debug: bool) -> Optional[Any]:
     url = api_base.rstrip("/") + "/tickets/merged"
     for key in query_keys:
         params = {"token": token, key: ticket_id}
@@ -225,14 +214,7 @@ def extract_relations_from_obj(obj: Dict[str, Any]) -> List[MergedRelation]:
                 break
     if merged_ticket_id is None or merged_into_id is None:
         return []
-    return [
-        MergedRelation(
-            merged_ticket_id=merged_ticket_id,
-            merged_into_id=merged_into_id,
-            merged_at=merged_at,
-            raw=obj,
-        )
-    ]
+    return [MergedRelation(merged_ticket_id=merged_ticket_id, merged_into_id=merged_into_id, merged_at=merged_at, raw=obj)]
 
 
 def extract_relations(payload: Any) -> List[MergedRelation]:
@@ -264,14 +246,8 @@ def ensure_jsonb(v: Dict[str, Any]) -> str:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
 
-def read_control(
-    conn,
-    schema: str,
-    control_table: str,
-    id_col: str,
-    start_override: Optional[int],
-    end_override: Optional[int],
-) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
+def read_control(conn, schema: str, control_table: str, id_col: str,
+                 start_override: Optional[int], end_override: Optional[int]) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
     cols = get_table_columns(conn, schema, control_table)
     where_active = ""
     order_by = "ctid desc"
@@ -355,14 +331,9 @@ def delete_ticket_from_mesclados(conn, schema: str, table: str, ticket_id: int) 
         return cur.rowcount
 
 
-def delete_from_other_tables(
-    conn,
-    merged_ticket_id: int,
-    resolvidos_schema: str,
-    resolvidos_table: str,
-    abertos_schema: str,
-    abertos_table: str,
-) -> Tuple[int, int]:
+def delete_from_other_tables(conn, merged_ticket_id: int,
+                            resolvidos_schema: str, resolvidos_table: str,
+                            abertos_schema: str, abertos_table: str) -> Tuple[int, int]:
     deleted_resolvidos = 0
     deleted_abertos = 0
     with conn.cursor() as cur:
@@ -413,25 +384,15 @@ def main() -> None:
             conn.rollback()
             return
 
-        id_inicial, id_final, last_processed, meta = read_control(
-            conn, schema, control_table, id_col, start_override_i, end_override_i
-        )
+        id_inicial, id_final, last_processed, meta = read_control(conn, schema, control_table, id_col, start_override_i, end_override_i)
 
         if last_processed is None:
             next_id = id_inicial
         else:
             next_id = last_processed - 1
 
-        logging.info(
-            "begin id_inicial=%s id_final=%s last_processed=%s next_id=%s batch=%s query_keys=%s debug_ids=%s",
-            id_inicial,
-            id_final,
-            last_processed,
-            next_id,
-            batch_size,
-            ",".join(query_keys),
-            ",".join(map(str, sorted(debug_ids))) if debug_ids else "",
-        )
+        logging.info("begin id_inicial=%s id_final=%s last_processed=%s next_id=%s batch=%s query_keys=%s debug_ids=%s",
+                     id_inicial, id_final, last_processed, next_id, batch_size, ",".join(query_keys), ",".join(map(str, sorted(debug_ids))) if debug_ids else "")
 
         total_checked = 0
         total_upsert = 0
@@ -447,7 +408,7 @@ def main() -> None:
             batch_removed_other = 0
 
             for tid in batch_ids:
-                debug = tid in debug_ids
+                debug = (tid in debug_ids)
                 payload = movidesk_get_merged(api_base, token, tid, query_keys, http_timeout, http_retries, debug)
                 rels = extract_relations(payload)
 
@@ -457,9 +418,7 @@ def main() -> None:
                 if rels:
                     batch_upsert += upsert_mesclados(conn, schema, target_table, rels)
                     for r in rels:
-                        d1, d2 = delete_from_other_tables(
-                            conn, r.merged_ticket_id, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table
-                        )
+                        d1, d2 = delete_from_other_tables(conn, r.merged_ticket_id, resolvidos_schema, resolvidos_table, abertos_schema, abertos_table)
                         batch_removed_other += d1 + d2
                 else:
                     batch_deleted += delete_ticket_from_mesclados(conn, schema, target_table, tid)
@@ -482,14 +441,7 @@ def main() -> None:
             elapsed = time.time() - loop_started
             logging.info(
                 "progress next_id=%s last_processed=%s checked=%s upsert=%s deleted=%s removed_other=%s elapsed_s=%.1f control_update=%s",
-                next_id,
-                new_last_processed,
-                total_checked,
-                total_upsert,
-                total_deleted,
-                total_removed_other,
-                elapsed,
-                ok,
+                next_id, new_last_processed, total_checked, total_upsert, total_deleted, total_removed_other, elapsed, ok
             )
 
             if not ok:
