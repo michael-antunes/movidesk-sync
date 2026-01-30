@@ -1,132 +1,182 @@
-name: Kickoff (range/date)
+name: Movidesk - Kickoff (range/date)
 
 on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: "10 3 * * *"
-
-permissions:
-  contents: read
-  actions: write
-
-concurrency:
-  group: range-scan-kickoff
-  cancel-in-progress: false
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Data inicial (YYYY-MM-DD). Se vazio, usa ontem."
+        required: false
+        default: ""
+      end_date:
+        description: "Data final (YYYY-MM-DD). Se vazio, usa hoje."
+        required: false
+        default: ""
+      window_days:
+        description: "Tamanho da janela (dias) se start/end estiverem vazios."
+        required: false
+        default: "2"
+      branch:
+        description: "Branch para disparar os workflows dependentes (default: branch atual)."
+        required: false
+        default: ""
 
 jobs:
   kickoff:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      group: movidesk-db
+      cancel-in-progress: true
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Cancelar workflows que mexem no banco (queued/in_progress)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branchInput = (context.payload.inputs && context.payload.inputs.branch) ? String(context.payload.inputs.branch).trim() : "";
+            const branch = branchInput || context.ref.replace("refs/heads/", "");
+            const workflowFiles = [
+              "sync_resolved_detail.yml",
+              "detail_watchdog.yml",
+              "audit_recent_resolved_scan.yml",
+              "audit_resolved_daily.yml",
+              "id_scan_to_audit_missing.yml",
+              "range_scan_to_audit.yml",
+              "sync_range_tickets_merged.yml",
+              "sync_tickets_merged.yml",
+              "sync_tickets_abertos.yml",
+              "sync_tickets_abertos_raw.yml",
+              "sync_tickets_excluidos.yml"
+            ];
+
+            async function listRuns(workflow_id, status) {
+              try {
+                const res = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id,
+                  branch,
+                  status,
+                  per_page: 50
+                });
+                return res.data.workflow_runs || [];
+              } catch (e) {
+                core.warning(`nao consegui listar runs de ${workflow_id} (${status}): ${e.message}`);
+                return [];
+              }
+            }
+
+            async function cancelRun(run_id) {
+              try {
+                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id });
+                core.info(`cancel_requested run_id=${run_id}`);
+              } catch (e) {
+                core.warning(`falha ao cancelar run_id=${run_id}: ${e.message}`);
+              }
+            }
+
+            core.info(`branch=${branch}`);
+            for (const wf of workflowFiles) {
+              const runsQueued = await listRuns(wf, "queued");
+              const runsInProgress = await listRuns(wf, "in_progress");
+              const runs = [...runsQueued, ...runsInProgress];
+              const unique = new Map();
+              for (const r of runs) unique.set(r.id, r);
+              for (const r of unique.values()) {
+                await cancelRun(r.id);
+              }
+            }
+
+            const maxWaitSeconds = 240;
+            const pollEverySeconds = 8;
+            const started = Date.now();
+
+            while (true) {
+              let anyRunning = false;
+              for (const wf of workflowFiles) {
+                const runsQueued = await listRuns(wf, "queued");
+                const runsInProgress = await listRuns(wf, "in_progress");
+                if (runsQueued.length > 0 || runsInProgress.length > 0) {
+                  anyRunning = true;
+                  core.info(`ainda executando: ${wf} queued=${runsQueued.length} in_progress=${runsInProgress.length}`);
+                }
+              }
+              const elapsed = Math.floor((Date.now() - started) / 1000);
+              if (!anyRunning) {
+                core.info("ok: nenhum workflow concorrente em execução");
+                break;
+              }
+              if (elapsed >= maxWaitSeconds) {
+                core.warning("continuando mesmo com workflows ainda em execução (timeout de espera)");
+                break;
+              }
+              await new Promise(r => setTimeout(r, pollEverySeconds * 1000));
+            }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: python -m pip install --upgrade pip && pip install psycopg2-binary
+      - name: Install deps
+        run: python -m pip install --upgrade pip requests psycopg2-binary
 
-      - name: Kickoff (range/date)
+      - name: Run range_scan_kickoff.py
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
-        run: python range_scan_kickoff.py
+        run: |
+          python range_scan_kickoff.py \
+            --start-date "${{ github.event.inputs.start_date }}" \
+            --end-date "${{ github.event.inputs.end_date }}" \
+            --window-days "${{ github.event.inputs.window_days }}"
 
-      - name: Cancelar workflows alvo se estiverem rodando/na fila
+      - name: Set branch var
+        id: branch
+        run: |
+          if [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "value=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Dispatch Movidesk - Range scan (tickets merged) (loop)
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          THIS_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.value }}
         run: |
           set -euo pipefail
-
-          workflows=(
-            "sync_tickets_excluidos.yml"
-            "sync_range_tickets_merged.yml"
-            "range_scan_to_audit.yml"
-            "id_scan_to_audit_missing.yml"
-          )
-
-          api() {
-            curl -sS -L \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              "$@"
-          }
-
-          cancel_runs_for_workflow() {
-            local wf="$1"
-            for st in "in_progress" "queued"; do
-              ids=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=${st}&branch=${BRANCH}&per_page=50" \
-                | jq -r '.workflow_runs[].id // empty')
-              for id in $ids; do
-                if [ "${id}" = "${THIS_RUN_ID}" ]; then
-                  continue
-                fi
-                echo "Cancelando run ${id} do workflow ${wf} (status=${st})"
-                api -X POST "https://api.github.com/repos/${REPO}/actions/runs/${id}/cancel" >/dev/null || true
-              done
-            done
-          }
-
-          for wf in "${workflows[@]}"; do
-            cancel_runs_for_workflow "${wf}"
-          done
-
-          echo "Aguardando cancelamentos efetivarem..."
-          for i in $(seq 1 12); do
-            any=0
-            for wf in "${workflows[@]}"; do
-              ip=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=in_progress&branch=${BRANCH}&per_page=1" | jq -r '.total_count // 0')
-              qd=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=queued&branch=${BRANCH}&per_page=1" | jq -r '.total_count // 0')
-              if [ "${ip}" != "0" ] || [ "${qd}" != "0" ]; then
-                any=1
-                echo "Ainda há execuções em ${wf}: in_progress=${ip} queued=${qd}"
-              fi
-            done
-            if [ "${any}" = "0" ]; then
-              echo "Nenhuma execução restante (in_progress/queued)."
-              break
-            fi
-            sleep 5
-          done
-
-      - name: Dispatch sync_tickets_excluidos
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -L -X POST \
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_tickets_excluidos.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync_range_tickets_merged.yml/dispatches" \
+            -d "{\"ref\":\"${BRANCH}\"}"
 
-      - name: Dispatch sync_range_tickets_merged
+      - name: Dispatch Movidesk - Range scan to audit (loop)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.value }}
         run: |
-          curl -L -X POST \
+          set -euo pipefail
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_range_tickets_merged.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/range_scan_to_audit.yml/dispatches" \
+            -d "{\"ref\":\"${BRANCH}\"}"
 
-      - name: Dispatch range_scan_to_audit
+      - name: Dispatch Movidesk - ID scan (API) -> audit_recent_missing
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.value }}
         run: |
-          curl -L -X POST \
+          set -euo pipefail
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/range_scan_to_audit.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
-
-      - name: Dispatch id_scan_to_audit_missing
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -L -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/id_scan_to_audit_missing.yml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/id_scan_to_audit_missing.yml/dispatches" \
+            -d "{\"ref\":\"${BRANCH}\"}"
