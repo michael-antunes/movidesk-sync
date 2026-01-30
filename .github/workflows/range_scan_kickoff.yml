@@ -31,6 +31,66 @@ jobs:
           NEON_DSN: ${{ secrets.NEON_DSN }}
         run: python range_scan_kickoff.py
 
+      - name: Cancelar workflows alvo se estiverem rodando/na fila
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          THIS_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          workflows=(
+            "sync_tickets_excluidos.yml"
+            "sync_range_tickets_merged.yml"
+            "range_scan_to_audit.yml"
+            "id_scan_to_audit_missing.yml"
+          )
+
+          api() {
+            curl -sS -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "$@"
+          }
+
+          cancel_runs_for_workflow() {
+            local wf="$1"
+            for st in "in_progress" "queued"; do
+              ids=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=${st}&branch=${BRANCH}&per_page=50" \
+                | jq -r '.workflow_runs[].id // empty')
+              for id in $ids; do
+                if [ "${id}" = "${THIS_RUN_ID}" ]; then
+                  continue
+                fi
+                echo "Cancelando run ${id} do workflow ${wf} (status=${st})"
+                api -X POST "https://api.github.com/repos/${REPO}/actions/runs/${id}/cancel" >/dev/null || true
+              done
+            done
+          }
+
+          for wf in "${workflows[@]}"; do
+            cancel_runs_for_workflow "${wf}"
+          done
+
+          echo "Aguardando cancelamentos efetivarem..."
+          for i in $(seq 1 12); do
+            any=0
+            for wf in "${workflows[@]}"; do
+              ip=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=in_progress&branch=${BRANCH}&per_page=1" | jq -r '.total_count // 0')
+              qd=$(api "https://api.github.com/repos/${REPO}/actions/workflows/${wf}/runs?status=queued&branch=${BRANCH}&per_page=1" | jq -r '.total_count // 0')
+              if [ "${ip}" != "0" ] || [ "${qd}" != "0" ]; then
+                any=1
+                echo "Ainda há execuções em ${wf}: in_progress=${ip} queued=${qd}"
+              fi
+            done
+            if [ "${any}" = "0" ]; then
+              echo "Nenhuma execução restante (in_progress/queued)."
+              break
+            fi
+            sleep 5
+          done
+
       - name: Dispatch sync_tickets_excluidos
         env:
           GH_TOKEN: ${{ github.token }}
