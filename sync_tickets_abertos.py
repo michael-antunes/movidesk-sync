@@ -7,23 +7,19 @@ import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
+
 API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
 PAGE_SIZE = int(os.getenv("MOVIDESK_PAGE_SIZE", "500"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
-
-RUN_DDL = os.getenv("RUN_DDL", "0") == "1"
 PG_SYNC_COMMIT_OFF = os.getenv("PG_SYNC_COMMIT_OFF", "1") == "1"
 
 if not TOKEN or not DSN:
     raise RuntimeError("Defina MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("tickets_abertos_index")
 
 http = requests.Session()
@@ -36,7 +32,6 @@ def req(url, params=None, timeout=90):
         if r.status_code in (429, 503):
             ra = r.headers.get("retry-after")
             wait = int(ra) if ra and str(ra).isdigit() else 60
-            logger.warning("Throttle HTTP %s, aguardando %ss…", r.status_code, wait)
             time.sleep(wait)
             continue
         if r.status_code == 404:
@@ -67,6 +62,24 @@ def set_fast_commit(cur):
         cur.execute("set local synchronous_commit=off")
 
 
+def ensure_dependency(conn):
+    with conn.cursor() as cur:
+        cur.execute("create schema if not exists dados_gerais")
+        cur.execute(
+            """
+            create or replace function dados_gerais.fn_scan_fix_from_abertos(p_limit integer)
+            returns void
+            language plpgsql
+            as $$
+            begin
+              return;
+            end;
+            $$;
+            """
+        )
+    conn.commit()
+
+
 def fetch_open_ticket_min():
     url = f"{API_BASE}/tickets"
     skip = 0
@@ -89,6 +102,7 @@ def fetch_open_ticket_min():
             break
 
         items.extend(page)
+
         if len(page) < PAGE_SIZE:
             break
 
@@ -96,46 +110,6 @@ def fetch_open_ticket_min():
         time.sleep(THROTTLE)
 
     return items
-
-
-def ensure_table(conn):
-    with conn.cursor() as cur:
-        cur.execute("create schema if not exists visualizacao_atual")
-        cur.execute(
-            """
-            create table if not exists visualizacao_atual.tickets_abertos(
-              ticket_id       bigint primary key,
-              raw             jsonb,
-              updated_at      timestamptz default now(),
-              raw_last_update timestamptz,
-              last_update     timestamptz,
-              base_status     text
-            )
-            """
-        )
-        cur.execute(
-            """
-            alter table visualizacao_atual.tickets_abertos
-              add column if not exists subject                       varchar(350),
-              add column if not exists type                          smallint,
-              add column if not exists status                        varchar(128),
-              add column if not exists owner_team                    varchar(128),
-              add column if not exists service_first_level           varchar(102),
-              add column if not exists created_date                  timestamptz,
-              add column if not exists contagem                      integer default 1,
-              add column if not exists responsavel                   varchar(255),
-              add column if not exists empresa_cod_ref_adicional     varchar(64),
-              add column if not exists agent_id                      bigint,
-              add column if not exists empresa_id                    text,
-              add column if not exists empresa_nome                  text,
-              add column if not exists adicional_137641_avaliado_csat text,
-              add column if not exists origin                        smallint,
-              add column if not exists reaberturas                   integer default 0,
-              add column if not exists service_second_level          text,
-              add column if not exists service_third_level           text
-            """
-        )
-    conn.commit()
 
 
 def upsert_min(conn, items):
@@ -183,7 +157,8 @@ def upsert_min(conn, items):
 
 
 def cleanup_not_open(conn, open_ids):
-    if not open_ids:
+    unique_ids = sorted({i for i in open_ids if i is not None})
+    if not unique_ids:
         with conn.cursor() as cur:
             set_fast_commit(cur)
             cur.execute("delete from visualizacao_atual.tickets_abertos")
@@ -191,19 +166,10 @@ def cleanup_not_open(conn, open_ids):
         conn.commit()
         return removed
 
-    unique_ids = sorted({i for i in open_ids if i is not None})
-    if not unique_ids:
-        return 0
-
     with conn.cursor() as cur:
         set_fast_commit(cur)
         cur.execute("create temporary table tmp_open_ids(ticket_id bigint primary key) on commit drop")
-        execute_values(
-            cur,
-            "insert into tmp_open_ids(ticket_id) values %s",
-            [(i,) for i in unique_ids],
-            page_size=2000,
-        )
+        execute_values(cur, "insert into tmp_open_ids(ticket_id) values %s", [(i,) for i in unique_ids], page_size=2000)
         cur.execute(
             """
             delete from visualizacao_atual.tickets_abertos ta
@@ -241,9 +207,7 @@ def main():
     open_ids = [iint(t.get("id")) for t in items if isinstance(t, dict)]
 
     with psycopg2.connect(DSN) as conn:
-        if RUN_DDL:
-            ensure_table(conn)
-
+        ensure_dependency(conn)
         up = upsert_min(conn, items)
         rem_closed = cleanup_not_open(conn, open_ids)
         rem_merged = cleanup_merged(conn)
