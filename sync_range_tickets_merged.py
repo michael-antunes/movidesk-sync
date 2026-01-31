@@ -12,7 +12,7 @@ import psycopg2.extras
 import requests
 
 
-SCRIPT_VERSION = "sync_range_tickets_merged_v6_2026_01_30"
+SCRIPT_VERSION = "sync_range_tickets_merged_range_control_2026-01-31"
 
 
 def env(name: str, default: Optional[str] = None) -> str:
@@ -31,17 +31,8 @@ def env_int(name: str, default: int) -> int:
 
 def setup_logging() -> None:
     level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
     logging.info("script_version=%s", SCRIPT_VERSION)
-    logging.info(
-        "run_context github_run_id=%s github_job=%s github_ref=%s",
-        os.getenv("GITHUB_RUN_ID"),
-        os.getenv("GITHUB_JOB"),
-        os.getenv("GITHUB_REF"),
-    )
 
 
 def qident(name: str) -> str:
@@ -126,6 +117,7 @@ def parse_dt(value: Any) -> Optional[datetime.datetime]:
         v = value.strip()
         if not v:
             return None
+        v = v.replace("Z", "+00:00")
         for fmt in (
             "%Y-%m-%dT%H:%M:%S.%f%z",
             "%Y-%m-%dT%H:%M:%S%z",
@@ -133,14 +125,24 @@ def parse_dt(value: Any) -> Optional[datetime.datetime]:
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d %H:%M:%S%z",
             "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
         ):
             try:
-                dt = datetime.datetime.strptime(v, fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=datetime.timezone.utc)
-                return dt.astimezone(datetime.timezone.utc)
+                dtv = datetime.datetime.strptime(v, fmt)
+                if dtv.tzinfo is None:
+                    dtv = dtv.replace(tzinfo=datetime.timezone.utc)
+                return dtv.astimezone(datetime.timezone.utc)
             except Exception:
                 continue
+        try:
+            dtv = datetime.datetime.fromisoformat(v)
+            if dtv.tzinfo is None:
+                dtv = dtv.replace(tzinfo=datetime.timezone.utc)
+            return dtv.astimezone(datetime.timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, datetime.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
     return None
 
 
@@ -176,17 +178,17 @@ def to_int_list(v: Any) -> List[int]:
         return out
     if isinstance(v, str):
         parts = [p.strip() for p in v.replace(";", ",").split(",")]
-        out: List[int] = []
+        out2: List[int] = []
         for p in parts:
             if not p:
                 continue
             try:
-                out.append(int(p))
+                out2.append(int(p))
             except Exception:
                 continue
-        return out
-    xi = as_int(v)
-    return [int(xi)] if xi is not None else []
+        return out2
+    xi2 = as_int(v)
+    return [int(xi2)] if xi2 is not None else []
 
 
 def extract_relations_from_obj(obj: Dict[str, Any], fallback_queried_id: int) -> List[MergedRelation]:
@@ -205,9 +207,7 @@ def extract_relations_from_obj(obj: Dict[str, Any], fallback_queried_id: int) ->
 
     out: List[MergedRelation] = []
 
-    if obj.get("ticketId") is not None and (
-        obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None
-    ):
+    if obj.get("ticketId") is not None and (obj.get("mergedTicketId") is not None or obj.get("mergedTicketID") is not None):
         try:
             dest = int(obj.get("ticketId"))
             src = int(obj.get("mergedTicketId") or obj.get("mergedTicketID"))
@@ -280,6 +280,79 @@ def extract_relations(payload: Any, fallback_queried_id: int) -> List[MergedRela
     return rels
 
 
+def parse_total_pages(payload: Dict[str, Any], current_page: int) -> int:
+    pn = str(payload.get("pageNumber") or "").strip()
+    if "of" in pn:
+        parts = [p.strip() for p in pn.split("of", 1)]
+        if len(parts) == 2:
+            tp = as_int(parts[1])
+            if tp and tp > 0:
+                return int(tp)
+    tp2 = as_int(payload.get("totalPages") or payload.get("pages") or payload.get("pageCount"))
+    if tp2 and tp2 > 0:
+        return int(tp2)
+    return int(current_page)
+
+
+def merged_fallback_scan(
+    api_base: str,
+    token: str,
+    child_id: int,
+    start_date: str,
+    end_date: Optional[str],
+    timeout: int,
+    max_retries: int,
+    max_pages: int,
+    debug: bool,
+) -> List[MergedRelation]:
+    url = api_base.rstrip("/") + "/tickets/merged"
+    page = 1
+    scanned = 0
+    child_id_i = int(child_id)
+
+    while scanned < max_pages:
+        params: Dict[str, Any] = {"token": token, "startDate": start_date, "page": str(page)}
+        if end_date:
+            params["endDate"] = end_date
+        r = request_with_retry(url, params=params, timeout=timeout, max_retries=max_retries)
+        if debug:
+            logging.info("fallback_page page=%s status=%s", page, r.status_code)
+        if r.status_code != 200:
+            return []
+        try:
+            payload = r.json()
+        except Exception:
+            return []
+        if not isinstance(payload, dict):
+            return []
+
+        merged_list = payload.get("mergedTickets")
+        if not isinstance(merged_list, list):
+            merged_list = []
+
+        for item in merged_list:
+            if not isinstance(item, dict):
+                continue
+            parent_id = as_int(item.get("ticketId"))
+            if not parent_id:
+                continue
+            ids = parse_csv_ints(str(item.get("mergedTicketsIds") or ""))
+            if child_id_i in ids:
+                merged_at = parse_dt(item.get("lastUpdate")) or datetime.datetime.now(datetime.timezone.utc)
+                raw = {"parentTicketId": str(parent_id), **item}
+                return [MergedRelation(merged_ticket_id=child_id_i, merged_into_id=int(parent_id), merged_at=merged_at, raw=raw)]
+
+        total_pages = parse_total_pages(payload, page)
+        if page >= total_pages:
+            return []
+
+        page += 1
+        scanned += 1
+        time.sleep(0.2)
+
+    return []
+
+
 def movidesk_fetch_best(
     api_base: str,
     token: str,
@@ -287,16 +360,24 @@ def movidesk_fetch_best(
     query_keys: Sequence[str],
     timeout: int,
     max_retries: int,
+    fallback_enabled: bool,
+    fallback_start_date: str,
+    fallback_end_date: Optional[str],
+    fallback_max_pages: int,
     debug: bool,
 ) -> Tuple[Optional[Any], List[MergedRelation], Optional[str]]:
     url = api_base.rstrip("/") + "/tickets/merged"
     best_payload: Optional[Any] = None
     best_key: Optional[str] = None
+    last_status: int = 0
+
     for key in query_keys:
         params = {"token": token, key: ticket_id}
         r = request_with_retry(url, params=params, timeout=timeout, max_retries=max_retries)
+        last_status = r.status_code
         if debug:
-            logging.info("api_call url=%s key=%s ticket_id=%s status=%s", url, key, ticket_id, r.status_code)
+            logging.info("api_call key=%s ticket_id=%s status=%s", key, ticket_id, r.status_code)
+
         if r.status_code == 200:
             try:
                 payload = r.json()
@@ -309,18 +390,40 @@ def movidesk_fetch_best(
                 best_payload = payload
                 best_key = key
             continue
+
         if r.status_code in (400, 404):
             continue
+
         if r.status_code in (401, 403):
             raise RuntimeError(f"movidesk auth error status={r.status_code} ticket_id={ticket_id}")
+
         if 500 <= r.status_code <= 599:
             if debug:
                 logging.warning("api_5xx ticket_id=%s status=%s body=%s", ticket_id, r.status_code, r.text[:500])
             continue
+
         if debug:
             logging.warning("api_unexpected ticket_id=%s status=%s body=%s", ticket_id, r.status_code, r.text[:500])
+
+    if fallback_enabled:
+        if last_status in (0, 400, 404) or best_payload is not None:
+            rels2 = merged_fallback_scan(
+                api_base,
+                token,
+                ticket_id,
+                fallback_start_date,
+                fallback_end_date,
+                timeout,
+                max_retries,
+                fallback_max_pages,
+                debug,
+            )
+            if rels2:
+                return None, rels2, "fallback_startDate_page"
+
     if best_payload is not None:
         return best_payload, extract_relations(best_payload, ticket_id), best_key
+
     return None, [], None
 
 
@@ -330,12 +433,8 @@ def ensure_jsonb(v: Dict[str, Any]) -> str:
 
 def _control_order_by(cols: Set[str]) -> str:
     bits: List[str] = []
-    if "data_fim" in cols:
-        bits.append("data_fim desc nulls last")
-    if "data_inicio" in cols:
-        bits.append("data_inicio desc nulls last")
-    if "id_inicial" in cols:
-        bits.append("id_inicial desc nulls last")
+    if "id" in cols:
+        bits.append("id desc nulls last")
     bits.append("ctid desc")
     return ", ".join(bits)
 
@@ -347,51 +446,47 @@ def read_control(
     id_col: str,
     start_override: Optional[int],
     end_override: Optional[int],
-) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
+) -> Tuple[int, int, Optional[int]]:
     cols = get_table_columns(conn, schema, control_table)
     order_by = _control_order_by(cols)
-    select_cols = ["id_inicial", "id_final", id_col]
-    select_cols_sql = ", ".join(qident(c) for c in select_cols if c in cols or c in ("id_inicial", "id_final", id_col))
-    sql = f"select {select_cols_sql} from {qname(schema, control_table)} order by {order_by} limit 1"
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"select id_inicial, id_final, {qident(id_col)} from {qname(schema, control_table)} order by {order_by} limit 1"
+        )
         row = cur.fetchone()
         if not row:
             raise RuntimeError(f"control row not found in {schema}.{control_table}")
-        id_inicial = int(row.get("id_inicial"))
-        id_final = int(row.get("id_final"))
-        last_processed = row.get(id_col)
-        if last_processed is not None:
-            last_processed = int(last_processed)
-        meta = dict(row)
+        id_inicial = int(row[0])
+        id_final = int(row[1])
+        last_processed = row[2]
+        last_processed = int(last_processed) if last_processed is not None else None
+
     if start_override is not None:
-        id_inicial = start_override
+        id_inicial = int(start_override)
     if end_override is not None:
-        id_final = end_override
+        id_final = int(end_override)
+
     if id_inicial < id_final:
         raise RuntimeError(f"invalid control range id_inicial={id_inicial} < id_final={id_final}")
-    return id_inicial, id_final, last_processed, meta
+
+    return id_inicial, id_final, last_processed
 
 
 def update_last_processed(conn, schema: str, control_table: str, id_col: str, new_value: int) -> bool:
     cols = get_table_columns(conn, schema, control_table)
     order_by = _control_order_by(cols)
-    set_bits = [f"{qident(id_col)} = %s"]
-    if "updated_at" in cols:
-        set_bits.append("updated_at = now()")
+
     with conn.cursor() as cur:
         cur.execute(f"select ctid from {qname(schema, control_table)} order by {order_by} limit 1 for update")
         row = cur.fetchone()
         if not row:
-            logging.error("control_update_failed_missing_row table=%s.%s", schema, control_table)
             return False
         ctid = row[0]
-        sql = f"update {qname(schema, control_table)} set {', '.join(set_bits)} where ctid = %s"
-        cur.execute(sql, (new_value, ctid))
-        if cur.rowcount == 1:
-            return True
-    logging.error("control_update_failed table=%s.%s id_col=%s new_value=%s", schema, control_table, id_col, new_value)
-    return False
+        cur.execute(
+            f"update {qname(schema, control_table)} set {qident(id_col)}=%s where ctid=%s",
+            (int(new_value), ctid),
+        )
+        return cur.rowcount == 1
 
 
 def upsert_mesclados(conn, schema: str, table: str, rels: List[MergedRelation]) -> int:
@@ -414,24 +509,68 @@ def upsert_mesclados(conn, schema: str, table: str, rels: List[MergedRelation]) 
 def delete_ticket_from_mesclados(conn, schema: str, table: str, ticket_id: int) -> int:
     sql = f"delete from {qname(schema, table)} where ticket_id = %s"
     with conn.cursor() as cur:
-        cur.execute(sql, (ticket_id,))
+        cur.execute(sql, (int(ticket_id),))
         return cur.rowcount
 
 
 def delete_from_other_tables(
     conn,
     merged_ticket_id: int,
+    merged_at: Optional[datetime.datetime],
     resolvidos_schema: str,
     resolvidos_table: str,
     abertos_schema: str,
     abertos_table: str,
-) -> Tuple[int, int]:
+    excluidos_schema: str,
+    excluidos_table: str,
+) -> Tuple[int, int, int]:
     with conn.cursor() as cur:
-        cur.execute(f"delete from {qname(resolvidos_schema, resolvidos_table)} where ticket_id = %s", (merged_ticket_id,))
-        deleted_resolvidos = cur.rowcount
-        cur.execute(f"delete from {qname(abertos_schema, abertos_table)} where ticket_id = %s", (merged_ticket_id,))
-        deleted_abertos = cur.rowcount
-    return deleted_resolvidos, deleted_abertos
+        if merged_at is None:
+            cur.execute(f"delete from {qname(resolvidos_schema, resolvidos_table)} where ticket_id = %s", (int(merged_ticket_id),))
+            d_res = cur.rowcount
+            cur.execute(f"delete from {qname(abertos_schema, abertos_table)} where ticket_id = %s", (int(merged_ticket_id),))
+            d_abe = cur.rowcount
+            cur.execute(f"delete from {qname(excluidos_schema, excluidos_table)} where ticket_id = %s", (int(merged_ticket_id),))
+            d_exc = cur.rowcount
+            return d_res, d_abe, d_exc
+
+        cur.execute(
+            f"""
+            delete from {qname(resolvidos_schema, resolvidos_table)}
+            where ticket_id = %s
+              and coalesce(last_update, updated_at, 'epoch'::timestamptz) <= %s
+            """,
+            (int(merged_ticket_id), merged_at),
+        )
+        d_res = cur.rowcount
+
+        cur.execute(
+            f"""
+            delete from {qname(abertos_schema, abertos_table)}
+            where ticket_id = %s
+              and coalesce(last_update, updated_at, 'epoch'::timestamptz) <= %s
+            """,
+            (int(merged_ticket_id), merged_at),
+        )
+        d_abe = cur.rowcount
+
+        cur.execute(
+            f"""
+            delete from {qname(excluidos_schema, excluidos_table)}
+            where ticket_id = %s
+              and coalesce(
+                    last_update,
+                    nullif(raw->>'lastUpdate','')::timestamptz,
+                    date_excluido,
+                    synced_at,
+                    'epoch'::timestamptz
+                  ) <= %s
+            """,
+            (int(merged_ticket_id), merged_at),
+        )
+        d_exc = cur.rowcount
+
+    return d_res, d_abe, d_exc
 
 
 def build_batch(next_id: int, end_id: int, batch_size: int) -> List[int]:
@@ -445,13 +584,17 @@ def main() -> None:
     dsn = env("NEON_DSN")
     token = env("MOVIDESK_TOKEN")
     api_base = env("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
+
     schema = env("DB_SCHEMA", "visualizacao_resolvidos")
     control_table = env("CONTROL_TABLE", "range_scan_control")
     target_table = env("TARGET_TABLE", "tickets_mesclados")
+
     resolvidos_schema = env("RESOLVIDOS_SCHEMA", "visualizacao_resolvidos")
     resolvidos_table = env("RESOLVIDOS_TABLE", "tickets_resolvidos_detail")
     abertos_schema = env("ABERTOS_SCHEMA", "visualizacao_atual")
     abertos_table = env("ABERTOS_TABLE", "tickets_abertos")
+    excluidos_schema = env("EXCLUIDOS_SCHEMA", "visualizacao_resolvidos")
+    excluidos_table = env("EXCLUIDOS_TABLE", "tickets_excluidos")
 
     id_col = env("ID_COL", "id_atual_merged")
     start_override = os.getenv("START_ID_OVERRIDE")
@@ -466,6 +609,15 @@ def main() -> None:
     query_keys = [s.strip() for s in env("MERGED_QUERY_KEYS", "ticketId,id,q").split(",") if s.strip()]
     debug_ids = parse_csv_ints(os.getenv("DEBUG_TICKET_IDS", ""))
 
+    fallback_enabled = env_int("MERGED_FALLBACK_ENABLED", 1) != 0
+    fallback_max_pages = env_int("MERGED_FALLBACK_MAX_PAGES", 50)
+    fb_start = os.getenv("MERGED_FALLBACK_START_DATE")
+    if not fb_start or fb_start.strip() == "":
+        fb_start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
+    fb_end = os.getenv("MERGED_FALLBACK_END_DATE")
+    if fb_end and fb_end.strip() == "":
+        fb_end = None
+
     conn = connect_db(dsn)
     conn.autocommit = False
     try:
@@ -474,21 +626,21 @@ def main() -> None:
             conn.rollback()
             return
 
-        id_inicial, id_final, last_processed, _meta = read_control(
-            conn, schema, control_table, id_col, start_override_i, end_override_i
-        )
-
-        next_id = id_inicial if last_processed is None else (last_processed - 1)
+        id_inicial, id_final, last_processed = read_control(conn, schema, control_table, id_col, start_override_i, end_override_i)
+        next_id = id_inicial if last_processed is None else int(last_processed) - 1
 
         logging.info(
-            "begin id_inicial=%s id_final=%s last_processed=%s next_id=%s batch=%s query_keys=%s debug_ids=%s",
+            "begin id_inicial=%s id_final=%s id_atual_merged=%s next_id=%s batch=%s query_keys=%s fallback_enabled=%s fb_start=%s fb_end=%s fb_pages=%s",
             id_inicial,
             id_final,
             last_processed,
             next_id,
             batch_size,
             ",".join(query_keys),
-            ",".join(map(str, sorted(debug_ids))) if debug_ids else "",
+            int(fallback_enabled),
+            fb_start,
+            fb_end or "",
+            fallback_max_pages,
         )
 
         total_checked = 0
@@ -499,6 +651,7 @@ def main() -> None:
 
         while next_id >= id_final:
             batch_ids = build_batch(next_id, id_final, batch_size)
+
             batch_checked = 0
             batch_upsert = 0
             batch_deleted = 0
@@ -506,8 +659,19 @@ def main() -> None:
 
             for tid in batch_ids:
                 debug = tid in debug_ids
+
                 _payload, rels, key_used = movidesk_fetch_best(
-                    api_base, token, tid, query_keys, http_timeout, http_retries, debug
+                    api_base,
+                    token,
+                    tid,
+                    query_keys,
+                    http_timeout,
+                    http_retries,
+                    fallback_enabled,
+                    fb_start,
+                    fb_end,
+                    fallback_max_pages,
+                    debug,
                 )
 
                 if debug:
@@ -516,15 +680,18 @@ def main() -> None:
                 if rels:
                     batch_upsert += upsert_mesclados(conn, schema, target_table, rels)
                     for r in rels:
-                        d1, d2 = delete_from_other_tables(
+                        d1, d2, d3 = delete_from_other_tables(
                             conn,
                             r.merged_ticket_id,
+                            r.merged_at,
                             resolvidos_schema,
                             resolvidos_table,
                             abertos_schema,
                             abertos_table,
+                            excluidos_schema,
+                            excluidos_table,
                         )
-                        batch_removed_other += d1 + d2
+                        batch_removed_other += d1 + d2 + d3
                 else:
                     batch_deleted += delete_ticket_from_mesclados(conn, schema, target_table, tid)
 
@@ -545,7 +712,7 @@ def main() -> None:
 
             elapsed = time.time() - loop_started
             logging.info(
-                "progress next_id=%s last_processed=%s checked=%s upsert=%s deleted=%s removed_other=%s elapsed_s=%.1f control_update=%s",
+                "progress next_id=%s id_atual_merged=%s checked=%s upsert=%s deleted=%s removed_other=%s elapsed_s=%.1f control_update=%s",
                 next_id,
                 new_last_processed,
                 total_checked,
@@ -557,7 +724,7 @@ def main() -> None:
             )
 
             if not ok:
-                logging.error("stopping_due_to_control_update_failure last_processed=%s", new_last_processed)
+                logging.error("stopping_due_to_control_update_failure id_atual_merged=%s", new_last_processed)
                 return
 
         logging.info(
