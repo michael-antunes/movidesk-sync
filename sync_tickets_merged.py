@@ -2,17 +2,15 @@ import os
 import json
 import time
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_window_env_db_after_api_with_merged_fallback_2026-01-31"
-
-MovideskResponse = Union[Dict[str, Any], List[Any], None]
+SCRIPT_VERSION = "sync_tickets_merged_by_date_page_into_children_2026-01-31"
 
 
 def env_str(k: str, default: Optional[str] = None) -> str:
@@ -34,16 +32,6 @@ def env_int(k: str, default: int) -> int:
         return default
 
 
-def env_float(k: str, default: float) -> float:
-    v = os.getenv(k)
-    if v is None or v.strip() == "":
-        return default
-    try:
-        return float(v.strip())
-    except Exception:
-        return default
-
-
 def qident(s: str) -> str:
     return '"' + s.replace('"', '""') + '"'
 
@@ -52,7 +40,11 @@ def qname(schema: str, table: str) -> str:
     return f"{qident(schema)}.{qident(table)}"
 
 
-def parse_dt(v: Any) -> Optional[datetime]:
+def json_payload(x: Any) -> psycopg2.extras.Json:
+    return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
+def parse_merged_lastupdate(v: Any) -> Optional[datetime]:
     if not v:
         return None
     if isinstance(v, datetime):
@@ -61,6 +53,12 @@ def parse_dt(v: Any) -> Optional[datetime]:
     if not s:
         return None
     s = s.replace("Z", "+00:00")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(s, fmt)
+            return d.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
     try:
         d = datetime.fromisoformat(s)
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
@@ -79,10 +77,6 @@ def to_int(v: Any) -> Optional[int]:
             return int(s) if s else None
         except Exception:
             return None
-
-
-def json_payload(x: Any) -> psycopg2.extras.Json:
-    return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
 
 
 def pg_connect(dsn: str):
@@ -112,283 +106,14 @@ def ensure_table(conn, schema: str, table: str) -> None:
         cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
 
 
-def list_columns(conn, schema: str, table: str) -> List[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select column_name
-            from information_schema.columns
-            where lower(table_schema) = lower(%s)
-              and lower(table_name) = lower(%s)
-            order by ordinal_position
-            """,
-            (schema, table),
-        )
-        return [r[0] for r in cur.fetchall()]
-
-
-def resolve_id_column(conn, schema: str, table: str, preferred: str, log: logging.Logger) -> str:
-    cols = list_columns(conn, schema, table)
-    cols_lower = {c.lower(): c for c in cols}
-    candidates: List[str] = []
-    if preferred:
-        candidates.append(preferred)
-    candidates.extend(["ticket_id", "ticketid", "ticketId", "id"])
-    for cand in candidates:
-        key = cand.lower()
-        if key in cols_lower:
-            chosen = cols_lower[key]
-            log.info("SOURCE_ID_COL resolved: preferred=%s chosen=%s", preferred, chosen)
-            return chosen
-    raise RuntimeError(f"Não achei coluna de ID em {schema}.{table}. Colunas={cols}")
-
-
-def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
-    with conn.cursor() as cur:
-        cur.execute(f"select max({qident(col)}) from {qname(schema, table)}")
-        v = cur.fetchone()[0]
-    return to_int(v)
-
-
-def movidesk_get(
-    sess: requests.Session,
-    base_url: str,
-    endpoint: str,
-    token: str,
-    params: Dict[str, Any],
-    timeout: int,
-) -> Tuple[MovideskResponse, Optional[int], str]:
-    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-    p = {"token": token, **params}
-    last_status: Optional[int] = None
-    last_text = ""
-    for i in range(5):
-        try:
-            r = sess.get(url, params=p, timeout=timeout)
-            last_status = r.status_code
-            last_text = (r.text or "")[:2000]
-            if r.status_code == 404:
-                return None, 404, last_text
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(2 * (i + 1))
-                continue
-            if r.status_code != 200:
-                return None, r.status_code, last_text
-            try:
-                return r.json(), 200, last_text
-            except Exception:
-                return None, 200, last_text
-        except Exception:
-            time.sleep(2 * (i + 1))
-    return None, last_status, last_text
-
-
-def first_ticket_obj(data: MovideskResponse) -> Optional[Dict[str, Any]]:
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, list):
-        for it in data:
-            if isinstance(it, dict):
-                return it
-    return None
-
-
-def extract_returned_ticket_id(obj: Dict[str, Any]) -> Optional[int]:
-    for k in ("id", "ticketId", "ticketID"):
-        if k in obj:
-            v = to_int(obj.get(k))
-            if v is not None:
-                return v
-    if "ticket" in obj and isinstance(obj.get("ticket"), dict):
-        t = obj.get("ticket") or {}
-        v = to_int(t.get("id") or t.get("ticketId") or t.get("ticketID"))
-        if v is not None:
-            return v
-    return None
-
-
-def flatten_dict_values(d: Any, out: List[Tuple[str, Any]], prefix: str = ""):
-    if isinstance(d, dict):
-        for k, v in d.items():
-            kk = f"{prefix}.{k}" if prefix else str(k)
-            out.append((kk, v))
-            flatten_dict_values(v, out, kk)
-    elif isinstance(d, list):
-        for i, v in enumerate(d):
-            kk = f"{prefix}[{i}]"
-            out.append((kk, v))
-            flatten_dict_values(v, out, kk)
-
-
-def infer_merge_from_merged_api(payload: MovideskResponse, requested_id: int) -> Tuple[Optional[int], Optional[datetime]]:
-    def candidates_from_obj(obj: Dict[str, Any]) -> Tuple[List[int], Optional[datetime]]:
-        vals: List[Tuple[str, Any]] = []
-        flatten_dict_values(obj, vals)
-
-        src = None
-        dest = None
-
-        direct_src_keys = {"mergedticketid", "merged_ticket_id", "childticketid", "child_ticket_id", "source_ticket_id", "sourceticketid"}
-        direct_dest_keys = {"ticketid", "ticket_id", "parentticketid", "parent_ticket_id", "destination_ticket_id", "destinationticketid", "targetticketid", "target_ticket_id"}
-
-        for k, v in vals:
-            kl = k.lower().replace(" ", "").replace("-", "").replace("__", "_")
-            if any(x in kl for x in direct_src_keys):
-                iv = to_int(v)
-                if iv is not None:
-                    src = iv
-            if any(x in kl for x in direct_dest_keys):
-                iv = to_int(v)
-                if iv is not None:
-                    dest = iv
-
-        if src == requested_id and dest is not None and dest != requested_id:
-            dt = None
-            for k, v in vals:
-                kl = k.lower()
-                if "merged" in kl and ("at" in kl or "date" in kl):
-                    dt = parse_dt(v)
-                    if dt:
-                        break
-            if not dt:
-                for k, v in vals:
-                    kl = k.lower()
-                    if "lastupdate" in kl or "last_update" in kl or "updated" in kl or "created" in kl:
-                        dt = parse_dt(v)
-                        if dt:
-                            break
-            return [dest], dt
-
-        into_keys = {"mergedintoid", "merged_into_id", "mergedintoticketid", "merged_into_ticket_id", "mergedtoid", "merged_to_id"}
-        into: List[int] = []
-        for k, v in vals:
-            kl = k.lower().replace(" ", "").replace("-", "").replace("__", "_")
-            if any(x in kl for x in into_keys):
-                iv = to_int(v)
-                if iv is not None and iv != requested_id:
-                    into.append(iv)
-
-        if not into:
-            if dest is not None and dest != requested_id:
-                into.append(dest)
-
-        if not into:
-            for k, v in vals:
-                kl = k.lower()
-                if kl.endswith(".ticketid") or kl == "ticketid":
-                    iv = to_int(v)
-                    if iv is not None and iv != requested_id:
-                        into.append(iv)
-
-        dt = None
-        for k, v in vals:
-            kl = k.lower()
-            if "merged" in kl and ("at" in kl or "date" in kl):
-                dt = parse_dt(v)
-                if dt:
-                    break
-        if not dt:
-            for k, v in vals:
-                kl = k.lower()
-                if "lastupdate" in kl or "last_update" in kl or "updated" in kl or "created" in kl:
-                    dt = parse_dt(v)
-                    if dt:
-                        break
-
-        return into, dt
-
-    if payload is None:
-        return None, None
-
-    candidates: List[int] = []
-    merged_dt: Optional[datetime] = None
-
-    if isinstance(payload, dict):
-        c, dt = candidates_from_obj(payload)
-        candidates.extend(c)
-        merged_dt = merged_dt or dt
-
-        if "mergedTickets" in payload and isinstance(payload.get("mergedTickets"), list):
-            t_id = to_int(payload.get("ticketId") or payload.get("ticket_id") or payload.get("id"))
-            if t_id is not None and t_id != requested_id:
-                candidates.append(t_id)
-
-            for it in payload.get("mergedTickets") or []:
-                if isinstance(it, dict):
-                    src_id = to_int(it.get("id") or it.get("ticketId") or it.get("ticket_id"))
-                    if src_id == requested_id and t_id is not None and t_id != requested_id:
-                        candidates.append(t_id)
-
-    elif isinstance(payload, list):
-        for it in payload:
-            if isinstance(it, dict):
-                c, dt = candidates_from_obj(it)
-                candidates.extend(c)
-                merged_dt = merged_dt or dt
-
-    candidates2: List[int] = []
-    seen = set()
-    for x in candidates:
-        if x is None:
-            continue
-        ix = int(x)
-        if ix == requested_id:
-            continue
-        if ix not in seen:
-            seen.add(ix)
-            candidates2.append(ix)
-
-    if not candidates2:
-        return None, merged_dt
-
-    return candidates2[0], merged_dt
-
-
-def get_triggers(conn, schema: str, table: str) -> List[Tuple[str, str, str]]:
-    rel = f"{schema}.{table}"
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select t.tgname, ns.nspname as fn_schema, p.proname
-            from pg_trigger t
-            join pg_proc p on p.oid = t.tgfoid
-            join pg_namespace ns on ns.oid = p.pronamespace
-            where t.tgrelid = %s::regclass
-              and not t.tgisinternal
-            order by t.tgname
-            """,
-            (rel,),
-        )
-        return [(r[0], r[1], r[2]) for r in cur.fetchall()]
-
-
-def disable_satisfacao_triggers(conn, schema: str, table: str) -> List[str]:
-    disabled: List[str] = []
-    trgs = get_triggers(conn, schema, table)
-    with conn.cursor() as cur:
-        for (tgname, fn_schema, proname) in trgs:
-            if fn_schema == "visualizacao_satisfacao" or "satisfacao" in (proname or "").lower():
-                cur.execute(f"alter table {qname(schema, table)} disable trigger {qident(tgname)}")
-                disabled.append(tgname)
-    return disabled
-
-
-def enable_triggers(conn, schema: str, table: str, triggers: List[str]) -> None:
-    if not triggers:
-        return
-    with conn.cursor() as cur:
-        for tgname in triggers:
-            cur.execute(f"alter table {qname(schema, table)} enable trigger {qident(tgname)}")
-
-
 def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
     if not rows:
         return 0
     dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
-    for (src, dest, merged_at, payload) in rows:
-        if src is None or dest is None:
+    for (child_id, parent_id, merged_at, payload) in rows:
+        if child_id is None or parent_id is None:
             continue
-        dedup[int(src)] = (int(src), int(dest), merged_at, payload)
+        dedup[int(child_id)] = (int(child_id), int(parent_id), merged_at, payload)
     rows2 = list(dedup.values())
     if not rows2:
         return 0
@@ -401,17 +126,57 @@ def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Option
           raw_payload = excluded.raw_payload
     """
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows2, page_size=500)
+        psycopg2.extras.execute_values(cur, sql, rows2, page_size=1000)
     return len(rows2)
 
 
-def qident(s: str) -> str:
-    return '"' + s.replace('"', '""') + '"'
+def req(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int, attempts: int) -> Tuple[Optional[Dict[str, Any]], int]:
+    last_status = 0
+    for i in range(attempts):
+        try:
+            r = sess.get(url, params=params, timeout=timeout)
+            last_status = r.status_code
+            if r.status_code == 200:
+                try:
+                    return r.json(), 200
+                except Exception:
+                    return None, 200
+            if r.status_code == 404:
+                return None, 404
+            if r.status_code in (429, 500, 502, 503, 504):
+                ra = r.headers.get("retry-after")
+                if ra:
+                    try:
+                        time.sleep(max(1, int(float(ra))))
+                    except Exception:
+                        time.sleep(min(2 ** i, 30))
+                else:
+                    time.sleep(min(2 ** i, 30))
+                continue
+            return None, r.status_code
+        except Exception:
+            time.sleep(min(2 ** i, 30))
+    return None, last_status
+
+
+def read_range_control_page(conn, schema: str, table: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(f"select id_atual_merged from {qname(schema, table)} limit 1")
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return 1
+    v = to_int(row[0])
+    return v if v and v > 0 else 1
+
+
+def write_range_control_page(conn, schema: str, table: str, page: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"update {qname(schema, table)} set id_atual_merged=%s", (int(page),))
+    conn.commit()
 
 
 def main():
-    log_level = env_str("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=getattr(logging, env_str("LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("sync_tickets_merged")
 
     token = env_str("MOVIDESK_TOKEN")
@@ -421,141 +186,93 @@ def main():
     db_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
     table_name = env_str("TABLE_NAME", "tickets_mesclados")
 
-    source_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
-    source_table = env_str("SOURCE_TABLE", "tickets_suporte")
-    source_id_col_pref = env_str("SOURCE_ID_COL", "ticket_id")
+    control_schema = env_str("CONTROL_SCHEMA", "visualizacao_resolvidos")
+    control_table = env_str("CONTROL_TABLE", "range_scan_control")
 
     window_size = env_int("WINDOW_SIZE", 50)
-    rpm = env_float("RPM", 10.0)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
+    attempts = env_int("HTTP_ATTEMPTS", 6)
 
-    delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
+    start_date = os.getenv("MERGED_START_DATE")
+    if not start_date or start_date.strip() == "":
+        start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+    end_date = os.getenv("MERGED_END_DATE")
+    if end_date and end_date.strip() == "":
+        end_date = None
 
-    log.info("script_version=%s window_size=%d rpm=%.2f", SCRIPT_VERSION, window_size, rpm)
-
-    conn0 = pg_connect(dsn)
-    conn0.autocommit = True
-    try:
-        source_id_col = resolve_id_column(conn0, source_schema, source_table, source_id_col_pref, log)
-        max_id_db = get_max_id(conn0, source_schema, source_table, source_id_col)
-        if not max_id_db or max_id_db <= 0:
-            return
-        start_id = int(max_id_db)
-    finally:
-        conn0.close()
-
-    end_id = max(1, start_id - window_size + 1)
-    ids = list(range(start_id, end_id - 1, -1))
-    log.info("max_id_db=%d start_id=%d end_id=%d", start_id, start_id, end_id)
-
-    sess = requests.Session()
-    all_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
-
-    for idx, tid in enumerate(ids, start=1):
-        data_t, st_t, _txt_t = movidesk_get(
-            sess,
-            base_url,
-            "tickets",
-            token,
-            {"id": str(tid), "returnAllProperties": "true"},
-            http_timeout,
-        )
-        if delay_between_requests:
-            time.sleep(delay_between_requests)
-
-        if st_t == 200:
-            obj = first_ticket_obj(data_t)
-            if obj is None:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
-                continue
-
-            returned_id = extract_returned_ticket_id(obj)
-            merged_at = parse_dt(
-                obj.get("lastUpdate")
-                or obj.get("updatedDate")
-                or obj.get("updatedAt")
-                or obj.get("createdDate")
-                or obj.get("createdAt")
-            )
-            raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
-
-            if returned_id is not None and int(returned_id) != int(tid):
-                all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
-                log.info(
-                    "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
-                    idx,
-                    len(ids),
-                    tid,
-                    returned_id,
-                )
-            else:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
-            continue
-
-        if st_t == 404:
-            data_m, st_m, _txt_m = movidesk_get(
-                sess,
-                base_url,
-                "tickets/merged",
-                token,
-                {"id": str(tid)},
-                http_timeout,
-            )
-            if delay_between_requests:
-                time.sleep(delay_between_requests)
-
-            merged_into_id, merged_at = infer_merge_from_merged_api(data_m, int(tid))
-            raw = {"endpoint": "tickets/merged", "params": {"id": str(tid)}, "data": data_m}
-
-            if st_m == 200 and merged_into_id is not None:
-                all_rows.append((int(tid), int(merged_into_id), merged_at or datetime.now(timezone.utc), json_payload(raw)))
-                log.info(
-                    "resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=1 origem_fallback=tickets/merged merged_into_id=%d",
-                    idx,
-                    len(ids),
-                    tid,
-                    merged_into_id,
-                )
-            else:
-                log.info(
-                    "resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=0",
-                    idx,
-                    len(ids),
-                    tid,
-                )
-            continue
-
-        log.info("resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets rows=0", idx, len(ids), tid, st_t)
+    log.info("script_version=%s start_date=%s end_date=%s window_size=%d", SCRIPT_VERSION, start_date, end_date or "", window_size)
 
     conn = pg_connect(dsn)
     conn.autocommit = False
-    disabled: List[str] = []
     try:
         ensure_table(conn, db_schema, table_name)
-        if all_rows:
-            disabled = disable_satisfacao_triggers(conn, db_schema, table_name)
-        n = upsert_rows(conn, db_schema, table_name, all_rows)
-        if disabled:
-            enable_triggers(conn, db_schema, table_name, disabled)
         conn.commit()
-        log.info("done checked=%d upserted=%d window=[%d..%d]", len(ids), n, start_id, end_id)
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        try:
-            conn2 = pg_connect(dsn)
-            conn2.autocommit = True
-            with conn2.cursor() as cur:
-                cur.execute(f"alter table {qname(db_schema, table_name)} enable trigger all")
-            conn2.close()
-        except Exception:
-            pass
-        raise
+        current_page = read_range_control_page(conn, control_schema, control_table)
+    finally:
+        conn.close()
+
+    sess = requests.Session()
+    url = f"{base_url.rstrip('/')}/tickets/merged"
+    params = {"token": token, "startDate": start_date, "page": str(current_page)}
+    if end_date:
+        params["endDate"] = end_date
+
+    data, st = req(sess, url, params, http_timeout, attempts)
+    if st != 200 or not isinstance(data, dict):
+        log.info("merged_page page=%s status=%s rows=0", current_page, st)
+        return
+
+    page_number = str(data.get("pageNumber") or "").strip()
+    total_pages = None
+    if "of" in page_number:
+        parts = [p.strip() for p in page_number.split("of", 1)]
+        if len(parts) == 2:
+            total_pages = to_int(parts[1])
+    if not total_pages or total_pages <= 0:
+        total_pages = current_page
+
+    merged_list = data.get("mergedTickets")
+    if not isinstance(merged_list, list):
+        merged_list = []
+
+    merged_list = merged_list[: max(0, int(window_size))]
+
+    rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+    for item in merged_list:
+        if not isinstance(item, dict):
+            continue
+        parent_id = to_int(item.get("ticketId"))
+        if not parent_id:
+            continue
+        merged_at = parse_merged_lastupdate(item.get("lastUpdate")) or datetime.now(timezone.utc)
+        ids_str = str(item.get("mergedTicketsIds") or "").strip()
+        if not ids_str:
+            continue
+        child_ids = []
+        for s in ids_str.split(";"):
+            v = to_int(s)
+            if v:
+                child_ids.append(v)
+        if not child_ids:
+            continue
+        raw = {"parentTicketId": str(parent_id), **item}
+        payload = json_payload(raw)
+        for child_id in child_ids:
+            rows.append((int(child_id), int(parent_id), merged_at, payload))
+
+    conn2 = pg_connect(dsn)
+    conn2.autocommit = False
+    try:
+        n = upsert_rows(conn2, db_schema, table_name, rows)
+        next_page = current_page + 1
+        if next_page > int(total_pages):
+            next_page = 1
+        write_range_control_page(conn2, control_schema, control_table, next_page)
+        conn2.commit()
+        log.info("merged_page page=%s/%s parents=%s inserted_or_updated=%s next_page=%s", current_page, total_pages, len(merged_list), n, next_page)
     finally:
         try:
-            conn.close()
+            conn2.close()
         except Exception:
             pass
 
