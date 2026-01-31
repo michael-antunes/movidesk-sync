@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_child_infer_by_ticket_returned_id_window100_desc_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_window_env_db_after_api_2026-01-31"
 
 MovideskResponse = Union[Dict[str, Any], List[Any], None]
 
@@ -85,11 +85,14 @@ def json_payload(x: Any) -> psycopg2.extras.Json:
     return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
 
 
-def set_session_timeouts(conn, lock_timeout_ms: int) -> None:
-    if lock_timeout_ms <= 0:
-        return
-    with conn.cursor() as cur:
-        cur.execute(f"set lock_timeout = '{int(lock_timeout_ms)}ms'")
+def pg_connect(dsn: str):
+    return psycopg2.connect(
+        dsn,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 
 def ensure_table(conn, schema: str, table: str) -> None:
@@ -137,7 +140,7 @@ def resolve_id_column(conn, schema: str, table: str, preferred: str, log: loggin
             chosen = cols_lower[key]
             log.info("SOURCE_ID_COL resolved: preferred=%s chosen=%s", preferred, chosen)
             return chosen
-    raise RuntimeError(f"Não achei coluna de ID em {schema}.{table}. Preferido='{preferred}'. Colunas disponíveis={cols}")
+    raise RuntimeError(f"Não achei coluna de ID em {schema}.{table}. Colunas={cols}")
 
 
 def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
@@ -145,50 +148,6 @@ def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
         cur.execute(f"select max({qident(col)}) from {qname(schema, table)}")
         v = cur.fetchone()[0]
     return to_int(v)
-
-
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
-    if not rows:
-        return 0
-    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
-    for (src, dest, merged_at, payload) in rows:
-        if src is None or dest is None:
-            continue
-        dedup[int(src)] = (int(src), int(dest), merged_at, payload)
-    rows2 = list(dedup.values())
-    if not rows2:
-        return 0
-    sql = f"""
-    insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
-    values %s
-    on conflict (ticket_id) do update
-      set merged_into_id = excluded.merged_into_id,
-          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
-          raw_payload = excluded.raw_payload
-    """
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows2, page_size=500)
-    return len(rows2)
-
-
-def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
-    for attempt in range(max_retries):
-        try:
-            result = fn()
-            conn.commit()
-            return result
-        except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DeadlockDetected) as e:
-            conn.rollback()
-            wait = min(30, 2 ** attempt)
-            log.warning(
-                "DB lock/deadlock (%s). Retry em %ss (tentativa %d/%d).",
-                e.__class__.__name__,
-                wait,
-                attempt + 1,
-                max_retries,
-            )
-            time.sleep(wait)
-    raise RuntimeError("Falhou por lock/deadlock muitas vezes.")
 
 
 def movidesk_get(
@@ -266,7 +225,7 @@ def get_triggers(conn, schema: str, table: str) -> List[Tuple[str, str, str]]:
         return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
 
-def disable_satisfacao_triggers(conn, schema: str, table: str, log: logging.Logger) -> List[str]:
+def disable_satisfacao_triggers(conn, schema: str, table: str) -> List[str]:
     disabled: List[str] = []
     trgs = get_triggers(conn, schema, table)
     with conn.cursor() as cur:
@@ -274,20 +233,39 @@ def disable_satisfacao_triggers(conn, schema: str, table: str, log: logging.Logg
             if fn_schema == "visualizacao_satisfacao" or "satisfacao" in (proname or "").lower():
                 cur.execute(f"alter table {qname(schema, table)} disable trigger {qident(tgname)}")
                 disabled.append(tgname)
-    if disabled:
-        conn.commit()
-        log.info("triggers_disabled=%s", disabled)
     return disabled
 
 
-def enable_triggers(conn, schema: str, table: str, triggers: List[str], log: logging.Logger) -> None:
+def enable_triggers(conn, schema: str, table: str, triggers: List[str]) -> None:
     if not triggers:
         return
     with conn.cursor() as cur:
         for tgname in triggers:
             cur.execute(f"alter table {qname(schema, table)} enable trigger {qident(tgname)}")
-    conn.commit()
-    log.info("triggers_enabled=%s", triggers)
+
+
+def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
+    if not rows:
+        return 0
+    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    for (src, dest, merged_at, payload) in rows:
+        if src is None or dest is None:
+            continue
+        dedup[int(src)] = (int(src), int(dest), merged_at, payload)
+    rows2 = list(dedup.values())
+    if not rows2:
+        return 0
+    sql = f"""
+    insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+    values %s
+    on conflict (ticket_id) do update
+      set merged_into_id = excluded.merged_into_id,
+          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
+          raw_payload = excluded.raw_payload
+    """
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, rows2, page_size=500)
+    return len(rows2)
 
 
 def main():
@@ -306,101 +284,110 @@ def main():
     source_table = env_str("SOURCE_TABLE", "tickets_suporte")
     source_id_col_pref = env_str("SOURCE_ID_COL", "ticket_id")
 
+    window_size = env_int("WINDOW_SIZE", 50)
     rpm = env_float("RPM", 10.0)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
-    lock_timeout_ms = env_int("PG_LOCK_TIMEOUT_MS", 5000)
-    lock_retries = env_int("PG_LOCK_RETRIES", 6)
 
-    window_size = env_int("WINDOW_SIZE", 50)
     delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
 
     log.info("script_version=%s window_size=%d rpm=%.2f", SCRIPT_VERSION, window_size, rpm)
 
-    conn = psycopg2.connect(dsn)
-    conn.autocommit = False
-    set_session_timeouts(conn, lock_timeout_ms)
-    ensure_table(conn, db_schema, table_name)
-    conn.commit()
-
-    disabled_triggers: List[str] = []
+    conn0 = pg_connect(dsn)
+    conn0.autocommit = True
     try:
-        disabled_triggers = disable_satisfacao_triggers(conn, db_schema, table_name, log)
-
-        source_id_col = resolve_id_column(conn, source_schema, source_table, source_id_col_pref, log)
-        max_id_db = get_max_id(conn, source_schema, source_table, source_id_col)
+        source_id_col = resolve_id_column(conn0, source_schema, source_table, source_id_col_pref, log)
+        max_id_db = get_max_id(conn0, source_schema, source_table, source_id_col)
         if not max_id_db or max_id_db <= 0:
             return
-
         start_id = int(max_id_db)
-        end_id = max(1, start_id - window_size + 1)
-        ids = list(range(start_id, end_id - 1, -1))
-
-        log.info("max_id_db=%d start_id=%d end_id=%d", max_id_db, start_id, end_id)
-
-        sess = requests.Session()
-        all_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
-
-        for idx, tid in enumerate(ids, start=1):
-            data_t, st_t, _txt_t = movidesk_get(
-                sess,
-                base_url,
-                "tickets",
-                token,
-                {"id": str(tid), "returnAllProperties": "true"},
-                http_timeout,
-            )
-            if delay_between_requests:
-                time.sleep(delay_between_requests)
-
-            if st_t == 404:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=0", idx, len(ids), tid)
-                continue
-
-            if st_t != 200:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets rows=0", idx, len(ids), tid, st_t)
-                continue
-
-            obj = first_ticket_obj(data_t)
-            if obj is None:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
-                continue
-
-            returned_id = extract_returned_ticket_id(obj)
-            merged_at = parse_dt(
-                obj.get("lastUpdate")
-                or obj.get("updatedDate")
-                or obj.get("updatedAt")
-                or obj.get("createdDate")
-                or obj.get("createdAt")
-            )
-            raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
-
-            if returned_id is not None and int(returned_id) != int(tid):
-                all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
-                log.info(
-                    "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
-                    idx,
-                    len(ids),
-                    tid,
-                    returned_id,
-                )
-            else:
-                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
-
-        n = commit_with_retry(
-            conn,
-            lambda: upsert_rows(conn, db_schema, table_name, all_rows),
-            log=log,
-            max_retries=lock_retries,
-        )
-        log.info("done checked=%d upserted=%d window=[%d..%d]", len(ids), n, start_id, end_id)
-
     finally:
+        conn0.close()
+
+    end_id = max(1, start_id - window_size + 1)
+    ids = list(range(start_id, end_id - 1, -1))
+    log.info("max_id_db=%d start_id=%d end_id=%d", start_id, start_id, end_id)
+
+    sess = requests.Session()
+    all_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+
+    for idx, tid in enumerate(ids, start=1):
+        data_t, st_t, _txt_t = movidesk_get(
+            sess,
+            base_url,
+            "tickets",
+            token,
+            {"id": str(tid), "returnAllProperties": "true"},
+            http_timeout,
+        )
+        if delay_between_requests:
+            time.sleep(delay_between_requests)
+
+        if st_t == 404:
+            log.info("resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=0", idx, len(ids), tid)
+            continue
+
+        if st_t != 200:
+            log.info("resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets rows=0", idx, len(ids), tid, st_t)
+            continue
+
+        obj = first_ticket_obj(data_t)
+        if obj is None:
+            log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
+            continue
+
+        returned_id = extract_returned_ticket_id(obj)
+        merged_at = parse_dt(
+            obj.get("lastUpdate")
+            or obj.get("updatedDate")
+            or obj.get("updatedAt")
+            or obj.get("createdDate")
+            or obj.get("createdAt")
+        )
+        raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
+
+        if returned_id is not None and int(returned_id) != int(tid):
+            all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
+            log.info(
+                "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
+                idx,
+                len(ids),
+                tid,
+                returned_id,
+            )
+        else:
+            log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
+
+    conn = pg_connect(dsn)
+    conn.autocommit = False
+    disabled: List[str] = []
+    try:
+        ensure_table(conn, db_schema, table_name)
+        if all_rows:
+            disabled = disable_satisfacao_triggers(conn, db_schema, table_name)
+        n = upsert_rows(conn, db_schema, table_name, all_rows)
+        if disabled:
+            enable_triggers(conn, db_schema, table_name, disabled)
+        conn.commit()
+        log.info("done checked=%d upserted=%d window=[%d..%d]", len(ids), n, start_id, end_id)
+    except Exception:
         try:
-            enable_triggers(conn, db_schema, table_name, disabled_triggers, log)
+            conn.rollback()
         except Exception:
             pass
-        conn.close()
+        try:
+            conn2 = pg_connect(dsn)
+            conn2.autocommit = True
+            with conn2.cursor() as cur:
+                cur.execute(f"alter table {qname(db_schema, table_name)} enable trigger all")
+            conn2.close()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
