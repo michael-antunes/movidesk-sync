@@ -22,7 +22,7 @@ TIMEOUT = int(os.getenv("MOVIDESK_TIMEOUT", "30"))
 ATTEMPTS = int(os.getenv("MOVIDESK_ATTEMPTS", "6"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sync_tickets_excluidos")
+log = logging.getLogger("sync_tickets_excluidos_range")
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -189,6 +189,8 @@ def main():
         ptr = id_atual_excluido
         if ptr is None:
             ptr = id_atual
+        if ptr is None:
+            ptr = id_inicial
         if ptr is None:
             raise RuntimeError("Ponteiro inicial não definido (id_inicial/id_atual_excluido/id_atual)")
 
