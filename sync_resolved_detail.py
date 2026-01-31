@@ -212,6 +212,43 @@ def upsert_detail(conn, ticket_id, raw_obj, last_update_dt):
     )
 
 
+def cleanup_merged_and_excluidos_on_resolved(conn, ticket_id, last_update_dt):
+    pg_exec(
+        conn,
+        """
+        do $$
+        begin
+          if to_regclass('visualizacao_resolvidos.tickets_mesclados') is not null then
+            delete from visualizacao_resolvidos.tickets_mesclados tm
+            where tm.ticket_id = %s
+              and coalesce(tm.merged_at, 'epoch'::timestamptz) < coalesce(%s, 'epoch'::timestamptz);
+
+            delete from visualizacao_resolvidos.tickets_resolvidos_detail tr
+            using visualizacao_resolvidos.tickets_mesclados tm
+            where tr.ticket_id = %s
+              and tm.ticket_id = %s
+              and coalesce(tm.merged_at, 'epoch'::timestamptz) >= coalesce(%s, 'epoch'::timestamptz);
+          end if;
+
+          if to_regclass('visualizacao_resolvidos.tickets_excluidos') is not null then
+            delete from visualizacao_resolvidos.tickets_excluidos te
+            where te.ticket_id = %s
+              and coalesce(%s, 'epoch'::timestamptz)
+                  > coalesce(
+                      nullif(to_jsonb(te)->>'last_update','')::timestamptz,
+                      nullif((to_jsonb(te)->'raw')->>'lastUpdate','')::timestamptz,
+                      nullif((to_jsonb(te)->'raw')->>'lastUpdateDate','')::timestamptz,
+                      nullif(to_jsonb(te)->>'date_excluido','')::timestamptz,
+                      nullif(to_jsonb(te)->>'synced_at','')::timestamptz,
+                      'epoch'::timestamptz
+                    );
+          end if;
+        end $$;
+        """,
+        [int(ticket_id), last_update_dt, int(ticket_id), int(ticket_id), last_update_dt, int(ticket_id), last_update_dt],
+    )
+
+
 def main():
     logger = setup_logger()
 
@@ -287,6 +324,7 @@ def main():
         try:
             conn3.autocommit = False
             upsert_detail(conn3, ticket_id, ticket, last_update_dt)
+            cleanup_merged_and_excluidos_on_resolved(conn3, ticket_id, last_update_dt)
             delete_missing(conn3, ticket_id)
             conn3.commit()
             updated.append(ticket_id)
