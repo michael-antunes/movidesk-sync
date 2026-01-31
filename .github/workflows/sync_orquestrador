@@ -1,0 +1,82 @@
+name: Orquestrador - Start workflows se não estiverem executando
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/10 * * * *"
+
+concurrency:
+  group: orchestrador-start-workflows
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Orquestrar execuções
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          api="https://api.github.com"
+
+          is_running() {
+            local wf="$1"
+            local inprog queued
+            inprog=$(curl -sS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${api}/repos/${REPO}/actions/workflows/${wf}/runs?status=in_progress&per_page=1" | jq -r '.total_count // 0')
+            queued=$(curl -sS -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${api}/repos/${REPO}/actions/workflows/${wf}/runs?status=queued&per_page=1" | jq -r '.total_count // 0')
+            if [[ "${inprog}" != "0" || "${queued}" != "0" ]]; then
+              return 0
+            fi
+            return 1
+          }
+
+          dispatch() {
+            local wf="$1"
+            curl -sS -L -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${api}/repos/${REPO}/actions/workflows/${wf}/dispatches" \
+              -d "{\"ref\":\"${REF_NAME}\"}" >/dev/null
+          }
+
+          ensure_running() {
+            local wf="$1"
+            if is_running "${wf}"; then
+              echo "RUNNING: ${wf}"
+            else
+              echo "DISPATCH: ${wf}"
+              dispatch "${wf}"
+            fi
+          }
+
+          ensure_either_running_else_dispatch() {
+            local wf_a="$1"
+            local wf_b="$2"
+            local wf_dispatch="$3"
+
+            if is_running "${wf_a}" || is_running "${wf_b}"; then
+              echo "RUNNING: ${wf_a} OR ${wf_b}"
+            else
+              echo "DISPATCH: ${wf_dispatch}"
+              dispatch "${wf_dispatch}"
+            fi
+          }
+
+          ensure_running "sync_resolved_detail.yml"
+          ensure_either_running_else_dispatch "sync_tickets_abertos_raw.yml" "sync_tickets_abertos.yml" "sync_tickets_abertos.yml"
+          ensure_running "sync_tickets_merged.yml"
+          ensure_running "sync_tickets_excluidos_range.yml"
+          ensure_running "detail_watchdog.yml"
