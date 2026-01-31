@@ -1,4 +1,4 @@
-name: Movidesk - Tickets excluídos (range) (loop)
+name: Movidesk - Tickets excluídos (max->down 100) (loop)
 
 on:
   workflow_dispatch: {}
@@ -6,7 +6,7 @@ on:
     - cron: "*/20 * * * *"
 
 concurrency:
-  group: movidesk-excluidos-range-loop
+  group: movidesk-excluidos-max-range-loop
   cancel-in-progress: false
 
 permissions:
@@ -14,7 +14,7 @@ permissions:
   actions: write
 
 jobs:
-  tickets-excluidos-range:
+  tickets-excluidos-max-range:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -27,40 +27,39 @@ jobs:
 
       - run: python -m pip install --upgrade pip requests psycopg2-binary
 
-      - name: Sync tickets excluídos
+      - name: Sync tickets excluídos (max range)
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
           MOVIDESK_TOKEN: ${{ secrets.MOVIDESK_TOKEN }}
-          EXCLUIDOS_BATCH: "50"
+          EXCLUIDOS_BATCH: "100"
           MOVIDESK_THROTTLE: "0.25"
-        run: python sync_tickets_excluidos.py | tee excluidos_out.txt
+        run: python sync_tickets_excluidos_range.py | tee excluidos_range_out.txt
 
       - name: Check done
         shell: bash
         env:
           NEON_DSN: ${{ secrets.NEON_DSN }}
+          SCHEMA: visualizacao_resolvidos
+          CONTROL_TABLE: range_scan_control
         run: |
           set -euo pipefail
           DONE=$(python - <<'PY'
           import os, psycopg2
           dsn=os.environ["NEON_DSN"]
-          schema="visualizacao_resolvidos"
-          ctl="range_scan_control"
+          schema=os.getenv("SCHEMA","visualizacao_resolvidos")
+          ctl=os.getenv("CONTROL_TABLE","range_scan_control")
           c=psycopg2.connect(dsn)
           cur=c.cursor()
-          cur.execute(f"SELECT id_atual_excluido::bigint, id_final::bigint FROM {schema}.{ctl} LIMIT 1")
+          cur.execute(f'SELECT id_atual_excluido::bigint, id_final::bigint FROM "{schema}"."{ctl}" LIMIT 1')
           r=cur.fetchone()
           cur.close()
           c.close()
-          if not r:
-            print("1")
+          if not r or r[0] is None or r[1] is None:
+            print("0")
           else:
-            ptr=r[0]
-            end=r[1]
-            if ptr is None:
-              print("0")
-            else:
-              print("1" if int(ptr) <= int(end) else "0")
+            ptr=int(r[0])
+            end=int(r[1])
+            print("1" if ptr <= end else "0")
           PY
           )
           echo "done=${DONE}" | tee done_out.txt
@@ -77,5 +76,5 @@ jobs:
           curl -L -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_tickets_excluidos.yml/dispatches \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/sync_tickets_excluidos_range.yml/dispatches \
             -d '{"ref":"${{ github.ref_name }}"}'
