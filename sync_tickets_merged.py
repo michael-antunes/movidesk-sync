@@ -180,7 +180,13 @@ def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
         except (psycopg2.errors.LockNotAvailable, psycopg2.errors.DeadlockDetected) as e:
             conn.rollback()
             wait = min(30, 2 ** attempt)
-            log.warning("DB lock/deadlock (%s). Retry em %ss (tentativa %d/%d).", e.__class__.__name__, wait, attempt + 1, max_retries)
+            log.warning(
+                "DB lock/deadlock (%s). Retry em %ss (tentativa %d/%d).",
+                e.__class__.__name__,
+                wait,
+                attempt + 1,
+                max_retries,
+            )
             time.sleep(wait)
     raise RuntimeError("Falhou por lock/deadlock muitas vezes.")
 
@@ -305,7 +311,7 @@ def main():
     lock_timeout_ms = env_int("PG_LOCK_TIMEOUT_MS", 5000)
     lock_retries = env_int("PG_LOCK_RETRIES", 6)
 
-    window_size = 100
+    window_size = env_int("WINDOW_SIZE", 50)
     delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
 
     log.info("script_version=%s window_size=%d rpm=%.2f", SCRIPT_VERSION, window_size, rpm)
@@ -360,19 +366,33 @@ def main():
                 continue
 
             returned_id = extract_returned_ticket_id(obj)
-            merged_at = parse_dt(obj.get("lastUpdate") or obj.get("updatedDate") or obj.get("updatedAt") or obj.get("createdDate") or obj.get("createdAt"))
+            merged_at = parse_dt(
+                obj.get("lastUpdate")
+                or obj.get("updatedDate")
+                or obj.get("updatedAt")
+                or obj.get("createdDate")
+                or obj.get("createdAt")
+            )
             raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
 
             if returned_id is not None and int(returned_id) != int(tid):
                 all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
                 log.info(
                     "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
-                    idx, len(ids), tid, returned_id
+                    idx,
+                    len(ids),
+                    tid,
+                    returned_id,
                 )
             else:
                 log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
 
-        n = commit_with_retry(conn, lambda: upsert_rows(conn, db_schema, table_name, all_rows), log=log, max_retries=lock_retries)
+        n = commit_with_retry(
+            conn,
+            lambda: upsert_rows(conn, db_schema, table_name, all_rows),
+            log=log,
+            max_retries=lock_retries,
+        )
         log.info("done checked=%d upserted=%d window=[%d..%d]", len(ids), n, start_id, end_id)
 
     finally:
