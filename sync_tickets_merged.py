@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_window_env_db_after_api_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_window_env_db_after_api_with_merged_fallback_2026-01-31"
 
 MovideskResponse = Union[Dict[str, Any], List[Any], None]
 
@@ -207,6 +207,143 @@ def extract_returned_ticket_id(obj: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def flatten_dict_values(d: Any, out: List[Tuple[str, Any]], prefix: str = ""):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            kk = f"{prefix}.{k}" if prefix else str(k)
+            out.append((kk, v))
+            flatten_dict_values(v, out, kk)
+    elif isinstance(d, list):
+        for i, v in enumerate(d):
+            kk = f"{prefix}[{i}]"
+            out.append((kk, v))
+            flatten_dict_values(v, out, kk)
+
+
+def infer_merge_from_merged_api(payload: MovideskResponse, requested_id: int) -> Tuple[Optional[int], Optional[datetime]]:
+    def candidates_from_obj(obj: Dict[str, Any]) -> Tuple[List[int], Optional[datetime]]:
+        vals: List[Tuple[str, Any]] = []
+        flatten_dict_values(obj, vals)
+
+        src = None
+        dest = None
+
+        direct_src_keys = {"mergedticketid", "merged_ticket_id", "childticketid", "child_ticket_id", "source_ticket_id", "sourceticketid"}
+        direct_dest_keys = {"ticketid", "ticket_id", "parentticketid", "parent_ticket_id", "destination_ticket_id", "destinationticketid", "targetticketid", "target_ticket_id"}
+
+        for k, v in vals:
+            kl = k.lower().replace(" ", "").replace("-", "").replace("__", "_")
+            if any(x in kl for x in direct_src_keys):
+                iv = to_int(v)
+                if iv is not None:
+                    src = iv
+            if any(x in kl for x in direct_dest_keys):
+                iv = to_int(v)
+                if iv is not None:
+                    dest = iv
+
+        if src == requested_id and dest is not None and dest != requested_id:
+            dt = None
+            for k, v in vals:
+                kl = k.lower()
+                if "merged" in kl and ("at" in kl or "date" in kl):
+                    dt = parse_dt(v)
+                    if dt:
+                        break
+            if not dt:
+                for k, v in vals:
+                    kl = k.lower()
+                    if "lastupdate" in kl or "last_update" in kl or "updated" in kl or "created" in kl:
+                        dt = parse_dt(v)
+                        if dt:
+                            break
+            return [dest], dt
+
+        into_keys = {"mergedintoid", "merged_into_id", "mergedintoticketid", "merged_into_ticket_id", "mergedtoid", "merged_to_id"}
+        into: List[int] = []
+        for k, v in vals:
+            kl = k.lower().replace(" ", "").replace("-", "").replace("__", "_")
+            if any(x in kl for x in into_keys):
+                iv = to_int(v)
+                if iv is not None and iv != requested_id:
+                    into.append(iv)
+
+        if not into:
+            if dest is not None and dest != requested_id:
+                into.append(dest)
+
+        if not into:
+            for k, v in vals:
+                kl = k.lower()
+                if kl.endswith(".ticketid") or kl == "ticketid":
+                    iv = to_int(v)
+                    if iv is not None and iv != requested_id:
+                        into.append(iv)
+
+        dt = None
+        for k, v in vals:
+            kl = k.lower()
+            if "merged" in kl and ("at" in kl or "date" in kl):
+                dt = parse_dt(v)
+                if dt:
+                    break
+        if not dt:
+            for k, v in vals:
+                kl = k.lower()
+                if "lastupdate" in kl or "last_update" in kl or "updated" in kl or "created" in kl:
+                    dt = parse_dt(v)
+                    if dt:
+                        break
+
+        return into, dt
+
+    if payload is None:
+        return None, None
+
+    candidates: List[int] = []
+    merged_dt: Optional[datetime] = None
+
+    if isinstance(payload, dict):
+        c, dt = candidates_from_obj(payload)
+        candidates.extend(c)
+        merged_dt = merged_dt or dt
+
+        if "mergedTickets" in payload and isinstance(payload.get("mergedTickets"), list):
+            t_id = to_int(payload.get("ticketId") or payload.get("ticket_id") or payload.get("id"))
+            if t_id is not None and t_id != requested_id:
+                candidates.append(t_id)
+
+            for it in payload.get("mergedTickets") or []:
+                if isinstance(it, dict):
+                    src_id = to_int(it.get("id") or it.get("ticketId") or it.get("ticket_id"))
+                    if src_id == requested_id and t_id is not None and t_id != requested_id:
+                        candidates.append(t_id)
+
+    elif isinstance(payload, list):
+        for it in payload:
+            if isinstance(it, dict):
+                c, dt = candidates_from_obj(it)
+                candidates.extend(c)
+                merged_dt = merged_dt or dt
+
+    candidates2: List[int] = []
+    seen = set()
+    for x in candidates:
+        if x is None:
+            continue
+        ix = int(x)
+        if ix == requested_id:
+            continue
+        if ix not in seen:
+            seen.add(ix)
+            candidates2.append(ix)
+
+    if not candidates2:
+        return None, merged_dt
+
+    return candidates2[0], merged_dt
+
+
 def get_triggers(conn, schema: str, table: str) -> List[Tuple[str, str, str]]:
     rel = f"{schema}.{table}"
     with conn.cursor() as cur:
@@ -268,6 +405,10 @@ def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Option
     return len(rows2)
 
 
+def qident(s: str) -> str:
+    return '"' + s.replace('"', '""') + '"'
+
+
 def main():
     log_level = env_str("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
@@ -322,40 +463,69 @@ def main():
         if delay_between_requests:
             time.sleep(delay_between_requests)
 
-        if st_t == 404:
-            log.info("resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=0", idx, len(ids), tid)
-            continue
+        if st_t == 200:
+            obj = first_ticket_obj(data_t)
+            if obj is None:
+                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
+                continue
 
-        if st_t != 200:
-            log.info("resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets rows=0", idx, len(ids), tid, st_t)
-            continue
-
-        obj = first_ticket_obj(data_t)
-        if obj is None:
-            log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
-            continue
-
-        returned_id = extract_returned_ticket_id(obj)
-        merged_at = parse_dt(
-            obj.get("lastUpdate")
-            or obj.get("updatedDate")
-            or obj.get("updatedAt")
-            or obj.get("createdDate")
-            or obj.get("createdAt")
-        )
-        raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
-
-        if returned_id is not None and int(returned_id) != int(tid):
-            all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
-            log.info(
-                "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
-                idx,
-                len(ids),
-                tid,
-                returned_id,
+            returned_id = extract_returned_ticket_id(obj)
+            merged_at = parse_dt(
+                obj.get("lastUpdate")
+                or obj.get("updatedDate")
+                or obj.get("updatedAt")
+                or obj.get("createdDate")
+                or obj.get("createdAt")
             )
-        else:
-            log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
+            raw = {"endpoint": "tickets", "params": {"id": str(tid), "returnAllProperties": True}, "data": data_t}
+
+            if returned_id is not None and int(returned_id) != int(tid):
+                all_rows.append((int(tid), int(returned_id), merged_at, json_payload(raw)))
+                log.info(
+                    "resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d",
+                    idx,
+                    len(ids),
+                    tid,
+                    returned_id,
+                )
+            else:
+                log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=0", idx, len(ids), tid)
+            continue
+
+        if st_t == 404:
+            data_m, st_m, _txt_m = movidesk_get(
+                sess,
+                base_url,
+                "tickets/merged",
+                token,
+                {"id": str(tid)},
+                http_timeout,
+            )
+            if delay_between_requests:
+                time.sleep(delay_between_requests)
+
+            merged_into_id, merged_at = infer_merge_from_merged_api(data_m, int(tid))
+            raw = {"endpoint": "tickets/merged", "params": {"id": str(tid)}, "data": data_m}
+
+            if st_m == 200 and merged_into_id is not None:
+                all_rows.append((int(tid), int(merged_into_id), merged_at or datetime.now(timezone.utc), json_payload(raw)))
+                log.info(
+                    "resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=1 origem_fallback=tickets/merged merged_into_id=%d",
+                    idx,
+                    len(ids),
+                    tid,
+                    merged_into_id,
+                )
+            else:
+                log.info(
+                    "resultado_ticket %d/%d ticket_id=%d status=404 origem=tickets rows=0",
+                    idx,
+                    len(ids),
+                    tid,
+                )
+            continue
+
+        log.info("resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets rows=0", idx, len(ids), tid, st_t)
 
     conn = pg_connect(dsn)
     conn.autocommit = False
