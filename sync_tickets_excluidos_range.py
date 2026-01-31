@@ -13,18 +13,16 @@ TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
 SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
+CONTROL_TABLE = os.getenv("CONTROL_TABLE", "range_scan_control")
 TABLE_EXCLUIDOS = os.getenv("TABLE_EXCLUIDOS", "tickets_excluidos")
-CONTROL_TABLE = os.getenv("CONTROL_TABLE", "tickets_excluidos_scan_control")
 
-BATCH = int(os.getenv("EXCLUIDOS_BATCH", "100"))
-STOP_AT = int(os.getenv("EXCLUIDOS_STOP_AT", "1"))
-
+BATCH = int(os.getenv("EXCLUIDOS_BATCH", "50"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.25"))
 TIMEOUT = int(os.getenv("MOVIDESK_TIMEOUT", "30"))
 ATTEMPTS = int(os.getenv("MOVIDESK_ATTEMPTS", "6"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("sync_tickets_excluidos_range")
+log = logging.getLogger("sync_tickets_excluidos")
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -78,7 +76,7 @@ def req(url, params):
 def ensure_tables(conn):
     with conn.cursor() as cur:
         cur.execute(f'create schema if not exists "{SCHEMA}"')
-
+        cur.execute(f'alter table {qname(SCHEMA, CONTROL_TABLE)} add column if not exists id_atual_excluido bigint')
         cur.execute(
             f"""
             create table if not exists {qname(SCHEMA, TABLE_EXCLUIDOS)} (
@@ -93,24 +91,6 @@ def ensure_tables(conn):
         cur.execute(
             f"create index if not exists idx_{TABLE_EXCLUIDOS}_date_excluido on {qname(SCHEMA, TABLE_EXCLUIDOS)} (date_excluido)"
         )
-
-        cur.execute(
-            f"""
-            create table if not exists {qname(SCHEMA, CONTROL_TABLE)} (
-              id int primary key,
-              id_started bigint,
-              id_ptr bigint,
-              updated_at timestamptz
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            insert into {qname(SCHEMA, CONTROL_TABLE)} (id)
-            values (1)
-            on conflict (id) do nothing
-            """
-        )
     conn.commit()
 
 
@@ -118,53 +98,33 @@ def read_control(conn):
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            select id_started, id_ptr
+            select id_inicial, id_final, id_atual, id_atual_excluido
             from {qname(SCHEMA, CONTROL_TABLE)}
-            where id=1
+            limit 1
             """
         )
         row = cur.fetchone()
         if not row:
-            return None, None
-        s, p = row
-        return (int(s) if s is not None else None), (int(p) if p is not None else None)
+            raise RuntimeError("range_scan_control vazio")
+        id_inicial, id_final, id_atual, id_atual_excluido = row
+        return (
+            int(id_inicial),
+            int(id_final),
+            int(id_atual) if id_atual is not None else None,
+            int(id_atual_excluido) if id_atual_excluido is not None else None,
+        )
 
 
-def write_control(conn, id_started, id_ptr):
+def write_ptr(conn, new_ptr):
     with conn.cursor() as cur:
         cur.execute(
             f"""
             update {qname(SCHEMA, CONTROL_TABLE)}
-            set id_started=%s, id_ptr=%s, updated_at=now()
-            where id=1
+            set id_atual_excluido=%s
             """,
-            (int(id_started) if id_started is not None else None, int(id_ptr) if id_ptr is not None else None),
+            (int(new_ptr),),
         )
     conn.commit()
-
-
-def fetch_max_ticket_id():
-    order_bys = ["id desc", "createdDate desc", "lastUpdate desc"]
-    endpoints = ["tickets", "tickets/past"]
-    for ep in endpoints:
-        url = f"{API_BASE}/{ep}"
-        for ob in order_bys:
-            params = {
-                "token": TOKEN,
-                "includeDeletedItems": "true",
-                "$top": 1,
-                "$select": "id",
-                "$orderby": ob,
-            }
-            try:
-                data = req(url, params)
-            except Exception:
-                continue
-            if isinstance(data, list) and data:
-                tid = data[0].get("id")
-                if tid is not None:
-                    return int(tid)
-    raise RuntimeError("Não foi possível obter o maior ticket_id pela API")
 
 
 def fetch_ticket(ticket_id, endpoint):
@@ -224,18 +184,19 @@ def main():
     with psycopg2.connect(DSN) as conn:
         ensure_tables(conn)
 
-        id_started, ptr = read_control(conn)
-        if ptr is None:
-            max_id = fetch_max_ticket_id()
-            id_started = max_id
-            ptr = max_id
-            write_control(conn, id_started, ptr)
+        id_inicial, id_final, id_atual, id_atual_excluido = read_control(conn)
 
-        if ptr <= STOP_AT:
-            log.info("Fim: id_ptr=%s <= stop_at=%s", ptr, STOP_AT)
+        ptr = id_atual_excluido
+        if ptr is None:
+            ptr = id_atual
+        if ptr is None:
+            raise RuntimeError("Ponteiro inicial não definido (id_inicial/id_atual_excluido/id_atual)")
+
+        if ptr < id_final:
+            log.info("Fim: id_atual_excluido=%s < id_final=%s", ptr, id_final)
             return
 
-        to_id = max(STOP_AT, ptr - BATCH + 1)
+        to_id = max(id_final, ptr - BATCH + 1)
 
         encontrados = []
         checked = 0
@@ -256,17 +217,16 @@ def main():
         up = upsert_excluidos(conn, encontrados)
 
         new_ptr = to_id - 1
-        write_control(conn, id_started, new_ptr)
+        write_ptr(conn, new_ptr)
 
         log.info(
-            "OK: checked=%s deleted_found=%s not_found=%s upserted=%s id_ptr=%s->%s started_at=%s",
+            "OK: checked=%s deleted_found=%s not_found=%s upserted=%s id_atual_excluido=%s->%s",
             checked,
             deleted_found,
             not_found,
             up,
             ptr,
             new_ptr,
-            id_started,
         )
 
 
