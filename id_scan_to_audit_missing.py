@@ -1,356 +1,302 @@
 import os
 import time
-import random
-import logging
 import datetime as dt
-
-import requests
 import psycopg2
-import psycopg2.extras
-from psycopg2 import errors
+from psycopg2.extras import execute_values
+import requests
 
-API_BASE = os.getenv("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1").rstrip("/")
+API_BASE = "https://api.movidesk.com/public/v1"
 TOKEN = os.getenv("MOVIDESK_TOKEN") or os.getenv("MOVIDESK_API_TOKEN")
 DSN = os.getenv("NEON_DSN")
 
 SCHEMA = os.getenv("SCHEMA", "visualizacao_resolvidos")
-TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos_detail")
+TABLE_NAME = os.getenv("TABLE_NAME", "tickets_resolvidos")
 
 BATCH_SIZE = int(os.getenv("ID_SCAN_BATCH_SIZE", "50"))
-LOOPS = int(os.getenv("ID_SCAN_ITERATIONS", "200000"))
+ITERATIONS = int(os.getenv("ID_SCAN_ITERATIONS", "20"))
 TOP = int(os.getenv("MOVIDESK_TOP", "1000"))
 THROTTLE = float(os.getenv("MOVIDESK_THROTTLE", "0.2"))
-TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 
-LOCK_TIMEOUT_MS = int(os.getenv("DB_LOCK_TIMEOUT_MS", "5000"))
-STMT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "300000"))
-UPSERT_PAGE_SIZE = int(os.getenv("DB_UPSERT_PAGE_SIZE", "200"))
-TXN_RETRIES = int(os.getenv("DB_TXN_RETRIES", "6"))
+if not TOKEN or not DSN:
+    raise RuntimeError("MOVIDESK_TOKEN/MOVIDESK_API_TOKEN e NEON_DSN são obrigatórios")
 
-HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "5"))
-HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "1.2"))
+def conn():
+    return psycopg2.connect(DSN)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("id_scan_to_audit_missing")
+def table_cols(cur, schema, table):
+    cur.execute(
+        """
+        select column_name
+        from information_schema.columns
+        where table_schema=%s and table_name=%s
+        """,
+        (schema, table),
+    )
+    return {r[0] for r in cur.fetchall()}
 
-def _now_utc():
-    return dt.datetime.now(dt.timezone.utc)
+def ensure_missing_unique(cur):
+    cur.execute(
+        f"create unique index if not exists audit_recent_missing_uniq on {SCHEMA}.audit_recent_missing(table_name, ticket_id)"
+    )
 
-def _parse_dt(v):
-    if v is None:
+def create_run(cur):
+    cols = table_cols(cur, SCHEMA, "audit_recent_run")
+    ins_cols = []
+    ins_vals = []
+    params = []
+
+    def add_expr(col, expr):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append(expr)
+
+    def add_param(col, val):
+        if col in cols:
+            ins_cols.append(col)
+            ins_vals.append("%s")
+            params.append(val)
+
+    add_expr("started_at", "now()")
+    add_expr("window_start", "now()")
+    add_expr("window_end", "now()")
+    add_expr("run_at", "now()")
+    add_expr("total_api", "0")
+    add_expr("missing_total", "0")
+    add_expr("api_ids", "0")
+    add_expr("inserted_missing", "0")
+    add_expr("range_count", "0")
+    add_param("table_name", TABLE_NAME)
+    add_param("notes", "id-scan")
+
+    cur.execute(
+        f"insert into {SCHEMA}.audit_recent_run({','.join(ins_cols)}) values ({','.join(ins_vals)}) returning id",
+        tuple(params),
+    )
+    return int(cur.fetchone()[0])
+
+def update_run(cur, run_id, total_api, inserted_missing, range_count):
+    cols = table_cols(cur, SCHEMA, "audit_recent_run")
+    sets = []
+    params = []
+
+    if "window_end" in cols:
+        sets.append("window_end=now()")
+    if "total_api" in cols:
+        sets.append("total_api=%s")
+        params.append(int(total_api))
+    if "missing_total" in cols:
+        sets.append("missing_total=%s")
+        params.append(int(inserted_missing))
+    if "api_ids" in cols:
+        sets.append("api_ids=%s")
+        params.append(int(total_api))
+    if "inserted_missing" in cols:
+        sets.append("inserted_missing=%s")
+        params.append(int(inserted_missing))
+    if "range_count" in cols:
+        sets.append("range_count=%s")
+        params.append(int(range_count))
+
+    if not sets:
+        return
+
+    params.append(int(run_id))
+    cur.execute(
+        f"update {SCHEMA}.audit_recent_run set {', '.join(sets)} where id=%s",
+        tuple(params),
+    )
+
+def get_control(cur):
+    cols = table_cols(cur, SCHEMA, "range_scan_control")
+    if "id_inicial" not in cols or "id_final" not in cols:
+        return None, None, None
+    cur.execute(
+        f"select id_inicial, id_final, id_atual from {SCHEMA}.range_scan_control order by id desc limit 1"
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+def set_id_atual(cur, id_atual):
+    cols = table_cols(cur, SCHEMA, "range_scan_control")
+    if "id_atual" not in cols:
+        return
+    cur.execute(
+        f"update {SCHEMA}.range_scan_control set id_atual=%s where id=(select id from {SCHEMA}.range_scan_control order by id desc limit 1)",
+        (id_atual,),
+    )
+
+def parse_api_dt(s):
+    if not s:
         return None
-    if isinstance(v, dt.datetime):
-        d = v
-    else:
-        s = str(v).strip()
-        if not s:
-            return None
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        try:
-            d = dt.datetime.fromisoformat(s)
-        except Exception:
-            return None
+    try:
+        text = str(s)
+        if text.endswith("Z"):
+            text = text.replace("Z", "+00:00")
+        return dt.datetime.fromisoformat(text).astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+def normalize_dt(d):
+    if d is None:
+        return None
     if d.tzinfo is None:
         d = d.replace(tzinfo=dt.timezone.utc)
     return d.astimezone(dt.timezone.utc).replace(microsecond=0)
 
-def _sleep_backoff(i):
-    time.sleep(HTTP_BACKOFF * (i + 1) + random.random() * 0.2)
-
-def api_get(session, path, params):
-    url = f"{API_BASE}/{path.lstrip('/')}"
-    params = dict(params or {})
-    params["token"] = TOKEN
-    last = None
-    for i in range(HTTP_RETRIES):
-        try:
-            r = session.get(url, params=params, timeout=TIMEOUT)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code in (429, 500, 502, 503, 504):
-                last = RuntimeError(f"HTTP {r.status_code}: {r.text}")
-                _sleep_backoff(i)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-            _sleep_backoff(i)
-    raise last
-
-def api_list_meta(session, endpoint, low_id, high_id):
+def api_list_id_lastupdate(endpoint, low_id, high_id):
+    url = f"{API_BASE}/{endpoint}"
+    params = {
+        "token": TOKEN,
+        "$select": "id,lastUpdate",
+        "$filter": f"id ge {int(low_id)} and id le {int(high_id)} and (baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')",
+        "$orderby": "id",
+        "$top": int(TOP),
+        "includeDeletedItems": "true",
+    }
+    r = requests.get(url, params=params, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Movidesk HTTP {r.status_code}: {r.text[:800]}")
+    data = r.json() or []
     out = {}
-    skip = 0
-    flt = (
-        f"id ge {int(low_id)} and id le {int(high_id)} and "
-        f"(baseStatus eq 'Resolved' or baseStatus eq 'Closed' or baseStatus eq 'Canceled')"
-    )
-    while True:
-        data = api_get(
-            session,
-            endpoint,
-            {
-                "$select": "id,lastUpdate,baseStatus",
-                "$filter": flt,
-                "$top": str(TOP),
-                "$skip": str(skip),
-                "includeDeletedItems": "true",
-            },
-        )
-        if isinstance(data, dict) and "items" in data:
-            data = data["items"]
-        if not isinstance(data, list) or not data:
-            break
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            try:
-                tid = int(row.get("id"))
-            except Exception:
-                continue
-            out[tid] = row.get("lastUpdate")
-        if len(data) < TOP:
-            break
-        skip += TOP
-        if THROTTLE > 0:
-            time.sleep(THROTTLE)
+    for x in data:
+        try:
+            tid = int(x.get("id"))
+        except Exception:
+            continue
+        lu = parse_api_dt(x.get("lastUpdate"))
+        if lu is None:
+            continue
+        prev = out.get(tid)
+        if prev is None or lu > prev:
+            out[tid] = lu
     return out
 
-def db_conn():
-    return psycopg2.connect(DSN)
-
-def ensure_missing_unique_index():
-    c = db_conn()
-    try:
-        c.autocommit = True
-        with c.cursor() as cur:
-            cur.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS audit_recent_missing_ticket_id_uq "
-                f"ON {SCHEMA}.audit_recent_missing (ticket_id)"
-            )
-    except Exception:
-        pass
-    finally:
-        try:
-            c.close()
-        except Exception:
-            pass
-
-def is_retryable(e):
-    return isinstance(
-        e,
-        (
-            errors.DeadlockDetected,
-            errors.SerializationFailure,
-            errors.LockNotAvailable,
-            errors.QueryCanceled,
-            psycopg2.OperationalError,
-            psycopg2.InterfaceError,
-        ),
-    )
-
-def run_db_txn(fn):
-    last = None
-    for _ in range(TXN_RETRIES):
-        c = None
-        try:
-            c = db_conn()
-            with c:
-                with c.cursor() as cur:
-                    cur.execute(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'")
-                    cur.execute(f"SET LOCAL statement_timeout = '{STMT_TIMEOUT_MS}ms'")
-                    return fn(cur)
-        except Exception as e:
-            last = e
-            if c is not None:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            if is_retryable(e):
-                time.sleep(0.6 + random.random())
-                continue
-            raise
-    raise last
-
-def create_run(cur):
-    ext = os.getenv("GITHUB_RUN_ID")
-    ext_val = int(ext) if ext and str(ext).isdigit() else None
+def detail_last_update_map(cur, ids):
+    if not ids:
+        return {}
     cur.execute(
-        f"""
-        INSERT INTO {SCHEMA}.audit_recent_run
-          (started_at, window_start, window_end, total_api, missing_total, run_at, notes, table_name,
-           external_run_id, workflow, job, ref, sha, repo)
-        VALUES
-          (now(), now(), now(), 0, 0, now(), %s, %s,
-           %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (
-            "id_scan",
-            TABLE_NAME,
-            ext_val,
-            os.getenv("GITHUB_WORKFLOW"),
-            os.getenv("GITHUB_JOB"),
-            os.getenv("GITHUB_REF_NAME") or os.getenv("GITHUB_REF"),
-            os.getenv("GITHUB_SHA"),
-            os.getenv("GITHUB_REPOSITORY"),
-        ),
+        f"select ticket_id, last_update from {SCHEMA}.tickets_resolvidos_detail where ticket_id = any(%s)",
+        (list(ids),),
     )
-    return int(cur.fetchone()[0])
-
-def update_run(cur, run_id, total_api, missing_total):
-    cur.execute(
-        f"""
-        UPDATE {SCHEMA}.audit_recent_run
-           SET window_end = now(),
-               total_api = %s,
-               missing_total = %s
-         WHERE id = %s
-        """,
-        (int(total_api), int(missing_total), int(run_id)),
-    )
-
-def read_control(cur):
-    cur.execute(f"SELECT id_inicial, id_final, id_atual FROM {SCHEMA}.range_scan_control LIMIT 1")
-    row = cur.fetchone()
-    if not row:
-        raise RuntimeError(f"{SCHEMA}.range_scan_control sem linhas")
-    id_inicial, id_final, id_atual = row
-    if id_inicial is None or id_final is None:
-        raise RuntimeError(f"{SCHEMA}.range_scan_control precisa de id_inicial (maior) e id_final (menor)")
-    high_bound = int(id_inicial)
-    low_bound = int(id_final)
-    if high_bound < low_bound:
-        raise RuntimeError("range_scan_control inválido: id_inicial (maior) < id_final (menor)")
-    if id_atual is None:
-        cursor = high_bound
-    else:
-        cursor = int(id_atual)
-    if cursor > high_bound:
-        cursor = high_bound
-    if cursor < low_bound:
-        cursor = low_bound - 1
-    return high_bound, low_bound, cursor
-
-def set_cursor(cur, new_cursor):
-    cur.execute(f"UPDATE {SCHEMA}.range_scan_control SET id_atual=%s", (int(new_cursor),))
+    return {int(r[0]): r[1] for r in cur.fetchall()}
 
 def upsert_missing(cur, run_id, ids):
     if not ids:
         return 0
-    now = _now_utc()
-    ids = sorted({int(x) for x in ids})
-    rows = [(int(run_id), TABLE_NAME, int(tid), now, now, 0, now) for tid in ids]
+    cols = table_cols(cur, SCHEMA, "audit_recent_missing")
+    ins_cols = ["run_id", "table_name", "ticket_id"]
+    template_parts = ["%s", "%s", "%s"]
+    upd_sets = ["run_id=excluded.run_id"]
+
+    if "first_seen" in cols:
+        ins_cols.append("first_seen")
+        template_parts.append("now()")
+    if "last_seen" in cols:
+        ins_cols.append("last_seen")
+        template_parts.append("now()")
+        upd_sets.append("last_seen=now()")
+    if "attempts" in cols:
+        ins_cols.append("attempts")
+        template_parts.append("0")
+
+    template = "(" + ",".join(template_parts) + ")"
+
     sql = (
-        f"INSERT INTO {SCHEMA}.audit_recent_missing "
-        f"(run_id, table_name, ticket_id, first_seen, last_seen, attempts, run_started_at) "
-        f"VALUES %s "
-        f"ON CONFLICT (ticket_id) DO UPDATE SET "
-        f"table_name=EXCLUDED.table_name, "
-        f"last_seen=EXCLUDED.last_seen, "
-        f"run_id=EXCLUDED.run_id, "
-        f"run_started_at=EXCLUDED.run_started_at"
+        f"insert into {SCHEMA}.audit_recent_missing({','.join(ins_cols)}) values %s "
+        f"on conflict (table_name, ticket_id) do update set {', '.join(upd_sets)}"
     )
-    psycopg2.extras.execute_values(cur, sql, rows, page_size=UPSERT_PAGE_SIZE)
-    return len(rows)
+
+    execute_values(
+        cur,
+        sql,
+        [(int(run_id), TABLE_NAME, int(tid)) for tid in ids],
+        template=template,
+        page_size=1000,
+    )
+    return len(ids)
 
 def main():
-    if not TOKEN:
-        raise SystemExit("MOVIDESK_TOKEN obrigatório")
-    if not DSN:
-        raise SystemExit("NEON_DSN obrigatório")
+    with conn() as c, c.cursor() as cur:
+        ensure_missing_unique(cur)
+        id_inicial, id_final, id_atual = get_control(cur)
+        if id_inicial is None or id_final is None:
+            print("done=1 ranges=0 api_ids=0 excluded=0 inserted_missing=0 cursor_now=null")
+            return
 
-    ensure_missing_unique_index()
+        cursor = int(id_atual) if id_atual is not None else int(id_inicial)
+        if cursor < int(id_final):
+            set_id_atual(cur, None)
+            c.commit()
+            print(f"done=1 ranges=0 api_ids=0 excluded=0 inserted_missing=0 cursor_now=null id_inicial={id_inicial} id_final={id_final}")
+            return
 
-    run_id = run_db_txn(create_run)
-    high_bound, low_bound, cursor = run_db_txn(read_control)
+        run_id = create_run(cur)
+        c.commit()
 
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json"})
+        total_ranges = 0
+        total_api_ids = 0
+        total_excluded = 0
+        total_insert = 0
 
-    api_total = 0
-    missing_upserts = 0
-    loops = 0
+        for _ in range(int(ITERATIONS)):
+            high_id = cursor
+            low_id = max(int(id_final), cursor - int(BATCH_SIZE) + 1)
 
-    logger.info("control high=%s low=%s cursor=%s batch=%s", high_bound, low_bound, cursor, BATCH_SIZE)
+            api_map = {}
+            for endpoint in ("tickets", "tickets/past"):
+                m = api_list_id_lastupdate(endpoint, low_id, high_id)
+                for tid, lu in m.items():
+                    prev = api_map.get(tid)
+                    if prev is None or lu > prev:
+                        api_map[tid] = lu
 
-    while loops < LOOPS and cursor >= low_bound:
-        loops += 1
-        high_id = cursor
-        low_id = max(low_bound, cursor - BATCH_SIZE + 1)
+            api_ids = set(api_map.keys())
 
-        meta = {}
-        meta.update(api_list_meta(session, "tickets", low_id, high_id))
-        meta.update(api_list_meta(session, "tickets/past", low_id, high_id))
+            total_ranges += 1
+            total_api_ids += len(api_ids)
 
-        api_ids = set(meta.keys())
-        api_total += len(api_ids)
+            detail_map = detail_last_update_map(cur, api_ids)
 
-        def work(cur):
-            cur.execute(
-                f"SELECT ticket_id, last_update FROM {SCHEMA}.tickets_resolvidos_detail WHERE ticket_id BETWEEN %s AND %s",
-                (low_id, high_id),
-            )
-            detail_rows = cur.fetchall()
-            in_detail = {int(r[0]) for r in detail_rows}
-            detail_map = {int(r[0]): r[1] for r in detail_rows}
-
-            cur.execute(
-                "SELECT ticket_id FROM dados_gerais.tickets_suporte WHERE ticket_id BETWEEN %s AND %s",
-                (low_id, high_id),
-            )
-            in_abertos = {int(r[0]) for r in cur.fetchall()}
-
-            cur.execute(
-                f"SELECT ticket_id FROM {SCHEMA}.tickets_mesclados WHERE ticket_id BETWEEN %s AND %s",
-                (low_id, high_id),
-            )
-            in_mesclados = {int(r[0]) for r in cur.fetchall()}
-
-            local_present = set()
-            local_present |= in_detail
-            local_present |= in_abertos
-            local_present |= in_mesclados
-
-            missing_new = api_ids - local_present
-
-            stale = set()
-            for tid in (api_ids & in_detail):
-                api_dt = _parse_dt(meta.get(tid))
-                db_dt = _parse_dt(detail_map.get(tid))
+            candidates = []
+            for tid, api_dt in api_map.items():
+                api_dt = normalize_dt(api_dt)
+                db_dt = normalize_dt(detail_map.get(tid))
                 if api_dt is None:
                     continue
-                if db_dt is None or db_dt < api_dt:
-                    stale.add(tid)
+                if db_dt is None or api_dt > db_dt:
+                    candidates.append(int(tid))
 
-            missing = set(missing_new) | set(stale)
-            upserted = upsert_missing(cur, run_id, missing)
+            candidates = sorted(candidates)
+            excluded = len(api_ids) - len(candidates)
+            total_excluded += excluded
 
-            new_cursor = low_id - 1
-            set_cursor(cur, new_cursor)
+            total_insert += upsert_missing(cur, run_id, candidates)
+            c.commit()
 
-            new_sample = sorted(list(missing_new))[:20]
-            stale_sample = sorted(list(stale))[:20]
-            return upserted, len(missing_new), len(stale), new_sample, stale_sample, new_cursor
+            next_cursor = low_id - 1
+            if next_cursor < int(id_final):
+                cursor = None
+                set_id_atual(cur, None)
+                c.commit()
+                break
 
-        upserted, c_new, c_stale, new_sample, stale_sample, new_cursor = run_db_txn(work)
-        missing_upserts += upserted
+            cursor = int(next_cursor)
+            set_id_atual(cur, cursor)
+            c.commit()
 
-        msg = f"range={low_id}..{high_id} api={len(api_ids)} upsert_missing={upserted} novos={c_new} atualizacao={c_stale} cursor->{new_cursor}"
-        if new_sample:
-            msg += f" novos_ids={','.join(str(x) for x in new_sample)}"
-        if stale_sample:
-            msg += f" stale_ids={','.join(str(x) for x in stale_sample)}"
-        logger.info(msg)
+            if THROTTLE > 0:
+                time.sleep(float(THROTTLE))
 
-        cursor = new_cursor
-        if cursor < low_bound:
-            break
+        update_run(cur, run_id, total_api_ids, total_insert, total_ranges)
+        c.commit()
 
-    run_db_txn(lambda cur: update_run(cur, run_id, api_total, missing_upserts))
-    logger.info("done run_id=%s total_api=%s missing_upserts=%s", run_id, api_total, missing_upserts)
+        done = 1 if cursor is None else 0
+        cnow = "null" if cursor is None else str(cursor)
+        print(
+            f"done={done} ranges={total_ranges} api_ids={total_api_ids} excluded={total_excluded} inserted_missing={total_insert} cursor_now={cnow} id_inicial={id_inicial} id_final={id_final}"
+        )
 
 if __name__ == "__main__":
     main()
