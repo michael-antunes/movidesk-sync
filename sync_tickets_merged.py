@@ -3,14 +3,14 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union, Set
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_window100_desc_child_query_disable_satisfacao_triggers_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_fix_child_by_ticket_then_merged_window100_desc_2026-01-31"
 
 MovideskResponse = Union[Dict[str, Any], List[Any], None]
 
@@ -69,9 +69,7 @@ def parse_dt(v: Any) -> Optional[datetime]:
 
 
 def to_int(v: Any) -> Optional[int]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
+    if v is None or isinstance(v, bool):
         return None
     try:
         return int(v)
@@ -153,9 +151,13 @@ def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Option
     if not rows:
         return 0
     dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
-    for r in rows:
-        dedup[int(r[0])] = (int(r[0]), int(r[1]), r[2], r[3])
+    for (src, dest, merged_at, payload) in rows:
+        if src is None or dest is None:
+            continue
+        dedup[int(src)] = (int(src), int(dest), merged_at, payload)
     rows2 = list(dedup.values())
+    if not rows2:
+        return 0
     sql = f"""
     insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
     values %s
@@ -216,7 +218,46 @@ def movidesk_get(
     return None, last_status, last_text
 
 
-def extract_pairs(obj: Any, out: List[Tuple[int, int, Optional[datetime], Any]], depth: int = 0) -> None:
+def first_ticket_obj(data: MovideskResponse) -> Optional[Dict[str, Any]]:
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        if len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+        for it in data:
+            if isinstance(it, dict):
+                return it
+    return None
+
+
+def extract_parent_from_ticket_obj(obj: Dict[str, Any]) -> Optional[int]:
+    for k in (
+        "mergedIntoId",
+        "mergedIntoTicketId",
+        "mergedToTicketId",
+        "mainTicketId",
+        "mainTicketID",
+        "principalTicketId",
+        "principalId",
+    ):
+        if k in obj:
+            iv = to_int(obj.get(k))
+            if iv is not None:
+                return iv
+    if "mergedInto" in obj and isinstance(obj.get("mergedInto"), dict):
+        d = obj.get("mergedInto") or {}
+        iv = to_int(d.get("ticketId") or d.get("id") or d.get("ticketID"))
+        if iv is not None:
+            return iv
+    if "mainTicket" in obj and isinstance(obj.get("mainTicket"), dict):
+        d = obj.get("mainTicket") or {}
+        iv = to_int(d.get("ticketId") or d.get("id") or d.get("ticketID"))
+        if iv is not None:
+            return iv
+    return None
+
+
+def extract_pairs_from_merged(obj: Any, acc: List[Tuple[int, int, Optional[datetime]]], depth: int = 0) -> None:
     if depth > 10:
         return
     if isinstance(obj, dict):
@@ -234,16 +275,7 @@ def extract_pairs(obj: Any, out: List[Tuple[int, int, Optional[datetime], Any]],
         dest = to_int(obj.get("ticketId") or obj.get("ticketID"))
         src = to_int(obj.get("mergedTicketId") or obj.get("mergedTicketID"))
         if dest is not None and src is not None:
-            out.append((src, dest, merged_at, obj))
-
-        if "ticket" in obj and isinstance(obj.get("ticket"), dict):
-            d = obj.get("ticket") or {}
-            dest2 = to_int(d.get("id") or d.get("ticketId") or d.get("ticketID"))
-            if "mergedTicket" in obj and isinstance(obj.get("mergedTicket"), dict):
-                s = obj.get("mergedTicket") or {}
-                src2 = to_int(s.get("id") or s.get("ticketId") or s.get("ticketID"))
-                if dest2 is not None and src2 is not None:
-                    out.append((src2, dest2, merged_at, obj))
+            acc.append((src, dest, merged_at))
 
         merged_into = (
             obj.get("mergedIntoId")
@@ -255,49 +287,44 @@ def extract_pairs(obj: Any, out: List[Tuple[int, int, Optional[datetime], Any]],
             or obj.get("principalId")
         )
         if merged_into is not None:
-            dest3 = to_int(merged_into)
-            src3 = to_int(obj.get("ticketId") or obj.get("id"))
-            if src3 is not None and dest3 is not None:
-                out.append((src3, dest3, merged_at, obj))
+            dest2 = to_int(merged_into)
+            src2 = to_int(obj.get("ticketId") or obj.get("id") or obj.get("ticketID"))
+            if src2 is not None and dest2 is not None:
+                acc.append((src2, dest2, merged_at))
 
-        merged_ids = None
-        for k in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTickets", "mergedTicketsId", "mergedTicketsID"):
-            if k in obj:
-                merged_ids = obj.get(k)
-                break
-        if dest is not None and merged_ids is not None:
-            if isinstance(merged_ids, list):
-                for it in merged_ids:
-                    if isinstance(it, dict):
-                        mid = to_int(it.get("ticketId") or it.get("id") or it.get("ticketID"))
-                    else:
-                        mid = to_int(it)
-                    if mid is not None:
-                        out.append((mid, dest, merged_at, obj))
+        if "ticket" in obj and isinstance(obj.get("ticket"), dict):
+            t = obj.get("ticket") or {}
+            dest3 = to_int(t.get("id") or t.get("ticketId") or t.get("ticketID"))
+            if "mergedTicket" in obj and isinstance(obj.get("mergedTicket"), dict):
+                mt = obj.get("mergedTicket") or {}
+                src3 = to_int(mt.get("id") or mt.get("ticketId") or mt.get("ticketID"))
+                if src3 is not None and dest3 is not None:
+                    acc.append((src3, dest3, merged_at))
 
         for v in obj.values():
-            extract_pairs(v, out, depth + 1)
+            extract_pairs_from_merged(v, acc, depth + 1)
+        return
 
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         for it in obj:
-            extract_pairs(it, out, depth + 1)
+            extract_pairs_from_merged(it, acc, depth + 1)
 
 
 def extract_relations_from_merged(data: MovideskResponse, raw: Any) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
-    tmp: List[Tuple[int, int, Optional[datetime], Any]] = []
-    extract_pairs(data, tmp, 0)
-    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    tmp: List[Tuple[int, int, Optional[datetime]]] = []
+    extract_pairs_from_merged(data, tmp, 0)
     payload = json_payload(raw)
-    for (src, dest, merged_at, _obj) in tmp:
+    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    for (src, dest, merged_at) in tmp:
         if src is None or dest is None:
             continue
         dedup[int(src)] = (int(src), int(dest), merged_at, payload)
     return list(dedup.values())
 
 
-def relations_for_child(rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], child_id: int) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
-    c = int(child_id)
-    return [r for r in rows if int(r[0]) == c or int(r[1]) == c]
+def filter_involving(rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], tid: int) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
+    t = int(tid)
+    return [r for r in rows if int(r[0]) == t or int(r[1]) == t]
 
 
 def get_triggers(conn, schema: str, table: str) -> List[Tuple[str, str, str]]:
@@ -359,17 +386,20 @@ def main():
     source_id_col_pref = env_str("SOURCE_ID_COL", "ticket_id")
 
     rpm = env_float("RPM", 10.0)
-    pause_seconds = env_int("PAUSE_SECONDS", 20)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
 
     lock_timeout_ms = env_int("PG_LOCK_TIMEOUT_MS", 5000)
     lock_retries = env_int("PG_LOCK_RETRIES", 6)
 
-    window_size = 100
+    query_keys_env = env_str("MERGED_QUERY_KEYS", "q,ticketId,id")
+    query_keys = [k.strip() for k in query_keys_env.split(",") if k.strip()]
+    if not query_keys:
+        query_keys = ["q", "ticketId", "id"]
 
+    window_size = 100
     delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
 
-    log.info("script_version=%s window_size=%d rpm=%.2f", SCRIPT_VERSION, window_size, rpm)
+    log.info("script_version=%s window_size=%d rpm=%.2f merged_query_keys=%s", SCRIPT_VERSION, window_size, rpm, query_keys)
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -384,88 +414,77 @@ def main():
         source_id_col = resolve_id_column(conn, source_schema, source_table, source_id_col_pref, log)
         max_id_db = get_max_id(conn, source_schema, source_table, source_id_col)
         if not max_id_db or max_id_db <= 0:
-            log.warning("max_id_db veio vazio/0. Abortando.")
             return
 
         start_id = int(max_id_db)
         end_id = max(1, start_id - window_size + 1)
         ids = list(range(start_id, end_id - 1, -1))
 
-        log.info("max_id_db=%s start_id=%s end_id=%s", max_id_db, start_id, end_id)
+        log.info("max_id_db=%d start_id=%d end_id=%d", max_id_db, start_id, end_id)
 
         sess = requests.Session()
 
-        batch_map: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
-        total_checked = 0
-        total_upsert = 0
+        all_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
 
-        for i, ticket_id in enumerate(ids, start=1):
-            total_checked += 1
-
+        for idx, tid in enumerate(ids, start=1):
             rows_final: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
-            status_used: Optional[int] = None
-            key_used: str = "q"
 
-            data, st, _txt = movidesk_get(sess, base_url, "tickets/merged", token, {"q": str(ticket_id)}, http_timeout)
-            status_used = st
-            raw = {"endpoint": "tickets/merged", "params": {"q": str(ticket_id)}, "data": data}
-            if st == 200:
-                rows = extract_relations_from_merged(data, raw)
-                rows_final = relations_for_child(rows, ticket_id)
-
-            if not rows_final:
-                key_used = "ticketId"
-                data, st, _txt = movidesk_get(sess, base_url, "tickets/merged", token, {"ticketId": str(ticket_id)}, http_timeout)
-                status_used = st
-                raw = {"endpoint": "tickets/merged", "params": {"ticketId": str(ticket_id)}, "data": data}
-                if st == 200:
-                    rows = extract_relations_from_merged(data, raw)
-                    rows_final = relations_for_child(rows, ticket_id)
-
-            if not rows_final:
-                key_used = "id"
-                data, st, _txt = movidesk_get(sess, base_url, "tickets/merged", token, {"id": str(ticket_id)}, http_timeout)
-                status_used = st
-                raw = {"endpoint": "tickets/merged", "params": {"id": str(ticket_id)}, "data": data}
-                if st == 200:
-                    rows = extract_relations_from_merged(data, raw)
-                    rows_final = relations_for_child(rows, ticket_id)
-
-            log.info(
-                "resultado_ticket %d/%d ticket_id=%d status=%s key=%s rows=%d",
-                i, len(ids), ticket_id, status_used, key_used, len(rows_final)
-            )
-
-            for r in rows_final:
-                batch_map[int(r[0])] = r
-
-            if len(batch_map) >= 1000:
-                batch = list(batch_map.values())
-
-                def do_upsert():
-                    return upsert_rows(conn, db_schema, table_name, batch)
-
-                n = commit_with_retry(conn, do_upsert, log=log, max_retries=lock_retries)
-                total_upsert += int(n)
-                batch_map.clear()
-
-            if delay_between_requests > 0:
+            data_t, st_t, _txt_t = movidesk_get(sess, base_url, "tickets", token, {"id": str(tid)}, http_timeout)
+            if delay_between_requests:
                 time.sleep(delay_between_requests)
 
-        if batch_map:
-            batch = list(batch_map.values())
+            if st_t == 200:
+                obj = first_ticket_obj(data_t)
+                if obj is not None:
+                    parent = extract_parent_from_ticket_obj(obj)
+                    if parent is not None and int(parent) != int(tid):
+                        merged_at = parse_dt(
+                            obj.get("mergedDate")
+                            or obj.get("mergedAt")
+                            or obj.get("lastUpdate")
+                            or obj.get("updatedAt")
+                            or obj.get("updatedDate")
+                            or obj.get("updatedDateTime")
+                        )
+                        raw = {"endpoint": "tickets", "params": {"id": str(tid)}, "data": data_t}
+                        rows_final = [(int(tid), int(parent), merged_at, json_payload(raw))]
+                        log.info("resultado_ticket %d/%d ticket_id=%d status=200 origem=tickets rows=1 merged_into_id=%d", idx, len(ids), tid, parent)
 
-            def do_upsert_final():
-                return upsert_rows(conn, db_schema, table_name, batch)
+            if not rows_final:
+                found = False
+                last_status = None
+                last_key = None
+                for key in query_keys:
+                    data_m, st_m, _txt_m = movidesk_get(sess, base_url, "tickets/merged", token, {key: str(tid)}, http_timeout)
+                    if delay_between_requests:
+                        time.sleep(delay_between_requests)
+                    last_status = st_m
+                    last_key = key
+                    if st_m == 404:
+                        continue
+                    if st_m != 200:
+                        break
+                    raw = {"endpoint": "tickets/merged", "params": {key: str(tid)}, "data": data_m}
+                    rows = extract_relations_from_merged(data_m, raw)
+                    rows = filter_involving(rows, tid)
+                    if rows:
+                        rows_final = rows
+                        found = True
+                        break
+                log.info(
+                    "resultado_ticket %d/%d ticket_id=%d status=%s origem=tickets/merged key=%s rows=%d",
+                    idx, len(ids), tid, last_status, last_key, len(rows_final),
+                )
+                if not found:
+                    pass
 
-            n = commit_with_retry(conn, do_upsert_final, log=log, max_retries=lock_retries)
-            total_upsert += int(n)
-            batch_map.clear()
+            all_rows.extend(rows_final)
 
-        log.info("done checked=%d upserted=%d window=[%d..%d]", total_checked, total_upsert, start_id, end_id)
+        def do_upsert():
+            return upsert_rows(conn, db_schema, table_name, all_rows)
 
-        if pause_seconds > 0:
-            time.sleep(pause_seconds)
+        n = commit_with_retry(conn, do_upsert, log=log, max_retries=lock_retries)
+        log.info("done checked=%d upserted=%d window=[%d..%d]", len(ids), n, start_id, end_id)
 
     finally:
         try:
