@@ -3,7 +3,6 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -11,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_top_window_by_max_id_v3_fix_key_fallback_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_top_window_by_max_id_v4_window100_dedupe_fix_2026-01-31"
 
 MovideskResponse = Union[Dict[str, Any], List[Any], None]
 
@@ -154,20 +153,12 @@ def resolve_id_column(conn, schema: str, table: str, preferred: str, log: loggin
         key = cand.lower()
         if key in cols_lower:
             chosen = cols_lower[key]
-            log.info("SOURCE_ID_COL resolved: preferred=%s chosen=%s available_cols=%s", preferred, chosen, cols)
+            log.info("SOURCE_ID_COL resolved: preferred=%s chosen=%s", preferred, chosen)
             return chosen
 
     raise RuntimeError(
-        f"Não achei coluna de ID em {schema}.{table}. "
-        f"Preferido='{preferred}'. Colunas disponíveis={cols}"
+        f"Não achei coluna de ID em {schema}.{table}. Preferido='{preferred}'. Colunas disponíveis={cols}"
     )
-
-
-def get_max_updated_at(conn, schema: str, table: str, col: str) -> Optional[datetime]:
-    with conn.cursor() as cur:
-        cur.execute(f"select max({qident(col)}) from {qname(schema, table)}")
-        v = cur.fetchone()[0]
-    return parse_dt(v)
 
 
 def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
@@ -183,6 +174,12 @@ def get_max_id(conn, schema: str, table: str, col: str) -> Optional[int]:
 def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
     if not rows:
         return 0
+
+    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    for r in rows:
+        dedup[int(r[0])] = r
+    rows_u = list(dedup.values())
+
     sql = f"""
     insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
     values %s
@@ -192,8 +189,8 @@ def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Option
           raw_payload = excluded.raw_payload
     """
     with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows, page_size=500)
-    return len(rows)
+        psycopg2.extras.execute_values(cur, sql, rows_u, page_size=500)
+    return len(rows_u)
 
 
 def commit_with_retry(conn, fn, log: logging.Logger, max_retries: int = 6):
@@ -262,6 +259,8 @@ def extract_relations_from_obj(
         or obj.get("createdDate")
         or obj.get("lastUpdate")
         or obj.get("last_update")
+        or obj.get("merged_on")
+        or obj.get("mergedOn")
     )
 
     out: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
@@ -283,9 +282,10 @@ def extract_relations_from_obj(
         or obj.get("principalTicketId")
         or obj.get("principalId")
         or obj.get("mergedInto")
+        or obj.get("merged_into_id")
     )
     if merged_into is not None:
-        src_guess = obj.get("ticketId") or obj.get("id") or fallback_queried_id
+        src_guess = obj.get("ticketId") or obj.get("id") or obj.get("ticket_id") or fallback_queried_id
         try:
             src = int(src_guess)
             dest = int(merged_into)
@@ -295,13 +295,13 @@ def extract_relations_from_obj(
             pass
 
     merged_ids: List[int] = []
-    for key in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTicketsIdsList"):
+    for key in ("mergedTicketsIds", "mergedTicketsIDs", "mergedTicketsIdsList", "mergedTicketsIdsV2", "mergedTickets"):
         if key in obj:
             merged_ids = to_int_list(obj.get(key))
             break
 
     if merged_ids:
-        dest_guess = obj.get("ticketId") or obj.get("ticketID") or fallback_queried_id
+        dest_guess = obj.get("ticketId") or obj.get("ticketID") or obj.get("id") or fallback_queried_id
         try:
             dest = int(dest_guess)
             for mid in merged_ids:
@@ -341,6 +341,11 @@ def extract_relations(data: MovideskResponse, queried_id: int) -> List[Tuple[int
     return list(dedup.values())
 
 
+def filter_rows_for_ticket(rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], ticket_id: int) -> List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]:
+    t = int(ticket_id)
+    return [r for r in rows if int(r[0]) == t or int(r[1]) == t]
+
+
 def fetch_merged_relations(
     sess: requests.Session,
     base_url: str,
@@ -348,11 +353,12 @@ def fetch_merged_relations(
     ticket_id: int,
     timeout: int,
     query_keys: List[str],
-) -> Tuple[List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], Optional[int], Optional[str], int]:
+) -> Tuple[List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]], Optional[int], Optional[str], int, int]:
     last_status: Optional[int] = None
     tries = 0
-    best_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
     best_key: Optional[str] = None
+    best_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+    best_filtered_count = 0
 
     for key in query_keys:
         tries += 1
@@ -365,21 +371,23 @@ def fetch_merged_relations(
             continue
 
         if st in (401, 403):
-            return [], st, key, tries
+            return [], st, key, tries, 0
 
         rows = extract_relations(data, ticket_id)
+        rows_f = filter_rows_for_ticket(rows, ticket_id)
 
-        if st == 200 and rows:
-            return rows, st, key, tries
+        if st == 200 and rows_f:
+            return rows_f, st, key, tries, len(rows)
 
         if best_key is None:
             best_key = key
-            best_rows = rows
+            best_rows = rows_f
+            best_filtered_count = len(rows)
 
-        if st == 200 and not rows:
+        if st == 200 and not rows_f:
             continue
 
-    return best_rows, last_status, best_key, tries
+    return best_rows, last_status, best_key, tries, best_filtered_count
 
 
 def main():
@@ -396,24 +404,27 @@ def main():
 
     source_schema = env_str("SOURCE_SCHEMA", "dados_gerais")
     source_table = env_str("SOURCE_TABLE", "tickets_suporte")
-    source_date_col = env_str("SOURCE_DATE_COL", "updated_at")
     source_id_col_pref = env_str("SOURCE_ID_COL", "ticket_id")
 
-    window_size = env_int("WINDOW_SIZE", 50)
+    window_size_env = env_int("WINDOW_SIZE", 100)
+    window_size = 100
+    if window_size_env != 100:
+        window_size = 100
+
     rpm = env_float("RPM", 10.0)
-    pause_seconds = env_int("PAUSE_SECONDS", 20)
+    pause_seconds = env_int("PAUSE_SECONDS", 0)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
 
     lock_timeout_ms = env_int("PG_LOCK_TIMEOUT_MS", 5000)
     lock_retries = env_int("PG_LOCK_RETRIES", 6)
 
-    query_keys = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "q,ticketId,id").split(",") if k.strip()]
+    query_keys_raw = [k.strip() for k in env_str("MERGED_QUERY_KEYS", "q,ticketId,id").split(",") if k.strip()]
+    priority = {"q": 0, "ticketId": 1, "id": 2}
+    query_keys = sorted(query_keys_raw, key=lambda x: priority.get(x, 99))
+
     delay_between_requests = (60.0 / rpm) if rpm and rpm > 0 else 0.0
 
-    log.info(
-        "script_version=%s window_size=%d rpm=%.2f pause_seconds=%d query_keys=%s",
-        SCRIPT_VERSION, window_size, rpm, pause_seconds, query_keys
-    )
+    log.info("script_version=%s window_size=%d rpm=%.2f query_keys=%s", SCRIPT_VERSION, window_size, rpm, query_keys)
 
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -424,17 +435,12 @@ def main():
 
     source_id_col = resolve_id_column(conn, source_schema, source_table, source_id_col_pref, log)
 
-    anchor_ts = get_max_updated_at(conn, source_schema, source_table, source_date_col)
     max_id = get_max_id(conn, source_schema, source_table, source_id_col)
-
-    log.info(
-        "anchor_ts_db_max=%s (%s.%s.%s) max_id_db=%s (%s.%s.%s)",
-        anchor_ts.isoformat() if anchor_ts else None, source_schema, source_table, source_date_col,
-        max_id, source_schema, source_table, source_id_col
-    )
+    log.info("max_id_db=%s (%s.%s.%s)", max_id, source_schema, source_table, source_id_col)
 
     if not max_id or max_id <= 0:
         log.warning("max_id_db veio vazio/0. Abortando.")
+        conn.close()
         return
 
     start_id = int(max_id)
@@ -444,16 +450,16 @@ def main():
     sess = requests.Session()
 
     total_checked = 0
-    total_upsert = 0
-    total_rows_found = 0
-    batch: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+    total_rows_filtered = 0
+    total_rows_raw = 0
+
+    batch_map: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    flush_threshold = 1500
 
     for idx, tid in enumerate(ids, start=1):
         total_checked += 1
 
-        log.info("validando_ticket %d/%d ticket_id=%d", idx, len(ids), tid)
-
-        rows, st, key_used, tries = fetch_merged_relations(
+        rows, st, key_used, tries, raw_count = fetch_merged_relations(
             sess=sess,
             base_url=base_url,
             token=token,
@@ -462,45 +468,46 @@ def main():
             query_keys=query_keys,
         )
 
-        total_rows_found += len(rows)
+        total_rows_filtered += len(rows)
+        total_rows_raw += raw_count
 
-        log.info("resultado_ticket ticket_id=%d status=%s key=%s tries=%d rows=%d", tid, st, key_used, tries, len(rows))
+        log.info(
+            "resultado_ticket %d/%d ticket_id=%d status=%s key=%s tries=%d rows_filtered=%d rows_raw=%d",
+            idx, len(ids), tid, st, key_used, tries, len(rows), raw_count
+        )
 
-        for (src, dest, merged_at, _payload) in rows:
-            log.info(
-                "merge_encontrada source_ticket=%d merged_into=%d merged_at=%s (query_ticket=%d)",
-                src, dest, merged_at.isoformat() if merged_at else None, tid
-            )
+        for r in rows:
+            batch_map[int(r[0])] = r
 
-        if rows:
-            batch.extend(rows)
+        if len(batch_map) >= flush_threshold:
+            batch = list(batch_map.values())
 
-        if len(batch) >= 200:
             def do_upsert():
                 return upsert_rows(conn, db_schema, table_name, batch)
 
             n = commit_with_retry(conn, do_upsert, log=log, max_retries=lock_retries)
-            total_upsert += n
-            batch.clear()
+            log.info("flush upsert=%d unique_in_batch=%d", n, len(batch))
+            batch_map.clear()
 
         if delay_between_requests > 0:
             time.sleep(delay_between_requests)
 
-    if batch:
+    if batch_map:
+        batch = list(batch_map.values())
+
         def do_upsert_final():
             return upsert_rows(conn, db_schema, table_name, batch)
 
         n = commit_with_retry(conn, do_upsert_final, log=log, max_retries=lock_retries)
-        total_upsert += n
-        batch.clear()
+        log.info("flush_final upsert=%d unique_in_batch=%d", n, len(batch))
+        batch_map.clear()
 
     log.info(
-        "fim checked=%d total_rows_found=%d upsert=%d window=[%d..%d]",
-        total_checked, total_rows_found, total_upsert, start_id, end_id
+        "fim checked=%d total_rows_filtered=%d total_rows_raw=%d window=[%d..%d]",
+        total_checked, total_rows_filtered, total_rows_raw, start_id, end_id
     )
 
     if pause_seconds > 0:
-        log.info("pausando %ds antes de finalizar...", pause_seconds)
         time.sleep(pause_seconds)
 
     conn.close()
