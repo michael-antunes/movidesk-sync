@@ -3,7 +3,7 @@ name: Orquestrador - Start workflows se não estiverem executando
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
 
 concurrency:
   group: orchestrador-start-workflows
