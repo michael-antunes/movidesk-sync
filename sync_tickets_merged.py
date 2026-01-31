@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_by_date_page_into_children_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_2026-01-31"
 
 
 def env_str(k: str, default: Optional[str] = None) -> str:
@@ -32,6 +32,16 @@ def env_int(k: str, default: int) -> int:
         return default
 
 
+def env_float(k: str, default: float) -> float:
+    v = os.getenv(k)
+    if v is None or v.strip() == "":
+        return default
+    try:
+        return float(v.strip())
+    except Exception:
+        return default
+
+
 def qident(s: str) -> str:
     return '"' + s.replace('"', '""') + '"'
 
@@ -42,28 +52,6 @@ def qname(schema: str, table: str) -> str:
 
 def json_payload(x: Any) -> psycopg2.extras.Json:
     return psycopg2.extras.Json(x, dumps=lambda o: json.dumps(o, ensure_ascii=False))
-
-
-def parse_merged_lastupdate(v: Any) -> Optional[datetime]:
-    if not v:
-        return None
-    if isinstance(v, datetime):
-        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
-    s = str(v).strip()
-    if not s:
-        return None
-    s = s.replace("Z", "+00:00")
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            d = datetime.strptime(s, fmt)
-            return d.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-    try:
-        d = datetime.fromisoformat(s)
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
 
 
 def to_int(v: Any) -> Optional[int]:
@@ -79,55 +67,26 @@ def to_int(v: Any) -> Optional[int]:
             return None
 
 
-def pg_connect(dsn: str):
-    return psycopg2.connect(
-        dsn,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
-    )
-
-
-def ensure_table(conn, schema: str, table: str) -> None:
-    with conn.cursor() as cur:
-        cur.execute(f"create schema if not exists {qident(schema)}")
-        cur.execute(
-            f"""
-            create table if not exists {qname(schema, table)} (
-              ticket_id bigint primary key,
-              merged_into_id bigint not null,
-              merged_at timestamptz,
-              raw_payload jsonb
-            )
-            """
-        )
-        cur.execute(f"create index if not exists ix_{table}_merged_into_id on {qname(schema, table)} (merged_into_id)")
-        cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
-
-
-def upsert_rows(conn, schema: str, table: str, rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]]) -> int:
-    if not rows:
-        return 0
-    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
-    for (child_id, parent_id, merged_at, payload) in rows:
-        if child_id is None or parent_id is None:
-            continue
-        dedup[int(child_id)] = (int(child_id), int(parent_id), merged_at, payload)
-    rows2 = list(dedup.values())
-    if not rows2:
-        return 0
-    sql = f"""
-    insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
-    values %s
-    on conflict (ticket_id) do update
-      set merged_into_id = excluded.merged_into_id,
-          merged_at = coalesce(excluded.merged_at, {qname(schema, table)}.merged_at),
-          raw_payload = excluded.raw_payload
-    """
-    with conn.cursor() as cur:
-        psycopg2.extras.execute_values(cur, sql, rows2, page_size=1000)
-    return len(rows2)
+def parse_dt(v: Any) -> Optional[datetime]:
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    s = str(v).strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    try:
+        d = datetime.fromisoformat(s)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                d = datetime.strptime(s, fmt)
+                return d.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+    return None
 
 
 def req(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int, attempts: int) -> Tuple[Optional[Dict[str, Any]], int]:
@@ -159,20 +118,169 @@ def req(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int, 
     return None, last_status
 
 
-def read_range_control_page(conn, schema: str, table: str) -> int:
-    with conn.cursor() as cur:
-        cur.execute(f"select id_atual_merged from {qname(schema, table)} limit 1")
-        row = cur.fetchone()
-    if not row or row[0] is None:
-        return 1
-    v = to_int(row[0])
-    return v if v and v > 0 else 1
+def pg_connect(dsn: str):
+    return psycopg2.connect(
+        dsn,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 
-def write_range_control_page(conn, schema: str, table: str, page: int) -> None:
+def try_lock(conn, key: str) -> bool:
     with conn.cursor() as cur:
-        cur.execute(f"update {qname(schema, table)} set id_atual_merged=%s", (int(page),))
-    conn.commit()
+        cur.execute("select pg_try_advisory_lock(hashtext(%s))", (key,))
+        return bool(cur.fetchone()[0])
+
+
+def unlock(conn, key: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("select pg_advisory_unlock(hashtext(%s))", (key,))
+
+
+def ensure_table(conn, schema: str, table: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(f"create schema if not exists {qident(schema)}")
+        cur.execute(
+            f"""
+            create table if not exists {qname(schema, table)} (
+              ticket_id integer primary key,
+              merged_into_id integer not null,
+              merged_at timestamptz,
+              raw_payload jsonb
+            )
+            """
+        )
+        cur.execute(f"create index if not exists ix_{table}_merged_into_id on {qname(schema, table)} (merged_into_id)")
+        cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
+
+
+def upsert_rows(
+    conn,
+    schema: str,
+    table: str,
+    rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]],
+) -> int:
+    if not rows:
+        return 0
+    dedup: Dict[int, Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = {}
+    for (child_id, parent_id, merged_at, payload) in rows:
+        if child_id is None or parent_id is None:
+            continue
+        cid = int(child_id)
+        prev = dedup.get(cid)
+        if prev is None:
+            dedup[cid] = (cid, int(parent_id), merged_at, payload)
+        else:
+            prev_at = prev[2]
+            if prev_at is None and merged_at is not None:
+                dedup[cid] = (cid, int(parent_id), merged_at, payload)
+            elif prev_at is not None and merged_at is not None and merged_at > prev_at:
+                dedup[cid] = (cid, int(parent_id), merged_at, payload)
+
+    rows2 = list(dedup.values())
+    if not rows2:
+        return 0
+
+    sql = f"""
+    insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
+    values %s
+    on conflict (ticket_id) do update
+      set merged_into_id = excluded.merged_into_id,
+          merged_at = excluded.merged_at,
+          raw_payload = excluded.raw_payload
+    """
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(cur, sql, rows2, page_size=1000)
+    return len(rows2)
+
+
+def cleanup_other_tables(
+    conn,
+    resolvidos_schema: str,
+    resolvidos_table: str,
+    abertos_schema: str,
+    abertos_table: str,
+    excluidos_schema: str,
+    excluidos_table: str,
+    merged_rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]],
+) -> Tuple[int, int, int]:
+    if not merged_rows:
+        return 0, 0, 0
+
+    tmp_rows = []
+    for (child_id, _parent_id, merged_at, _payload) in merged_rows:
+        if child_id is None:
+            continue
+        tmp_rows.append((int(child_id), merged_at))
+
+    if not tmp_rows:
+        return 0, 0, 0
+
+    with conn.cursor() as cur:
+        cur.execute("create temporary table tmp_merged_children(ticket_id bigint primary key, merged_at timestamptz) on commit drop")
+        psycopg2.extras.execute_values(cur, "insert into tmp_merged_children(ticket_id, merged_at) values %s", tmp_rows, page_size=1000)
+
+        cur.execute(
+            f"""
+            delete from {qname(resolvidos_schema, resolvidos_table)} tr
+            using tmp_merged_children t
+            where tr.ticket_id = t.ticket_id
+              and (t.merged_at is null or coalesce(tr.last_update, tr.updated_at, 'epoch'::timestamptz) <= t.merged_at)
+            """
+        )
+        d_res = cur.rowcount
+
+        cur.execute(
+            f"""
+            delete from {qname(abertos_schema, abertos_table)} ta
+            using tmp_merged_children t
+            where ta.ticket_id = t.ticket_id
+              and (t.merged_at is null or coalesce(ta.last_update, ta.updated_at, 'epoch'::timestamptz) <= t.merged_at)
+            """
+        )
+        d_abe = cur.rowcount
+
+        cur.execute(
+            f"""
+            delete from {qname(excluidos_schema, excluidos_table)} te
+            using tmp_merged_children t
+            where te.ticket_id = t.ticket_id
+              and (
+                    t.merged_at is null
+                    or coalesce(
+                        te.last_update,
+                        nullif(te.raw->>'lastUpdate','')::timestamptz,
+                        te.date_excluido,
+                        te.synced_at,
+                        'epoch'::timestamptz
+                      ) <= t.merged_at
+                  )
+            """
+        )
+        d_exc = cur.rowcount
+
+    return d_res, d_abe, d_exc
+
+
+def fetch_latest_merged(
+    sess: requests.Session,
+    base_url: str,
+    token: str,
+    start_date: str,
+    end_date: Optional[str],
+    timeout: int,
+    attempts: int,
+) -> Dict[str, Any]:
+    url = f"{base_url.rstrip('/')}/tickets/merged"
+    params: Dict[str, Any] = {"token": token, "startDate": start_date, "page": "1"}
+    if end_date:
+        params["endDate"] = end_date
+    data, st = req(sess, url, params, timeout, attempts)
+    if st != 200 or not isinstance(data, dict):
+        return {}
+    return data
 
 
 def main():
@@ -183,15 +291,24 @@ def main():
     dsn = env_str("NEON_DSN")
     base_url = env_str("MOVIDESK_API_BASE", "https://api.movidesk.com/public/v1")
 
-    db_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
-    table_name = env_str("TABLE_NAME", "tickets_mesclados")
+    merged_schema = env_str("DB_SCHEMA", "visualizacao_resolvidos")
+    merged_table = env_str("TABLE_NAME", "tickets_mesclados")
 
-    control_schema = env_str("CONTROL_SCHEMA", "visualizacao_resolvidos")
-    control_table = env_str("CONTROL_TABLE", "range_scan_control")
+    resolvidos_schema = env_str("RESOLVIDOS_SCHEMA", "visualizacao_resolvidos")
+    resolvidos_table = env_str("RESOLVIDOS_TABLE", "tickets_resolvidos_detail")
+
+    abertos_schema = env_str("ABERTOS_SCHEMA", "visualizacao_atual")
+    abertos_table = env_str("ABERTOS_TABLE", "tickets_abertos")
+
+    excluidos_schema = env_str("EXCLUIDOS_SCHEMA", "visualizacao_resolvidos")
+    excluidos_table = env_str("EXCLUIDOS_TABLE", "tickets_excluidos")
 
     window_size = env_int("WINDOW_SIZE", 50)
     http_timeout = env_int("HTTP_TIMEOUT", 45)
     attempts = env_int("HTTP_ATTEMPTS", 6)
+
+    loop_sleep_seconds = env_float("LOOP_SLEEP_SECONDS", 60.0)
+    loop_max_cycles = env_int("LOOP_MAX_CYCLES", 0)
 
     start_date = os.getenv("MERGED_START_DATE")
     if not start_date or start_date.strip() == "":
@@ -200,79 +317,106 @@ def main():
     if end_date and end_date.strip() == "":
         end_date = None
 
-    log.info("script_version=%s start_date=%s end_date=%s window_size=%d", SCRIPT_VERSION, start_date, end_date or "", window_size)
+    log.info(
+        "script_version=%s start_date=%s end_date=%s window_size=%d loop_sleep_seconds=%.2f loop_max_cycles=%d",
+        SCRIPT_VERSION,
+        start_date,
+        end_date or "",
+        window_size,
+        loop_sleep_seconds,
+        loop_max_cycles,
+    )
+
+    sess = requests.Session()
 
     conn = pg_connect(dsn)
     conn.autocommit = False
     try:
-        ensure_table(conn, db_schema, table_name)
+        if not try_lock(conn, "sync_tickets_merged_loop"):
+            log.info("another_run_detected exiting")
+            conn.rollback()
+            return
+
+        ensure_table(conn, merged_schema, merged_table)
         conn.commit()
-        current_page = read_range_control_page(conn, control_schema, control_table)
-    finally:
-        conn.close()
 
-    sess = requests.Session()
-    url = f"{base_url.rstrip('/')}/tickets/merged"
-    params = {"token": token, "startDate": start_date, "page": str(current_page)}
-    if end_date:
-        params["endDate"] = end_date
+        cycles = 0
+        while True:
+            cycles += 1
 
-    data, st = req(sess, url, params, http_timeout, attempts)
-    if st != 200 or not isinstance(data, dict):
-        log.info("merged_page page=%s status=%s rows=0", current_page, st)
-        return
+            data = fetch_latest_merged(sess, base_url, token, start_date, end_date, http_timeout, attempts)
 
-    page_number = str(data.get("pageNumber") or "").strip()
-    total_pages = None
-    if "of" in page_number:
-        parts = [p.strip() for p in page_number.split("of", 1)]
-        if len(parts) == 2:
-            total_pages = to_int(parts[1])
-    if not total_pages or total_pages <= 0:
-        total_pages = current_page
+            merged_list = data.get("mergedTickets")
+            if not isinstance(merged_list, list):
+                merged_list = []
+            merged_list = merged_list[: max(0, int(window_size))]
 
-    merged_list = data.get("mergedTickets")
-    if not isinstance(merged_list, list):
-        merged_list = []
+            rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+            for item in merged_list:
+                if not isinstance(item, dict):
+                    continue
+                parent_id = to_int(item.get("ticketId"))
+                if not parent_id:
+                    continue
+                merged_at = parse_dt(item.get("lastUpdate")) or datetime.now(timezone.utc)
+                ids_str = str(item.get("mergedTicketsIds") or "").strip()
+                if not ids_str:
+                    continue
+                child_ids = []
+                for s in ids_str.split(";"):
+                    v = to_int(s)
+                    if v:
+                        child_ids.append(v)
+                if not child_ids:
+                    continue
+                raw = {"parentTicketId": str(parent_id), **item}
+                payload = json_payload(raw)
+                for child_id in child_ids:
+                    rows.append((int(child_id), int(parent_id), merged_at, payload))
 
-    merged_list = merged_list[: max(0, int(window_size))]
+            upserted = 0
+            d_res = 0
+            d_abe = 0
+            d_exc = 0
 
-    rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
-    for item in merged_list:
-        if not isinstance(item, dict):
-            continue
-        parent_id = to_int(item.get("ticketId"))
-        if not parent_id:
-            continue
-        merged_at = parse_merged_lastupdate(item.get("lastUpdate")) or datetime.now(timezone.utc)
-        ids_str = str(item.get("mergedTicketsIds") or "").strip()
-        if not ids_str:
-            continue
-        child_ids = []
-        for s in ids_str.split(";"):
-            v = to_int(s)
-            if v:
-                child_ids.append(v)
-        if not child_ids:
-            continue
-        raw = {"parentTicketId": str(parent_id), **item}
-        payload = json_payload(raw)
-        for child_id in child_ids:
-            rows.append((int(child_id), int(parent_id), merged_at, payload))
+            if rows:
+                upserted = upsert_rows(conn, merged_schema, merged_table, rows)
+                d_res, d_abe, d_exc = cleanup_other_tables(
+                    conn,
+                    resolvidos_schema,
+                    resolvidos_table,
+                    abertos_schema,
+                    abertos_table,
+                    excluidos_schema,
+                    excluidos_table,
+                    rows,
+                )
+                conn.commit()
+            else:
+                conn.commit()
 
-    conn2 = pg_connect(dsn)
-    conn2.autocommit = False
-    try:
-        n = upsert_rows(conn2, db_schema, table_name, rows)
-        next_page = current_page + 1
-        if next_page > int(total_pages):
-            next_page = 1
-        write_range_control_page(conn2, control_schema, control_table, next_page)
-        conn2.commit()
-        log.info("merged_page page=%s/%s parents=%s inserted_or_updated=%s next_page=%s", current_page, total_pages, len(merged_list), n, next_page)
+            log.info(
+                "cycle=%d parents=%d upserted_children=%d removed_resolvidos=%d removed_abertos=%d removed_excluidos=%d",
+                cycles,
+                len(merged_list),
+                upserted,
+                d_res,
+                d_abe,
+                d_exc,
+            )
+
+            if loop_max_cycles and cycles >= loop_max_cycles:
+                break
+
+            time.sleep(max(0.0, float(loop_sleep_seconds)))
+
     finally:
         try:
-            conn2.close()
+            unlock(conn, "sync_tickets_merged_loop")
+        except Exception:
+            pass
+        try:
+            conn.close()
         except Exception:
             pass
 
