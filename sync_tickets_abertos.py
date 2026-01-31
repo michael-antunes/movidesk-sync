@@ -62,21 +62,23 @@ def set_fast_commit(cur):
         cur.execute("set local synchronous_commit=off")
 
 
-def ensure_dependency(conn):
+def ensure_tables(conn):
     with conn.cursor() as cur:
-        cur.execute("create schema if not exists dados_gerais")
+        set_fast_commit(cur)
+        cur.execute('create schema if not exists "visualizacao_atual"')
         cur.execute(
             """
-            create or replace function dados_gerais.fn_scan_fix_from_abertos(p_limit integer)
-            returns void
-            language plpgsql
-            as $$
-            begin
-              return;
-            end;
-            $$;
+            create table if not exists visualizacao_atual.tickets_abertos (
+              ticket_id bigint primary key,
+              base_status text,
+              last_update timestamptz,
+              updated_at timestamptz
+            )
             """
         )
+        cur.execute("alter table visualizacao_atual.tickets_abertos add column if not exists base_status text")
+        cur.execute("alter table visualizacao_atual.tickets_abertos add column if not exists last_update timestamptz")
+        cur.execute("alter table visualizacao_atual.tickets_abertos add column if not exists updated_at timestamptz")
     conn.commit()
 
 
@@ -185,14 +187,50 @@ def cleanup_not_open(conn, open_ids):
     return removed
 
 
-def cleanup_merged(conn):
+def cleanup_merged_state(conn):
     with conn.cursor() as cur:
         set_fast_commit(cur)
         cur.execute(
             """
+            delete from visualizacao_resolvidos.tickets_mesclados tm
+            using visualizacao_atual.tickets_abertos ta
+            where tm.ticket_id = ta.ticket_id
+              and coalesce(tm.merged_at, 'epoch'::timestamptz)
+                  < coalesce(ta.last_update, ta.updated_at, 'epoch'::timestamptz)
+            """
+        )
+        removed_from_mesclados = cur.rowcount
+
+        cur.execute(
+            """
             delete from visualizacao_atual.tickets_abertos ta
-             using visualizacao_resolvidos.tickets_mesclados tm
-             where ta.ticket_id = tm.ticket_id
+            using visualizacao_resolvidos.tickets_mesclados tm
+            where ta.ticket_id = tm.ticket_id
+              and coalesce(tm.merged_at, 'epoch'::timestamptz)
+                  >= coalesce(ta.last_update, ta.updated_at, 'epoch'::timestamptz)
+            """
+        )
+        removed_from_abertos = cur.rowcount
+
+    conn.commit()
+    return removed_from_mesclados, removed_from_abertos
+
+
+def cleanup_excluidos_by_open(conn):
+    with conn.cursor() as cur:
+        set_fast_commit(cur)
+        cur.execute(
+            """
+            delete from visualizacao_resolvidos.tickets_excluidos te
+            using visualizacao_atual.tickets_abertos ta
+            where te.ticket_id = ta.ticket_id
+              and coalesce(ta.last_update, ta.updated_at, 'epoch'::timestamptz)
+                  > coalesce(
+                      te.last_update,
+                      nullif(te.raw->>'lastUpdate','')::timestamptz,
+                      te.date_excluido,
+                      'epoch'::timestamptz
+                    )
             """
         )
         removed = cur.rowcount
@@ -207,16 +245,19 @@ def main():
     open_ids = [iint(t.get("id")) for t in items if isinstance(t, dict)]
 
     with psycopg2.connect(DSN) as conn:
-        ensure_dependency(conn)
+        ensure_tables(conn)
         up = upsert_min(conn, items)
         rem_closed = cleanup_not_open(conn, open_ids)
-        rem_merged = cleanup_merged(conn)
+        rem_merged_from_mesclados, rem_abertos_by_merge = cleanup_merged_state(conn)
+        rem_excl = cleanup_excluidos_by_open(conn)
 
     logger.info(
-        "Finalizado. upsert=%s removidos_fechados=%s removidos_mesclados=%s total_api=%s",
+        "Finalizado. upsert=%s removidos_fechados=%s mesclados_removidos=%s abertos_removidos_por_merge=%s removidos_excluidos=%s total_api=%s",
         up,
         rem_closed,
-        rem_merged,
+        rem_merged_from_mesclados,
+        rem_abertos_by_merge,
+        rem_excl,
         len(items),
     )
 
