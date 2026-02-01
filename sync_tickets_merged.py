@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_logtickets_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_sorted_2026-01-31"
 
 
 def env_str(k: str, default: Optional[str] = None) -> str:
@@ -80,10 +80,10 @@ def parse_dt(v: Any) -> Optional[datetime]:
         d = datetime.fromisoformat(s)
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
             try:
                 d = datetime.strptime(s, fmt)
-                return d.replace(tzinfo=timezone.utc)
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
             except Exception:
                 pass
     return None
@@ -156,6 +156,17 @@ def ensure_table(conn, schema: str, table: str) -> None:
         cur.execute(f"create index if not exists ix_{table}_merged_at on {qname(schema, table)} (merged_at)")
 
 
+def get_cutoff_ts(conn, schema: str, table: str) -> datetime:
+    with conn.cursor() as cur:
+        cur.execute(f"select max(merged_at) from {qname(schema, table)}")
+        row = cur.fetchone()
+        if row and row[0]:
+            dtv = row[0]
+            if isinstance(dtv, datetime):
+                return dtv if dtv.tzinfo else dtv.replace(tzinfo=timezone.utc)
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def upsert_rows(
     conn,
     schema: str,
@@ -188,6 +199,9 @@ def upsert_rows(
       set merged_into_id = excluded.merged_into_id,
           merged_at = excluded.merged_at,
           raw_payload = excluded.raw_payload
+    where {qname(schema, table)}.merged_at is null
+       or excluded.merged_at > {qname(schema, table)}.merged_at
+       or {qname(schema, table)}.merged_into_id is distinct from excluded.merged_into_id
     """
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(cur, sql, rows2, page_size=1000)
@@ -259,23 +273,37 @@ def cleanup_other_tables(
     return d_res, d_abe, d_exc
 
 
-def fetch_latest_merged(
+def fetch_merged_page(
     sess: requests.Session,
     base_url: str,
     token: str,
     start_date: str,
     end_date: Optional[str],
+    page: int,
     timeout: int,
     attempts: int,
 ) -> Dict[str, Any]:
     url = f"{base_url.rstrip('/')}/tickets/merged"
-    params: Dict[str, Any] = {"token": token, "startDate": start_date, "page": "1"}
+    params: Dict[str, Any] = {"token": token, "startDate": start_date, "page": str(page)}
     if end_date:
         params["endDate"] = end_date
     data, st = req(sess, url, params, timeout, attempts)
     if st != 200 or not isinstance(data, dict):
         return {}
     return data
+
+
+def parse_total_pages(data: Dict[str, Any], fallback: int) -> int:
+    pn = str(data.get("pageNumber") or "").strip()
+    if "of" in pn:
+        parts = [p.strip() for p in pn.split("of", 1)]
+        if len(parts) == 2:
+            try:
+                tp = int(parts[1])
+                return tp if tp > 0 else fallback
+            except Exception:
+                return fallback
+    return fallback
 
 
 def main():
@@ -308,22 +336,9 @@ def main():
     loop_sleep_seconds = env_float("LOOP_SLEEP_SECONDS", 60.0)
     loop_max_cycles = env_int("LOOP_MAX_CYCLES", 0)
 
-    start_date = os.getenv("MERGED_START_DATE")
-    if not start_date or start_date.strip() == "":
-        start_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-    end_date = os.getenv("MERGED_END_DATE")
-    if end_date and end_date.strip() == "":
-        end_date = None
-
-    log.info(
-        "script_version=%s start_date=%s end_date=%s window_size=%d loop_sleep_seconds=%.2f loop_max_cycles=%d",
-        SCRIPT_VERSION,
-        start_date,
-        end_date or "",
-        window_size,
-        loop_sleep_seconds,
-        loop_max_cycles,
-    )
+    max_pages_per_cycle = env_int("MAX_PAGES_PER_CYCLE", 5)
+    cycle_max_seconds = env_float("CYCLE_MAX_SECONDS", 20.0)
+    lookback_days = env_int("MERGED_LOOKBACK_DAYS", 7)
 
     sess = requests.Session()
 
@@ -341,23 +356,58 @@ def main():
         cycles = 0
         while True:
             cycles += 1
+            cycle_started = time.time()
 
-            data = fetch_latest_merged(sess, base_url, token, start_date, end_date, http_timeout, attempts)
+            cutoff_ts = get_cutoff_ts(conn, merged_schema, merged_table)
+            start_date = (cutoff_ts - timedelta(days=int(lookback_days))).date().strftime("%Y-%m-%d")
+            end_date = None
 
-            merged_list = data.get("mergedTickets")
-            if not isinstance(merged_list, list):
-                merged_list = []
-            merged_list = merged_list[: max(0, int(window_size))]
+            log.info(
+                "cycle=%d cutoff_ts=%s startDate=%s window_size=%d max_pages_per_cycle=%d cycle_max_seconds=%.2f",
+                cycles,
+                cutoff_ts.isoformat(),
+                start_date,
+                window_size,
+                max_pages_per_cycle,
+                cycle_max_seconds,
+            )
+
+            candidates: List[Tuple[datetime, Dict[str, Any]]] = []
+            total_pages_seen = 0
+            total_pages_reported = 0
+
+            page = 1
+            while page <= max_pages_per_cycle and (time.time() - cycle_started) <= float(cycle_max_seconds):
+                data = fetch_merged_page(sess, base_url, token, start_date, end_date, page, http_timeout, attempts)
+                if not data:
+                    break
+
+                total_pages_seen = page
+                total_pages_reported = max(total_pages_reported, parse_total_pages(data, page))
+
+                merged_list = data.get("mergedTickets")
+                if not isinstance(merged_list, list) or len(merged_list) == 0:
+                    break
+
+                for it in merged_list:
+                    if not isinstance(it, dict):
+                        continue
+                    lu = parse_dt(it.get("lastUpdate")) or datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    candidates.append((lu, it))
+
+                if page >= total_pages_reported:
+                    break
+                page += 1
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            selected = candidates[: max(0, int(window_size))]
 
             rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
 
-            for item in merged_list:
-                if not isinstance(item, dict):
-                    continue
+            for merged_at, item in selected:
                 parent_id = to_int(item.get("ticketId"))
                 if not parent_id:
                     continue
-                merged_at = parse_dt(item.get("lastUpdate")) or datetime.now(timezone.utc)
                 ids_str = str(item.get("mergedTicketsIds") or "").strip()
                 if not ids_str:
                     continue
@@ -399,13 +449,17 @@ def main():
                 conn.commit()
 
             log.info(
-                "cycle=%d parents=%d upserted_children=%d removed_resolvidos=%d removed_abertos=%d removed_excluidos=%d",
+                "cycle=%d pages_seen=%d pages_reported=%d candidates=%d selected=%d upserted_children=%d removed_resolvidos=%d removed_abertos=%d removed_excluidos=%d elapsed_s=%.2f",
                 cycles,
-                len(merged_list),
+                total_pages_seen,
+                total_pages_reported,
+                len(candidates),
+                len(selected),
                 upserted,
                 d_res,
                 d_abe,
                 d_exc,
+                time.time() - cycle_started,
             )
 
             if loop_max_cycles and cycles >= loop_max_cycles:
