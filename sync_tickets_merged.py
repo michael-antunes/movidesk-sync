@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_logtickets_2026-01-31"
 
 
 def env_str(k: str, default: Optional[str] = None) -> str:
@@ -145,8 +145,8 @@ def ensure_table(conn, schema: str, table: str) -> None:
         cur.execute(
             f"""
             create table if not exists {qname(schema, table)} (
-              ticket_id integer primary key,
-              merged_into_id integer not null,
+              ticket_id bigint primary key,
+              merged_into_id bigint not null,
               merged_at timestamptz,
               raw_payload jsonb
             )
@@ -178,11 +178,9 @@ def upsert_rows(
                 dedup[cid] = (cid, int(parent_id), merged_at, payload)
             elif prev_at is not None and merged_at is not None and merged_at > prev_at:
                 dedup[cid] = (cid, int(parent_id), merged_at, payload)
-
     rows2 = list(dedup.values())
     if not rows2:
         return 0
-
     sql = f"""
     insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
     values %s
@@ -208,16 +206,13 @@ def cleanup_other_tables(
 ) -> Tuple[int, int, int]:
     if not merged_rows:
         return 0, 0, 0
-
     tmp_rows = []
     for (child_id, _parent_id, merged_at, _payload) in merged_rows:
         if child_id is None:
             continue
         tmp_rows.append((int(child_id), merged_at))
-
     if not tmp_rows:
         return 0, 0, 0
-
     with conn.cursor() as cur:
         cur.execute("create temporary table tmp_merged_children(ticket_id bigint primary key, merged_at timestamptz) on commit drop")
         psycopg2.extras.execute_values(cur, "insert into tmp_merged_children(ticket_id, merged_at) values %s", tmp_rows, page_size=1000)
@@ -284,7 +279,10 @@ def fetch_latest_merged(
 
 
 def main():
-    logging.basicConfig(level=getattr(logging, env_str("LOG_LEVEL", "INFO").upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, env_str("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     log = logging.getLogger("sync_tickets_merged")
 
     token = env_str("MOVIDESK_TOKEN")
@@ -352,6 +350,7 @@ def main():
             merged_list = merged_list[: max(0, int(window_size))]
 
             rows: List[Tuple[int, int, Optional[datetime], psycopg2.extras.Json]] = []
+
             for item in merged_list:
                 if not isinstance(item, dict):
                     continue
@@ -369,9 +368,13 @@ def main():
                         child_ids.append(v)
                 if not child_ids:
                     continue
+
+                log.info("checking_parent_ticket parent_ticket_id=%s merged_at=%s children_count=%s", parent_id, merged_at.isoformat(), len(child_ids))
+
                 raw = {"parentTicketId": str(parent_id), **item}
                 payload = json_payload(raw)
                 for child_id in child_ids:
+                    log.info("checking_child_ticket child_ticket_id=%s parent_ticket_id=%s", child_id, parent_id)
                     rows.append((int(child_id), int(parent_id), merged_at, payload))
 
             upserted = 0
