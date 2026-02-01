@@ -12,7 +12,7 @@ import psycopg2.extras
 import requests
 
 
-SCRIPT_VERSION = "sync_range_tickets_merged_range_control_2026-01-31"
+SCRIPT_VERSION = "sync_range_tickets_merged_range_control_logtickets_2026-01-31"
 
 
 def env(name: str, default: Optional[str] = None) -> str:
@@ -406,20 +406,19 @@ def movidesk_fetch_best(
             logging.warning("api_unexpected ticket_id=%s status=%s body=%s", ticket_id, r.status_code, r.text[:500])
 
     if fallback_enabled:
-        if last_status in (0, 400, 404) or best_payload is not None:
-            rels2 = merged_fallback_scan(
-                api_base,
-                token,
-                ticket_id,
-                fallback_start_date,
-                fallback_end_date,
-                timeout,
-                max_retries,
-                fallback_max_pages,
-                debug,
-            )
-            if rels2:
-                return None, rels2, "fallback_startDate_page"
+        rels2 = merged_fallback_scan(
+            api_base,
+            token,
+            ticket_id,
+            fallback_start_date,
+            fallback_end_date,
+            timeout,
+            max_retries,
+            fallback_max_pages,
+            debug,
+        )
+        if rels2:
+            return None, rels2, "fallback_startDate_page"
 
     if best_payload is not None:
         return best_payload, extract_relations(best_payload, ticket_id), best_key
@@ -433,8 +432,6 @@ def ensure_jsonb(v: Dict[str, Any]) -> str:
 
 def _control_order_by(cols: Set[str]) -> str:
     bits: List[str] = []
-    if "id" in cols:
-        bits.append("id desc nulls last")
     bits.append("ctid desc")
     return ", ".join(bits)
 
@@ -658,6 +655,8 @@ def main() -> None:
             batch_removed_other = 0
 
             for tid in batch_ids:
+                logging.info("checking_ticket ticket_id=%s", tid)
+
                 debug = tid in debug_ids
 
                 _payload, rels, key_used = movidesk_fetch_best(
@@ -673,9 +672,6 @@ def main() -> None:
                     fallback_max_pages,
                     debug,
                 )
-
-                if debug:
-                    logging.info("debug_ticket ticket_id=%s key_used=%s relations=%s", tid, key_used, len(rels))
 
                 if rels:
                     batch_upsert += upsert_mesclados(conn, schema, target_table, rels)
