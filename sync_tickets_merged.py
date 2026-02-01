@@ -10,7 +10,7 @@ import psycopg2
 import psycopg2.extras
 
 
-SCRIPT_VERSION = "sync_tickets_merged_loop_latest50_sorted_2026-01-31"
+SCRIPT_VERSION = "sync_tickets_merged_loop_top50_sorted_paged_2026-02-01"
 
 
 def env_str(k: str, default: Optional[str] = None) -> str:
@@ -108,13 +108,13 @@ def req(sess: requests.Session, url: str, params: Dict[str, Any], timeout: int, 
                     try:
                         time.sleep(max(1, int(float(ra))))
                     except Exception:
-                        time.sleep(min(2 ** i, 30))
+                        time.sleep(min(2 ** i, 15))
                 else:
-                    time.sleep(min(2 ** i, 30))
+                    time.sleep(min(2 ** i, 15))
                 continue
             return None, r.status_code
         except Exception:
-            time.sleep(min(2 ** i, 30))
+            time.sleep(min(2 ** i, 15))
     return None, last_status
 
 
@@ -189,9 +189,11 @@ def upsert_rows(
                 dedup[cid] = (cid, int(parent_id), merged_at, payload)
             elif prev_at is not None and merged_at is not None and merged_at > prev_at:
                 dedup[cid] = (cid, int(parent_id), merged_at, payload)
+
     rows2 = list(dedup.values())
     if not rows2:
         return 0
+
     sql = f"""
     insert into {qname(schema, table)} (ticket_id, merged_into_id, merged_at, raw_payload)
     values %s
@@ -303,7 +305,11 @@ def parse_total_pages(data: Dict[str, Any], fallback: int) -> int:
                 return tp if tp > 0 else fallback
             except Exception:
                 return fallback
-    return fallback
+    try:
+        tp2 = int(data.get("totalPages"))
+        return tp2 if tp2 > 0 else fallback
+    except Exception:
+        return fallback
 
 
 def main():
@@ -333,12 +339,27 @@ def main():
     http_timeout = env_int("HTTP_TIMEOUT", 45)
     attempts = env_int("HTTP_ATTEMPTS", 6)
 
-    loop_sleep_seconds = env_float("LOOP_SLEEP_SECONDS", 60.0)
-    loop_max_cycles = env_int("LOOP_MAX_CYCLES", 0)
+    loop_sleep_seconds = env_float("LOOP_SLEEP_SECONDS", 0.0)
+    loop_max_cycles = env_int("LOOP_MAX_CYCLES", 1)
 
     max_pages_per_cycle = env_int("MAX_PAGES_PER_CYCLE", 5)
-    cycle_max_seconds = env_float("CYCLE_MAX_SECONDS", 20.0)
+    cycle_max_seconds = env_float("CYCLE_MAX_SECONDS", 35.0)
+
     lookback_days = env_int("MERGED_LOOKBACK_DAYS", 7)
+
+    end_date = os.getenv("MERGED_END_DATE")
+    if end_date and end_date.strip() == "":
+        end_date = None
+
+    log.info(
+        "script_version=%s window_size=%d max_pages_per_cycle=%d cycle_max_seconds=%.2f lookback_days=%d loop_max_cycles=%d",
+        SCRIPT_VERSION,
+        window_size,
+        max_pages_per_cycle,
+        cycle_max_seconds,
+        lookback_days,
+        loop_max_cycles,
+    )
 
     sess = requests.Session()
 
@@ -358,23 +379,16 @@ def main():
             cycles += 1
             cycle_started = time.time()
 
-            cutoff_ts = get_cutoff_ts(conn, merged_schema, merged_table)
-            start_date = (cutoff_ts - timedelta(days=int(lookback_days))).date().strftime("%Y-%m-%d")
-            end_date = None
-
-            log.info(
-                "cycle=%d cutoff_ts=%s startDate=%s window_size=%d max_pages_per_cycle=%d cycle_max_seconds=%.2f",
-                cycles,
-                cutoff_ts.isoformat(),
-                start_date,
-                window_size,
-                max_pages_per_cycle,
-                cycle_max_seconds,
-            )
+            env_start_date = os.getenv("MERGED_START_DATE")
+            if env_start_date and env_start_date.strip():
+                start_date = env_start_date.strip()
+            else:
+                cutoff_ts = get_cutoff_ts(conn, merged_schema, merged_table)
+                start_date = (cutoff_ts - timedelta(days=int(lookback_days))).date().strftime("%Y-%m-%d")
 
             candidates: List[Tuple[datetime, Dict[str, Any]]] = []
-            total_pages_seen = 0
-            total_pages_reported = 0
+            pages_seen = 0
+            pages_reported = 0
 
             page = 1
             while page <= max_pages_per_cycle and (time.time() - cycle_started) <= float(cycle_max_seconds):
@@ -382,11 +396,11 @@ def main():
                 if not data:
                     break
 
-                total_pages_seen = page
-                total_pages_reported = max(total_pages_reported, parse_total_pages(data, page))
+                pages_seen = page
+                pages_reported = max(pages_reported, parse_total_pages(data, page))
 
                 merged_list = data.get("mergedTickets")
-                if not isinstance(merged_list, list) or len(merged_list) == 0:
+                if not isinstance(merged_list, list) or not merged_list:
                     break
 
                 for it in merged_list:
@@ -395,7 +409,7 @@ def main():
                     lu = parse_dt(it.get("lastUpdate")) or datetime(1970, 1, 1, tzinfo=timezone.utc)
                     candidates.append((lu, it))
 
-                if page >= total_pages_reported:
+                if page >= pages_reported:
                     break
                 page += 1
 
@@ -449,10 +463,11 @@ def main():
                 conn.commit()
 
             log.info(
-                "cycle=%d pages_seen=%d pages_reported=%d candidates=%d selected=%d upserted_children=%d removed_resolvidos=%d removed_abertos=%d removed_excluidos=%d elapsed_s=%.2f",
+                "cycle=%d startDate=%s pages_seen=%d pages_reported=%d candidates=%d selected=%d upserted_children=%d removed_resolvidos=%d removed_abertos=%d removed_excluidos=%d elapsed_s=%.2f",
                 cycles,
-                total_pages_seen,
-                total_pages_reported,
+                start_date,
+                pages_seen,
+                pages_reported,
                 len(candidates),
                 len(selected),
                 upserted,
@@ -465,7 +480,8 @@ def main():
             if loop_max_cycles and cycles >= loop_max_cycles:
                 break
 
-            time.sleep(max(0.0, float(loop_sleep_seconds)))
+            if loop_sleep_seconds > 0:
+                time.sleep(max(0.0, float(loop_sleep_seconds)))
 
     finally:
         try:
